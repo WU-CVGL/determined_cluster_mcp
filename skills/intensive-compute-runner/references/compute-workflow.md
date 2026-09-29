@@ -87,6 +87,8 @@ Review project-specific secret filenames before copying. Never use an experiment
 
 `request_id` makes a known launch retry idempotent. It does not justify resubmitting after an unknown outcome. If submission times out, retain the local record and call `compute_reconcile` only with a verified remote ID. The service will require the remote submission marker to match. If there is no trustworthy link, report the task as uncertain and require investigation before another launch.
 
+`compute_usage(task_id)` reads measured CPU, memory, and GPU use when the Determined master provides task resources; `task_resources_disabled` or `task_resources_unsupported` means no measurements, not an idle task. A null value is a missing measurement, never zero, and GPU metrics cover the whole device. Inspect its `warnings` before concluding that a job is underusing or saturating its resources. Use its `gpus` entries (`utilization_spread_percent`, `least_utilized_gpu_uuid`, `idle_fraction`, and `gpu_count` against `requested_slots`) to spot idle or straggling GPUs, and treat an experiment's `trial.batches_per_second_lower_bound` as a lifetime floor; a `total_batches_processed` of 0 is expected when the workload does not report through Determined's Core API (or has not reported yet), and does not mean it made no progress.
+
 Authentication failure is a configuration failure. Do not run the workload locally as a fallback and do not expose credentials while diagnosing it.
 
 Logs and reports may contain commands, paths, IDs, states, and sanitized errors. They must not include tokens, passwords, authorization headers, environment-file contents, or copied secret values.

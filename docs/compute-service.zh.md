@@ -1,3 +1,4 @@
+<a id="compute-service-reference"></a>
 # 计算服务参考
 
 [English](compute-service.md) | [简体中文](compute-service.zh.md)
@@ -11,7 +12,7 @@
 
 ```mermaid
 flowchart LR
-    U[Any local stdio MCP client] --> M[13 base MCP tools]
+    U[Any local stdio MCP client] --> M[14 base MCP tools]
     M --> C[ComputeService]
     C --> D[(local SQLite database)]
     C --> A[Determined API]
@@ -26,13 +27,13 @@ MCP server 是供一个可信用户使用的本地 stdio 服务。进程启动�
 owner 参数。多个进程可以在同一个数据库中使用不同 owner；需要协作时也可以有意共用 owner。
 这只是命名空间边界，不是多用户认证。若要远程暴露服务，需要另行设计带认证的传输层。
 
-`ComputeService` 负责规划、幂等提交、状态、日志、取消、发现、接管以及保守的调和。其本地
-`task_id` 在服务重启后保持稳定，与 Determined 的 `remote_id` 不同。SQLite 数据库应放在
-持久的本地存储上；源码、数据、包、检查点、日志和输出应放在映射的共享存储上。
+`ComputeService` 负责规划、幂等提交、状态、日志、用量测量、取消、发现、接管以及保守的
+调和。其本地 `task_id` 在服务重启后保持稳定，与 Determined 的 `remote_id` 不同。SQLite
+数据库应放在持久的本地存储上；源码、数据、包、检查点、日志和输出应放在映射的共享存储上。
 
-咨询后端默认为 `none`。此模式注册 13 个基础工具，不导入咨询 worker，不要求安装 Codex，
+咨询后端默认为 `none`。此模式注册 14 个基础工具，不导入咨询 worker，不要求安装 Codex，
 也不要求存在仓库 skill 目录。启用 Codex 后端会增加 `compute_consult` 和 `workflow_status`，
-总计 15 个工具。咨询只提供建议，不能提交或取消任务。
+总计 16 个工具。咨询只提供建议，不能提交或取消任务。
 
 <a id="compute-profile"></a>
 ## 计算配置
@@ -65,7 +66,7 @@ shell_inactivity_seconds: 7200
 服务本身不强制 shell 空闲超时。
 
 `cluster_identity` 是可选的运维标签。服务把本地提交记录绑定到配置指纹、解析后的 Determined
-端点和这个标签。改变该绑定后，不能再对这些记录执行状态、日志、取消或调和操作。
+端点和这个标签。改变该绑定后，不能再对这些记录执行状态、日志、用量、取消或调和操作。
 
 <a id="request-object-and-planning"></a>
 ## 请求对象与规划
@@ -140,7 +141,7 @@ CLI 的默认数据库路径是 `~/.local/state/determined-compute/tasks.sqlite3
 <a id="mcp-api"></a>
 ## MCP API
 
-基础 server 提供 13 个工具。下文的 `owner` 始终指启动时绑定的命名空间，不是工具参数。
+基础 server 提供 14 个工具。下文的 `owner` 始终指启动时绑定的命名空间，不是工具参数。
 
 | 工具 | 参数 | 返回值与作用 |
 | --- | --- | --- |
@@ -148,6 +149,7 @@ CLI 的默认数据库路径是 `~/.local/state/determined-compute/tasks.sqlite3
 | `compute_launch` | `request`、`request_id` | 持久化任务记录；最多提交一次 |
 | `compute_status` | `task_id` | 本地任务记录、刷新后的远端状态，以及绑定后取得的远端实体 |
 | `compute_logs` | `task_id`，可选 `tail=200` | 最新远端日志按时间正序排列的列表 |
+| `compute_usage` | `task_id`，可选 `window_seconds=3600`、`allocation_id`、`trial_id`、`metrics`、`include_samples=false` | 一个任务实测 CPU、内存和 GPU 用量的只读摘要 |
 | `compute_cancel` | `task_id` | 更新后的记录、远端取消响应与确认标志 |
 | `compute_reconcile` | `task_id`、`remote_id` | 仅在验证标记后绑定的记录 |
 | `compute_list_tasks` | 无 | 已绑定 owner 命名空间内的本地记录 |
@@ -190,7 +192,8 @@ CLI 的默认数据库路径是 `~/.local/state/determined-compute/tasks.sqlite3
 `submitting` 记录会变为 `submission_uncertain`，但不会触发自动重提。
 
 `compute_logs` 要求 `tail` 为正数。command 和 shell 日志来自相应 task log API；experiment
-日志来自数值最大的 trial ID，没有 trial 时返回空列表。结果按从旧到新排列。没有 remote ID
+日志来自数值最大的 trial ID，该 trial 由服务端排序选出，即使 experiment 超过 100 个 trial
+也能正确选择；没有 trial 时返回空列表。结果按从旧到新排列。没有 remote ID
 的任务也返回空列表。
 
 `compute_cancel` 对 command 和 shell 使用 task kill endpoint，对 experiment 使用 experiment
@@ -201,6 +204,131 @@ cancel endpoint。它要求任务已绑定 remote ID；API 调用完成后返回
 对于正在运行的 shell，应使用已清理的 `reconnectCommand`，当前为
 `det shell show_ssh_command <remote-id>`。适配器会移除 `privateKey`；不要把私钥材料写入任务
 记录、咨询 context 或报告。
+
+<a id="task-usage-measurements"></a>
+### 任务用量测量
+
+`compute_usage` 是只读工具，汇总当前 owner 命名空间中某个任务实测的 CPU、内存和 GPU 用量；
+`compute_resources` 描述的则是调度容量。它要求 Determined master 来自 research-cluster fork
+0.40.1 或更高版本，并由管理员配置 `integrations.task_resources`（`prometheus_url` 和
+`det_cluster`）。
+
+服务先验证参数，再执行与 `compute_status` 相同的 owner 和绑定检查。没有 remote ID 的记录返回
+`remote_id_unknown`，应先调和。adopted 任务会再次验证远端 owner。随后服务向 master 查询任务
+资源功能是否可用：集成未启用时返回 `task_resources_disabled`，master 不提供该 API 时返回
+`task_resources_unsupported`。两者都不可重试。
+
+command 和 shell 的 `determined_task_id` 就是 remote ID。experiment 只报告一个 trial：默认是
+ID 最大的 trial，指定 `trial_id` 时则为该 trial。指定的 trial 属于其他 experiment 时返回
+`trial_not_found`；trial ID 不存在或无权访问时返回 Determined 的 HTTP 404。其他任务类型会拒绝
+`trial_id`。服务测量所选 trial 最新的 Determined task。experiment 尚无 trial，或 trial 尚无
+task 时，返回 `task_not_started`。`allocation_id` 把结果限定为该 task 列出的一个 allocation；
+其他值返回 `allocation_not_found`。
+
+`window_seconds` 必须在 60 到 604,800（七天）之间，默认 3,600。已结束任务的窗口终点是任务结束
+时间（不晚于当前时间），其他任务的终点是当前时间。如果所选的每个 allocation 都在此之前结束，
+例如已暂停的 trial，或通过 `allocation_id` 指定的较早 allocation，窗口终点改为其中最晚的
+allocation 结束时间。起点比终点早 `window_seconds`，但不早于任务开始时间或所请求 allocation 的
+开始时间，且至少比终点早一秒。`window.anchor` 说明采用的终点：`task_end`、`allocation_end` 或
+`now`。步长取 15 秒与窗口长度除以 1,439 后向上取整两者中的较大值，因此每个序列不超过
+1,440 个点。`metrics` 是非空列表，取值来自 `allocation_active`（count）、`cpu_cores`
+（cores）、`memory_working_set_bytes` 和 `memory_rss_bytes`（bytes）、
+`gpu_utilization_percent`（percent）、`gpu_memory_used_bytes`（bytes）、`gpu_power_watts`
+（watts）以及 `gpu_temperature_celsius`（celsius）；省略时保留所有返回的序列。
+
+结果包含：
+
+| 字段 | 含义 |
+| --- | --- |
+| `task_id`、`kind`、`remote_id` | 本地任务身份 |
+| `determined_task_id` | 实际读取测量值的 Determined task |
+| `trial` | command 和 shell 为 `null`；否则包含 `id`、`state`、`selection`（`latest` 或 `requested`）、`experiment_trial_count`（指定 `trial_id` 时为 `null`）、`task_count`，以及下文所述的 trial 进度和汇总指标字段 |
+| `resource_pool` | 任务所在资源池的 `name`，以及 Determined 中由运维人员填写的 `description`（去除首尾空白，最多 4,096 个字符；资源池没有描述或不在当前账户可见的资源池列表中时为 `null`）；资源池名称未知时整个字段为 `null` |
+| `task_start_time`、`task_end_time` | Determined task 的生命周期 |
+| `allocations` | 每个 allocation 的 `allocation_id`、`state`、`is_ready`、UTC 时间 `start_time` 和 `end_time`、`slots`、`exit_reason`（最多 1,024 个字符）以及 `status_code` |
+| `allocation_details_limit` | 仅当任务的 allocation 超过 8 个时出现，值为 8；见下文 |
+| `allocation_id` | 请求的 allocation 过滤条件，或 `null` |
+| `window` | 以 Unix 秒表示的 `start` 和 `end`、以秒为单位的 `step`，以及 `start_at`、`end_at`、`anchor` 和 `expected_points` |
+| `series` | 每个指标和标签组合一条摘要 |
+| `gpus` | 每个 allocation 一条 GPU 对比；见下文 |
+| `warnings` | Determined 返回的 `{code, message}` 警告，原样透传 |
+| `context_unavailable` | 查询失败的上下文：`resource_pool`、`allocation_details` 或 `gpu_models` |
+| `explanation`、`advisory` | 如何解读本结果 |
+| `observed_at` | 服务生成结果的时间 |
+
+每个序列包含 `metric`、`unit`，标签 `allocation_id`、`node` 和 `gpu_uuid`，`gpu_model`，
+`points`、`available_points`、`first_at`、`last_at`，以及基于可用样本的 `last`、`min`、`max`、
+`mean`、`p50` 和 `p95`。`p50` 和 `p95` 是最近秩（nearest-rank）百分位数。`gpu_model` 是
+Determined agent 为该 `gpu_uuid` 报告的型号名称；非 GPU 序列或设备未知时为 `null`。
+`gpu_utilization_percent` 序列还包含 `idle_fraction`，即其可用样本中低于 10% 的比例。
+
+数值是每 `step` 秒一次的点采样，因此 `min`、`max`、`mean` 和百分位数描述的是这些样本，
+而不是每个时刻的值。null 或缺失值表示没有测量，绝不表示用量为零。`allocation_active`
+大于零表示该 allocation 在该采样点处于运行状态。CPU 和内存序列按 allocation 和节点区分；GPU
+序列按 GPU UUID 区分，覆盖整块分配到的设备，可能包含其他进程。下结论前先检查 `warnings`，
+例如 `rss_unverified` 或 `gpu_full_device`。空的 `series` 列表表示该窗口没有数据，
+而不是任务空闲；如果 `metrics` 过滤掉了所有返回的序列，`explanation` 会列出实际返回的指标。
+未指定 `trial_id` 且 experiment 有多个 trial 时，`explanation` 会说明 trial 总数以及报告的是
+哪一个。
+
+`gpus` 比较每个 allocation 内的各块 GPU。每个带有 GPU 利用率或显存序列的 `allocation_id`
+对应一个条目，基于该窗口返回的所有此类序列计算，即使 `metrics` 过滤条件使其不出现在 `series`
+中；指定 `allocation_id` 时只覆盖该 allocation。每个条目包含 `gpu_count`（返回了利用率或显存
+序列的不同 GPU UUID 数，即使其样本全为 null）、`requested_slots`（该 allocation 的槽位数，
+未知时为 `null`）、`gpu_models`（已知的不同型号名称，可能为空），以及各 GPU 平均利用率的统
+计：`mean_utilization_percent` 是各 GPU 均值的平均，每块 GPU 权重相同；
+`min_gpu_mean_utilization_percent` 和 `max_gpu_mean_utilization_percent` 是其中的最低值和最
+高值；`utilization_spread_percent` 是两者之差；`least_utilized_gpu_uuid` 是均值最低的 GPU，
+并列时取字典序最小的 UUID。这些利用率统计只包含至少有一个可用利用率样本的 GPU，因此覆盖的
+GPU 数可能少于 `gpu_count`。`idle_fraction` 则是该 allocation 全部 GPU 利用率样本中低于
+`idle_threshold_percent`（10）的比例。`max_memory_used_bytes` 是该 allocation 中单块 GPU
+采样到的最大显存用量，而不是真正的峰值；不报告显存容量。差值较大提示存在空闲或掉队的 GPU，
+可先查看 `least_utilized_gpu_uuid`；`idle_fraction` 较高表示这些 GPU 在窗口内大部分时间低于
+阈值。`gpu_count` 小于 `requested_slots` 表示返回了序列的 GPU 少于该 allocation 持有的槽位；
+在认定其余 GPU 未被使用之前，应先检查 `warnings` 和监控覆盖情况。
+
+对于 experiment，`trial` 还包含 Determined 针对整个 trial（而不是测量窗口）记录的值：
+`total_batches_processed`、`wall_clock_seconds` 和 `restarts`，缺失或格式异常时为 `null`。
+`total_batches_processed` 是报告过的最大 `steps_completed`，`restarts` 不超过该 experiment
+的 `max_restarts`。`batches_per_second_lower_bound` 是批次数除以挂钟秒数，任一值未知或挂钟时
+间为零时为 `null`；其单位取决于工作负载以 `steps_completed` 报告的内容。它只是下界，因为
+`wall_clock_seconds` 累加每个 allocation 从 Determined 首次报告其资源处于拉取镜像或运行状态
+起，到该 allocation 结束（运行中则到当前时间）为止的时间，其中可能包括镜像拉取、启动、
+初始化以及因重启损失的 allocation 时间（不含调度排队时间和 allocation 之间的暂停间隔）。
+`summary_metrics` 收录 Determined 按组、按指标的统计，其中只保留 `type` 以及有限数值
+`count`、`sum`、`min`、`max`、`last` 和 `mean`；`avg_metrics`（训练）和 `validation_metrics`
+等组名来自 Determined，原样透传。最多保留 100 个指标条目：先是 `validation_metrics`，
+然后是 `avg_metrics`，再按组名排列其他组，每组内按指标名排序；存在更多条目时
+`summary_metrics_truncated` 为 true。这些字段依赖工作负载通过 Determined 的
+Core API 报告。对于不这样报告的工作负载（例如普通 bash 入口）或尚未报告的工作负载，
+`total_batches_processed` 为 0 属于预期，`explanation` 也会说明这一点；这并不表示工作负载
+没有进展。工作负载未报告指标时，
+`summary_metrics` 为 `{}`。
+
+资源池、allocation 详情和 GPU 型号等上下文以尽力而为的方式获取，并在读取测量值之后进行。
+其中某项查询出现 Determined API 错误（包括传输失败或响应格式异常）时，会把 `resource_pool`、
+`allocation_details` 或 `gpu_models` 加入 `context_unavailable`，受影响字段为空或 `null`，
+测量值仍照常返回。出现传输失败后，其余查询会被跳过并以相同方式报告，因此无响应的 master
+只会让结果延迟一次超时，而不是每项查询各一次。submitted 任务需要额外读取一次任务实体以获得
+资源池名称，`compute_logs` 不会进行这次读取；该读取失败时报告 `resource_pool`。adopted 任务
+复用所有权检查时读取的实体。Determined 只在已结束的 command 或 shell 结束后 24 小时内提供
+其实体，master 重启后也不再提供；对这类任务，`resource_pool` 为 `null`，且
+`context_unavailable` 中没有相应条目。
+只有已知资源池名称时才读取资源池列表。allocation 详情只读取 Determined 顺序（先是尚无结束时
+间的 allocation，例如排队中或运行中的，再按结束时间由近到远）中的前八个 allocation，
+以及请求的 `allocation_id`；其他 allocation 的详情为 `null`，并由 `allocation_details_limit`
+报告上限。提供 GPU 型号名称的 agent 列表只在存在 GPU 序列时读取。RBAC 对当前账户隐藏设备
+UUID 时，`gpu_model` 为 `null`，`gpu_models` 为空，且 `context_unavailable` 中没有相应条目。
+
+`include_samples=true` 会增加 `samples_omitted`。`samples_omitted` 为 false 时，每个序列还包含
+`samples`，格式为 `[unix_seconds, value_or_null]` 对。所选序列合计超过 2,880 个点时，服务省略
+样本并报告 `samples_limit`；应缩短窗口、减少指标或选择一个 allocation。
+
+master 限制每次查询最多覆盖七天、最小步长 15 秒、每个序列 1,440 个点、超时 10 秒，并且同时
+最多运行四个资源查询。HTTP 503 表示测量后端繁忙或不可用，可以重试。master 会以 HTTP 400 拒绝
+比其自身时钟超前 60 秒以上的终点，因此客户端时钟明显快于 master 时可能出现该错误。Determined
+task 或指定的 trial ID 不存在或无权访问时返回 HTTP 404。参见
+[故障排查](troubleshooting.zh.md#usage-measurements-are-unavailable-or-empty)。
 
 <a id="discover-and-adopt"></a>
 ### 发现与接管
@@ -218,8 +346,8 @@ submitted 记录会原样返回，不会被替换。
 
 新接管记录使用 `origin: "adopted"`、本地 `state: "adopted"` 和内部接管 request ID。记录只
 保留白名单中的身份、状态、名称和说明元数据。未知的 `workdir`、`output_dir` 和
-`code_revision` 对外为 `null`；存储层不会推断这些值，也不保留原始远端配置。后续状态、日志
-和取消操作会再次检查实际集群和账户绑定。接管任务不把提交时配置作为授权依据，也不会获得
+`code_revision` 对外为 `null`；存储层不会推断这些值，也不保留原始远端配置。后续状态、日志、
+用量和取消操作会再次检查实际集群和账户绑定。接管任务不把提交时配置作为授权依据，也不会获得
 任何存储权限。
 
 对于通过 WebUI、原生 CLI 或同一账户的另一设备创建的工作，使用发现和接管；对于远端是否
@@ -252,6 +380,16 @@ MCP 失败使用 `isError: true`；其文本内容是如下形式的紧凑 JSON�
 task ID 和容量信息。认证、权限、传输和响应结构错误都会返回错误，而不是空结果。错误消息和
 报告可以包含清理后的命令、路径、ID、状态和错误类别，但不能包含凭据或 secrets 文件内容。
 
+Determined 的 HTTP 失败（包括 gRPC-gateway 错误响应体）显示为 `<status> <message>`。HTTP 429
+以及除 501 之外的 5xx 响应可以重试；501 表示 master 缺少对应路由。用量相关的错误码见
+[任务用量测量](#task-usage-measurements)。
+
+在使用 basic authorization 的 Determined fork 0.40.1 或更高版本上，只有任务的 Determined 所有者
+或管理员可以终止或取消 command、shell 和 experiment。因此，对于其他账户拥有的任务，
+`compute_cancel` 对 command 或 shell 返回 HTTP 403，对 experiment 返回 HTTP 404
+`experiment '<id>' not found`。submitted 记录绑定配置和端点而不是账户，所以把凭据切换到
+另一个账户后可能遇到这些错误。应使用拥有该任务的账户取消，或联系管理员。
+
 <a id="cli-equivalents"></a>
 ## CLI 等价命令
 
@@ -271,6 +409,7 @@ determined-compute plan --request-file .local/request.json
 determined-compute launch --request-file .local/request.json --request-id my-job-001
 determined-compute status TASK_ID
 determined-compute logs TASK_ID
+determined-compute usage TASK_ID --window-seconds 7200 --metric gpu_utilization_percent
 
 determined-compute discover command --limit 20 --offset 0
 determined-compute adopt command REMOTE_ID

@@ -36,6 +36,15 @@ class FakeService:
         self.calls.append(("logs", task_id, owner, tail))
         return [{"message": "hello"}]
 
+    def usage(
+        self, task_id, owner, window_seconds, allocation_id, trial_id, metrics, include_samples
+    ):
+        self.calls.append((
+            "usage", task_id, owner, window_seconds, allocation_id, trial_id, metrics,
+            include_samples,
+        ))
+        return {"task_id": task_id, "owner": owner, "series": []}
+
     def cancel(self, task_id, owner):
         self.calls.append(("cancel", task_id, owner))
         return {"task_id": task_id, "state": "cancelling"}
@@ -98,6 +107,7 @@ def test_real_sdk_client_lists_tools_and_invokes_bound_owner():
                 "compute_launch",
                 "compute_status",
                 "compute_logs",
+                "compute_usage",
                 "compute_cancel",
                 "compute_reconcile",
                 "compute_list_tasks",
@@ -121,6 +131,14 @@ def test_real_sdk_client_lists_tools_and_invokes_bound_owner():
             assert tools["compute_adopt"].annotations.destructive_hint is False
             assert tools["compute_adopt"].annotations.idempotent_hint is True
             assert tools["compute_adopt"].annotations.open_world_hint is True
+            usage_schema = tools["compute_usage"].input_schema
+            assert set(usage_schema["required"]) == {"task_id"}
+            assert usage_schema["properties"]["window_seconds"]["default"] == 3600
+            assert usage_schema["properties"]["include_samples"]["default"] is False
+            assert tools["compute_usage"].annotations.read_only_hint is True
+            assert tools["compute_usage"].annotations.destructive_hint is False
+            assert tools["compute_usage"].annotations.open_world_hint is True
+            assert "compute_resources" in tools["compute_usage"].description
 
             launched = await client.call_tool(
                 "compute_launch",
@@ -130,6 +148,19 @@ def test_real_sdk_client_lists_tools_and_invokes_bound_owner():
 
             logs = await client.call_tool("compute_logs", {"task_id": "task-1", "tail": 5})
             assert _structured(logs) == {"result": [{"message": "hello"}]}
+
+            usage = await client.call_tool(
+                "compute_usage",
+                {
+                    "task_id": "task-1",
+                    "window_seconds": 900,
+                    "allocation_id": "a.1",
+                    "trial_id": 4,
+                    "metrics": ["cpu_cores", "gpu_power_watts"],
+                    "include_samples": True,
+                },
+            )
+            assert _structured(usage)["owner"] == "alice"
 
             discovered = await client.call_tool(
                 "compute_discover",
@@ -154,6 +185,9 @@ def test_real_sdk_client_lists_tools_and_invokes_bound_owner():
 
         assert ("launch", {"command": "true"}, "req-1", "alice") in service.calls
         assert ("discover", "command", "alice", 7, 2) in service.calls
+        assert (
+            "usage", "task-1", "alice", 900, "a.1", 4, ["cpu_cores", "gpu_power_watts"], True
+        ) in service.calls
         assert ("adopt", "command", "remote-1", "alice") in service.calls
         assert workflows.calls == [
             (
@@ -254,7 +288,7 @@ def test_stdio_subprocess_initializes_and_calls_offline_plan(tmp_path):
     async def exercise():
         async with Client(params) as client:
             tools = {tool.name for tool in (await client.list_tools()).tools}
-            assert len(tools) == 13
+            assert len(tools) == 14
             assert "compute_plan" in tools
             assert "compute_discover" in tools
             assert "compute_adopt" in tools
@@ -308,12 +342,13 @@ def test_default_runtime_does_not_import_consultation_worker(tmp_path, monkeypat
     async def exercise():
         async with Client(server) as client:
             tools = {tool.name for tool in (await client.list_tools()).tools}
-            assert len(tools) == 13
+            assert len(tools) == 14
             assert "compute_plan" in tools
             assert "compute_discover" in tools
             assert "compute_adopt" in tools
             assert "storage_check" in tools
             assert "compute_resources" in tools
+            assert "compute_usage" in tools
             assert "compute_consult" not in tools
             assert "workflow_status" not in tools
             result = await client.call_tool(
@@ -370,7 +405,7 @@ def test_codex_backend_passes_deployment_options_and_registers_tools(tmp_path, m
     async def exercise():
         async with Client(server) as client:
             tools = {tool.name: tool for tool in (await client.list_tools()).tools}
-            assert len(tools) == 15
+            assert len(tools) == 16
             assert "compute_consult" in tools
             assert "workflow_status" in tools
 

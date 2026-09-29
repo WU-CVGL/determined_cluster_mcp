@@ -84,6 +84,8 @@ GUI 应用可能不会继承终端中导出的变量。应在客户端的 MCP �
 
 当 `allow_queue: false` 时，容量不足或无法确定会拒绝提交，而不是进入队列。不要擅自选择建议的其他资源池、减少资源或设置 `allow_queue: true`；这些变化需要明确的任务决策。认证或资源清单结构错误属于错误，不能当作容量存在的证据。
 
+管理员动态创建的资源池只有在进入 Ready 状态后才会出现在 `compute_resources` 中。处于 Pending 或 Failed 状态的资源池不会出现：结果会说明该资源池不在集群资源清单中且可用性未知，不排队的提交会以 `capacity_unknown` 被拒绝。本 MCP 不提供动态资源池管理 API，请向管理员确认该资源池的状态。
+
 <a id="submission-outcome-is-uncertain"></a>
 ## 提交结果不确定
 
@@ -96,9 +98,27 @@ GUI 应用可能不会继承终端中导出的变量。应在客户端的 MCP �
 <a id="a-task-is-terminal-but-the-result-is-unclear"></a>
 ## 任务已终止但结果不明确
 
-使用本地 task ID 调用 `compute_status` 和 `compute_logs`。API 提交成功、获得远端 ID 或任务进入终态，本身都不能证明工作负载成功。检查退出信息和提交前定义的成功判据。已经配置存储访问时，用 `storage_check` 验证预期共享产物；需要本地副本时，先预览再执行 `storage_fetch`。没有存储访问时，使用任务输出或另一项明确的任务内检查。
+使用本地 task ID 调用 `compute_status` 和 `compute_logs`。API 提交成功、获得远端 ID 或任务进入终态，本身都不能证明工作负载成功。检查退出信息和提交前定义的成功判据。已经配置存储访问时，用 `storage_check` 验证预期共享产物；需要本地副本时，先预览再执行 `storage_fetch`。没有存储访问时，使用任务输出或另一项明确的任务内检查。要确认任务结束前是否真正使用了 CPU、内存或 GPU，调用 `compute_usage(task_id)`；对于已结束的任务或已暂停的 trial，窗口终点是任务或其最后一个 allocation 的结束时间。
 
 Experiment 在 trial 启动前可能没有 trial 日志。Shell 仍然可用时，可以使用经过清理的重连命令。报告可以包含任务 ID、状态、经过清理的命令、路径和错误，但不得包含凭据值或 secrets 文件内容。
+
+<a id="usage-measurements-are-unavailable-or-empty"></a>
+## 用量测量不可用或为空
+
+`compute_usage` 依赖 master 的任务资源 API。`task_resources_disabled` 表示 master 具备该 API，但管理员尚未启用 `integrations.task_resources`。`task_resources_unsupported` 表示 master 缺少该 API，需要 research-cluster fork 0.40.1 或更高版本的 Determined master。两者都不可重试，应联系管理员。无法取得测量值不能作为任务空闲的证据。
+
+HTTP 503 表示测量后端繁忙或不可用；每个 master 同时最多运行四个资源查询，因此应稍后重试。HTTP 400 可能表示时钟偏差：master 会拒绝比其自身时钟超前 60 秒以上的窗口终点，应校正运行 MCP 服务的机器的时钟。HTTP 404 表示 Determined task 或指定的 trial ID 不存在，或当前账户无权访问。
+
+`task_not_started` 表示 experiment 尚无 trial，或其 trial 尚无 Determined task；应等待任务启动。`trial_not_found` 表示请求的 trial 不属于该 experiment。`allocation_not_found` 表示所选 task 未列出该 allocation；应从返回的 `allocations` 中选择。`remote_id_unknown` 表示本地提交尚未绑定，必须先执行 reconcile。
+
+`context_unavailable` 非空并不致命。它列出因 Determined API 错误而失败的上下文查询（`resource_pool`、`allocation_details` 或 `gpu_models`）；相关字段为空或 `null`，但返回的测量值仍然有效。需要这些上下文时，可稍后重试。出现传输失败后会跳过其余查询，因此可能同时列出多个名称。对于已结束的 command 或 shell，`resource_pool` 为 `null` 而 `context_unavailable` 中没有相应条目，表示 Determined 已不再提供该任务的实体，重试也无济于事。`gpu_model` 为 `null` 而 `context_unavailable` 中没有 `gpu_models` 时，可能是 RBAC 对当前账户隐藏了设备 UUID，因而无法匹配型号名称。工作负载不通过 Determined 的 Core API 报告进度（例如普通 bash 入口）或尚未报告时，trial 的 `total_batches_processed` 为 0 属于预期；这不能说明工作负载没有任何进展，应改为根据日志、实测用量和预期产物判断进展。
+
+空的 `series` 列表表示该窗口没有数据，而不是任务空闲：任务可能未在该窗口内运行，或监控系统没有保留其数据。将窗口及其 `anchor` 与 `task_start_time` 和 `allocations` 对照，或使用更长的 `window_seconds`。如果 `samples_omitted` 为 true，应缩短窗口、减少指标或选择一个 allocation。agent 断开期间，任务可能仍保持 `RUNNING` 最多约 150 秒，因为该 fork 默认会等待 agent 重连这么久（`agent_reconnect_wait`）；因此仅凭 `RUNNING` 状态不能证明任务在推进。字段含义和限制见[任务用量测量](compute-service.zh.md#task-usage-measurements)。
+
+<a id="cancellation-is-rejected"></a>
+## 取消请求被拒绝
+
+在使用 basic authorization 的 Determined fork 0.40.1 或更高版本上，只有任务的 Determined 所有者或管理员可以终止或取消任务。对于其他账户拥有的任务，`compute_cancel` 对 command 或 shell 返回 HTTP 403，对 experiment 返回 HTTP 404 `experiment '<id>' not found`。这通常发生在更换凭据之后：submitted 记录绑定配置和端点而不是账户，因此服务仍会发出请求。应恢复拥有该任务的账户凭据，或请管理员取消任务。已登记（adopted）的记录会在发出任何取消请求之前返回 `ownership_mismatch`。
 
 <a id="a-transfer-is-partial-or-different-from-the-preview"></a>
 ## 传输不完整或与预览不同

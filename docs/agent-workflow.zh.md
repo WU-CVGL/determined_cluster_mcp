@@ -101,6 +101,8 @@ MCP 不接受 `kind: notebook`。
 
 调用 `compute_status(task_id)`，直到任务进入终态；使用 `compute_logs(task_id, tail)` 检查进度和最后的消息。用户不再需要运行中的任务时，调用 `compute_cancel(task_id)`。
 
+需要了解运行中的任务实际使用了多少 CPU、内存和 GPU 时，例如在提议调整资源、取消或重新提交之前确认 GPU 利用率是否接近零或 allocation 是否空闲，调用 `compute_usage(task_id)`；对于已结束的任务，它报告任务结束前的窗口。该工具只读，并要求 master 启用任务资源集成；`task_resources_disabled` 或 `task_resources_unsupported` 表示无法取得测量值，而不是任务空闲。先检查 `warnings`。null 或缺失值表示没有测量，绝不表示零；空的 `series` 列表表示该窗口没有数据。数值是每 `step` 秒一次的点采样，GPU 指标覆盖整块分配到的设备，可能包含其他进程。除非指定 `trial_id`，experiment 报告其最新 trial。即使 `metrics` 隐藏了 GPU 序列，`gpus` 仍会比较每个 allocation 的各块 GPU：`utilization_spread_percent` 较大、`least_utilized_gpu_uuid` 的均值很低或 `idle_fraction` 较高，都提示存在空闲或掉队的 GPU；`gpu_count` 小于 `requested_slots` 表示返回了序列的 GPU 少于该 allocation 持有的槽位，并不一定表示其余 GPU 未被使用。对于 experiment，`trial.batches_per_second_lower_bound` 是整个生命周期的下界，因为作为分母的挂钟时间还可能计入镜像拉取、启动、初始化以及因重启损失的 allocation 时间（不含调度排队时间和 allocation 之间的暂停间隔）；工作负载不通过 Determined 的 Core API 报告时，`total_batches_processed` 为 0 属于预期。只报告观察结果；更改槽位数或资源池仍需明确的任务决策。参见[任务用量测量](compute-service.zh.md#task-usage-measurements)。
+
 提交成功或进入终态本身不等于验收通过。检查进程退出信息和任务开始时定义的成功判据。已经配置存储访问时，使用 `storage_check` 验证预期共享产物；否则使用任务输出或另一项明确的任务内检查。需要本地副本时，先配置存储访问，再调用 `storage_fetch(shared_dir, local_dir, dry_run=true)` 预览，审核后以 `dry_run=false` 执行，并检查取回的结果。
 
 报告本地 task ID、远端 ID、最终状态、存在时的退出结果、输出路径，以及实际观察到的产物或指标。绝不包含 token、密码、私钥、cookie 或 secrets 文件内容。
@@ -112,7 +114,7 @@ MCP 不接受 `kind: notebook`。
 
 1. 调用 `compute_discover(kind, limit=50, offset=0)`，其中 kind 为 `command`、`shell` 或 `experiment`。这是只读远端查询，不会创建本地记录，也不会提交任务。
 2. 选择目标结果，再调用 `compute_adopt(kind, remote_id)`。
-3. 保存返回的本地 `task_id`，然后用它调用 `compute_status`、`compute_logs` 和 `compute_cancel`。
+3. 保存返回的本地 `task_id`，然后用它调用 `compute_status`、`compute_logs`、`compute_usage` 和 `compute_cancel`。
 
 登记时会核对实际集群、当前认证账户和远端 owner。它会创建幂等的本地记录，绝不会重新启动远端任务。未知的工作路径、输出路径或版本仍保持未知。登记不会授予存储访问权或新的集群权限。
 
@@ -131,6 +133,8 @@ Reconcile 的用途更窄：`compute_reconcile` 通过核对提交标记，修�
 | 集群身份 | 用于避免跨集群任务混淆的实际远端集群 |
 
 只有使用相同数据库和 owner 的会话才共享本地记录。不同数据库可以分别登记同一个远端任务。数据库应放在本地持久磁盘，不要放在共享 NFS 中。共享 owner 不等于共享凭据，更换凭据也不会重命名 owner 命名空间。
+
+在使用 basic authorization 的 Determined fork 0.40.1 或更高版本上，只有任务的 Determined 所有者或管理员可以取消任务。submitted 记录绑定配置和端点而不是账户，因此把凭据切换到另一个账户后，`compute_cancel` 可能对 command 或 shell 返回 HTTP 403，对 experiment 返回 HTTP 404；已登记的记录则返回 `ownership_mismatch`。请使用拥有该任务的账户。
 
 <a id="optional-consultation"></a>
 ## 可选咨询

@@ -5,11 +5,14 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import posixpath
 import re
 import shlex
+import time
 import unicodedata
 import uuid
+from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import urlsplit
@@ -19,6 +22,7 @@ from determined_compute.core.api_client import DeterminedAPIClient
 from .models import (
     APIError,
     ConflictError,
+    NotFoundError,
     SubmissionUncertainError,
     TaskRecord,
     ValidationError,
@@ -58,6 +62,44 @@ _FORBIDDEN_FIELDS = {
     "uploadcontext",
     "uploads",
 }
+
+
+# Units of the fixed metric names served by the task resources API.
+_USAGE_METRICS = {
+    "allocation_active": "count",
+    "cpu_cores": "cores",
+    "memory_working_set_bytes": "bytes",
+    "memory_rss_bytes": "bytes",
+    "gpu_utilization_percent": "percent",
+    "gpu_memory_used_bytes": "bytes",
+    "gpu_power_watts": "watts",
+    "gpu_temperature_celsius": "celsius",
+}
+# Server limits: at most seven days, a 15-second step, and 1,440 points per series.
+_USAGE_MIN_WINDOW_SECONDS = 60
+_USAGE_MAX_WINDOW_SECONDS = 7 * 24 * 60 * 60
+_USAGE_MIN_STEP_SECONDS = 15
+_USAGE_MAX_POINTS = 1440
+_USAGE_MAX_RETURNED_SAMPLES = 2880
+# Context lookups are bounded: allocation details for the newest allocations, and a
+# fixed number of trial summary metrics.
+_USAGE_MAX_ALLOCATION_DETAILS = 8
+_USAGE_MAX_SUMMARY_METRICS = 100
+_USAGE_SUMMARY_STATISTICS = ("count", "sum", "min", "max", "last", "mean")
+# A GPU utilization sample below this percentage counts as idle.
+_GPU_IDLE_PERCENT = 10
+_USAGE_ADVISORY = (
+    "Values are point samples taken every step seconds, so min, max, and mean describe "
+    "those samples rather than every moment of the window. A missing value means no "
+    "measurement, not zero use. GPU metrics describe each whole assigned device and may "
+    "include other processes. allocation_active above zero means the allocation was running. "
+    f"idle_fraction is the share of GPU utilization samples below {_GPU_IDLE_PERCENT}%, and "
+    "p50 and p95 are nearest-rank percentiles of the available samples. "
+    "Coverage depends on the cluster's monitoring retention."
+)
+_TIMESTAMP = re.compile(
+    r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})?"
+)
 
 
 def _normalized_key(key: Any) -> str:
@@ -129,6 +171,61 @@ def _remote_id(entity: Any) -> str:
     if value is None:
         raise SubmissionUncertainError("launch response did not contain a remote task id")
     return str(value)
+
+
+def _unix_seconds(value: Optional[str]) -> Optional[int]:
+    """Floor an RFC 3339 timestamp to Unix seconds; a missing offset means UTC."""
+    if value is None:
+        return None
+    match = _TIMESTAMP.fullmatch(value)
+    try:
+        if match is None:
+            raise ValueError(value)
+        base, offset = match.groups()
+        parsed = datetime.fromisoformat(base + ("+00:00" if offset in {None, "Z"} else offset))
+    except ValueError as exc:
+        raise APIError("Task response contained an invalid timestamp", code="invalid_response") from exc
+    return int(parsed.timestamp())
+
+
+def _finite(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+    )
+
+
+def _percentile(ordered: Sequence[float], fraction: float) -> Optional[float]:
+    """Nearest-rank percentile of already sorted values."""
+    if not ordered:
+        return None
+    return ordered[max(0, math.ceil(fraction * len(ordered)) - 1)]
+
+
+def _idle_fraction(values: Sequence[float]) -> Optional[float]:
+    if not values:
+        return None
+    return round(sum(value < _GPU_IDLE_PERCENT for value in values) / len(values), 6)
+
+
+def _lenient_unix_seconds(value: Optional[str]) -> Optional[int]:
+    try:
+        return _unix_seconds(value)
+    except APIError:
+        return None
+
+
+def _utc_text(value: Optional[str]) -> Optional[str]:
+    """Mark an offset-less allocation time, stored by Determined in UTC, as UTC."""
+    if value is None:
+        return None
+    match = _TIMESTAMP.fullmatch(value)
+    return value + "Z" if match is not None and match.group(2) is None else value
+
+
+def _iso_seconds(value: float) -> str:
+    return datetime.fromtimestamp(value, timezone.utc).isoformat()
 
 
 def _remote_state(entity: Any) -> Optional[str]:
@@ -670,6 +767,425 @@ class ComputeService:
         result = self.client.task_logs(record.kind, record.remote_id, tail)
         if not isinstance(result, list):
             raise APIError("task log response was not a list", code="invalid_api_response")
+        return result
+
+    def usage(
+        self,
+        task_id: str,
+        owner: str,
+        window_seconds: int = 3600,
+        allocation_id: Optional[str] = None,
+        trial_id: Optional[int] = None,
+        metrics: Optional[Sequence[str]] = None,
+        include_samples: bool = False,
+    ) -> Dict[str, Any]:
+        """Summarize measured CPU, memory, and GPU use of one owned task."""
+        if (
+            isinstance(window_seconds, bool)
+            or not isinstance(window_seconds, int)
+            or not _USAGE_MIN_WINDOW_SECONDS <= window_seconds <= _USAGE_MAX_WINDOW_SECONDS
+        ):
+            raise ValidationError(
+                f"window_seconds must be an integer from {_USAGE_MIN_WINDOW_SECONDS} "
+                f"to {_USAGE_MAX_WINDOW_SECONDS}"
+            )
+        if allocation_id is not None and (
+            not isinstance(allocation_id, str)
+            or not 1 <= len(allocation_id) <= 256
+            or not allocation_id.isprintable()
+            or allocation_id.strip() != allocation_id
+        ):
+            raise ValidationError("allocation_id must be a printable string of 1 to 256 characters")
+        if trial_id is not None:
+            try:
+                trial_id = int(DeterminedAPIClient.normalize_user_id(trial_id))
+            except ValueError as exc:
+                raise ValidationError("trial_id must be a positive integer") from exc
+        if metrics is not None:
+            if (
+                isinstance(metrics, str)
+                or not isinstance(metrics, (list, tuple))
+                or not metrics
+                or not all(isinstance(item, str) and item in _USAGE_METRICS for item in metrics)
+            ):
+                raise ValidationError(
+                    f"metrics must be a non-empty list drawn from: {', '.join(_USAGE_METRICS)}"
+                )
+            metrics = list(dict.fromkeys(metrics))
+        if not isinstance(include_samples, bool):
+            raise ValidationError("include_samples must be a boolean")
+
+        record = self.store.get_owned(task_id, owner)
+        if trial_id is not None and record.kind != "experiment":
+            raise ValidationError("trial_id applies only to experiment tasks")
+        self._validate_binding(record)
+        if record.remote_id is None:
+            raise ConflictError(
+                "remote task id is unknown; reconcile the submission before reading usage",
+                code="remote_id_unknown",
+            )
+        entity: Any = None
+        if record.origin == "adopted":
+            entity = self.client.get_task(record.kind, record.remote_id)
+            self._check_adopted_entity(record, entity)
+        if not self.client.task_resources_enabled():
+            raise APIError(
+                "task resource monitoring is not enabled on this Determined master",
+                code="task_resources_disabled",
+            )
+        trial = (
+            self._usage_trial(record.remote_id, trial_id)
+            if record.kind == "experiment"
+            else None
+        )
+        determined_task_id = trial["task_id"] if trial is not None else record.remote_id
+        info = self.client.get_task_info(determined_task_id)
+        allocations = [
+            {
+                **item,
+                "start_time": _utc_text(item["start_time"]),
+                "end_time": _utc_text(item["end_time"]),
+            }
+            for item in info["allocations"]
+        ]
+        selected = [
+            item for item in allocations
+            if allocation_id is None or item["allocation_id"] == allocation_id
+        ]
+        if allocation_id is not None and not selected:
+            raise NotFoundError(
+                "allocation does not belong to the selected Determined task",
+                code="allocation_not_found",
+            )
+
+        now = int(time.time())
+        task_start = _unix_seconds(info["start_time"])
+        task_end = _unix_seconds(info["end_time"])
+        # Mirror the WebUI: an ended task shows the window preceding its end.
+        end, anchor = (min(task_end, now), "task_end") if task_end is not None else (now, "now")
+        # A paused trial has no task end time, and an older allocation of a running task
+        # has its own end; nothing is measured after the last selected allocation ends.
+        allocation_ends = [_lenient_unix_seconds(item["end_time"]) for item in selected]
+        if selected and all(value is not None for value in allocation_ends):
+            if max(allocation_ends) < end:
+                end, anchor = max(allocation_ends), "allocation_end"
+        start = end - window_seconds
+        floors = [task_start]
+        if allocation_id is not None:
+            floors.append(_lenient_unix_seconds(selected[0]["start_time"]))
+        for floor in floors:
+            if floor is not None:
+                start = max(start, floor)
+        start = max(0, min(start, end - 1))
+        step = max(
+            _USAGE_MIN_STEP_SECONDS, math.ceil((end - start) / (_USAGE_MAX_POINTS - 1))
+        )
+        response = self.client.get_task_resources(
+            determined_task_id, start=start, end=end, step=step, allocation_id=allocation_id
+        )
+        expected = (end - start) // step + 1
+        returned = response["series"]
+        series = [item for item in returned if metrics is None or item["metric"] in metrics]
+
+        # Context is best-effort: a failed lookup is reported and never hides measurements.
+        unavailable: List[str] = []
+        unreachable = False
+
+        def context(name: str, operation: Any, *args: Any) -> Any:
+            nonlocal unreachable
+            if not unreachable:
+                try:
+                    return operation(*args)
+                except APIError as exc:
+                    # After a timeout, each further lookup would wait the full timeout too.
+                    unreachable = exc.code == "transport_error"
+            if name not in unavailable:
+                unavailable.append(name)
+            return None
+
+        if entity is None:
+            try:
+                entity = self.client.get_task(record.kind, record.remote_id)
+            except APIError as exc:
+                unreachable = exc.code == "transport_error"
+                # Determined keeps an ended command or shell for only 24 hours and drops it
+                # on a master restart, so its absence then leaves the pool unknown.
+                if not (exc.code == 404 and task_end is not None):
+                    unavailable.append("resource_pool")
+        pool_name = (
+            self._remote_text(entity.get("resourcePool"), 256)
+            if isinstance(entity, Mapping)
+            else None
+        )
+        resource_pool = None
+        if pool_name is not None:
+            pools = context("resource_pool", self.client.list_resource_pools) or []
+            described = next((item for item in pools if item["name"] == pool_name), None)
+            resource_pool = {
+                "name": pool_name,
+                "description": self._remote_text(described["description"]) if described else None,
+            }
+        detail_ids = [item["allocation_id"] for item in allocations[:_USAGE_MAX_ALLOCATION_DETAILS]]
+        if allocation_id is not None and allocation_id not in detail_ids:
+            detail_ids.append(allocation_id)
+        details: Dict[str, Dict[str, Any]] = {}
+        for detail_id in detail_ids:
+            detail = context("allocation_details", self.client.get_allocation, detail_id)
+            if detail is not None:
+                details[detail_id] = detail
+        for item in allocations:
+            detail = details.get(item["allocation_id"], {})
+            for key in ("slots", "exit_reason", "status_code"):
+                item[key] = detail.get(key)
+        gpu_models: Dict[str, str] = {}
+        if any(item["labels"]["gpu_uuid"] for item in returned):
+            gpu_models = context("gpu_models", self.client.list_gpu_devices) or {}
+
+        summaries = [self._usage_series(item, gpu_models) for item in series]
+        if summaries:
+            explanation = f"{len(summaries)} measurement series over the selected window"
+        elif returned:
+            others = sorted({item["metric"] for item in returned})
+            explanation = (
+                "None of the requested metrics were measured in this window; Determined "
+                f"returned {len(returned)} other series ({', '.join(others)})"
+            )
+        else:
+            explanation = (
+                "No measurements were returned; the task may not have run in this "
+                "window, or monitoring retained no data for it"
+            )
+        if anchor == "allocation_end":
+            explanation += (
+                "; the window ends when the last selected allocation ended because no "
+                "selected allocation is running"
+            )
+        if trial is not None and (trial["experiment_trial_count"] or 0) > 1:
+            explanation += (
+                f"; the experiment has {trial['experiment_trial_count']} trials and this "
+                f"reports trial {trial['id']}, so pass trial_id to inspect another"
+            )
+        if trial is not None and trial["total_batches_processed"] == 0:
+            explanation += (
+                "; the trial reports no batches, which is expected when the workload does "
+                "not report training progress through Determined's Core API or has not "
+                "reported yet"
+            )
+        result: Dict[str, Any] = {
+            "task_id": record.task_id,
+            "kind": record.kind,
+            "remote_id": record.remote_id,
+            "determined_task_id": determined_task_id,
+            "trial": (
+                {key: value for key, value in trial.items() if key != "task_id"}
+                if trial is not None
+                else None
+            ),
+            "resource_pool": resource_pool,
+            "task_start_time": info["start_time"],
+            "task_end_time": info["end_time"],
+            "allocations": allocations,
+            "allocation_id": allocation_id,
+            "window": {
+                "start": start,
+                "end": end,
+                "step": step,
+                "start_at": _iso_seconds(start),
+                "end_at": _iso_seconds(end),
+                "anchor": anchor,
+                "expected_points": expected,
+            },
+            "series": summaries,
+            "gpus": self._usage_gpus(returned, gpu_models, details),
+            "warnings": response["warnings"],
+            "context_unavailable": unavailable,
+            "explanation": explanation,
+            "observed_at": _iso_seconds(now),
+            "advisory": _USAGE_ADVISORY,
+        }
+        if len(allocations) > _USAGE_MAX_ALLOCATION_DETAILS:
+            result["allocation_details_limit"] = _USAGE_MAX_ALLOCATION_DETAILS
+        if include_samples:
+            omitted = sum(len(item["samples"]) for item in series) > _USAGE_MAX_RETURNED_SAMPLES
+            result["samples_omitted"] = omitted
+            if omitted:
+                result["samples_limit"] = _USAGE_MAX_RETURNED_SAMPLES
+            else:
+                for summary, item in zip(summaries, series):
+                    summary["samples"] = item["samples"]
+        return result
+
+    def _usage_trial(self, experiment_id: str, trial_id: Optional[int]) -> Dict[str, Any]:
+        count: Optional[int] = None
+        if trial_id is None:
+            latest = self.client.get_latest_trial(experiment_id)
+            trial, count = latest["trial"], latest["total"]
+            if trial is None:
+                raise ConflictError("experiment has no trials yet", code="task_not_started")
+        else:
+            trial = self.client.get_trial(str(trial_id))
+        try:
+            actual_id = int(DeterminedAPIClient.normalize_user_id(trial.get("id")))
+            parent = DeterminedAPIClient.normalize_user_id(trial.get("experimentId"))
+        except ValueError as exc:
+            raise APIError("Trial response is malformed", code="invalid_response") from exc
+        if parent != experiment_id or (trial_id is not None and actual_id != trial_id):
+            raise NotFoundError("trial does not belong to this experiment", code="trial_not_found")
+        task_ids = trial.get("taskIds") or ([trial["taskId"]] if trial.get("taskId") else [])
+        if not isinstance(task_ids, list) or not all(
+            isinstance(item, str) and item for item in task_ids
+        ):
+            raise APIError("Trial response is malformed", code="invalid_response")
+        if not task_ids:
+            raise ConflictError("trial has no Determined task yet", code="task_not_started")
+        state = trial.get("state")
+        batches, restarts = (
+            value if not isinstance(value, bool) and isinstance(value, int) and value >= 0 else None
+            for value in (trial.get("totalBatchesProcessed"), trial.get("restarts"))
+        )
+        wall_clock = trial.get("wallClockTime")
+        wall_clock = float(wall_clock) if _finite(wall_clock) and wall_clock >= 0 else None
+        summary_metrics, truncated = self._summary_metrics(trial.get("summaryMetrics"))
+        return {
+            "id": actual_id,
+            "state": state if isinstance(state, str) else None,
+            "selection": "requested" if trial_id is not None else "latest",
+            "experiment_trial_count": count,
+            "task_count": len(task_ids),
+            "total_batches_processed": batches,
+            "wall_clock_seconds": wall_clock,
+            "restarts": restarts,
+            # Wall-clock time spans every allocation, including image pulls, startup, and
+            # restarts, so this is a floor on the training rate.
+            "batches_per_second_lower_bound": (
+                round(batches / wall_clock, 6) if batches is not None and wall_clock else None
+            ),
+            "summary_metrics": summary_metrics,
+            "summary_metrics_truncated": truncated,
+            # taskIds is ordered by task start; a continued trial's newest task is last.
+            "task_id": task_ids[-1],
+        }
+
+    @staticmethod
+    def _summary_metrics(value: Any) -> tuple[Dict[str, Dict[str, Any]], bool]:
+        """Keep numeric per-metric statistics from a trial's summary metrics."""
+        result: Dict[str, Dict[str, Any]] = {}
+        if not isinstance(value, Mapping):
+            return result, False
+        kept = 0
+        # Determined's built-in groups come first so a large training or custom group
+        # cannot crowd validation metrics out of the cap.
+        builtin = ("validation_metrics", "avg_metrics")
+        groups = [key for key in builtin if key in value] + sorted(
+            key for key in value if isinstance(key, str) and key not in builtin
+        )
+        for group in groups:
+            metrics = value[group]
+            if not isinstance(metrics, Mapping):
+                continue
+            for name in sorted(key for key in metrics if isinstance(key, str)):
+                stats = metrics[name]
+                if not isinstance(stats, Mapping):
+                    continue
+                if kept == _USAGE_MAX_SUMMARY_METRICS:
+                    return result, True
+                entry: Dict[str, Any] = (
+                    {"type": stats["type"]} if isinstance(stats.get("type"), str) else {}
+                )
+                entry.update(
+                    (key, stats[key])
+                    for key in _USAGE_SUMMARY_STATISTICS
+                    if _finite(stats.get(key))
+                )
+                result.setdefault(group, {})[name] = entry
+                kept += 1
+        return result, False
+
+    @staticmethod
+    def _usage_series(series: Mapping[str, Any], gpu_models: Mapping[str, str]) -> Dict[str, Any]:
+        points = sorted(
+            (stamp, value) for stamp, value in series["samples"] if value is not None
+        )
+        values = [value for _stamp, value in points]
+        ordered = sorted(values)
+        gpu_uuid = series["labels"]["gpu_uuid"]
+        summary = {
+            "metric": series["metric"],
+            "unit": _USAGE_METRICS.get(series["metric"]),
+            **series["labels"],
+            "gpu_model": gpu_models.get(gpu_uuid) if gpu_uuid else None,
+            "points": len(series["samples"]),
+            "available_points": len(values),
+            "first_at": _iso_seconds(points[0][0]) if points else None,
+            "last_at": _iso_seconds(points[-1][0]) if points else None,
+            "last": values[-1] if values else None,
+            "min": ordered[0] if ordered else None,
+            "max": ordered[-1] if ordered else None,
+            "mean": round(sum(values) / len(values), 6) if values else None,
+            "p50": _percentile(ordered, 0.5),
+            "p95": _percentile(ordered, 0.95),
+        }
+        if series["metric"] == "gpu_utilization_percent":
+            summary["idle_fraction"] = _idle_fraction(values)
+        return summary
+
+    @staticmethod
+    def _usage_gpus(
+        series: Sequence[Mapping[str, Any]],
+        gpu_models: Mapping[str, str],
+        details: Mapping[str, Mapping[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Compare the GPUs of each allocation using every returned GPU series."""
+        groups: Dict[Optional[str], Dict[str, Dict[str, List[float]]]] = {}
+        for item in series:
+            gpu_uuid = item["labels"]["gpu_uuid"]
+            if not gpu_uuid or item["metric"] not in {
+                "gpu_utilization_percent", "gpu_memory_used_bytes",
+            }:
+                continue
+            values = [value for _stamp, value in item["samples"] if value is not None]
+            devices = groups.setdefault(item["labels"]["allocation_id"], {})
+            devices.setdefault(gpu_uuid, {}).setdefault(item["metric"], []).extend(values)
+        result: List[Dict[str, Any]] = []
+        for allocation, devices in sorted(groups.items(), key=lambda pair: pair[0] or ""):
+            means = {
+                gpu_uuid: sum(values) / len(values)
+                for gpu_uuid, metrics in devices.items()
+                if (values := metrics.get("gpu_utilization_percent"))
+            }
+            utilization = [
+                value
+                for metrics in devices.values()
+                for value in metrics.get("gpu_utilization_percent", [])
+            ]
+            memory = [
+                value
+                for metrics in devices.values()
+                for value in metrics.get("gpu_memory_used_bytes", [])
+            ]
+            lowest = min(sorted(means), key=means.__getitem__) if means else None
+            detail = details.get(allocation) if allocation is not None else None
+            result.append({
+                "allocation_id": allocation,
+                "gpu_count": len(devices),
+                "requested_slots": detail["slots"] if detail else None,
+                "gpu_models": sorted({gpu_models[key] for key in devices if key in gpu_models}),
+                # Each GPU counts equally, whatever its number of available samples.
+                "mean_utilization_percent": (
+                    round(sum(means.values()) / len(means), 6) if means else None
+                ),
+                "min_gpu_mean_utilization_percent": round(means[lowest], 6) if means else None,
+                "max_gpu_mean_utilization_percent": (
+                    round(max(means.values()), 6) if means else None
+                ),
+                "utilization_spread_percent": (
+                    round(max(means.values()) - means[lowest], 6) if means else None
+                ),
+                "least_utilized_gpu_uuid": lowest,
+                "idle_fraction": _idle_fraction(utilization),
+                "idle_threshold_percent": _GPU_IDLE_PERCENT,
+                "max_memory_used_bytes": max(memory) if memory else None,
+            })
         return result
 
     def cancel(self, task_id: str, owner: str) -> Dict[str, Any]:

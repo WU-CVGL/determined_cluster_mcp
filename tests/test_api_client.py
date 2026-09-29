@@ -317,6 +317,10 @@ def test_get_experiment_unwrap_and_true_tail(monkeypatch):
         item["message"] for item in client().task_logs("experiment", "9", tail=2)
     ]
     assert messages == ["old", "new"]
+    assert (
+        "/api/v1/experiments/9/trials",
+        {"sortBy": "SORT_BY_ID", "orderBy": "ORDER_BY_DESC", "limit": 1},
+    ) in requested
     assert requested[-1] == (
         "/api/v1/trials/17/logs",
         {"limit": 2, "follow": False, "orderBy": "ORDER_BY_DESC"},
@@ -581,3 +585,298 @@ def test_remote_discovery_does_not_swallow_authentication_error(monkeypatch):
         client().list_remote_tasks("command", user_id="7")
     assert caught.value.code == 401
     assert caught.value.retryable is False
+
+
+def gateway_error(status, grpc_code, reason, message):
+    return Response({"error": {"code": grpc_code, "reason": reason, "error": message}}, status)
+
+
+@pytest.mark.parametrize(
+    ("status", "retryable"), [(404, False), (500, True), (501, False), (503, True)]
+)
+def test_gateway_error_body_message_and_retryability(monkeypatch, status, retryable):
+    monkeypatch.setattr(
+        requests, "get",
+        lambda *a, **k: gateway_error(status, 5, "NotFound", "task 'x' not found"),
+    )
+    with pytest.raises(APIError) as caught:
+        client().get_task("command", "c1")
+    assert str(caught.value) == f"{status} task 'x' not found"
+    assert caught.value.code == status
+    assert caught.value.retryable is retryable
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_task_resources_capability(monkeypatch, enabled):
+    requested = []
+
+    def get(url, **kwargs):
+        requested.append(url)
+        return Response({"enabled": enabled})
+
+    monkeypatch.setattr(requests, "get", get)
+    assert client().task_resources_enabled() is enabled
+    assert requested == ["http://master:8080/api/v1/task-resources/capability"]
+
+
+@pytest.mark.parametrize("status", [404, 501])
+def test_task_resources_capability_missing_route_is_unsupported(monkeypatch, status):
+    monkeypatch.setattr(
+        requests, "get",
+        lambda *a, **k: gateway_error(status, 12, "Unimplemented", "Not Implemented"),
+    )
+    with pytest.raises(APIError) as caught:
+        client().task_resources_enabled()
+    assert caught.value.code == "task_resources_unsupported"
+    assert caught.value.retryable is False
+
+
+def test_task_resources_capability_keeps_authentication_errors(monkeypatch):
+    monkeypatch.setattr(
+        requests, "get", lambda *a, **k: gateway_error(401, 16, "Unauthenticated", "no")
+    )
+    with pytest.raises(APIError) as caught:
+        client().task_resources_enabled()
+    assert caught.value.code == 401
+
+    monkeypatch.setattr(requests, "get", lambda *a, **k: Response({"enabled": "yes"}))
+    with pytest.raises(APIError) as caught:
+        client().task_resources_enabled()
+    assert caught.value.code == "invalid_response"
+
+
+def test_task_resources_request_and_parsing(monkeypatch):
+    requested = []
+    payload = {
+        "enabled": True,
+        "series": [
+            {
+                "metric": "gpu_utilization_percent",
+                "labels": {"allocationId": "1.abc.1", "node": "", "gpuUuid": "GPU-1"},
+                "samples": [
+                    {"timestampSeconds": 100, "value": 0},
+                    {"timestampSeconds": 115.5, "value": None},
+                    {"timestampSeconds": 130},
+                ],
+            }
+        ],
+        "warnings": [{"code": "gpu_full_device", "message": "whole device"}],
+    }
+
+    def get(url, **kwargs):
+        requested.append((url, kwargs.get("params")))
+        return Response(payload)
+
+    monkeypatch.setattr(requests, "get", get)
+    result = client().get_task_resources(
+        "1.abc/def", start=100, end=130, step=15, allocation_id="1.abc.1"
+    )
+
+    assert requested == [(
+        "http://master:8080/api/v1/tasks/1.abc%2Fdef/resources",
+        {"start": 100, "end": 130, "step": 15, "allocationId": "1.abc.1"},
+    )]
+    assert result == {
+        "enabled": True,
+        "series": [
+            {
+                "metric": "gpu_utilization_percent",
+                "labels": {"allocation_id": "1.abc.1", "node": None, "gpu_uuid": "GPU-1"},
+                "samples": [[100, 0], [115.5, None], [130, None]],
+            }
+        ],
+        "warnings": [{"code": "gpu_full_device", "message": "whole device"}],
+    }
+
+    requested.clear()
+    client().get_task_resources("c1", start=0, end=900, step=15)
+    assert requested[0][1] == {"start": 0, "end": 900, "step": 15}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"enabled": True, "series": {}, "warnings": [], "raw": "do-not-echo"},
+        {"enabled": True, "series": [{"metric": "cpu_cores", "labels": {}}], "warnings": []},
+        {
+            "enabled": True,
+            "series": [{
+                "metric": "cpu_cores", "labels": {},
+                "samples": [{"timestampSeconds": 1, "value": "NaN"}],
+            }],
+            "warnings": [],
+        },
+        {"enabled": True, "series": [], "warnings": [{"code": "x"}]},
+        {
+            "enabled": True,
+            "series": [{
+                "metric": "cpu_cores", "labels": {},
+                "samples": [{"timestampSeconds": 1.7e12, "value": 1.0}],
+            }],
+            "warnings": [],
+        },
+        {
+            "enabled": True,
+            "series": [{
+                "metric": "cpu_cores", "labels": {},
+                "samples": [{"timestampSeconds": -1, "value": 1.0}],
+            }],
+            "warnings": [],
+        },
+        {"series": [], "warnings": []},
+    ],
+)
+def test_task_resources_rejects_malformed_payload(monkeypatch, payload):
+    monkeypatch.setattr(requests, "get", lambda *a, **k: Response(payload))
+    with pytest.raises(APIError) as caught:
+        client().get_task_resources("c1", start=0, end=900, step=15)
+    assert caught.value.code == "invalid_response"
+    assert "do-not-echo" not in str(caught.value)
+    assert caught.value.details is None
+
+
+def test_task_resources_validates_range_before_request(monkeypatch):
+    monkeypatch.setattr(requests, "get", lambda *a, **k: pytest.fail("no request expected"))
+    with pytest.raises(ValueError):
+        client().get_task_resources("c1", start=True, end=900, step=15)
+    with pytest.raises(ValueError):
+        client().get_task_resources("c1", start=0, end=900, step=15, allocation_id="")
+
+
+def test_task_info_and_trials(monkeypatch):
+    requested = []
+    responses = {
+        "/api/v1/tasks/c1": Response({
+            "task": {
+                "taskId": "c1",
+                "startTime": "2026-09-20T00:00:00.123456789Z",
+                "allocations": [{
+                    "allocationId": "c1.1",
+                    "state": "STATE_RUNNING",
+                    "isReady": True,
+                    "startTime": "2026-09-20T00:00:05.5",
+                }],
+            }
+        }),
+        "/api/v1/experiments/9/trials": Response({
+            "trials": [{"id": 17, "experimentId": 9, "taskIds": ["9.a", "9.a-1"]}],
+            "pagination": {"total": 30},
+        }),
+        "/api/v1/trials/4": Response({"trial": {"id": 4, "experimentId": 9}}),
+    }
+
+    def get(url, **kwargs):
+        key = url.removeprefix("http://master:8080")
+        requested.append((key, kwargs.get("params")))
+        return responses[key]
+
+    monkeypatch.setattr(requests, "get", get)
+    assert client().get_task_info("c1") == {
+        "task_id": "c1",
+        "start_time": "2026-09-20T00:00:00.123456789Z",
+        "end_time": None,
+        "allocations": [{
+            "allocation_id": "c1.1",
+            "state": "STATE_RUNNING",
+            "is_ready": True,
+            "start_time": "2026-09-20T00:00:05.5",
+            "end_time": None,
+        }],
+    }
+    latest = client().get_latest_trial("9")
+    assert latest == {"trial": {"id": 17, "experimentId": 9, "taskIds": ["9.a", "9.a-1"]}, "total": 30}
+    assert client().get_trial("4")["experimentId"] == 9
+    assert requested[1] == (
+        "/api/v1/experiments/9/trials",
+        {"sortBy": "SORT_BY_ID", "orderBy": "ORDER_BY_DESC", "limit": 1},
+    )
+
+    responses["/api/v1/tasks/c1"] = Response({"task": {"taskId": "other", "allocations": []}})
+    with pytest.raises(APIError) as caught:
+        client().get_task_info("c1")
+    assert caught.value.code == "invalid_response"
+
+
+def test_allocation_details_parse_and_validate(monkeypatch):
+    requested = []
+    payload = {"allocation": {
+        "taskId": "1.a", "allocationId": "1.a/b.1", "state": "STATE_TERMINATED", "slots": 4,
+        "exitReason": "x" * 2000, "statusCode": 137, "startTime": "2027-01-15 06:00:00 +0000 UTC",
+    }}
+
+    def get(url, **kwargs):
+        requested.append(url)
+        return Response(payload)
+
+    monkeypatch.setattr(requests, "get", get)
+    detail = client().get_allocation("1.a/b.1")
+    assert requested == ["http://master:8080/api/v1/allocations/1.a%2Fb.1"]
+    assert detail == {
+        "allocation_id": "1.a/b.1", "slots": 4, "exit_reason": "x" * 1024, "status_code": 137,
+    }
+
+    payload["allocation"] = {"allocationId": "1.a/b.1", "slots": 1}
+    assert client().get_allocation("1.a/b.1")["exit_reason"] is None
+
+    for broken in (
+        {"allocationId": "other", "slots": 1},
+        {"allocationId": "1.a/b.1", "slots": "1"},
+        {"allocationId": "1.a/b.1", "slots": 1, "statusCode": True},
+    ):
+        payload["allocation"] = broken
+        with pytest.raises(APIError) as caught:
+            client().get_allocation("1.a/b.1")
+        assert caught.value.code == "invalid_response"
+
+
+def test_resource_pool_descriptions(monkeypatch):
+    requested = []
+
+    def get(url, **kwargs):
+        requested.append((url, kwargs.get("params")))
+        return Response({"resourcePools": [
+            {"name": "gpu", "description": "Operator text", "slotsAvailable": 8},
+            {"name": "cpu", "description": ""},
+        ]})
+
+    monkeypatch.setattr(requests, "get", get)
+    assert client().list_resource_pools() == [
+        {"name": "gpu", "description": "Operator text"},
+        {"name": "cpu", "description": None},
+    ]
+    assert requested == [("http://master:8080/api/v1/resource-pools", {"limit": 0})]
+
+    monkeypatch.setattr(requests, "get", lambda *a, **k: Response({"resourcePools": [{}]}))
+    with pytest.raises(APIError) as caught:
+        client().list_resource_pools()
+    assert caught.value.code == "invalid_response"
+
+
+def test_gpu_device_models_skip_hidden_and_non_accelerator_devices(monkeypatch):
+    agents = {"agents": [
+        {"id": "a", "slots": {
+            "0": {"device": {"brand": "Model X", "uuid": "GPU-1", "type": "TYPE_CUDA"}},
+            "1": {"device": {"brand": "Model X", "uuid": "********", "type": "TYPE_CUDA"}},
+            "2": {"device": {"brand": "Epyc", "uuid": "cpu-0", "type": "TYPE_CPU"}},
+        }},
+        {"id": "b", "slots": [
+            {"device": {"brand": "Model Y", "uuid": "GPU-2", "type": "TYPE_ROCM"}},
+            {"device": {"brand": "", "uuid": "GPU-3", "type": "TYPE_CUDA"}},
+            {"device": None},
+        ]},
+        {"id": "c"},
+    ]}
+    monkeypatch.setattr(requests, "get", lambda *a, **k: Response(agents))
+    assert client().list_gpu_devices() == {"GPU-1": "Model X", "GPU-2": "Model Y"}
+
+    monkeypatch.setattr(requests, "get", lambda *a, **k: Response({"agents": ["bad"]}))
+    with pytest.raises(APIError) as caught:
+        client().list_gpu_devices()
+    assert caught.value.code == "invalid_response"
+
+
+def test_cpu_only_allocation_has_zero_slots(monkeypatch):
+    monkeypatch.setattr(requests, "get", lambda *a, **k: Response({"allocation": {
+        "allocationId": "c.1", "slots": 0,
+    }}))
+    assert client().get_allocation("c.1")["slots"] == 0

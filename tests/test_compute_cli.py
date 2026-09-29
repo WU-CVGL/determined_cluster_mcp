@@ -111,6 +111,30 @@ def test_discover_and_adopt_bind_owner_and_forward_pagination(monkeypatch, capsy
     ]
 
 
+def test_usage_binds_owner_and_forwards_options(monkeypatch, capsys):
+    service = FakeService()
+    calls = []
+
+    def usage(*args):
+        calls.append(args)
+        return {"task_id": args[0], "series": []}
+
+    service.usage = usage
+    monkeypatch.setattr(compute_cli, "_resolve_runtime", lambda args: (service, "alice"))
+
+    assert compute_cli.main(["usage", "task-1"]) == 0
+    assert json.loads(capsys.readouterr().out)["result"]["task_id"] == "task-1"
+    assert compute_cli.main([
+        "usage", "task-2", "--window-seconds", "900", "--allocation-id", "a.1",
+        "--trial-id", "4", "--metric", "cpu_cores", "--metric", "gpu_power_watts",
+        "--samples",
+    ]) == 0
+    assert calls == [
+        ("task-1", "alice", 3600, None, None, None, False),
+        ("task-2", "alice", 900, "a.1", 4, ["cpu_cores", "gpu_power_watts"], True),
+    ]
+
+
 def test_plan_accepts_yaml_request_file(tmp_path, monkeypatch, capsys):
     service = FakeService()
     request = tmp_path / "request.yaml"

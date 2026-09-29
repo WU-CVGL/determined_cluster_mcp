@@ -11,7 +11,7 @@ server-side advice worker, see [Consultation backend](consultation.md).
 
 ```mermaid
 flowchart LR
-    U[Any local stdio MCP client] --> M[13 base MCP tools]
+    U[Any local stdio MCP client] --> M[14 base MCP tools]
     M --> C[ComputeService]
     C --> D[(local SQLite database)]
     C --> A[Determined API]
@@ -28,16 +28,16 @@ names with one database, while collaborators can deliberately share a name. This
 namespace boundary, not multi-user authentication. A remotely exposed service needs
 its own authenticated transport.
 
-`ComputeService` owns planning, idempotent submission, status, logs, cancellation,
-discovery, adoption, and conservative reconciliation. Its local `task_id` remains
-stable across restarts and is distinct from the Determined `remote_id`. Keep the SQLite
-database on durable local storage. Keep source, data, packages, checkpoints, logs, and
-outputs on mapped shared storage.
+`ComputeService` owns planning, idempotent submission, status, logs, usage measurements,
+cancellation, discovery, adoption, and conservative reconciliation. Its local `task_id`
+remains stable across restarts and is distinct from the Determined `remote_id`. Keep the
+SQLite database on durable local storage. Keep source, data, packages, checkpoints,
+logs, and outputs on mapped shared storage.
 
-The default consultation backend is `none`. That mode registers 13 base tools and does
+The default consultation backend is `none`. That mode registers 14 base tools and does
 not import the consultation worker, require Codex, or require a repository skill
 directory. Enabling the Codex backend adds `compute_consult` and `workflow_status`, for
-15 tools in total. Consultation is advisory and cannot submit or cancel work.
+16 tools in total. Consultation is advisory and cannot submit or cancel work.
 
 ## Compute profile
 
@@ -73,8 +73,8 @@ does not enforce an idle timeout.
 
 `cluster_identity` is an optional operator-facing label. Submitted local records bind
 to the profile fingerprint and the resolved Determined endpoint, including this label.
-Changing that binding prevents later status, log, cancellation, and reconciliation
-operations on those records.
+Changing that binding prevents later status, log, usage, cancellation, and
+reconciliation operations on those records.
 
 ## Request object and planning
 
@@ -153,7 +153,7 @@ storage configuration. See [Shared-storage access](shared-storage-access.md).
 
 ## MCP API
 
-The base server exposes 13 tools. The `owner` below is always the startup-bound
+The base server exposes 14 tools. The `owner` below is always the startup-bound
 namespace and never a tool argument.
 
 | Tool | Arguments | Return value and effect |
@@ -162,6 +162,7 @@ namespace and never a tool argument.
 | `compute_launch` | `request`, `request_id` | Persisted task record; may submit once |
 | `compute_status` | `task_id` | Local task record, refreshed remote state, and remote entity when bound |
 | `compute_logs` | `task_id`, optional `tail=200` | Chronological list of the newest remote log records |
+| `compute_usage` | `task_id`, optional `window_seconds=3600`, `allocation_id`, `trial_id`, `metrics`, `include_samples=false` | Read-only summary of one task's measured CPU, memory, and GPU use |
 | `compute_cancel` | `task_id` | Updated record, remote cancellation response, and acknowledgement |
 | `compute_reconcile` | `task_id`, `remote_id` | Record bound only after marker verification |
 | `compute_list_tasks` | none | Local records in the bound owner namespace |
@@ -209,7 +210,8 @@ sanitized entity as `remote`. A stale `pending` or `submitting` row becomes
 `submission_uncertain`; this never causes automatic resubmission.
 
 `compute_logs` requires a positive `tail`. Command and shell logs come from their task
-log API. Experiment logs come from the highest numeric trial ID; an experiment with no
+log API. Experiment logs come from the highest numeric trial ID, which a server-side
+sort selects even when an experiment has more than 100 trials; an experiment with no
 trials returns an empty list. Results are ordered oldest to newest. A task with no
 remote ID also returns an empty list.
 
@@ -221,6 +223,160 @@ does not prove success; inspect exit information and expected shared-storage art
 For a running shell, use the sanitized `reconnectCommand`, currently
 `det shell show_ssh_command <remote-id>`. The adapter removes `privateKey`; never put
 private key material in task records, consultation context, or reports.
+
+### Task usage measurements
+
+`compute_usage` is read-only and summarizes the measured CPU, memory, and GPU use of one
+owned task; `compute_resources` describes scheduler capacity instead. It requires a
+Determined master from the research-cluster fork 0.40.1 or later on which an
+administrator has configured `integrations.task_resources` (`prometheus_url` and
+`det_cluster`).
+
+The service validates arguments first and then applies the same owner and binding
+checks as `compute_status`. A record without a remote ID returns `remote_id_unknown`;
+reconcile it first. An adopted task's remote owner is verified again. The service then
+asks the master whether task resources are available: a disabled integration returns
+`task_resources_disabled`, and a master without the API returns
+`task_resources_unsupported`. Neither is retryable.
+
+For a command or shell, `determined_task_id` is the remote ID. An experiment reports one
+trial: the highest-ID trial by default, or `trial_id` when given. A requested trial that
+belongs to another experiment returns `trial_not_found`; a nonexistent or inaccessible
+trial ID returns Determined's HTTP 404. Other kinds reject `trial_id`. The service
+measures the selected trial's newest Determined task. An experiment with no trial, or a
+trial with no task, returns `task_not_started`. `allocation_id` restricts results to one
+allocation listed for that task; any other value returns `allocation_not_found`.
+
+`window_seconds` must be 60 through 604,800 (seven days); the default is 3,600. The
+window ends at the task end time for an ended task, capped at the current time, and
+otherwise at the current time. If every selected allocation ended before that, as for a
+paused trial or an earlier allocation named by `allocation_id`, the window ends when the
+last of them ended instead. It starts `window_seconds` earlier, but never before the
+task start or the requested allocation's start, and always at least one second before
+its end. `window.anchor` reports which end applied: `task_end`, `allocation_end`, or
+`now`. The step is the larger of 15 seconds and the window length divided by 1,439,
+rounded up to a whole second, so no series exceeds 1,440 points. `metrics` is a
+non-empty list drawn from `allocation_active` (count), `cpu_cores` (cores),
+`memory_working_set_bytes` and `memory_rss_bytes` (bytes), `gpu_utilization_percent`
+(percent), `gpu_memory_used_bytes` (bytes), `gpu_power_watts` (watts), and
+`gpu_temperature_celsius` (celsius); omit it to keep every returned series.
+
+The result contains:
+
+| Field | Meaning |
+| --- | --- |
+| `task_id`, `kind`, `remote_id` | Local task identity |
+| `determined_task_id` | Determined task whose measurements were read |
+| `trial` | `null` for commands and shells; otherwise `id`, `state`, `selection` (`latest` or `requested`), `experiment_trial_count` (`null` when `trial_id` was given), `task_count`, and the trial progress and summary-metric fields described below |
+| `resource_pool` | The task's pool as `name` and the operator-written `description` from Determined, trimmed and truncated to 4,096 characters. `description` is `null` when the pool has none or is not in the pool list returned to this account. The whole field is `null` when the pool name is unknown |
+| `task_start_time`, `task_end_time` | Lifetime of the Determined task |
+| `allocations` | Each allocation's `allocation_id`, `state`, `is_ready`, UTC `start_time` and `end_time`, `slots`, `exit_reason` (at most 1,024 characters), and `status_code` |
+| `allocation_details_limit` | Present, as 8, only when the task has more than 8 allocations; see below |
+| `allocation_id` | Requested allocation filter, or `null` |
+| `window` | `start` and `end` in Unix seconds, `step` in seconds, plus `start_at`, `end_at`, `anchor`, and `expected_points` |
+| `series` | One summary per metric and label set |
+| `gpus` | One GPU comparison per allocation; see below |
+| `warnings` | Determined's `{code, message}` warnings, passed through unchanged |
+| `context_unavailable` | Context lookups that failed: `resource_pool`, `allocation_details`, or `gpu_models` |
+| `explanation`, `advisory` | How to read this result |
+| `observed_at` | Time the service built the result |
+
+Each series has `metric`, `unit`, the labels `allocation_id`, `node`, and `gpu_uuid`,
+`gpu_model`, `points`, `available_points`, `first_at`, `last_at`, and `last`, `min`,
+`max`, `mean`, `p50`, and `p95` over the available samples. `p50` and `p95` are
+nearest-rank percentiles. `gpu_model` is the model name the Determined agent reports for
+`gpu_uuid`, or `null` for a non-GPU series or an unknown device. A
+`gpu_utilization_percent` series also has `idle_fraction`, the share of its available
+samples below 10%.
+
+Values are point samples taken every `step` seconds, so `min`, `max`, `mean`, and the
+percentiles describe those samples rather than every instant. A null or missing value
+means no measurement, never zero use. `allocation_active` above zero means the
+allocation was running. CPU and memory series are per allocation and node; GPU series
+are per GPU UUID and cover the whole assigned device, which can include other processes.
+Inspect `warnings`, such as `rss_unverified` or `gpu_full_device`, before drawing
+conclusions. An empty `series` list means no data for the window, not an idle task; if a
+`metrics` filter removed every returned series, `explanation` names the metrics that
+were returned. When `trial_id` is omitted and the experiment has several trials,
+`explanation` states how many exist and which one is reported.
+
+`gpus` compares the GPUs within each allocation. It has one entry per `allocation_id`
+with GPU utilization or memory series and uses every such series returned for the
+window, even those a `metrics` filter hides from `series`; with `allocation_id`, it
+covers that allocation only. Each entry has `gpu_count` (distinct GPU UUIDs with a
+returned utilization or memory series, even if every sample is null), `requested_slots`
+(the allocation's slot count, or `null` when unknown), `gpu_models` (distinct known
+model names, possibly empty), and statistics of per-GPU mean utilization:
+`mean_utilization_percent` averages the per-GPU means so each GPU counts equally,
+`min_gpu_mean_utilization_percent` and `max_gpu_mean_utilization_percent` are the lowest
+and highest, `utilization_spread_percent` is their difference, and
+`least_utilized_gpu_uuid` names the lowest, with ties going to the lexicographically
+first UUID. These utilization statistics include only GPUs with at least one available
+utilization sample, so they can cover fewer GPUs than `gpu_count`. `idle_fraction` is
+instead the share of all the allocation's utilization samples below
+`idle_threshold_percent` (10). `max_memory_used_bytes` is the largest single-GPU memory
+sample in the allocation, not a true peak; GPU memory capacity is not reported. A large
+spread points to an idle or straggling GPU, starting with `least_utilized_gpu_uuid`, and
+a high `idle_fraction` means the GPUs spent much of the window below the threshold. A
+`gpu_count` below `requested_slots` means fewer GPUs returned a series than the
+allocation holds; check `warnings` and monitoring coverage before calling the rest
+unused.
+
+For an experiment, `trial` also carries Determined's values for the whole trial, not for
+the measurement window: `total_batches_processed`, `wall_clock_seconds`, and `restarts`,
+each `null` when missing or malformed. `total_batches_processed` is the highest reported
+`steps_completed`, and `restarts` is capped at the experiment's `max_restarts`.
+`batches_per_second_lower_bound` divides batches by wall-clock seconds and is `null`
+when either is unknown or wall-clock time is zero; its unit is whatever the workload
+reports as `steps_completed`. It is a floor, because `wall_clock_seconds` adds up each
+allocation from when Determined first reports its resources pulling or running until it
+ends, or until now while it runs. That can include image pull, startup, initialization,
+and allocations lost to restarts; scheduler queue time and gaps between allocations,
+such as pauses, are not counted. `summary_metrics` keeps Determined's per-group,
+per-metric statistics, reduced to `type` and the finite numeric `count`, `sum`, `min`,
+`max`, `last`, and `mean`; group names such as `avg_metrics` (training) and
+`validation_metrics` are Determined's and are passed through unchanged. At most 100
+metric entries are kept: `validation_metrics` first, then `avg_metrics`, then other groups
+by name, with metrics in name order within each group; `summary_metrics_truncated` is
+true when more existed. These fields depend on the
+workload reporting through Determined's Core API. A `total_batches_processed` of 0,
+which `explanation` then notes, is expected for a workload that does not, such as a
+plain bash entrypoint, or that has not reported yet, and does not mean it made no
+progress. `summary_metrics` is `{}`
+when the workload reports no metrics.
+
+Pool, allocation-detail, and GPU-model context is best-effort and read after the
+measurements. A Determined API error in one of these lookups, including a transport
+failure or malformed response, adds `resource_pool`, `allocation_details`, or
+`gpu_models` to `context_unavailable` and leaves the affected fields empty or `null`;
+the measurements are still returned. After a transport failure, the remaining lookups are
+skipped and reported the same way, so an unresponsive master delays the result by one
+timeout rather than one per lookup. A submitted task needs one extra entity read, which
+`compute_logs` does not make, to learn its pool name, and a failure there reports
+`resource_pool`; an adopted task reuses the entity read for its ownership check.
+Determined serves an ended command or shell for only 24 hours after it ends and not
+after a master restart; for such a task, `resource_pool` is then `null` without a
+`context_unavailable` entry. The
+pool list is read only when the pool name is known. Allocation details are read for the
+first eight allocations in Determined's order (allocations without an end time, such as
+queued or running ones, first, then most recently ended) plus a requested
+`allocation_id`; other allocations keep `null` details, and `allocation_details_limit`
+reports the limit. The agent list, which supplies GPU model names, is read only when a
+GPU series exists. When RBAC hides device UUIDs from the current account, `gpu_model` is
+`null` and `gpu_models` is empty without any `context_unavailable` entry.
+
+`include_samples=true` adds `samples_omitted`. When `samples_omitted` is false, each
+series also has `samples` as `[unix_seconds, value_or_null]` pairs. When the selected
+series together exceed 2,880 points, the service omits samples and reports
+`samples_limit`; narrow the window, select fewer metrics, or choose one allocation.
+
+The master limits a query to a seven-day range, a 15-second minimum step, 1,440 points
+per series, and a 10-second timeout, and runs at most four resource queries at once.
+HTTP 503 means the measurement backend is busy or unavailable and is retryable. The
+master rejects an end more than 60 seconds ahead of its own clock with HTTP 400, so a
+client clock far ahead of the master can cause that error. HTTP 404 means the Determined
+task, or a requested trial ID, is missing or inaccessible. See
+[troubleshooting](troubleshooting.md#usage-measurements-are-unavailable-or-empty).
 
 ### Discover and adopt
 
@@ -242,8 +398,8 @@ New adopted records have `origin: "adopted"`, local `state: "adopted"`, and an i
 adoption request ID. They retain only whitelisted identity, state, name, and description
 metadata. Unknown `workdir`, `output_dir`, and `code_revision` are exposed as `null`;
 the store does not infer them or retain raw remote configuration. Later status, logs,
-and cancellation re-check the actual cluster and account binding. Adopted tasks do not
-use the submitting profile as their authority and gain no storage permissions.
+usage, and cancellation re-check the actual cluster and account binding. Adopted tasks
+do not use the submitting profile as their authority and gain no storage permissions.
 
 Use discovery and adoption for work created by the WebUI, native CLI, or another device
 under the same account. Use reconciliation for a local submission whose acceptance was
@@ -281,6 +437,19 @@ permission, transport, and response-shape failures are errors rather than empty
 results. Error messages and reports may contain sanitized commands, paths, IDs, states,
 and error classes, but must not include credentials or secret-file contents.
 
+A Determined HTTP failure, including a gRPC-gateway error body, appears as
+`<status> <message>`. HTTP 429 and 5xx responses other than 501 are retryable; 501 means
+the master lacks the route. Usage-specific codes are described in
+[Task usage measurements](#task-usage-measurements).
+
+On the Determined fork 0.40.1 or later with basic authorization, only the task's
+Determined owner or an administrator can kill or cancel commands, shells, and
+experiments. For a task owned by another account, `compute_cancel` therefore returns
+HTTP 403 for a command or shell and HTTP 404 `experiment '<id>' not found` for an
+experiment. Submitted records bind to the profile and endpoint rather than the account,
+so switching credentials to another account can produce these errors. Cancel with the
+owning account or ask an administrator.
+
 ## CLI equivalents
 
 The JSON CLI uses the same service boundaries and can share the database and owner with
@@ -300,6 +469,7 @@ determined-compute plan --request-file .local/request.json
 determined-compute launch --request-file .local/request.json --request-id my-job-001
 determined-compute status TASK_ID
 determined-compute logs TASK_ID
+determined-compute usage TASK_ID --window-seconds 7200 --metric gpu_utilization_percent
 
 determined-compute discover command --limit 20 --offset 0
 determined-compute adopt command REMOTE_ID

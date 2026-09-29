@@ -198,6 +198,20 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("task_id")
     logs.add_argument("--tail", type=int, default=200)
 
+    usage = commands.add_parser(
+        "usage", help="Summarize one task's measured CPU, memory, and GPU use"
+    )
+    usage.add_argument("task_id")
+    usage.add_argument("--window-seconds", type=int, default=3600)
+    usage.add_argument("--allocation-id", help="Restrict results to one allocation of the task")
+    usage.add_argument("--trial-id", type=int, help="Experiment trial to inspect (default: latest)")
+    usage.add_argument(
+        "--metric", action="append", dest="metrics", help="Report only this metric (repeatable)"
+    )
+    usage.add_argument(
+        "--samples", action="store_true", dest="include_samples", help="Include raw samples"
+    )
+
     cancel = commands.add_parser("cancel", help="Cancel one task")
     cancel.add_argument("task_id")
 
@@ -251,6 +265,11 @@ def _dispatch(args: argparse.Namespace, service: ComputeService, owner: str) -> 
         if args.tail < 1:
             raise ValueError("--tail must be at least 1")
         return service.logs(args.task_id, owner, args.tail)
+    if args.command == "usage":
+        return service.usage(
+            args.task_id, owner, args.window_seconds, args.allocation_id, args.trial_id,
+            args.metrics, args.include_samples,
+        )
     if args.command == "cancel":
         return service.cancel(args.task_id, owner)
     if args.command == "reconcile":

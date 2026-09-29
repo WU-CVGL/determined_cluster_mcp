@@ -14,7 +14,7 @@ anything. The backend model is separate from the calling client's model.
 ## Enable the Codex backend
 
 The MCP server defaults to `--consultation-backend none`. In that mode it exposes the
-13 base tools, does not import the consultation worker, and does not require Codex,
+14 base tools, does not import the consultation worker, and does not require Codex,
 `--repo-root`, or `skills/intensive-compute-runner/SKILL.md`.
 
 To enable the backend, install and sign in to Codex on the server machine. The selected
@@ -38,7 +38,7 @@ determined-compute-mcp \
 `--consultation-codex-bin` is also optional and defaults to `codex` on `PATH`.
 `--repo-root` can instead be supplied through `DETERMINED_COMPUTE_REPO_ROOT`. These
 are deployment options, not MCP tool arguments. Consultation adds
-`compute_consult` and `workflow_status`, bringing the total to 15 tools.
+`compute_consult` and `workflow_status`, bringing the total to 16 tools.
 
 The worker stores its tables in the same local SQLite file passed with `--db`. Protect
 that file as service state because it contains questions, curated context, lifecycle

@@ -93,6 +93,8 @@ If the launch result is uncertain, do not create a new request ID or submit agai
 
 Call `compute_status(task_id)` until the task reaches a terminal state, and use `compute_logs(task_id, tail)` to inspect progress and the final messages. Cancel a running task with `compute_cancel(task_id)` when the user no longer needs it.
 
+Call `compute_usage(task_id)` when you need to know how much CPU, memory, and GPU a running job uses, for example to spot near-zero GPU utilization or an idle allocation before proposing a resize, cancellation, or relaunch; for an ended task it reports the window before the task ended. It is read-only and requires the master's task-resources integration; `task_resources_disabled` or `task_resources_unsupported` means measurements are unavailable, not that the task is idle. Inspect `warnings` first. A null or missing value means no measurement, never zero, and an empty `series` list means no data for the window. Values are point samples taken every `step` seconds, and GPU metrics cover the whole assigned device, which can include other processes. An experiment reports its latest trial unless `trial_id` is given. `gpus` compares each allocation's GPUs even when `metrics` hides their series: a large `utilization_spread_percent`, a low mean on `least_utilized_gpu_uuid`, or a high `idle_fraction` points to idle or straggling GPUs, and a `gpu_count` below `requested_slots` means fewer GPUs returned a series than the allocation holds, not necessarily that the rest are unused. For an experiment, `trial.batches_per_second_lower_bound` is a lifetime floor, because its wall-clock denominator can also count image pull, startup, initialization, and allocations lost to restarts (not scheduler queue time or gaps between allocations); a `total_batches_processed` of 0 is expected when the workload does not report through Determined's Core API. Report what you observe; changing slots or pools remains an explicit workload decision. See [task usage measurements](compute-service.md#task-usage-measurements).
+
 A successful submission or a terminal state alone is not acceptance. Check the process exit information and the success criteria defined at the start. When storage access is configured, verify expected shared artifacts with `storage_check`; otherwise use workload output or another explicit task-level check. When a local copy is needed, configure storage access, preview `storage_fetch(shared_dir, local_dir, dry_run=true)`, review it, then execute with `dry_run=false` and inspect the fetched result.
 
 Report the local task ID, remote ID, final state, exit result when available, output path, and observed artifact or metric. Never include tokens, passwords, private keys, cookies, or secrets-file contents.
@@ -103,7 +105,7 @@ Use discovery and adoption for a task created independently through the Determin
 
 1. Call `compute_discover(kind, limit=50, offset=0)` with `command`, `shell`, or `experiment`. This is a read-only remote query; it does not create a local record or submit work.
 2. Select the intended remote result, then call `compute_adopt(kind, remote_id)`.
-3. Keep the returned local `task_id` and use it with `compute_status`, `compute_logs`, and `compute_cancel`.
+3. Keep the returned local `task_id` and use it with `compute_status`, `compute_logs`, `compute_usage`, and `compute_cancel`.
 
 Adoption verifies the actual cluster, current authenticated account, and remote owner. It creates an idempotent local record and never relaunches the remote task. Unknown work paths, output paths, or revisions remain unknown. Adoption does not grant storage access or new cluster permissions.
 
@@ -121,6 +123,8 @@ Four values participate in task identity and access:
 | Cluster identity | Actual remote cluster used to prevent cross-cluster task confusion |
 
 Sessions share local records only when they use the same database and owner. Separate databases can adopt the same remote task independently. Keep the database on local durable disk rather than shared NFS. Sharing an owner does not share credentials, and changing credentials does not rename the owner namespace.
+
+On the Determined fork 0.40.1 or later with basic authorization, only a task's Determined owner or an administrator can cancel it. A submitted record binds to the profile and endpoint rather than the account, so after credentials switch to another account, `compute_cancel` can return HTTP 403 for a command or shell and HTTP 404 for an experiment; an adopted record reports `ownership_mismatch` instead. Use the account that owns the task.
 
 ## Optional consultation
 

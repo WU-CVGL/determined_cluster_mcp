@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Union
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import requests
 import yaml
@@ -58,10 +59,15 @@ def _error_from_response(response: requests.Response) -> APIError:
     if not isinstance(payload, dict):
         payload = {}
     status = response.status_code
-    message = payload.get("message") or payload.get("error") or response.text or getattr(response, "reason", "API request failed")
+    error = payload.get("error")
+    if isinstance(error, dict):
+        # The gRPC gateway nests its message: {"error": {"code", "reason", "error"}}.
+        error = error.get("error") or error.get("message") or error.get("reason")
+    message = payload.get("message") or error or response.text or getattr(response, "reason", "API request failed")
     return APIError(
         f"{status} {message}", code=payload.get("code", status), details=payload.get("details"),
-        retryable=status == 429 or status >= 500,
+        # 501 means the master lacks the route; repeating the request cannot help.
+        retryable=status == 429 or (status >= 500 and status != 501),
     )
 
 
@@ -491,16 +497,10 @@ class DeterminedAPIClient:
         if tail < 0:
             raise ValueError("tail must be non-negative")
         if kind == "experiment":
-            trials = self.get_trials(task_id)
-            if not trials:
+            trial = self.get_latest_trial(task_id)["trial"]
+            if trial is None:
                 return []
-
-            def trial_key(trial: Dict[str, Any]) -> tuple:
-                try:
-                    return (1, int(trial.get("id")))
-                except (TypeError, ValueError):
-                    return (0, str(trial.get("id") or ""))
-            return self.get_trial_logs(str(max(trials, key=trial_key)["id"]), limit=tail)
+            return self.get_trial_logs(str(trial["id"]), limit=tail)
         entries = self._stream_logs(f"api/v1/tasks/{task_id}/logs", {"limit": tail, "follow": False, "orderBy": "ORDER_BY_DESC"})
         entries.reverse()
         return entries
@@ -525,10 +525,242 @@ class DeterminedAPIClient:
             raise APIError("Trial list response had no trials array", code="invalid_response")
         return value
 
+    @staticmethod
+    def _trial_key(trial: Mapping[str, Any]) -> tuple:
+        try:
+            return (1, int(trial.get("id")))
+        except (TypeError, ValueError):
+            return (0, str(trial.get("id") or ""))
+
+    def get_latest_trial(self, experiment_id: str) -> Dict[str, Any]:
+        """Return the highest-id trial, or None, and the reported trial count."""
+        # An unbounded trial listing is capped at 100 rows in ascending order.
+        response = self._get(
+            f"api/v1/experiments/{experiment_id}/trials",
+            params={"sortBy": "SORT_BY_ID", "orderBy": "ORDER_BY_DESC", "limit": 1},
+        )
+        trials = response.get("trials")
+        if not isinstance(trials, list) or not all(isinstance(item, Mapping) for item in trials):
+            raise APIError("Trial list response had no trials array", code="invalid_response")
+        pagination = response.get("pagination")
+        total = pagination.get("total") if isinstance(pagination, Mapping) else None
+        if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            total = None
+        latest = max(trials, key=self._trial_key) if trials else None
+        return {"trial": dict(latest) if latest is not None else None, "total": total}
+
+    def get_trial(self, trial_id: str) -> Dict[str, Any]:
+        trial = self._get(f"api/v1/trials/{quote(str(trial_id), safe='')}").get("trial")
+        if not isinstance(trial, Mapping) or trial.get("id") is None:
+            raise APIError("Trial response did not contain a trial", code="invalid_response")
+        return dict(trial)
+
     def get_trial_logs(self, trial_id: str, limit: int = 100) -> List[Dict[str, Any]]:
         entries = self._stream_logs(f"api/v1/trials/{trial_id}/logs", {"limit": limit, "follow": False, "orderBy": "ORDER_BY_DESC"})
         entries.reverse()
         return entries
+
+    # Task resource measurements (Determined fork 0.40.1 and later).
+
+    _TASK_RESOURCE_LABELS = (("allocationId", "allocation_id"), ("node", "node"), ("gpuUuid", "gpu_uuid"))
+
+    def task_resources_enabled(self) -> bool:
+        """Return whether the master serves task resource measurements."""
+        try:
+            response = self._get("api/v1/task-resources/capability")
+        except APIError as exc:
+            # A master without the route answers 501 through the gateway, or 404 behind a proxy.
+            if exc.code in {404, 501}:
+                raise APIError(
+                    "Determined master does not provide the task resources API",
+                    code="task_resources_unsupported",
+                ) from exc
+            raise
+        enabled = response.get("enabled")
+        if not isinstance(enabled, bool):
+            raise APIError("Task-resources capability response is malformed", code="invalid_response")
+        return enabled
+
+    @staticmethod
+    def _optional_text(value: Any) -> Optional[str]:
+        if value is None or value == "":
+            return None
+        if not isinstance(value, str):
+            raise APIError("Task response is malformed", code="invalid_response")
+        return value
+
+    def get_task_info(self, task_id: str) -> Dict[str, Any]:
+        """Return the lifetime and allocations of one Determined task ID."""
+        task = self._get(f"api/v1/tasks/{quote(task_id, safe='')}").get("task")
+        if not isinstance(task, Mapping) or task.get("taskId") != task_id:
+            raise APIError("Task response is malformed", code="invalid_response")
+        allocations = task.get("allocations") or []
+        if not isinstance(allocations, list):
+            raise APIError("Task response is malformed", code="invalid_response")
+        summaries: List[Dict[str, Any]] = []
+        for item in allocations:
+            if (
+                not isinstance(item, Mapping)
+                or not isinstance(item.get("allocationId"), str)
+                or not item["allocationId"]
+            ):
+                raise APIError("Task response is malformed", code="invalid_response")
+            is_ready = item.get("isReady")
+            summaries.append({
+                "allocation_id": item["allocationId"],
+                "state": self._optional_text(item.get("state")),
+                "is_ready": is_ready if isinstance(is_ready, bool) else None,
+                "start_time": self._optional_text(item.get("startTime")),
+                "end_time": self._optional_text(item.get("endTime")),
+            })
+        return {
+            "task_id": task_id,
+            "start_time": self._optional_text(task.get("startTime")),
+            "end_time": self._optional_text(task.get("endTime")),
+            "allocations": summaries,
+        }
+
+    def get_allocation(self, allocation_id: str) -> Dict[str, Any]:
+        """Return the slot count and exit details of one allocation."""
+        allocation = self._get(f"api/v1/allocations/{quote(allocation_id, safe='')}").get("allocation")
+        malformed = APIError("Allocation response is malformed", code="invalid_response")
+        if not isinstance(allocation, Mapping) or allocation.get("allocationId") != allocation_id:
+            raise malformed
+        slots, reason, status = (
+            allocation.get(key) for key in ("slots", "exitReason", "statusCode")
+        )
+        if (
+            isinstance(slots, bool)
+            or not isinstance(slots, int)
+            or slots < 0
+            or (reason is not None and not isinstance(reason, str))
+            or (status is not None and (isinstance(status, bool) or not isinstance(status, int)))
+        ):
+            raise malformed
+        return {
+            "allocation_id": allocation_id,
+            "slots": slots,
+            "exit_reason": reason[:1024] if reason else None,
+            "status_code": status,
+        }
+
+    def list_resource_pools(self) -> List[Dict[str, Optional[str]]]:
+        """Return each resource pool's name and operator-written description."""
+        pools = self._get("api/v1/resource-pools", params={"limit": 0}).get("resourcePools")
+        malformed = APIError("Resource-pool response is malformed", code="invalid_response")
+        if not isinstance(pools, list):
+            raise malformed
+        result: List[Dict[str, Optional[str]]] = []
+        for pool in pools:
+            if not isinstance(pool, Mapping) or not isinstance(pool.get("name"), str):
+                raise malformed
+            description = pool.get("description")
+            result.append({
+                "name": pool["name"],
+                "description": description if isinstance(description, str) and description else None,
+            })
+        return result
+
+    def list_gpu_devices(self) -> Dict[str, str]:
+        """Map each visible accelerator UUID to its model name."""
+        agents = self._get("api/v1/agents", params={"limit": 0}).get("agents")
+        if not isinstance(agents, list) or not all(isinstance(item, Mapping) for item in agents):
+            raise APIError("Agent response is malformed", code="invalid_response")
+        models: Dict[str, str] = {}
+        for agent in agents:
+            slots = agent.get("slots")
+            if isinstance(slots, Mapping):
+                entries = list(slots.values())
+            else:
+                entries = slots if isinstance(slots, list) else []
+            for slot in entries:
+                device = slot.get("device") if isinstance(slot, Mapping) else None
+                if not isinstance(device, Mapping) or device.get("type") not in {"TYPE_CUDA", "TYPE_ROCM"}:
+                    continue
+                uuid_text, brand = device.get("uuid"), device.get("brand")
+                # RBAC without sensitive-agent access replaces UUIDs with asterisks.
+                if (
+                    isinstance(uuid_text, str)
+                    and uuid_text.strip("*")
+                    and isinstance(brand, str)
+                    and brand
+                ):
+                    models[uuid_text] = brand[:256]
+        return models
+
+    def get_task_resources(
+        self,
+        task_id: str,
+        *,
+        start: int,
+        end: int,
+        step: int,
+        allocation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return validated measurement series for one Determined task ID."""
+        for name, value in (("start", start), ("end", end), ("step", step)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if allocation_id is not None and (not isinstance(allocation_id, str) or not allocation_id):
+            raise ValueError("allocation_id must be a non-empty string")
+        # Send only these keys: the gateway lets an unfiltered taskId override the path.
+        params: Dict[str, Any] = {"start": start, "end": end, "step": step}
+        if allocation_id is not None:
+            params["allocationId"] = allocation_id
+        response = self._get(f"api/v1/tasks/{quote(task_id, safe='')}/resources", params=params)
+        return self._task_resources(response)
+
+    @classmethod
+    def _task_resources(cls, response: Mapping[str, Any]) -> Dict[str, Any]:
+        def number(value: Any) -> bool:
+            return (
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(value)
+            )
+
+        malformed = APIError("Task-resources response is malformed", code="invalid_response")
+        enabled, series, warnings = (response.get(key) for key in ("enabled", "series", "warnings"))
+        if not isinstance(enabled, bool) or not isinstance(series, list) or not isinstance(warnings, list):
+            raise malformed
+        parsed: List[Dict[str, Any]] = []
+        for item in series:
+            if not isinstance(item, Mapping) or not isinstance(item.get("metric"), str) or not item["metric"]:
+                raise malformed
+            labels = item.get("labels") or {}
+            samples = item.get("samples")
+            if not isinstance(labels, Mapping) or not isinstance(samples, list):
+                raise malformed
+            parsed_labels: Dict[str, Optional[str]] = {}
+            for wire, name in cls._TASK_RESOURCE_LABELS:
+                value = labels.get(wire)
+                if value is not None and not isinstance(value, str):
+                    raise malformed
+                parsed_labels[name] = value or None
+            points: List[List[Any]] = []
+            for sample in samples:
+                if not isinstance(sample, Mapping):
+                    raise malformed
+                # A null or absent value is an unavailable sample, never zero.
+                stamp, value = sample.get("timestampSeconds"), sample.get("value")
+                if (
+                    not number(stamp)
+                    or not 0 <= stamp < 253402300800  # representable before year 10000
+                    or (value is not None and not number(value))
+                ):
+                    raise malformed
+                points.append([stamp, value])
+            parsed.append({"metric": item["metric"], "labels": parsed_labels, "samples": points})
+        parsed_warnings: List[Dict[str, str]] = []
+        for warning in warnings:
+            if (
+                not isinstance(warning, Mapping)
+                or not isinstance(warning.get("code"), str)
+                or not isinstance(warning.get("message"), str)
+            ):
+                raise malformed
+            parsed_warnings.append({"code": warning["code"], "message": warning["message"]})
+        return {"enabled": enabled, "series": parsed, "warnings": parsed_warnings}
 
 
 __all__ = ["APIError", "SubmissionUncertainError", "DeterminedAPIClient"]

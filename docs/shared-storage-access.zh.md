@@ -1,3 +1,4 @@
+<a id="shared-storage-access-from-a-client"></a>
 # 从客户端访问共享存储
 
 [English](shared-storage-access.md) | [简体中文](shared-storage-access.zh.md)

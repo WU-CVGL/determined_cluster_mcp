@@ -77,6 +77,8 @@ Run `compute_resources` for the requested pool and slot count. Zero slots check 
 
 With `allow_queue: false`, unavailable or unknown capacity rejects the launch instead of queuing. Do not silently choose a suggested alternative pool, reduce resources, or set `allow_queue: true`; those changes require an explicit workload decision. Authentication or inventory-shape errors are errors, not evidence that capacity exists.
 
+A resource pool that an administrator created dynamically appears in `compute_resources` only once it is Ready. A Pending or Failed pool is absent: the result reports that the pool was not present in the cluster inventory with unknown availability, and a launch without queuing is rejected with `capacity_unknown`. This MCP does not expose the dynamic-pool administration API, so ask an administrator about the pool's status.
+
 ## Submission outcome is uncertain
 
 A connection failure after a mutation was sent may mean the remote task was accepted even though the client did not receive its ID. The service records `submission_uncertain` and does not automatically retry.
@@ -87,9 +89,25 @@ Use `compute_adopt` for a remote task that was created independently. Adoption i
 
 ## A task is terminal but the result is unclear
 
-Use `compute_status` and `compute_logs` with the local task ID. A successful API submission, remote ID, or terminal state does not by itself prove workload success. Check exit information and the success criteria defined before launch. With storage access configured, verify the expected shared artifact with `storage_check`; if a local copy is required, preview and then execute `storage_fetch`. Without storage access, use task output or another explicit workload-level check.
+Use `compute_status` and `compute_logs` with the local task ID. A successful API submission, remote ID, or terminal state does not by itself prove workload success. Check exit information and the success criteria defined before launch. With storage access configured, verify the expected shared artifact with `storage_check`; if a local copy is required, preview and then execute `storage_fetch`. Without storage access, use task output or another explicit workload-level check. To see whether the task actually used its CPU, memory, or GPUs before it ended, call `compute_usage(task_id)`; for an ended task or a paused trial, the window ends when the task or its last allocation ended.
 
 An experiment may have no trial logs before a trial starts. For a shell, the sanitized reconnect command can be used while the shell remains available. Reports may include task IDs, states, sanitized commands, paths, and errors, but must omit credential values and secret-file contents.
+
+## Usage measurements are unavailable or empty
+
+`compute_usage` depends on the master's task-resources API. `task_resources_disabled` means the master has the API but an administrator has not enabled `integrations.task_resources`. `task_resources_unsupported` means the master lacks the API; it needs a Determined master from the research-cluster fork 0.40.1 or later. Neither is retryable, so ask an administrator. Unavailable measurements are not evidence that a task is idle.
+
+HTTP 503 means the measurement backend is busy or unavailable; each master runs at most four resource queries at once, so wait and retry. HTTP 400 can mean clock skew: the master rejects a window end more than 60 seconds ahead of its own clock, so correct the clock of the machine running the MCP server. HTTP 404 means the Determined task, or a requested trial ID, is missing or inaccessible to the current account.
+
+`task_not_started` means the experiment has no trial yet or its trial has no Determined task; wait until it starts. `trial_not_found` means the requested trial does not belong to this experiment. `allocation_not_found` means the allocation is not listed for the selected task; choose one from the returned `allocations`. `remote_id_unknown` means the local submission is not bound and must be reconciled first.
+
+A non-empty `context_unavailable` is not fatal. It lists context lookups (`resource_pool`, `allocation_details`, or `gpu_models`) that failed with a Determined API error; the related fields are empty or `null`, and the returned measurements remain valid. Retry later if you need that context. After a transport failure the remaining lookups are skipped, so several names can appear at once. A `null` `resource_pool` without a `context_unavailable` entry for an ended command or shell means Determined no longer serves that task's entity, so retrying will not help. A `null` `gpu_model` without a `gpu_models` entry in `context_unavailable` can mean that RBAC hides device UUIDs from the current account, so model names cannot be matched. A trial's `total_batches_processed` of 0 is expected when the workload does not report progress through Determined's Core API, as with a plain bash entrypoint, or has not reported yet; it does not show that the workload made no progress, so judge progress from logs, measured use, and expected artifacts instead.
+
+An empty `series` list means no data for the window, not an idle task: the task may not have run in that window, or monitoring retained no data for it. Compare the window and its `anchor` with `task_start_time` and `allocations`, or use a longer `window_seconds`. If `samples_omitted` is true, narrow the window, select fewer metrics, or choose one allocation. A task can stay `RUNNING` for up to about 150 seconds while its agent is disconnected, because by default the fork waits that long (`agent_reconnect_wait`) for the agent to reconnect; a `RUNNING` state alone therefore does not prove progress. Field meanings and limits are in [task usage measurements](compute-service.md#task-usage-measurements).
+
+## Cancellation is rejected
+
+On the Determined fork 0.40.1 or later with basic authorization, only a task's Determined owner or an administrator can kill or cancel it. For a task owned by another account, `compute_cancel` returns HTTP 403 for a command or shell and HTTP 404 `experiment '<id>' not found` for an experiment. This usually follows a credential change: submitted records bind to the profile and endpoint, not the account, so the service still sends the request. Restore the owning account's credentials or ask an administrator to cancel the task. An adopted record reports `ownership_mismatch` before any cancellation request is sent.
 
 ## A transfer is partial or different from the preview
 

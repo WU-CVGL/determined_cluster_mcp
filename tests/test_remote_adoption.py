@@ -68,6 +68,36 @@ class FakeClient:
         self.calls.append(("POST", f"api/v1/{kind}s/{remote_id}/cancel"))
         return {"id": remote_id, "state": "TERMINATING"}
 
+    def task_resources_enabled(self):
+        self.calls.append(("GET", "api/v1/task-resources/capability"))
+        return True
+
+    def get_task_info(self, task_id):
+        self.calls.append(("GET", f"api/v1/tasks/{task_id}"))
+        return {
+            "task_id": task_id,
+            "start_time": "2026-09-20T00:00:00Z",
+            "end_time": None,
+            "allocations": [],
+        }
+
+    def get_task_resources(self, task_id, *, start, end, step, allocation_id=None):
+        self.calls.append(("GET", f"api/v1/tasks/{task_id}/resources"))
+        return {"enabled": True, "series": [], "warnings": []}
+
+    def list_resource_pools(self):
+        self.calls.append(("GET", "api/v1/resource-pools"))
+        return [{"name": "gpu", "description": "shared GPUs"}]
+
+    def get_allocation(self, allocation_id):
+        self.calls.append(("GET", f"api/v1/allocations/{allocation_id}"))
+        return {"allocation_id": allocation_id, "slots": 1, "exit_reason": None,
+                "status_code": None}
+
+    def list_gpu_devices(self):
+        self.calls.append(("GET", "api/v1/agents"))
+        return {}
+
     def launch_task(self, kind, config):
         self.calls.append(("POST", f"api/v1/{kind}s", copy.deepcopy(config)))
         raise AssertionError("adoption must never launch a task")
@@ -512,10 +542,15 @@ def test_adopted_management_uses_live_cluster_and_account_not_profile_hash(
 
     status = restarted.status(adopted["task_id"], "session-a")
     logs = restarted.logs(adopted["task_id"], "session-a", tail=12)
+    usage = restarted.usage(adopted["task_id"], "session-a")
     cancelled = restarted.cancel(adopted["task_id"], "session-a")
 
     assert status["remote_state"] == "COMPLETED"
     assert logs == [{"message": "remote log"}]
+    assert usage["determined_task_id"] == COMMAND_ID
+    assert ("GET", f"api/v1/tasks/{COMMAND_ID}/resources") in client.calls
+    assert usage["resource_pool"] == {"name": "gpu", "description": "shared GPUs"}
+    assert usage["context_unavailable"] == []
     assert cancelled["remote_state"] == "TERMINATING"
     assert any(call[0] == "POST" for call in client.calls)
 
@@ -526,9 +561,11 @@ def test_adopted_management_uses_live_cluster_and_account_not_profile_hash(
         ("status", "cluster", "binding_mismatch"),
         ("logs", "cluster", "binding_mismatch"),
         ("cancel", "cluster", "binding_mismatch"),
+        ("usage", "cluster", "binding_mismatch"),
         ("status", "account", "ownership_mismatch"),
         ("logs", "account", "ownership_mismatch"),
         ("cancel", "account", "ownership_mismatch"),
+        ("usage", "account", "ownership_mismatch"),
     ],
 )
 def test_management_identity_changes_fail_before_remote_task_access(
@@ -550,7 +587,7 @@ def test_management_identity_changes_fail_before_remote_task_access(
     assert client.calls == [("GET", "info"), ("GET", "api/v1/me")]
 
 
-@pytest.mark.parametrize("operation", ["status", "logs", "cancel"])
+@pytest.mark.parametrize("operation", ["status", "logs", "cancel", "usage"])
 def test_management_remote_owner_change_fails_before_logs_or_cancel(
     tmp_path, profile, operation
 ):
@@ -569,7 +606,10 @@ def test_management_remote_owner_change_fails_before_logs_or_cancel(
         ("GET", "api/v1/me"),
         ("GET", f"api/v1/commands/{COMMAND_ID}"),
     ]
-    assert not any(call[0] == "POST" or call[1].endswith("/logs") for call in client.calls)
+    assert not any(
+        call[0] == "POST" or call[1].endswith(("/logs", "/resources", "/capability"))
+        for call in client.calls
+    )
 
 
 def test_adopted_task_cannot_be_reconciled_or_used_as_launch_retry(tmp_path, profile):
@@ -665,3 +705,18 @@ def test_experiment_detail_omits_opaque_raw_configs_and_redacts_parsed_config(
     }
     assert "originalConfig" not in task
     assert secret not in repr(task)
+
+
+def test_adopted_usage_reuses_verified_entity_for_pool_context(tmp_path, profile):
+    service, client, _store = service_for(tmp_path, profile)
+    client.entities[("command", COMMAND_ID)] = command_entity()
+    adopted = service.adopt("command", COMMAND_ID, "session-a")
+    client.calls.clear()
+
+    usage = service.usage(adopted["task_id"], "session-a")
+
+    assert client.calls.count(("GET", f"api/v1/commands/{COMMAND_ID}")) == 1
+    assert client.calls.index(("GET", f"api/v1/commands/{COMMAND_ID}")) < client.calls.index(
+        ("GET", "api/v1/task-resources/capability")
+    )
+    assert usage["resource_pool"]["name"] == "gpu"

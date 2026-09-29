@@ -60,6 +60,7 @@ def create_server(
             "Check capacity with compute_resources; queuing requires explicit allow_queue=true. "
             "Keep code and data on shared mounts; use storage_check/sync/fetch for file access. "
             "Plan before launch, keep request_id stable, and use the returned task_id for control. "
+            "Use compute_usage to check a task's measured CPU, memory, and GPU use. "
             "Credentials belong in local configuration, never in tool arguments."
         ),
     )
@@ -111,6 +112,24 @@ def create_server(
         if tail < 1:
             fail(ValueError("tail must be at least 1"))
         return await call(service.logs, task_id, owner, tail)
+
+    @server.tool(annotations=ToolAnnotations(
+        read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
+    ))
+    async def compute_usage(
+        task_id: str,
+        window_seconds: int = 3600,
+        allocation_id: Optional[str] = None,
+        trial_id: Optional[int] = None,
+        metrics: Optional[list[str]] = None,
+        include_samples: bool = False,
+    ) -> dict[str, Any]:
+        """Summarize one task's measured CPU, memory, and GPU use; compute_resources is cluster capacity."""
+
+        return await call(
+            service.usage, task_id, owner, window_seconds, allocation_id, trial_id,
+            metrics, include_samples,
+        )
 
     @server.tool(annotations=ToolAnnotations(
         read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=True,
