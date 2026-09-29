@@ -1,0 +1,533 @@
+from __future__ import annotations
+
+import json
+import shlex
+import threading
+import uuid
+
+import pytest
+
+from determined_compute import compute_cli
+from determined_compute.compute import (
+    ComputeProfile,
+    ComputeService,
+    ConflictError,
+    SQLiteTaskStore,
+    ValidationError,
+)
+from determined_compute.storage import (
+    PathInspector,
+    SSHConfig,
+    StorageAccessConfig,
+    StorageError,
+    StorageService,
+)
+from determined_compute.storage import paths as paths_module
+
+
+class FakeClient:
+    api_url = "https://det.example.test"
+
+    def __init__(self):
+        self.launches = []
+
+    def launch_task(self, kind, config):
+        self.launches.append((kind, config))
+        return {"id": str(len(self.launches)), "state": "QUEUED"}
+
+
+class Admission:
+    def __init__(self):
+        self.calls = []
+
+    def require_capacity(self, kind, config):
+        self.calls.append(kind)
+        return {"admitted": True}
+
+
+def make_profile(host_root):
+    return ComputeProfile.from_dict(
+        {
+            "mounts": [{"host_path": str(host_root), "container_path": "/shared"}],
+            "defaults": {"image": "image", "pool": "pool", "slots": 1},
+            "cluster_identity": "test-cluster",
+        }
+    )
+
+
+def make_service(tmp_path, host_root, access=None, inspector=True, timeout=10.0):
+    profile = make_profile(host_root)
+    paths = None
+    if inspector:
+        storage = StorageService(profile, access or StorageAccessConfig(), tmp_path / "none.env")
+        paths = PathInspector(storage, timeout_seconds=timeout)
+    client = FakeClient()
+    admission = Admission()
+    service = ComputeService(
+        client,
+        SQLiteTaskStore(tmp_path / "tasks.db"),
+        profile,
+        inspector=admission,
+        path_inspector=paths,
+    )
+    return service, client, admission
+
+
+def experiment(host_root, **overrides):
+    request = {
+        "name": "train",
+        "kind": "experiment",
+        "command": "python train.py",
+        "workdir": "/shared/code",
+        "output_dir": "/shared/out",
+        "experiment_config": {
+            "searcher": {"name": "single", "metric": "loss", "max_length": {"batches": 1}},
+            "checkpoint_storage": {
+                "type": "shared_fs",
+                "host_path": str(host_root / "checkpoints"),
+            },
+        },
+    }
+    request.update(overrides)
+    return request
+
+
+@pytest.fixture
+def host(tmp_path):
+    root = tmp_path / "host"
+    (root / "code").mkdir(parents=True)
+    return root
+
+
+def checks_by_field(plan):
+    return {item["field"]: item for item in plan["path_checks"]}
+
+
+def test_undecidable_roots_are_unverified_and_plan_is_otherwise_unchanged(tmp_path):
+    root = tmp_path / f"nonexistent-root-{uuid.uuid4().hex}"
+    service, _client, _admission = make_service(tmp_path, root)
+    bare, _client, _admission = make_service(tmp_path, root, inspector=False)
+    request = experiment(root)
+
+    plan = service.plan(request)
+
+    assert {item["status"] for item in plan["path_checks"]} == {"unverified"}
+    assert {item["reason"] for item in plan["path_checks"]} == {"not_locally_visible"}
+    assert {key: value for key, value in plan.items() if key != "path_checks"} == bare.plan(request)
+    assert plan["advisories"] == []
+    assert list(checks_by_field(plan)) == [
+        "bind_mounts[0].host_path",
+        "workdir",
+        "experiment_config.checkpoint_storage.host_path",
+        "output_dir",
+    ]
+
+
+def test_present_paths_are_reported_with_output_dir_optional(tmp_path, host):
+    (host / "checkpoints").mkdir()
+    service, _client, _admission = make_service(tmp_path, host)
+
+    checks = checks_by_field(service.plan(experiment(host)))
+
+    assert checks["bind_mounts[0].host_path"] == {
+        "field": "bind_mounts[0].host_path",
+        "host_path": str(host),
+        "container_path": "/shared",
+        "required": True,
+        "status": "present",
+        "reason": None,
+    }
+    assert checks["workdir"]["host_path"] == str(host / "code")
+    assert checks["workdir"]["container_path"] == "/shared/code"
+    assert checks["experiment_config.checkpoint_storage.host_path"]["container_path"] is None
+    assert checks["output_dir"]["required"] is False
+    assert checks["output_dir"]["status"] == "missing"
+
+
+def test_missing_checkpoint_path_fails_plan_and_launch_before_any_claim(tmp_path, host):
+    service, client, admission = make_service(tmp_path, host)
+    request = experiment(host)
+    expected = [
+        {
+            "field": "experiment_config.checkpoint_storage.host_path",
+            "host_path": str(host / "checkpoints"),
+            "status": "missing",
+        }
+    ]
+
+    with pytest.raises(ValidationError) as planned:
+        service.plan(request)
+    with pytest.raises(ValidationError) as launched:
+        service.launch(request, "request-1", "session-a")
+
+    for caught in (planned, launched):
+        assert caught.value.code == "path_not_found"
+        assert caught.value.details == {"missing_paths": expected}
+        assert "experiment_config.checkpoint_storage.host_path" in str(caught.value)
+    assert service.store.list_owned("session-a") == []
+    assert client.launches == []
+    assert admission.calls == []
+
+
+def test_missing_workdir_and_file_in_place_of_directory_fail(tmp_path, host):
+    (host / "checkpoints").write_text("not a directory", encoding="utf-8")
+    service, _client, _admission = make_service(tmp_path, host)
+
+    with pytest.raises(ValidationError) as caught:
+        service.plan(experiment(host, workdir="/shared/missing"))
+
+    assert caught.value.details["missing_paths"] == [
+        {"field": "workdir", "host_path": str(host / "missing"), "status": "missing"},
+        {
+            "field": "experiment_config.checkpoint_storage.host_path",
+            "host_path": str(host / "checkpoints"),
+            "status": "not_directory",
+        },
+    ]
+
+
+def test_blocked_filesystem_probe_times_out_as_unverified(tmp_path, host, monkeypatch):
+    release = threading.Event()
+    original = paths_module._stat_directory
+
+    def blocked(path):
+        release.wait(5)
+        return original(path)
+
+    monkeypatch.setattr(paths_module, "_stat_directory", blocked)
+    service, _client, _admission = make_service(tmp_path, host, timeout=0.2)
+    try:
+        plan = service.plan(experiment(host))
+    finally:
+        release.set()
+
+    assert {(item["status"], item["reason"]) for item in plan["path_checks"]} == {
+        ("unverified", "timeout")
+    }
+
+
+def test_ssh_only_and_unavailable_storage_are_unverified(tmp_path, host):
+    ssh_only = StorageAccessConfig(mode="ssh", ssh=SSHConfig(host="login"))
+    service, _client, _admission = make_service(tmp_path, host, access=ssh_only)
+    assert {item["reason"] for item in service.plan(experiment(host))["path_checks"]} == {
+        "ssh_only_access"
+    }
+
+    unavailable = ComputeService(
+        FakeClient(),
+        SQLiteTaskStore(":memory:"),
+        make_profile(host),
+        path_inspector=PathInspector(None),
+    )
+    assert {item["reason"] for item in unavailable.plan(experiment(host))["path_checks"]} == {
+        "storage_config_unavailable"
+    }
+
+
+def test_explicit_local_mount_decides_a_root_invisible_on_this_machine(tmp_path):
+    local = tmp_path / "local-view"
+    (local / "code").mkdir(parents=True)
+    profile = ComputeProfile.from_dict(
+        {
+            "mounts": [{"host_path": "/cluster-only/data", "container_path": "/shared"}],
+            "defaults": {"image": "image", "pool": "pool"},
+        }
+    )
+    access = StorageAccessConfig.from_dict(
+        {"local_mounts": [{"host_path": "/cluster-only/data", "local_path": str(local)}]}
+    )
+    service = ComputeService(
+        FakeClient(),
+        SQLiteTaskStore(":memory:"),
+        profile,
+        path_inspector=PathInspector(StorageService(profile, access, tmp_path / "none.env")),
+    )
+    request = experiment(tmp_path)
+    request["experiment_config"]["checkpoint_storage"]["host_path"] = "/cluster-only/data/ckpt"
+
+    with pytest.raises(ValidationError) as caught:
+        service.plan(request)
+
+    assert caught.value.details["missing_paths"] == [
+        {
+            "field": "experiment_config.checkpoint_storage.host_path",
+            "host_path": "/cluster-only/data/ckpt",
+            "status": "missing",
+        }
+    ]
+
+
+def test_create_directories_plans_nothing_and_launch_creates_before_submitting(tmp_path, host):
+    service, client, admission = make_service(tmp_path, host)
+    request = experiment(host, create_directories=["output_dir", "checkpoint_storage"])
+
+    plan = service.plan(request)
+
+    checks = checks_by_field(plan)
+    assert plan["create_directories"] == ["checkpoint_storage", "output_dir"]
+    assert checks["experiment_config.checkpoint_storage.host_path"]["status"] == "will_create"
+    assert checks["output_dir"]["status"] == "will_create"
+    assert checks["output_dir"]["required"] is True
+    assert not (host / "checkpoints").exists() and not (host / "out").exists()
+
+    launched = service.launch(request, "request-1", "session-a")
+
+    assert (host / "checkpoints").is_dir() and (host / "out").is_dir()
+    assert launched["prepared_directories"] == [
+        {
+            "field": "experiment_config.checkpoint_storage.host_path",
+            "host_path": str(host / "checkpoints"),
+            "created": True,
+        },
+        {"field": "output_dir", "host_path": str(host / "out"), "created": True},
+    ]
+    assert len(client.launches) == 1
+    assert admission.calls == ["experiment"]
+    retried = service.launch(request, "request-1", "session-a")
+    assert "prepared_directories" not in retried
+    assert retried["task_id"] == launched["task_id"]
+    assert len(client.launches) == 1
+
+
+def test_client_failure_creates_no_directories_and_no_record(tmp_path, host):
+    profile = make_profile(host)
+    client = FakeClient()
+    attempts = []
+
+    def factory(api_url):
+        attempts.append(api_url)
+        if len(attempts) == 1:
+            raise RuntimeError("temporary login failure")
+        return client
+
+    storage = StorageService(profile, StorageAccessConfig(), tmp_path / "none.env")
+    service = ComputeService(
+        compute_cli._LazyClient(factory, lambda: client.api_url),
+        SQLiteTaskStore(tmp_path / "tasks.db"),
+        profile,
+        inspector=Admission(),
+        path_inspector=PathInspector(storage),
+    )
+    request = experiment(host, create_directories=["output_dir", "checkpoint_storage"])
+
+    with pytest.raises(RuntimeError, match="temporary login failure"):
+        service.launch(request, "request-1", "session-a")
+
+    assert not (host / "checkpoints").exists() and not (host / "out").exists()
+    assert service.store.list_owned("session-a") == []
+    launched = service.launch(request, "request-1", "session-a")
+    assert launched["state"] == "submitted"
+    assert [item["created"] for item in launched["prepared_directories"]] == [True, True]
+    assert len(client.launches) == 1
+
+
+def test_create_directories_needs_storage_access_before_claim(tmp_path, host):
+    request = experiment(host, create_directories=["checkpoint_storage"])
+    service = ComputeService(
+        FakeClient(), SQLiteTaskStore(tmp_path / "a.db"), make_profile(host),
+        inspector=Admission(), path_inspector=PathInspector(None),
+    )
+    assert checks_by_field(service.plan(request))[
+        "experiment_config.checkpoint_storage.host_path"
+    ]["status"] == "will_create"
+    with pytest.raises(StorageError) as caught:
+        service.launch(request, "request-1", "session-a")
+    assert caught.value.code == "configuration_required"
+    assert service.store.list_owned("session-a") == []
+
+    library = ComputeService(
+        FakeClient(), SQLiteTaskStore(tmp_path / "b.db"), make_profile(host), inspector=Admission()
+    )
+    assert "path_checks" not in library.plan(request)
+    with pytest.raises(ConflictError) as missing:
+        library.launch(request, "request-1", "session-a")
+    assert missing.value.code == "configuration_required"
+    assert library.store.list_owned("session-a") == []
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (["checkpoint_storage"], "requires an experiment"),
+        (["output_dir", "output_dir"], "repeat"),
+        (["workdir"], "unknown"),
+        ("output_dir", "list of strings"),
+    ],
+)
+def test_create_directories_validation(tmp_path, host, value, message):
+    service, _client, _admission = make_service(tmp_path, host, inspector=False)
+    request = {
+        "name": "run",
+        "command": "true",
+        "workdir": "/shared/code",
+        "output_dir": "/shared/out",
+        "create_directories": value,
+    }
+    with pytest.raises(ValidationError, match=message):
+        service.plan(request)
+
+
+def test_empty_create_directories_keeps_the_legacy_hash(tmp_path, host):
+    service, _client, _admission = make_service(tmp_path, host, inspector=False)
+    request = experiment(host)
+    baseline = service.plan(request)
+
+    assert service.plan({**request, "create_directories": []}) == baseline
+    assert service._payload_hash(
+        service.plan({**request, "create_directories": ["output_dir"]})
+    ) != service._payload_hash(baseline)
+
+
+def test_existing_request_is_returned_without_path_checks(tmp_path, host):
+    (host / "checkpoints").mkdir()
+    service, client, _admission = make_service(tmp_path, host)
+    request = experiment(host)
+    first = service.launch(request, "request-1", "session-a")
+    (host / "checkpoints").rmdir()
+
+    again = service.launch(request, "request-1", "session-a")
+
+    assert again == first
+    assert len(client.launches) == 1
+
+
+def test_cli_plan_degrades_when_storage_config_is_invalid(tmp_path, host, monkeypatch, capsys):
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(
+        f"mounts:\n  - host_path: {host}\n    container_path: /shared\n"
+        "defaults:\n  image: image\n  pool: pool\n",
+        encoding="utf-8",
+    )
+    storage = tmp_path / "storage.yaml"
+    storage.write_text("unknown_setting: true\n", encoding="utf-8")
+    monkeypatch.delenv("DETERMINED_COMPUTE_STORAGE", raising=False)
+
+    code = compute_cli.main([
+        "--profile", str(profile), "--storage-config", str(storage), "plan",
+        "--request", json.dumps(experiment(host)),
+    ])
+
+    assert code == 0
+    result = json.loads(capsys.readouterr().out)["result"]
+    assert {(item["status"], item["reason"]) for item in result["path_checks"]} == {
+        ("unverified", "storage_config_unavailable")
+    }
+
+
+def test_cli_reports_missing_paths_in_error_details(tmp_path, host, monkeypatch, capsys):
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(
+        f"mounts:\n  - host_path: {host}\n    container_path: /shared\n"
+        "defaults:\n  image: image\n  pool: pool\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("DETERMINED_COMPUTE_STORAGE", raising=False)
+
+    code = compute_cli.main(
+        ["--profile", str(profile), "plan", "--request", json.dumps(experiment(host))]
+    )
+
+    assert code == 2
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert error["code"] == "path_not_found"
+    assert error["retryable"] is False
+    assert error["details"] == {
+        "missing_paths": [
+            {
+                "field": "experiment_config.checkpoint_storage.host_path",
+                "host_path": str(host / "checkpoints"),
+                "status": "missing",
+            }
+        ]
+    }
+
+
+def test_safe_error_details_keep_only_allowed_keys():
+    error = ValidationError("missing", code="path_not_found")
+    error.details = {"missing_paths": [{"field": "workdir"}], "secret": "value"}
+
+    assert compute_cli.safe_error_details(error) == {"missing_paths": [{"field": "workdir"}]}
+
+
+def remote_profile():
+    return ComputeProfile.from_dict(
+        {
+            "mounts": [
+                {"host_path": "/cluster/shared", "container_path": "/work"},
+                {"host_path": "/cluster/reference", "container_path": "/ref", "read_only": True},
+            ],
+            "defaults": {"image": "image", "pool": "pool"},
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("output", "created"), [("created\n", True), ("banner\nexisted\n", False)]
+)
+def test_ssh_directory_creation_uses_a_fixed_quoted_script(monkeypatch, output, created):
+    config = StorageAccessConfig.from_dict(
+        {"mode": "ssh", "ssh": {"host": "storage.example", "user": "alice", "auth": "openssh"}}
+    )
+    service = StorageService(remote_profile(), config)
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return {"output": output, "truncated": False}
+
+    monkeypatch.setattr(service, "_run", run)
+    host_path = "/cluster/shared/a path/with'quote;$(x)"
+
+    result = service.ensure_directories([{"field": "output_dir", "host_path": host_path}])
+
+    assert result == [{"field": "output_dir", "host_path": host_path, "created": created}]
+    argv, kwargs = calls[0]
+    assert argv[0] == "ssh" and argv[-2] == "storage.example"
+    assert shlex.split(argv[-1]) == [
+        "sh",
+        "-c",
+        'if [ -d "$1" ]; then echo existed; else mkdir -p -- "$1" && echo created; fi',
+        "sh",
+        host_path,
+    ]
+    assert set(kwargs["env_overrides"]) <= {"SSH_AUTH_SOCK"}
+
+
+@pytest.mark.parametrize("output", ["", "maybe\n", "created\nextra\n"])
+def test_ssh_directory_creation_rejects_unexpected_responses(monkeypatch, output):
+    config = StorageAccessConfig.from_dict({"mode": "ssh", "ssh": {"host": "storage.example"}})
+    service = StorageService(remote_profile(), config)
+    monkeypatch.setattr(service, "_run", lambda argv, **kwargs: {"output": output})
+
+    with pytest.raises(StorageError) as caught:
+        service.ensure_directories([{"field": "output_dir", "host_path": "/cluster/shared/x"}])
+
+    assert caught.value.code == "storage_operation_failed"
+
+
+def test_directory_creation_refuses_read_only_roots_and_escaping_parents(tmp_path):
+    local_root = tmp_path / "client-mount"
+    outside = tmp_path / "outside"
+    local_root.mkdir()
+    outside.mkdir()
+    (local_root / "escape").symlink_to(outside, target_is_directory=True)
+    config = StorageAccessConfig.from_dict(
+        {"local_mounts": [{"host_path": "/cluster/shared", "local_path": str(local_root)}]}
+    )
+    service = StorageService(remote_profile(), config)
+
+    cases = {
+        "/cluster/reference/new": "read_only_storage",
+        "/cluster/shared": "invalid_storage_path",
+        "/cluster/shared/escape/new": "invalid_storage_path",
+    }
+    for host_path, code in cases.items():
+        with pytest.raises(StorageError) as caught:
+            service.ensure_directories([{"field": "output_dir", "host_path": host_path}])
+        assert caught.value.code == code, host_path
+
+    assert list(outside.iterdir()) == []
+    assert service.ensure_directories(
+        [{"field": "output_dir", "host_path": "/cluster/shared/runs/one"}]
+    ) == [{"field": "output_dir", "host_path": "/cluster/shared/runs/one", "created": True}]
+    assert (local_root / "runs" / "one").is_dir()

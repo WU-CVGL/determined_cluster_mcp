@@ -11,7 +11,7 @@ server-side advice worker, see [Consultation backend](consultation.md).
 
 ```mermaid
 flowchart LR
-    U[Any local stdio MCP client] --> M[14 base MCP tools]
+    U[Any local stdio MCP client] --> M[15 base MCP tools]
     M --> C[ComputeService]
     C --> D[(local SQLite database)]
     C --> A[Determined API]
@@ -34,10 +34,10 @@ remains stable across restarts and is distinct from the Determined `remote_id`. 
 SQLite database on durable local storage. Keep source, data, packages, checkpoints,
 logs, and outputs on mapped shared storage.
 
-The default consultation backend is `none`. That mode registers 14 base tools and does
+The default consultation backend is `none`. That mode registers 15 base tools and does
 not import the consultation worker, require Codex, or require a repository skill
 directory. Enabling the Codex backend adds `compute_consult` and `workflow_status`, for
-16 tools in total. Consultation is advisory and cannot submit or cancel work.
+17 tools in total. Consultation is advisory and cannot submit or cancel work.
 
 ## Compute profile
 
@@ -73,8 +73,11 @@ does not enforce an idle timeout.
 
 `cluster_identity` is an optional operator-facing label. Submitted local records bind
 to the profile fingerprint and the resolved Determined endpoint, including this label.
-Changing that binding prevents later status, log, usage, cancellation, and
-reconciliation operations on those records.
+Cancellation, reconciliation, and launch retries require that exact binding. If only the
+profile changed and the endpoint and label still match, status, logs, and usage remain
+available read-only after the service verifies the remote owner and submission marker;
+see [Cross-profile observation](#cross-profile-observation). A changed endpoint or label
+blocks every operation on those records.
 
 ## Request object and planning
 
@@ -95,15 +98,18 @@ reconciliation operations on those records.
 | `pool`, `image` | string | Optional overrides of profile defaults |
 | `code_revision` | string or null | Caller-provided revision or content identifier |
 | `experiment_config` | object | Extra experiment configuration; requires experiment mode |
+| `create_directories` | array of `output_dir`, `checkpoint_storage` | Directories that launch creates before submission; default none. See [Launch-path checks](#launch-path-checks) |
+| `gpu_admission` | object, `false`, or null | Optional in-container GPU check before the workload; see [GPU admission](#gpu-admission) |
 
 Unknown request fields and upload/context fields are rejected. In auto mode,
 `interactive` selects `shell`, then `overnight` or `experiment_config` selects
 `experiment`, and all other requests select `command`. An explicit `kind` is retained;
 an overnight command therefore stays a command and receives an advisory.
 
-Planning is offline and does not authenticate, inspect capacity, create projects, or
-submit work. It returns `kind`, `name`, `description`, `allow_queue`, rendered `config`,
-`code_revision`, and `advisories`. If `name` is omitted, the service creates one and
+Planning does not contact Determined: it does not authenticate, inspect capacity, create
+projects, or submit work. It returns `kind`, `name`, `description`, `allow_queue`,
+rendered `config`, `code_revision`, and `advisories`, plus `create_directories` and
+`gpu_admission` when the request uses them and `path_checks` from the CLI and MCP server. If `name` is omitted, the service creates one and
 adds an advisory. Commands and shells place the name on the first description line;
 experiments use their native name field. Top-level display metadata overrides matching
 experiment fields.
@@ -112,14 +118,89 @@ Command and experiment entrypoints create `output_dir`, change to `workdir`, and
 run the command through `/bin/bash -lc`. Command and shell configs use
 `resources.slots`; experiments use `resources.slots_per_trial`. The service supplies
 profile bind mounts and manages `COMPUTE_WORKDIR`, `COMPUTE_OUTPUT_DIR`,
-`COMPUTE_CODE_REVISION`, and the private submission marker. A request cannot override
-those variables or bind mounts.
+`COMPUTE_CODE_REVISION`, the `COMPUTE_GPU_ADMISSION*` policy variables, and the private
+submission marker. A request cannot override those variables or bind mounts.
 
 Experiments require `command` or `experiment_config.entrypoint`, but not both. An
 explicit `checkpoint_storage` must have `type: shared_fs`, a writable mapped
 `host_path`, and an optional `storage_path` that remains inside that host path. Legacy
 `checkpoint_path` and `tensorboard_path` aliases are rejected. If checkpoint storage is
 omitted, Determined applies its cluster default, which offline planning cannot inspect.
+
+### Launch-path checks
+
+The CLI and MCP server give planning a read-only view of shared storage through the
+storage configuration. The plan then gains `path_checks`, one entry per launch path in
+the cluster-agent host namespace: every profile bind mount (`bind_mounts[i].host_path`),
+the `workdir` of a command or experiment, an experiment's
+`experiment_config.checkpoint_storage.host_path`, and `output_dir`. Each entry has
+`field`, `host_path`, `container_path` (null for a checkpoint path without a configured
+container path), `required`, `status`, and `reason`. `output_dir` is not required,
+because the entrypoint creates it, unless `create_directories` names it.
+
+A path is decided only through a trusted local view: an explicit `local_mounts` entry of
+the storage configuration or, in `auto` or `local` mode, a profile host root that exists
+locally. `status` is `present`, `missing`, `not_directory`, `unverified`, or
+`will_create`. A path the client cannot decide is `unverified`, and `reason` explains why:
+`not_locally_visible`, `ssh_only_access`, `permission_denied`, `timeout`, or
+`storage_config_unavailable` when the storage configuration cannot be loaded. All probes
+share a 10-second deadline, so a stalled network mount cannot hang planning. Before
+reporting a path missing, the service lists its parent and checks again, which refreshes
+cached negative lookups on network filesystems. Unverified paths never fail. A required
+path that is `missing` or `not_directory` fails `compute_plan` and `compute_launch` with
+`path_not_found`; `details.missing_paths` lists its `field`, `host_path`, and `status`.
+`path_checks` is an observation: it never changes `config` or `advisories` and is not
+part of the idempotency payload.
+
+Launch runs the same checks after it looks up `request_id` and before it checks capacity,
+so a failed check writes no task record and submits nothing. An existing `request_id` is
+returned unchanged without checks, even if a path was removed later. After the checks and
+also before the capacity check, launch builds the Determined API client, so a login or
+client configuration error likewise leaves no task record and no created directory, and a
+retry with the same `request_id` can still submit.
+
+`create_directories` explicitly asks launch to create `output_dir`, `checkpoint_storage`
+(the experiment's `checkpoint_storage.host_path`, which Determined bind-mounts when the
+container starts and which therefore must exist before the entrypoint runs), or both.
+Nothing is created implicitly or while planning; the plan reports `will_create`. After
+the capacity check and before the task record is claimed, launch creates each directory
+with its parents and the default umask: through the local view when one exists,
+otherwise with `mkdir -p` on the configured SSH login node, and otherwise it fails with
+`configuration_required`. A new submission's result gains `prepared_directories`, a list
+of `{field, host_path, created}`. Nothing is ever deleted. `checkpoint_storage` requires
+an experiment with `checkpoint_storage`. A non-empty list is part of the idempotency
+payload; an absent or empty list leaves earlier payloads unchanged.
+
+### GPU admission
+
+`gpu_admission` adds an optional preflight that runs inside the container after the
+entrypoint changes to `workdir` and before the workload starts. It applies to commands
+and single-node experiments with at least one slot; a shell has no managed entrypoint and
+rejects it. `false` or null disables it. The object accepts:
+
+| Field | Meaning |
+| --- | --- |
+| `count` | Positive integer; the number of visible GPUs must equal it. Default: the requested slots |
+| `names` | Up to 8 `fnmatch`-style patterns of at most 128 printable characters without `\|`; every visible GPU name must match one |
+| `driver_versions` | Patterns of the same form for the driver version |
+| `min_free_mib`, `min_total_mib` | Non-negative integers checked for every visible GPU |
+| `receipt` | Receipt file name under `output_dir`, ending in `.json`; default `gpu-admission.json` |
+
+The plan gains the normalized `gpu_admission` object, the config gains the managed
+`COMPUTE_GPU_ADMISSION*` variables, and the entrypoint becomes
+`mkdir -p OUTPUT && cd WORKDIR && /bin/bash -c '<script v1>' determined-compute-gpu-admission && COMMAND`.
+The versioned script needs only bash, coreutils, and `nvidia-smi`, which it runs under
+`timeout` when available. It atomically writes the receipt, appends the same JSON record
+as one line to the receipt's `.jsonl` history so experiment restarts keep earlier
+attempts, prints one `determined-compute gpu_admission: passed|failed ...` line, and exits
+86 on failure so the workload never starts. A missing or failing `nvidia-smi` fails
+admission. The receipt records `schema_version` (`determined-compute-gpu-admission-v1`),
+`status`, `observed_at`, `policy`, `devices` (index, UUID, name, driver version, and
+total and free MiB), `failures`, `cuda_visible_devices`, `nvidia_visible_devices`,
+`hostname`, and the Determined task, allocation, and trial IDs when set; it records no
+other environment value. In an experiment, a failed admission consumes a restart; set
+`max_restarts: 0` in `experiment_config` to stop after one failure. A request without
+the field renders exactly as before.
 
 ## Start the MCP server
 
@@ -153,25 +234,26 @@ storage configuration. See [Shared-storage access](shared-storage-access.md).
 
 ## MCP API
 
-The base server exposes 14 tools. The `owner` below is always the startup-bound
+The base server exposes 15 tools. The `owner` below is always the startup-bound
 namespace and never a tool argument.
 
 | Tool | Arguments | Return value and effect |
 | --- | --- | --- |
 | `compute_plan` | `request` | Offline normalized plan; no cluster or database mutation |
 | `compute_launch` | `request`, `request_id` | Persisted task record; may submit once |
-| `compute_status` | `task_id` | Local task record, refreshed remote state, and remote entity when bound |
-| `compute_logs` | `task_id`, optional `tail=200` | Chronological list of the newest remote log records |
+| `compute_status` | `task_id` | Local task record, refreshed remote state, remote entity when bound, and `binding` |
+| `compute_logs` | `task_id`, optional `tail=200`, `include_binding=false` | Chronological list of the newest remote log records, or `{task_id, binding, logs}` with `include_binding=true` |
 | `compute_usage` | `task_id`, optional `window_seconds=3600`, `allocation_id`, `trial_id`, `metrics`, `include_samples=false` | Read-only summary of one task's measured CPU, memory, and GPU use |
 | `compute_cancel` | `task_id` | Updated record, remote cancellation response, and acknowledgement |
 | `compute_reconcile` | `task_id`, `remote_id` | Record bound only after marker verification |
-| `compute_list_tasks` | none | Local records in the bound owner namespace |
+| `compute_list_tasks` | none | Local records in the bound owner namespace, each with an offline `binding` |
 | `compute_discover` | `kind`, optional `limit=50`, `offset=0` | One current-account remote page; no local mutation |
 | `compute_adopt` | `kind`, `remote_id` | Idempotently registered local record; no remote submission |
 | `compute_resources` | optional `slots=1`, `pool` | Current scheduler capacity and candidate pools |
 | `storage_check` | `path` | Access information for a mapped container path |
 | `storage_sync` | `local_dir`, `shared_dir`, optional `dry_run=true` | Preview or copy local directory contents to shared storage |
 | `storage_fetch` | `shared_dir`, `local_dir`, optional `dry_run=true` | Preview or copy shared directory contents locally |
+| `storage_snapshot` | `repo_dir`, optional `revision="HEAD"`, `include`, `exclude`, `dry_run=true`, `verify=false` | Preview or publish a git revision as a read-only, content-addressed shared workdir |
 
 `compute_consult(question, request_id, context?)` and
 `workflow_status(workflow_id)` appear only with an enabled consultation backend. Their
@@ -179,8 +261,8 @@ configuration, lifecycle, and limits are in [Consultation backend](consultation.
 
 ### Plan, capacity, and launch
 
-Call `compute_plan` first and review resolved paths, mode, image, pool, slots, and
-advisories. `compute_resources` is a live snapshot, not a reservation. Positive slot
+Call `compute_plan` first and review resolved paths, mode, image, pool, slots,
+advisories, and `path_checks`. `compute_resources` is a live snapshot, not a reservation. Positive slot
 requests inspect schedulable agent slots; zero checks auxiliary-container capacity.
 Candidate pools are suggestions and are never substituted automatically.
 
@@ -203,6 +285,16 @@ binding fields, an optional fixed `error_code`, and timestamps. Internal request
 profile hashes, and submission markers are never public. The service stores no full
 request body, generated config, API response, logs, or raw exception text in a task
 record.
+
+`compute_status`, `compute_usage`, and `compute_logs` with `include_binding=true` report
+`binding`: `mode` (`profile`, `cross_profile`, or `adopted`), `profile_matches` (null for
+an adopted task), `cluster_identity_matches`, `verified` (the checks made for this call:
+none for `profile`, `remote_owner` and `submission_marker` for `cross_profile` with a
+remote ID, and `remote_cluster` and `remote_owner` for `adopted`), `mutations_allowed`,
+and `message`. `compute_list_tasks` adds an offline `binding` to each row without
+contacting Determined; its `mode` can also be `mismatch` when the endpoint or label
+differs, or `unknown` when the client configuration cannot be resolved, and
+`mutations_allowed` is null for adopted records because their checks are live.
 
 `compute_status` returns local state without contacting Determined when no remote ID is
 bound. Otherwise it fetches the entity, updates `remote_state`, and includes the
@@ -419,9 +511,26 @@ a matching marker must be reconciled, while an independently created remote task
 adopted. If evidence is unavailable, investigate rather than launching the same work
 again.
 
-Submitted local tasks remain bound to the original profile fingerprint and endpoint.
-Adopted tasks remain bound to the actual cluster ID and authenticated user ID. These
-checks prevent a changed profile or account from operating on an unrelated task.
+### Cross-profile observation
+
+Submitted local tasks remain bound to the original profile fingerprint and endpoint for
+every mutation. Cancellation, reconciliation, and adoption that returns a submitted record
+require both and otherwise return `binding_mismatch` before any remote call; a launch
+retry with a changed profile returns `idempotency_conflict`. Status, logs, and usage are
+read-only and also accept a record submitted with another profile when its stored
+endpoint and label equal the current ones. Before reading task data, the service calls
+`/me`, fetches the entity, and requires its `userId` to be the authenticated account
+(`ownership_mismatch` otherwise), its ID to equal the record's remote ID, and its
+submission marker to equal the record's marker, or, for a legacy record without display
+metadata, its first description line (`identity_mismatch` otherwise). The marker proves
+that the remote task is this record's submission even if IDs repeat after a master is
+reinstalled at the same address. Such a read costs one `/me` call, plus one entity read
+for logs and usage; the exact-profile path makes no extra call. A cross-profile status
+writes only the cached `remote_state`, and a record without a remote ID is returned as
+stored, without remote calls or the stale-submission transition. To cancel or reconcile,
+use the task's original profile. A changed endpoint or label still blocks every
+operation. Adopted tasks remain bound to the actual cluster ID and authenticated user ID.
+These checks prevent a changed profile or account from operating on an unrelated task.
 
 ### Errors
 
@@ -432,7 +541,8 @@ MCP failures use `isError: true`; their text content is compact JSON of this for
 ```
 
 `retryable` and `details` appear only when available, and structured content is null.
-Safe details can include the local task ID and capacity information. Authentication,
+Safe details can include the local task ID, capacity information, and `missing_paths`
+for `path_not_found`. Authentication,
 permission, transport, and response-shape failures are errors rather than empty
 results. Error messages and reports may contain sanitized commands, paths, IDs, states,
 and error classes, but must not include credentials or secret-file contents.
@@ -471,9 +581,19 @@ determined-compute status TASK_ID
 determined-compute logs TASK_ID
 determined-compute usage TASK_ID --window-seconds 7200 --metric gpu_utilization_percent
 
+determined-compute logs TASK_ID --with-binding
+
 determined-compute discover command --limit 20 --offset 0
 determined-compute adopt command REMOTE_ID
+
+determined-compute --storage-config .local/storage.yaml snapshot "$PWD" --revision HEAD
 ```
+
+`plan` and `launch` read `--storage-config` or `DETERMINED_COMPUTE_STORAGE` for
+[launch-path checks](#launch-path-checks); when that file cannot be loaded, they report
+the paths as `unverified` and continue. `logs --with-binding` returns the
+`{task_id, binding, logs}` envelope. `snapshot` previews by default and publishes with
+`--execute`; see [Shared-storage access](shared-storage-access.md#publish-a-code-snapshot).
 
 For file staging and retrieval, use the separate
 [shared-storage guide](shared-storage-access.md). For the full agent sequence around

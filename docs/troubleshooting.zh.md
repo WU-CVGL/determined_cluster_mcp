@@ -15,7 +15,7 @@
 /absolute/path/to/determined_cluster_mcp/.venv/bin/determined-compute --profile /absolute/path/to/profile.yaml plan --request-file /absolute/path/to/request.json
 ```
 
-服务使用 stdout 传输 MCP 协议帧，启动错误写入 stderr。请在 MCP 客户端的服务日志中查看准确错误。更改安装或升级服务后，重启共享该数据库的所有 MCP 进程，使其加载相同的工具和数据库结构。
+服务使用 stdout 传输 MCP 协议帧，启动错误写入 stderr。请在 MCP 客户端的服务日志中查看准确错误。更改安装或升级服务后，重启共享该数据库的所有 MCP 进程，使其加载相同的工具和数据库结构。profile 和存储配置文件会拒绝未知字段，因此升级引入的新字段（例如 `snapshots`）只能在读取该文件的所有进程都运行新版本后再添加。
 
 计算任务不需要 `--storage-config`。共享路径与已配置的 `host_path` 在本机一致时，存储工具会自动使用该本地路径。需要自定义本地映射或登录节点 SSH 时，将 `cfg/storage-access.example.yaml` 复制为 `.local/storage.yaml`，编辑后再添加 `--storage-config /absolute/path/to/.local/storage.yaml`。
 
@@ -64,7 +64,11 @@ GUI 应用可能不会继承终端中导出的变量。应在客户端的 MCP �
 
 先确认参数要求哪一种路径空间。任务的 `workdir` 和 `output_dir`、`storage_check.path`，以及传输的 `shared_dir` 一侧，都使用计算 profile 中的容器路径。`mounts[].host_path` 是集群计算节点路径。`local_dir` 是运行 MCP 服务的机器上的绝对路径。
 
-规划会检查配置的路径边界，但不会查询远端文件或权限。MCP 服务具有已配置的本地或 SSH 访问方式时，可以使用 `storage_check`。如果任务文件已经位于共享存储，而且不需要从客户端检查或传输，计算操作可以不配置存储访问。
+规划会检查配置的路径边界。CLI 和 MCP 服务还会为 bind mount、工作目录、experiment 检查点目录和输出目录报告 `path_checks`；参见[启动路径检查](compute-service.zh.md#launch-path-checks)。`path_not_found` 表示已知某个必需路径不存在或不是目录，`details.missing_paths` 会列出该路径。请创建它、修正请求，或对输出目录和 experiment 检查点目录使用 `create_directories`。否则，缺失的 experiment 检查点 `host_path` 会让任务在容器启动前失败，因为 Determined 在启动时 bind mount 该路径。
+
+`unverified` 状态永远不会导致失败，只表示客户端无法判定：`not_locally_visible`（MCP 所在机器没有挂载该主机根目录；若挂载在其他位置，请添加 `local_mounts` 条目）、`ssh_only_access`、`permission_denied`、`timeout`（文件系统未在 10 秒内响应）或 `storage_config_unavailable`（无法加载存储配置；请运行 `storage_check` 或修正该文件）。此时 `create_directories` 需要本地视图或 SSH 访问，否则 launch 会在提交前返回 `configuration_required`。如果共享根目录本身不可写，但其子目录可写，请用 `local_mounts` 映射该子目录。
+
+MCP 服务具有已配置的本地或 SSH 访问方式时，可以使用 `storage_check`。如果任务文件已经位于共享存储，而且不需要从客户端检查或传输，计算操作可以不配置存储访问。
 
 标记为 `read_only: true` 的挂载允许读取和取回，但会拒绝其下的工作目录、输出目录、检查点目标或同步目标。本地映射、SSH 主机密钥、认证和 rsync 要求见[共享存储访问](shared-storage-access.zh.md)。
 
@@ -76,6 +80,11 @@ GUI 应用可能不会继承终端中导出的变量。应在客户端的 MCP �
 使用 `auth: openssh` 时，服务只继承已有 agent。stdio MCP 进程必须继承可用的 `SSH_AUTH_SOCK`；更早启动的 GUI 客户端可能没有该变量。使用密码或 keyring 认证时，遵循[共享存储访问](shared-storage-access.zh.md)中的凭据放置规则。
 
 修正 SSH、路径或权限错误后，始终重新执行 dry run。不要在未审核新的解析端点和逐项变更时，直接把失败的预览改为实际传输。
+
+<a id="gpu-admission-failed-exit-code-86"></a>
+## GPU 准入失败（退出码 86）
+
+带 `gpu_admission` 的任务在可见 GPU 不满足策略时以退出码 86 结束，工作负载没有启动。日志中有一行 `determined-compute gpu_admission: failed: ...`，`output_dir` 中有回执（默认 `gpu-admission.json`），其中包含 `devices` 和 `failures`，每次尝试还会在 `.jsonl` 中追加一行。常见原因包括 GPU 数量与 `count` 不同、GPU 名称或驱动不在允许的模式内、其他进程占用设备导致空闲显存低于 `min_free_mib`，或镜像中没有可用的 `nvidia-smi`。请报告回执内容；更改策略、资源池或槽位数需要明确的任务决策。在 experiment 中，每次准入失败都会消耗一次重启，因此若希望第一次失败即停止，请设置 `max_restarts: 0`。参见 [GPU 准入](compute-service.zh.md#gpu-admission)。
 
 <a id="capacity-is-unavailable-or-unknown"></a>
 ## 容量不足或无法确定
@@ -119,6 +128,11 @@ HTTP 503 表示测量后端繁忙或不可用；每个 master 同时最多运行
 ## 取消请求被拒绝
 
 在使用 basic authorization 的 Determined fork 0.40.1 或更高版本上，只有任务的 Determined 所有者或管理员可以终止或取消任务。对于其他账户拥有的任务，`compute_cancel` 对 command 或 shell 返回 HTTP 403，对 experiment 返回 HTTP 404 `experiment '<id>' not found`。这通常发生在更换凭据之后：submitted 记录绑定配置和端点而不是账户，因此服务仍会发出请求。应恢复拥有该任务的账户凭据，或请管理员取消任务。已登记（adopted）的记录会在发出任何取消请求之前返回 `ownership_mismatch`。
+
+<a id="a-task-reports-binding_mismatch"></a>
+## 任务返回 binding_mismatch
+
+submitted 记录绑定提交它的计算配置和端点。如果只有配置改变，`compute_cancel` 或 `compute_reconcile` 返回的 `binding_mismatch` 会说明状态、日志和用量仍可只读查询；请使用任务原来的配置取消或调和。如果端点或 `cluster_identity` 标签不同，所有操作都会被拒绝，因为该记录可能描述的是另一个 master 上的任务。`compute_list_tasks` 显示每条记录的离线 `binding`（`profile`、`cross_profile`、`mismatch`、`unknown` 或 `adopted`）。跨配置读取返回 `identity_mismatch` 或 `ownership_mismatch` 时，表示找到的远端任务的提交标记或所有者与记录不符；不要把它当作同一个任务。参见[跨配置只读观察](compute-service.zh.md#cross-profile-observation)。
 
 <a id="a-transfer-is-partial-or-different-from-the-preview"></a>
 ## 传输不完整或与预览不同

@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 from determined_compute.core.api_client import DeterminedAPIClient
 
+from . import gpu_admission
 from .models import (
     APIError,
     ConflictError,
@@ -46,7 +47,22 @@ _REQUEST_FIELDS = {
     "image",
     "code_revision",
     "experiment_config",
+    "create_directories",
+    "gpu_admission",
 }
+_CREATE_DIRECTORY_FIELDS = ("checkpoint_storage", "output_dir")
+_MANAGED_VARIABLES = frozenset(
+    {
+        "COMPUTE_WORKDIR",
+        "COMPUTE_OUTPUT_DIR",
+        "COMPUTE_CODE_REVISION",
+        "COMPUTE_SUBMISSION_MARKER",
+        *gpu_admission.ENVIRONMENT_NAMES,
+    }
+)
+_CROSS_PROFILE_MESSAGE = (
+    "cancel, reconcile and launch retries require the task's original compute profile"
+)
 _NAME_MAX_LENGTH = 128
 _DESCRIPTION_MAX_LENGTH = 2048
 _SUBMISSION_MARKER_VARIABLE = "COMPUTE_SUBMISSION_MARKER"
@@ -97,6 +113,9 @@ _USAGE_ADVISORY = (
     "p50 and p95 are nearest-rank percentiles of the available samples. "
     "Coverage depends on the cluster's monitoring retention."
 )
+# Sentinels for the lazily resolved cluster identity used by list_tasks.
+_UNRESOLVED = object()
+_UNKNOWN = object()
 _TIMESTAMP = re.compile(
     r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})?"
 )
@@ -248,6 +267,7 @@ class ComputeService:
         profile: ComputeProfile,
         submission_stale_seconds: int = 300,
         inspector: Any = None,
+        path_inspector: Any = None,
     ) -> None:
         if (
             isinstance(submission_stale_seconds, bool)
@@ -260,9 +280,25 @@ class ComputeService:
         self.profile = profile
         self.submission_stale_seconds = submission_stale_seconds
         self.inspector = inspector
+        # Optional local view of shared storage used to check and create launch paths.
+        self.path_inspector = path_inspector
 
     def plan(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate and normalize a request without contacting Determined."""
+        """Validate and normalize a request without contacting Determined.
+
+        With a path inspector, the result also reports observational ``path_checks``
+        and rejects a required launch path that is known to be missing.
+        """
+
+        rendered = self._render(request)
+        if self.path_inspector is None:
+            return rendered
+        result = dict(rendered)
+        result["path_checks"] = self._check_paths(rendered, request)
+        return result
+
+    def _render(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate and render a request; this pure result is the idempotency payload."""
 
         if not isinstance(request, Mapping):
             raise ValidationError("request must be an object")
@@ -346,6 +382,12 @@ class ComputeService:
         if generated_name:
             basename = PurePosixPath(workdir).name or "shared-root"
             name = _display_name(f"{kind}: {basename}")
+        admission = gpu_admission.normalize_policy(
+            request.get("gpu_admission"),
+            kind=kind,
+            slots=slots,
+            experiment_config=experiment_config,
+        )
 
         if kind == "experiment":
             config = self._experiment_config(
@@ -359,6 +401,7 @@ class ComputeService:
                 pool,
                 image,
                 code_revision,
+                admission,
             )
         else:
             config = self._task_config(
@@ -372,7 +415,11 @@ class ComputeService:
                 pool,
                 image,
                 code_revision,
+                admission,
             )
+        create_directories = self._create_directories(
+            request.get("create_directories"), kind, config
+        )
 
         advisories: List[Dict[str, Any]] = []
         if generated_name:
@@ -403,7 +450,7 @@ class ComputeService:
                     ),
                 }
             )
-        return {
+        result = {
             "kind": kind,
             "name": name,
             "description": description,
@@ -412,6 +459,36 @@ class ComputeService:
             "code_revision": code_revision,
             "advisories": advisories,
         }
+        # New request-derived keys appear only when used, so existing payload hashes and
+        # idempotent retries of earlier requests are unchanged.
+        if create_directories:
+            result["create_directories"] = create_directories
+        if admission is not None:
+            result["gpu_admission"] = admission
+        return result
+
+    @staticmethod
+    def _create_directories(value: Any, kind: str, config: Mapping[str, Any]) -> List[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise ValidationError("create_directories must be a list of strings")
+        if len(set(value)) != len(value):
+            raise ValidationError("create_directories must not repeat an entry")
+        unknown = set(value) - set(_CREATE_DIRECTORY_FIELDS)
+        if unknown:
+            raise ValidationError(
+                f"create_directories accepts only {', '.join(_CREATE_DIRECTORY_FIELDS)}; "
+                f"unknown: {sorted(unknown)}"
+            )
+        if "checkpoint_storage" in value and (
+            kind != "experiment" or not isinstance(config.get("checkpoint_storage"), Mapping)
+        ):
+            raise ValidationError(
+                "create_directories checkpoint_storage requires an experiment with "
+                "experiment_config.checkpoint_storage"
+            )
+        return sorted(value)
 
     def _base_config(
         self,
@@ -422,6 +499,7 @@ class ComputeService:
         pool: str,
         image: str,
         code_revision: Optional[str],
+        admission: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         variables = [
             f"COMPUTE_WORKDIR={workdir}",
@@ -429,6 +507,8 @@ class ComputeService:
         ]
         if code_revision is not None:
             variables.append(f"COMPUTE_CODE_REVISION={code_revision}")
+        if admission is not None:
+            variables.extend(gpu_admission.environment_variables(admission))
         return {
             "resources": {
                 ("slots_per_trial" if kind == "experiment" else "slots"): slots,
@@ -453,9 +533,10 @@ class ComputeService:
         pool: str,
         image: str,
         code_revision: Optional[str],
+        admission: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         config = self._base_config(
-            kind, workdir, output_dir, slots, pool, image, code_revision
+            kind, workdir, output_dir, slots, pool, image, code_revision, admission
         )
         config["description"] = name + (
             ("\n" + description) if description is not None else ""
@@ -465,7 +546,9 @@ class ComputeService:
             config["entrypoint"] = [
                 "/bin/bash",
                 "-lc",
-                self._render_entrypoint(command, workdir, output_dir),
+                self._render_entrypoint(
+                    command, workdir, output_dir, admission is not None
+                ),
             ]
         elif command is not None:
             raise ValidationError(
@@ -485,6 +568,7 @@ class ComputeService:
         pool: str,
         image: str,
         code_revision: Optional[str],
+        admission: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         config = copy.deepcopy(dict(value or {}))
         self._validate_config_paths(config)
@@ -534,14 +618,8 @@ class ComputeService:
         variables = environment.get("environment_variables", [])
         if not isinstance(variables, list) or not all(isinstance(item, str) for item in variables):
             raise ValidationError("environment.environment_variables must be a list of strings")
-        managed_names = {
-            "COMPUTE_WORKDIR",
-            "COMPUTE_OUTPUT_DIR",
-            "COMPUTE_CODE_REVISION",
-            _SUBMISSION_MARKER_VARIABLE,
-        }
         for item in variables:
-            if item.split("=", 1)[0] in managed_names:
+            if item.split("=", 1)[0] in _MANAGED_VARIABLES:
                 raise ValidationError("compute-managed environment variables cannot be overridden")
         variables = list(variables) + [
             f"COMPUTE_WORKDIR={workdir}",
@@ -549,6 +627,8 @@ class ComputeService:
         ]
         if code_revision is not None:
             variables.append(f"COMPUTE_CODE_REVISION={code_revision}")
+        if admission is not None:
+            variables.extend(gpu_admission.environment_variables(admission))
         environment["environment_variables"] = variables
         config["environment"] = environment
         config["bind_mounts"] = [mount.as_config() for mount in self.profile.mounts]
@@ -557,10 +637,12 @@ class ComputeService:
                 raise ValidationError(
                     "provide command or experiment_config.entrypoint, not both"
                 )
-            config["entrypoint"] = self._render_entrypoint(command, workdir, output_dir)
+            config["entrypoint"] = self._render_entrypoint(
+                command, workdir, output_dir, admission is not None
+            )
         elif "entrypoint" in config:
             config["entrypoint"] = self._render_entrypoint(
-                config["entrypoint"], workdir, output_dir
+                config["entrypoint"], workdir, output_dir, admission is not None
             )
         else:
             raise ValidationError("experiment requires command or experiment_config.entrypoint")
@@ -582,7 +664,9 @@ class ComputeService:
                 self._validate_config_paths(nested, f"{path}[{index}]")
 
     @staticmethod
-    def _render_entrypoint(command: Any, workdir: str, output_dir: str) -> str:
+    def _render_entrypoint(
+        command: Any, workdir: str, output_dir: str, admission: bool = False
+    ) -> str:
         if isinstance(command, str):
             if not command:
                 raise ValidationError("command must not be empty")
@@ -593,20 +677,128 @@ class ComputeService:
             rendered = " ".join(shlex.quote(part) for part in command)
         else:
             raise ValidationError("command must be a string or string-list")
+        # The optional GPU admission step exits 86 so that the workload never starts.
+        preflight = f"{gpu_admission.entrypoint_step()} && " if admission else ""
         return (
             f"mkdir -p {shlex.quote(output_dir)} && "
-            f"cd {shlex.quote(workdir)} && {rendered}"
+            f"cd {shlex.quote(workdir)} && {preflight}{rendered}"
         )
+
+    def _path_entries(
+        self, rendered: Mapping[str, Any], request: Mapping[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """List launch paths in the cluster-agent host namespace."""
+
+        creates = set(rendered.get("create_directories", ()))
+        config = rendered["config"]
+        entries: List[Dict[str, Any]] = [
+            {
+                "field": f"bind_mounts[{index}].host_path",
+                "host_path": mount["host_path"],
+                "container_path": mount["container_path"],
+                "required": True,
+                "create": False,
+            }
+            for index, mount in enumerate(config.get("bind_mounts", []))
+        ]
+        if rendered["kind"] in {"command", "experiment"}:
+            workdir = self.profile.validate_container_path(request.get("workdir"), "workdir")
+            entries.append({
+                "field": "workdir",
+                "host_path": self.profile.host_path_for(workdir, "workdir"),
+                "container_path": workdir,
+                "required": True,
+                "create": False,
+            })
+        checkpoint = config.get("checkpoint_storage") if rendered["kind"] == "experiment" else None
+        if isinstance(checkpoint, Mapping) and isinstance(checkpoint.get("host_path"), str):
+            container = checkpoint.get("container_path")
+            entries.append({
+                "field": "experiment_config.checkpoint_storage.host_path",
+                "host_path": posixpath.normpath(checkpoint["host_path"]),
+                "container_path": container if isinstance(container, str) else None,
+                "required": True,
+                "create": "checkpoint_storage" in creates,
+            })
+        output_dir = self.profile.validate_container_path(request.get("output_dir"), "output_dir")
+        # The entrypoint creates output_dir, so it is required only when created here.
+        entries.append({
+            "field": "output_dir",
+            "host_path": self.profile.host_path_for(output_dir, "output_dir"),
+            "container_path": output_dir,
+            "required": "output_dir" in creates,
+            "create": "output_dir" in creates,
+        })
+        return entries
+
+    def _check_paths(
+        self, rendered: Mapping[str, Any], request: Mapping[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Observe launch paths through a trusted local view; unknown is never missing."""
+
+        entries = self._path_entries(rendered, request)
+        observed = self.path_inspector.inspect([entry["host_path"] for entry in entries])
+        checks: List[Dict[str, Any]] = []
+        missing: List[Dict[str, Any]] = []
+        for entry, (status, reason) in zip(entries, observed):
+            if entry["create"] and status in {"missing", "unverified"}:
+                # Nothing is created while planning; launch creates it before the claim.
+                reason = "missing" if status == "missing" else reason
+                status = "will_create"
+            check = {
+                "field": entry["field"],
+                "host_path": entry["host_path"],
+                "container_path": entry["container_path"],
+                "required": entry["required"],
+                "status": status,
+                "reason": reason,
+            }
+            checks.append(check)
+            if entry["required"] and status in {"missing", "not_directory"}:
+                missing.append(
+                    {"field": entry["field"], "host_path": entry["host_path"], "status": status}
+                )
+        if missing:
+            error = ValidationError(
+                "required launch paths are missing or not directories: "
+                + ", ".join(f"{item['field']} ({item['host_path']})" for item in missing)
+                + "; create them or request create_directories",
+                code="path_not_found",
+            )
+            error.details = {"missing_paths": missing}
+            raise error
+        return checks
+
+    def _prepare_directories(
+        self, rendered: Mapping[str, Any], request: Mapping[str, Any]
+    ) -> List[Dict[str, Any]]:
+        if self.path_inspector is None:
+            raise ConflictError(
+                "create_directories requires shared-storage access configuration",
+                code="configuration_required",
+            )
+        entries = [
+            {"field": entry["field"], "host_path": entry["host_path"]}
+            for entry in self._path_entries(rendered, request)
+            if entry["create"]
+        ]
+        return self.path_inspector.ensure_directories(entries)
 
     def launch(self, request: Dict[str, Any], request_id: str, owner: str) -> Dict[str, Any]:
         request_id = _required_text(request_id, "request_id")
         owner = _required_text(owner, "owner")
-        plan = self.plan(request)
+        plan = self._render(request)
         payload_hash = self._payload_hash(plan)
         existing = self.store.lookup_request(request_id, owner)
         if existing is not None:
+            # An established request is returned unchanged, even if its paths later moved.
             self._validate_idempotent_payload(existing, payload_hash, request, plan)
             return self._public(existing)
+        if self.path_inspector is not None:
+            self._check_paths(plan, request)
+        # Bind the submit call before any durable write: a lazily built client that fails
+        # (for example a login error) must fail before directories exist or the id is claimed.
+        launch_task = self.client.launch_task
 
         if not plan["allow_queue"]:
             try:
@@ -620,6 +812,9 @@ class ComputeService:
                     )
                     return self._public(existing)
                 raise
+        prepared = (
+            self._prepare_directories(plan, request) if plan.get("create_directories") else None
+        )
         workdir = self.profile.validate_container_path(request.get("workdir"), "workdir")
         output_dir = self.profile.validate_container_path(request.get("output_dir"), "output_dir")
         record, created = self.store.claim(
@@ -641,9 +836,12 @@ class ComputeService:
         self.store.mark_submitting(record.task_id)
         launch_config = self._with_submission_marker(plan["config"], record.submission_marker)
         try:
-            entity = self.client.launch_task(plan["kind"], launch_config)
+            entity = launch_task(plan["kind"], launch_config)
             remote_id = _remote_id(entity)
-            return self._public(self.store.mark_submitted(record.task_id, remote_id))
+            result = self._public(self.store.mark_submitted(record.task_id, remote_id))
+            if prepared is not None:
+                result["prepared_directories"] = prepared
+            return result
         except SubmissionUncertainError as exc:
             self._best_effort_submission_state(record.task_id, "uncertain")
             self._attach_task_details(exc, record)
@@ -680,7 +878,7 @@ class ComputeService:
             )
         if record.payload_hash == payload_hash:
             return
-        new_fields = {"name", "description", "allow_queue"}
+        new_fields = {"name", "description", "allow_queue", "create_directories", "gpu_admission"}
         legacy_record = record.name is None and record.description is None
         legacy_request = not new_fields.intersection(request)
         if (
@@ -735,38 +933,60 @@ class ComputeService:
 
     def status(self, task_id: str, owner: str) -> Dict[str, Any]:
         record = self.store.get_owned(task_id, owner)
-        self._validate_binding(record)
+        binding = self._validate_binding(record, "observe")
+        cross_profile = binding["mode"] == "cross_profile"
+        if record.remote_id is None and cross_profile:
+            # Another profile's unbound submission is shown as stored; nothing is written.
+            result = self._public(record)
+            result["binding"] = binding
+            return result
         if record.remote_id is None and record.state in {"pending", "submitting"}:
             record = self.store.mark_stale_submission_uncertain(
                 task_id, owner, self.submission_stale_seconds
             )
         result = self._public(record)
         if record.remote_id is None:
+            result["binding"] = binding
             return result
+        user_id = self._current_user_id() if cross_profile else None
         entity = self.client.get_task(record.kind, record.remote_id)
         if record.origin == "adopted":
             self._check_adopted_entity(record, entity)
+        elif cross_profile:
+            self._verify_cross_profile(record, entity, user_id, binding)
         state = _remote_state(entity)
         if state != record.remote_state:
             record = self.store.update_remote_state(record.task_id, state)
             result = self._public(record)
         result["remote"] = entity
+        result["binding"] = binding
         return result
 
-    def logs(self, task_id: str, owner: str, tail: int = 100) -> List[Any]:
+    def logs(
+        self, task_id: str, owner: str, tail: int = 100, include_binding: bool = False
+    ) -> Any:
+        """Return log records, or ``{task_id, binding, logs}`` with ``include_binding``."""
         if isinstance(tail, bool) or not isinstance(tail, int) or tail <= 0:
             raise ValidationError("tail must be a positive integer")
+        if not isinstance(include_binding, bool):
+            raise ValidationError("include_binding must be a boolean")
         record = self.store.get_owned(task_id, owner)
-        self._validate_binding(record)
-        if record.remote_id is None:
-            return []
-        if record.origin == "adopted":
-            self._check_adopted_entity(
-                record, self.client.get_task(record.kind, record.remote_id)
-            )
-        result = self.client.task_logs(record.kind, record.remote_id, tail)
-        if not isinstance(result, list):
-            raise APIError("task log response was not a list", code="invalid_api_response")
+        binding = self._validate_binding(record, "observe")
+        result: List[Any] = []
+        if record.remote_id is not None:
+            if record.origin == "adopted":
+                self._check_adopted_entity(
+                    record, self.client.get_task(record.kind, record.remote_id)
+                )
+            elif binding["mode"] == "cross_profile":
+                user_id = self._current_user_id()
+                entity = self.client.get_task(record.kind, record.remote_id)
+                self._verify_cross_profile(record, entity, user_id, binding)
+            result = self.client.task_logs(record.kind, record.remote_id, tail)
+            if not isinstance(result, list):
+                raise APIError("task log response was not a list", code="invalid_api_response")
+        if include_binding:
+            return {"task_id": record.task_id, "binding": binding, "logs": result}
         return result
 
     def usage(
@@ -818,7 +1038,7 @@ class ComputeService:
         record = self.store.get_owned(task_id, owner)
         if trial_id is not None and record.kind != "experiment":
             raise ValidationError("trial_id applies only to experiment tasks")
-        self._validate_binding(record)
+        binding = self._validate_binding(record, "observe")
         if record.remote_id is None:
             raise ConflictError(
                 "remote task id is unknown; reconcile the submission before reading usage",
@@ -828,6 +1048,10 @@ class ComputeService:
         if record.origin == "adopted":
             entity = self.client.get_task(record.kind, record.remote_id)
             self._check_adopted_entity(record, entity)
+        elif binding["mode"] == "cross_profile":
+            user_id = self._current_user_id()
+            entity = self.client.get_task(record.kind, record.remote_id)
+            self._verify_cross_profile(record, entity, user_id, binding)
         if not self.client.task_resources_enabled():
             raise APIError(
                 "task resource monitoring is not enabled on this Determined master",
@@ -1002,6 +1226,7 @@ class ComputeService:
             "explanation": explanation,
             "observed_at": _iso_seconds(now),
             "advisory": _USAGE_ADVISORY,
+            "binding": binding,
         }
         if len(allocations) > _USAGE_MAX_ALLOCATION_DETAILS:
             result["allocation_details_limit"] = _USAGE_MAX_ALLOCATION_DETAILS
@@ -1211,7 +1436,47 @@ class ComputeService:
 
     def list_tasks(self, owner: str) -> List[Dict[str, Any]]:
         owner = _required_text(owner, "owner")
-        return [self._public(record) for record in self.store.list_owned(owner)]
+        records = self.store.list_owned(owner)
+        identity: Any = _UNRESOLVED
+        result = []
+        for record in records:
+            if identity is _UNRESOLVED and record.origin != "adopted":
+                try:
+                    identity = self._cluster_identity()
+                except Exception:
+                    # Listing stays local and never fails on client configuration.
+                    identity = _UNKNOWN
+            item = self._public(record)
+            item["binding"] = self._offline_binding(record, identity)
+            result.append(item)
+        return result
+
+    def _offline_binding(self, record: TaskRecord, identity: Any) -> Dict[str, Any]:
+        """Summarize, without remote calls, which operations the current binding permits."""
+        if record.origin == "adopted":
+            # The live cluster ID and account are checked only when the task is used.
+            return {
+                "mode": "adopted",
+                "profile_matches": None,
+                "cluster_identity_matches": None,
+                "mutations_allowed": None,
+            }
+        profile_matches = record.profile_hash == self.profile.fingerprint
+        identity_matches = None if identity is _UNKNOWN else record.cluster_identity == identity
+        if identity_matches is None:
+            mode, mutations = "unknown", None
+        elif not identity_matches:
+            mode, mutations = "mismatch", False
+        elif profile_matches:
+            mode, mutations = "profile", True
+        else:
+            mode, mutations = "cross_profile", False
+        return {
+            "mode": mode,
+            "profile_matches": profile_matches,
+            "cluster_identity_matches": identity_matches,
+            "mutations_allowed": mutations,
+        }
 
     @staticmethod
     def _management_kind(kind: Any) -> str:
@@ -1479,22 +1744,89 @@ class ComputeService:
             separators=(",", ":"),
         )
 
-    def _validate_binding(self, record: TaskRecord) -> None:
+    def _validate_binding(self, record: TaskRecord, purpose: str = "mutate") -> Dict[str, Any]:
+        """Check the record's binding before any remote task access.
+
+        ``mutate`` requires the original profile and endpoint. ``observe`` also accepts a
+        record from another profile on the same endpoint and label; the caller must then
+        verify the remote owner and submission marker before reading task data.
+        """
         if record.origin == "adopted":
             cluster_id, user = self._remote_account()
             if cluster_id != record.remote_cluster_id:
                 raise ConflictError("task belongs to a different remote cluster", code="binding_mismatch")
             if user["id"] != record.remote_user_id:
                 raise ConflictError("task belongs to a different authenticated account", code="ownership_mismatch")
-            return
-        if (
-            record.profile_hash != self.profile.fingerprint
-            or record.cluster_identity != self._cluster_identity()
-        ):
+            return {
+                "mode": "adopted",
+                "profile_matches": None,
+                "cluster_identity_matches": True,
+                "verified": ["remote_cluster", "remote_owner"],
+                "mutations_allowed": True,
+                "message": "adopted task verified against the live cluster ID and account",
+            }
+        identity_matches = record.cluster_identity == self._cluster_identity()
+        profile_matches = record.profile_hash == self.profile.fingerprint
+        if identity_matches and profile_matches:
+            return {
+                "mode": "profile",
+                "profile_matches": True,
+                "cluster_identity_matches": True,
+                "verified": [],
+                "mutations_allowed": True,
+                "message": "bound to the current compute profile and endpoint",
+            }
+        if identity_matches and purpose == "observe":
+            return {
+                "mode": "cross_profile",
+                "profile_matches": False,
+                "cluster_identity_matches": True,
+                "verified": [],
+                "mutations_allowed": False,
+                "message": _CROSS_PROFILE_MESSAGE,
+            }
+        if identity_matches:
             raise ConflictError(
-                "task belongs to a different compute profile or cluster",
+                f"task was submitted with a different compute profile; {_CROSS_PROFILE_MESSAGE}. "
+                "Read-only status, logs and usage remain available",
                 code="binding_mismatch",
             )
+        raise ConflictError(
+            "task belongs to a different compute profile or cluster",
+            code="binding_mismatch",
+        )
+
+    def _current_user_id(self) -> str:
+        user = self.client.get_current_user()
+        try:
+            return DeterminedAPIClient.normalize_user_id(
+                user.get("id") if isinstance(user, Mapping) else None
+            )
+        except ValueError as exc:
+            raise APIError(
+                "Remote account identity is unavailable", code="invalid_response"
+            ) from exc
+
+    def _verify_cross_profile(
+        self, record: TaskRecord, entity: Any, user_id: str, binding: Dict[str, Any]
+    ) -> None:
+        """Prove that a remote entity is this record's submission and the caller owns it."""
+        self._check_remote_entity(record.kind, record.remote_id, entity, user_id)
+        marker = entity.get("submissionMarker")
+        legacy_match = (
+            record.name is None
+            and record.description is None
+            and any(
+                self._legacy_description_marker(description, record.submission_marker)
+                for description in self._entity_descriptions(entity)
+            )
+        )
+        if marker != record.submission_marker and not legacy_match:
+            raise ConflictError(
+                "remote task identity marker does not match this task record",
+                code="identity_mismatch",
+            )
+        binding["verified"] = ["remote_owner", "submission_marker"]
 
     @staticmethod
     def _public(record: TaskRecord) -> Dict[str, Any]:

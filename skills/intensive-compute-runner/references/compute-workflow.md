@@ -21,8 +21,12 @@ Load this reference when preparing a service request, copying a workspace to sha
 | `pool`, `image` | Optional overrides of profile defaults |
 | `code_revision` | Stable revision or content identifier for reproducibility |
 | `experiment_config` | Experiment-only configuration; selects `experiment` in auto mode |
+| `create_directories` | `output_dir` and/or `checkpoint_storage` to create on shared storage before submission |
+| `gpu_admission` | Optional in-container GPU policy (`count`, `names`, `driver_versions`, `min_free_mib`, `min_total_mib`, `receipt`) checked before the workload |
 
-Auto mode otherwise resolves to `command`. Call `plan` before `launch`; planning is read-only.
+Auto mode otherwise resolves to `command`. Call `plan` before `launch`; planning is read-only. Through the CLI or MCP server, the plan's `path_checks` shows whether bind mounts, `workdir`, an experiment checkpoint directory, and `output_dir` exist; `unverified` means the service cannot see the path, and a missing required path fails with `path_not_found`. An experiment checkpoint `host_path` is bind-mounted when the container starts, so create it first or request `create_directories: ["checkpoint_storage"]`.
+
+With `gpu_admission`, the task writes a JSON receipt and a `.jsonl` history under `output_dir` and exits 86 before the workload when its visible GPUs do not match the policy. In an experiment each failure consumes a restart; use `max_restarts: 0` to fail once.
 
 Call `compute_resources(slots=1, pool=None)` with the requested values before launch; `slots=0` checks auxiliary capacity. With `allow_queue: false`, launch admits a new request only when capacity is known and currently sufficient; a rejection creates no task or remote submission. `allow_queue: true` explicitly permits scheduler queueing for that request. Capacity is a race-prone snapshot rather than a reservation, and the service never switches pools or execution locations automatically.
 
@@ -40,7 +44,7 @@ Configured shared roots may include `/SSD`, `/SSD_home`, `/SSD_datasets`, `/SSD3
 
 Translate paths by replacing the matching host prefix with its container prefix. Do not assume that old image names, pool names, master addresses, or site paths are current; read them from the deployment profile or the user.
 
-For an unattended or durable run, copy or check out the exact revision into a revision-specific directory such as `/workspace/<user>/compute/runs/<project>/<revision>/repo`. Record the revision in the request. Reserve a mutable directory such as `/workspace/<user>/compute/debug/<project>` for interactive shells.
+For an unattended or durable run, publish the exact revision with `storage_snapshot(repo_dir, revision)` (CLI: `determined-compute snapshot REPO_DIR --revision REV`) when the storage configuration sets `snapshots.root`. Preview first, review `excluded` and `warnings`, then publish with `dry_run=false` (`--execute`) and copy `request_fields.workdir` and `request_fields.code_revision` into the request. The snapshot reads tracked files from git, stores identical files once, and is read-only, so write results under `output_dir`; add generated or untracked inputs with `include`. Without a snapshot root, check out the exact revision into a revision-specific directory such as `/workspace/<user>/compute/runs/<project>/<revision>/repo` and record the revision in the request. Reserve a mutable directory such as `/workspace/<user>/compute/debug/<project>` for interactive shells.
 
 When the client does not mount shared storage, use `storage_check`, then preview `storage_sync` or `storage_fetch`. Shared paths use the container namespace. Execute only after checking the resolved endpoints and exclusions. Read [the shared-storage access guide](../../../docs/shared-storage-access.md) for the separate storage config, SSH agent/password/keyring setup, and connection reuse.
 

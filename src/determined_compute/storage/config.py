@@ -138,6 +138,34 @@ class SSHConfig:
         )
 
 
+SNAPSHOT_LINK_MODES = ("auto", "reflink", "hardlink", "copy")
+
+
+@dataclass(frozen=True)
+class SnapshotConfig:
+    """Where content-addressed code snapshots live; root is a container path."""
+
+    root: str
+    link_mode: str = "auto"
+
+    @classmethod
+    def from_mapping(cls, value: Any) -> "SnapshotConfig":
+        if not isinstance(value, Mapping):
+            raise StorageError("snapshots must be an object", code="invalid_storage_config")
+        unknown = set(value) - {"root", "link_mode"}
+        if unknown:
+            raise StorageError(
+                f"snapshots has unknown fields: {sorted(unknown)}", code="invalid_storage_config"
+            )
+        link_mode = value.get("link_mode", "auto")
+        if link_mode not in SNAPSHOT_LINK_MODES:
+            raise StorageError(
+                f"snapshots.link_mode must be one of: {', '.join(SNAPSHOT_LINK_MODES)}",
+                code="invalid_storage_config",
+            )
+        return cls(root=_host_path(value.get("root"), "snapshots.root"), link_mode=link_mode)
+
+
 @dataclass(frozen=True)
 class StorageAccessConfig:
     mode: str = "auto"
@@ -146,6 +174,7 @@ class StorageAccessConfig:
     connect_timeout_seconds: int = 10
     timeout_seconds: int = 120
     preserve_permissions: bool = True
+    snapshots: Optional[SnapshotConfig] = None
 
     @classmethod
     def from_file(cls, path: Any) -> "StorageAccessConfig":
@@ -173,6 +202,7 @@ class StorageAccessConfig:
             "connect_timeout_seconds",
             "timeout_seconds",
             "preserve_permissions",
+            "snapshots",
         }
         unknown = set(value) - allowed
         if unknown:
@@ -198,6 +228,10 @@ class StorageAccessConfig:
                 "preserve_permissions must be a boolean",
                 code="invalid_storage_config",
             )
+        snapshots_value = value.get("snapshots")
+        snapshots = (
+            SnapshotConfig.from_mapping(snapshots_value) if snapshots_value is not None else None
+        )
         return cls(
             mode=mode,
             local_mounts=mounts,
@@ -205,6 +239,7 @@ class StorageAccessConfig:
             connect_timeout_seconds=connect,
             timeout_seconds=timeout,
             preserve_permissions=preserve_permissions,
+            snapshots=snapshots,
         )
 
 
@@ -218,4 +253,11 @@ def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
-__all__ = ["LocalMount", "SSHConfig", "StorageAccessConfig", "StorageError"]
+__all__ = [
+    "LocalMount",
+    "SNAPSHOT_LINK_MODES",
+    "SSHConfig",
+    "SnapshotConfig",
+    "StorageAccessConfig",
+    "StorageError",
+]

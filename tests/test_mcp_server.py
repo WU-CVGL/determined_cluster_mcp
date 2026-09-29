@@ -288,10 +288,11 @@ def test_stdio_subprocess_initializes_and_calls_offline_plan(tmp_path):
     async def exercise():
         async with Client(params) as client:
             tools = {tool.name for tool in (await client.list_tools()).tools}
-            assert len(tools) == 14
+            assert len(tools) == 15
             assert "compute_plan" in tools
             assert "compute_discover" in tools
             assert "compute_adopt" in tools
+            assert "storage_snapshot" in tools
             assert "compute_consult" not in tools
             assert "workflow_status" not in tools
             result = await client.call_tool(
@@ -342,11 +343,12 @@ def test_default_runtime_does_not_import_consultation_worker(tmp_path, monkeypat
     async def exercise():
         async with Client(server) as client:
             tools = {tool.name for tool in (await client.list_tools()).tools}
-            assert len(tools) == 14
+            assert len(tools) == 15
             assert "compute_plan" in tools
             assert "compute_discover" in tools
             assert "compute_adopt" in tools
             assert "storage_check" in tools
+            assert "storage_snapshot" in tools
             assert "compute_resources" in tools
             assert "compute_usage" in tools
             assert "compute_consult" not in tools
@@ -405,7 +407,7 @@ def test_codex_backend_passes_deployment_options_and_registers_tools(tmp_path, m
     async def exercise():
         async with Client(server) as client:
             tools = {tool.name: tool for tool in (await client.list_tools()).tools}
-            assert len(tools) == 16
+            assert len(tools) == 17
             assert "compute_consult" in tools
             assert "workflow_status" in tools
 

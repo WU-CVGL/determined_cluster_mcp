@@ -465,6 +465,58 @@ def test_allow_queue_bypasses_admission_without_leaking_into_config(
     assert "allow_queue" not in client.launches[0][1]
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        APIError("Could not authenticate", code="transport_error", retryable=True),
+        RuntimeError("temporary login failure"),
+    ],
+    ids=["api_error", "other_error"],
+)
+@pytest.mark.parametrize("allow_queue", [True, False])
+def test_lazy_client_failure_happens_before_claim_and_request_can_retry(
+    tmp_path, profile, command_request, failure, allow_queue
+):
+    from determined_compute import compute_cli
+
+    client = FakeClient()
+    endpoints = []
+
+    def factory(api_url):
+        endpoints.append(api_url)
+        if len(endpoints) == 1:
+            raise failure
+        return client
+
+    inspector = ToggleInspector(available=True)
+    store = SQLiteTaskStore(tmp_path / "tasks.db")
+    service = ComputeService(
+        compute_cli._LazyClient(factory, lambda: client.api_url),
+        store,
+        profile,
+        inspector=inspector,
+    )
+    request = dict(command_request, allow_queue=allow_queue)
+
+    with pytest.raises(type(failure)) as caught:
+        service.launch(request, "lazy-retry", "session-a")
+
+    assert caught.value is failure
+    assert store.list_owned("session-a") == []
+    assert inspector.calls == []
+    assert client.launches == []
+
+    launched = service.launch(request, "lazy-retry", "session-a")
+
+    assert launched["state"] == "submitted"
+    assert len(client.launches) == 1
+    assert len(inspector.calls) == (0 if allow_queue else 1)
+    assert endpoints == [client.api_url, client.api_url]
+    assert store.get_owned(launched["task_id"], "session-a").cluster_identity == (
+        service._cluster_identity()
+    )
+
+
 def test_named_command_uses_display_name_and_reconciles(
     tmp_path, profile, command_request
 ):
@@ -921,3 +973,71 @@ def test_store_additively_migrates_legacy_task_schema(tmp_path):
         for row in sqlite3.connect(db_path).execute("PRAGMA table_info(compute_tasks)")
     }
     assert {"name", "description"}.issubset(columns)
+
+
+# Payload hashes of requests rendered by release 0.5.0. Idempotent retries of existing
+# request IDs depend on these values, so a change here needs a migration plan.
+GOLDEN_PAYLOAD_HASHES = {
+    "command": "9c8ff0c3cd4b8fef968d7cba4de97058d99e94a4cd774fb3afc768c44a4c2483",
+    "named": "bc6a23b3a0c9a21c647f33bf9c47443331161b6c46f2507f48f781203f666c94",
+    "shell": "18d6875cae55e4b72bbf18a60f283b9d294fc4c55d6e050ac6f82025b16ce8ac",
+    "experiment": "be87af468ac7b97290596b1d92ecd83d0a95f13a72046535bac4dc2865bc67ec",
+}
+
+
+def test_existing_request_payload_hashes_and_profile_fingerprint_are_stable(
+    profile, command_request
+):
+    service = ComputeService(FakeClient(), SQLiteTaskStore(":memory:"), profile)
+    requests = {
+        "command": command_request,
+        "named": {
+            "name": "n",
+            "description": "d",
+            "command": "true",
+            "workdir": "/shared/container/a",
+            "output_dir": "/shared/container/b",
+            "slots": 2,
+        },
+        "shell": {
+            "interactive": True,
+            "workdir": "/shared/container/a",
+            "output_dir": "/shared/container/b",
+        },
+        "experiment": {
+            "name": "exp",
+            "kind": "experiment",
+            "command": ["python", "t.py"],
+            "workdir": "/shared/container/a",
+            "output_dir": "/shared/container/b",
+            "experiment_config": {
+                "searcher": {"name": "single", "metric": "m", "max_length": {"batches": 1}},
+                "checkpoint_storage": {"type": "shared_fs", "host_path": "/shared/host/ckpt"},
+                "environment": {"environment_variables": ["A=1"]},
+            },
+        },
+    }
+
+    assert profile.fingerprint == (
+        "5b58b5378262430e4c35235eefca45e5b65d089c2c2316767ea7ca4eee19915d"
+    )
+    for key, request in requests.items():
+        rendered = service._render(request)
+        assert service._payload_hash(rendered) == GOLDEN_PAYLOAD_HASHES[key], key
+        # Without a path inspector, planning returns exactly the hashed render.
+        assert service.plan(request) == rendered
+
+
+def test_store_reads_rows_with_columns_added_by_a_newer_release(tmp_path, profile, command_request):
+    db_path = tmp_path / "tasks.db"
+    service = ComputeService(FakeClient(), SQLiteTaskStore(db_path), profile)
+    launched = service.launch(command_request, "request-1", "session-a")
+    connection = sqlite3.connect(db_path)
+    connection.execute("ALTER TABLE compute_tasks ADD COLUMN future_field TEXT")
+    connection.commit()
+    connection.close()
+
+    reopened = SQLiteTaskStore(db_path)
+
+    assert reopened.get_owned(launched["task_id"], "session-a").task_id == launched["task_id"]
+    assert [record.task_id for record in reopened.list_owned("session-a")] == [launched["task_id"]]

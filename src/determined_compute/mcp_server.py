@@ -17,7 +17,7 @@ from typing import Any, Optional, Sequence
 from determined_compute.compute import ComputeError, ComputeProfile, ComputeService, SQLiteTaskStore
 from determined_compute.compute_cli import DEFAULT_DB_PATH, _LazyClient, normalize_owner, safe_error_details
 from determined_compute.core.api_client import APIError as ClientAPIError
-from determined_compute.core.api_client import DeterminedAPIClient
+from determined_compute.core.api_client import DeterminedAPIClient, resolve_api_url
 
 
 def _tool_error(exc: BaseException) -> dict[str, Any]:
@@ -58,7 +58,8 @@ def create_server(
         instructions=(
             "Choose a meaningful request.name and request.description for each launch. "
             "Check capacity with compute_resources; queuing requires explicit allow_queue=true. "
-            "Keep code and data on shared mounts; use storage_check/sync/fetch for file access. "
+            "Keep code and data on shared mounts; use storage_check/sync/fetch for file access "
+            "and storage_snapshot to publish an exact git revision as a read-only workdir. "
             "Plan before launch, keep request_id stable, and use the returned task_id for control. "
             "Use compute_usage to check a task's measured CPU, memory, and GPU use. "
             "Credentials belong in local configuration, never in tool arguments."
@@ -106,11 +107,20 @@ def create_server(
     @server.tool(annotations=ToolAnnotations(
         read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
     ))
-    async def compute_logs(task_id: str, tail: int = 200) -> list[Any]:
-        """Return the latest task log records; tail must be a positive integer."""
+    async def compute_logs(
+        task_id: str, tail: int = 200, include_binding: bool = False
+    ) -> list[Any] | dict[str, Any]:
+        """Return the latest task log records; tail must be a positive integer.
+
+        include_binding=true returns {task_id, binding, logs} instead of the bare list.
+        """
 
         if tail < 1:
             fail(ValueError("tail must be at least 1"))
+        if include_binding:
+            return await call(
+                lambda: service.logs(task_id, owner, tail, include_binding=True)
+            )
         return await call(service.logs, task_id, owner, tail)
 
     @server.tool(annotations=ToolAnnotations(
@@ -204,6 +214,28 @@ def create_server(
         async def storage_fetch(shared_dir: str, local_dir: str, dry_run: bool = True) -> dict[str, Any]:
             """Copy shared directory contents to a local directory; preview by default, no deletions."""
             return await call(storage_service.fetch, shared_dir, local_dir, dry_run)
+
+        @server.tool(annotations=ToolAnnotations(
+            read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
+        ))
+        async def storage_snapshot(
+            repo_dir: str,
+            revision: str = "HEAD",
+            include: Optional[list[str]] = None,
+            exclude: Optional[list[str]] = None,
+            dry_run: bool = True,
+            verify: bool = False,
+        ) -> dict[str, Any]:
+            """Publish a git revision as a read-only, content-addressed shared workdir.
+
+            Preview by default; review excluded secret-like files before dry_run=false. The
+            result's request_fields supply workdir and code_revision for compute_plan.
+            """
+            return await call(
+                lambda: storage_service.snapshot(
+                    repo_dir, revision, include, exclude, dry_run=dry_run, verify=verify
+                )
+            )
 
     if workflow_manager is not None:
 
@@ -320,20 +352,25 @@ def _runtime(args: argparse.Namespace) -> tuple[Any, str]:
     profile = ComputeProfile.from_file(profile_path)
     store = SQLiteTaskStore(db_path)
 
-    def make_client() -> DeterminedAPIClient:
+    def make_client(resolved_api_url: str) -> DeterminedAPIClient:
+        # The lazy client passes the endpoint it already used for task bindings.
         return DeterminedAPIClient(
-            api_url=args.api_url,
+            api_url=resolved_api_url,
             api_token=args.api_token,
             secrets_path=Path(args.secrets_file) if args.secrets_file else None,
             verify_ssl=args.verify_ssl,
         )
 
-    service = ComputeService(_LazyClient(make_client), store, profile)
+    def api_url() -> str:
+        return resolve_api_url(args.api_url, Path(args.secrets_file) if args.secrets_file else None)
 
-    from determined_compute.storage import StorageAccessConfig, StorageService
+    from determined_compute.storage import PathInspector, StorageAccessConfig, StorageService
     access_path = args.storage_config or os.environ.get("DETERMINED_COMPUTE_STORAGE")
     access = StorageAccessConfig.from_file(access_path) if access_path else StorageAccessConfig()
     storage = StorageService(profile, access, Path(args.secrets_file).expanduser() if args.secrets_file else None)
+    service = ComputeService(
+        _LazyClient(make_client, api_url), store, profile, path_inspector=PathInspector(storage)
+    )
 
     workflow_manager = None
     if args.consultation_backend == "codex":

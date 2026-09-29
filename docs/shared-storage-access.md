@@ -26,11 +26,21 @@ ssh:
 connect_timeout_seconds: 10
 timeout_seconds: 120
 preserve_permissions: true # set false only for a verified incompatible filesystem
+# snapshots:               # optional; see "Publish a code snapshot"
+#   root: /SSD/project/snapshots  # container path below a writable mount
+#   link_mode: auto        # auto, reflink, hardlink, or copy
 ```
 
 `local_mounts` maps a compute-profile host root or subdirectory to an absolute path on the client. `auto` uses an explicit mapping or the same host root when that root exists locally, then falls back to configured SSH. `local` requires local access; `ssh` always accesses the login node. The `shared_dir` argument is always a container-namespace path. The service first resolves the authoritative compute-profile mount, then translates to its cluster host path and the chosen client backend.
 
 Without a storage file, the service uses empty `auto` configuration. A storage operation with neither local access nor SSH returns `configuration_required`; compute planning and launch remain available. `connect_timeout_seconds` accepts 1–120 seconds and defaults to 10; `timeout_seconds` accepts 1–3600 seconds and defaults to 120. `preserve_permissions` is a boolean and defaults to `true`.
+
+The CLI and MCP server also use this file when planning and launching: it decides which
+launch paths can be checked locally and how directories named in a request's
+`create_directories` are created, through the local view or with `mkdir -p` on the SSH
+login node. See [launch-path checks](compute-service.md#launch-path-checks). Older releases
+reject unknown keys, so add `snapshots` only after every process that reads this file,
+including every MCP server that shares the task database, runs a release that supports it.
 
 Use the login node as `ssh.host`. A gateway is only an optional `ProxyJump`; do not mistake it for the storage endpoint. Prefer an SSH alias so user, identity, port, jump route, and host-key policy stay in `~/.ssh/config`:
 
@@ -143,6 +153,75 @@ Rsync exit code 23 means some files or attributes were not transferred and the d
 Sync requires an existing local source directory, and its shared destination must be below a mount root rather than equal to it. A local mapped root must already exist before execution can create nested destinations. Fetch accepts a local output directory or a new directory whose parent already exists. Local mappings are canonicalized so symlinks cannot escape their configured roots; the operator remains responsible for the policy and permissions of the configured remote SSH host.
 
 Confirm rsync 3.2.3 or newer is installed on both the client and login node because the backend always uses `--mkpath`. The official [rsync manual](https://rsync.samba.org/ftp/rsync/rsync.1) also explains that `-s` sends arguments through the protocol rather than the remote shell.
+
+## Publish a code snapshot
+
+`storage_snapshot(repo_dir, revision="HEAD", include=None, exclude=None, dry_run=True, verify=False)`
+and `determined-compute snapshot REPO_DIR [--revision REV] [--include PATH]... [--exclude GLOB]... [--execute] [--verify]`
+publish the exact tracked content of one git commit as a read-only working directory on
+shared storage, so repeated jobs reuse one copy instead of each copying the workspace.
+Configure `snapshots.root`, a container path below a writable mount but not the mount
+root, and optionally `snapshots.link_mode`. This release needs a local, writable view of
+the root; SSH-only access returns `configuration_required`. Preview is the default, as for
+transfers.
+
+`repo_dir` is the top level of a git work tree on the machine running the service. The
+revision is resolved to a full commit, and files are read from the git object database,
+not the working tree, so the snapshot equals that commit. `include` adds working-tree files
+or directories, such as generated or untracked files, and overrides tracked paths; each
+must stay inside the repository and cannot be or traverse a symlink. Executable bits are
+kept. Relative symlinks that stay inside the tree, also when resolved through the
+snapshot's other symlinks, are recreated. A symlink that leaves the tree, directly or
+through such a chain, or that loops, fails with `unsafe_symlink`; a preview already
+reports it. Submodules are skipped and reported, and a Git LFS pointer produces a warning.
+A `.git` file or directory inside an included directory, as in a git worktree or a
+submodule checkout, is skipped and reported with reason `git_metadata`; naming a path
+inside `.git` as an include is `invalid_include`.
+
+Secret-like tracked files are left out: names matched by the transfer exclusions above,
+the configured secrets file when it lies in the repository, names containing `credential`
+or `secret`, and files named `token`, `.token`, or `*.token`. Cache directories and `*.pyc`
+from the same exclusion list are also left out, but an explicit include restores them. An
+include that matches a secret-like rule fails with `secret_like_include` instead of being
+dropped. `exclude` adds rsync-style patterns matched per path component: a trailing `/`
+matches directories and a leading `/` anchors at the repository root. Every excluded path
+is reported with its `reason` and `rule`. Review the preview before publishing to shared
+storage.
+
+`content_id` is the SHA-256 of the canonical list of files (path, SHA-256, size, and mode)
+and symlink targets, and the workdir is `<root>/trees/<content_id>`, so identical content is
+published once whichever revision produced it. A manifest at
+`<root>/manifests/<snapshot_key>.json` records `schema_version`, the revision, tree,
+sources, files, symlinks, exclusions, skipped entries, warnings, and `created_utc`. It never
+records a remote URL. Repeating a snapshot returns the existing manifest with the same
+`manifest_sha256`; another revision with the same content gets its own manifest and shares
+the tree.
+
+Files are stored once under `<root>/objects/sha256/`, executables separately with a `.x`
+suffix because hard links share one mode, and linked into each tree. `auto` probes reflink,
+then hard link, then copy. A file that cannot be linked, for example at a link limit or
+across devices, is copied; the result reports `link_mode` and `link_fallbacks`. `copy`
+skips the object store and deduplicates whole trees only. Objects, trees, and manifests are
+written under temporary names and never modified or deleted afterwards, and concurrent
+snapshots of the same content publish one tree. An existing tree is checked by size, and
+by full hash with `verify`, before reuse; a mismatch returns `snapshot_corrupt` and is
+never repaired. Trees are read-only, so a job must write under its `output_dir`. A hard
+link shares its inode with the object store, and on a network mount with squashed
+ownership, mode bits do not stop a determined writer; use `verify` or `link_mode: copy`
+where that matters.
+
+The result reports `dry_run`, `revision`, `tree`, `content_id`, `snapshot_key`, `workdir`
+(a container path), `host_path`, `local_path`, `manifest_path` and `manifest_sha256` (null
+in a preview unless already published), `existing` (the manifest already existed),
+`tree_existing`, the `files`, `symlinks`, and `bytes` totals, `new_objects`, `new_bytes`,
+`link_mode`, `link_fallbacks`, `excluded`, `skipped`, `warnings`, and `request_fields`,
+whose `workdir` and `code_revision` go directly into a compute request.
+
+```bash
+determined-compute snapshot "$PWD"                   # preview; writes nothing
+determined-compute snapshot "$PWD" --execute         # publish
+determined-compute snapshot "$PWD" --revision v1.2 --include generated/ --exclude '*.log'
+```
 
 ## Reuse an SSH connection
 

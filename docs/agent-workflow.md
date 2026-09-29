@@ -57,6 +57,8 @@ If the project is already complete on shared storage and the caller supplied its
 4. Call the identical operation with `dry_run=false` only when that preview is correct.
 5. Call `storage_check` again for the prepared working directory and required inputs.
 
+For a durable run of committed code, prefer `storage_snapshot(repo_dir, revision)` when the deployment configures `snapshots.root`: preview it, review the excluded secret-like files and warnings, then repeat it with `dry_run=false` and put its `request_fields.workdir` and `request_fields.code_revision` into the request. Identical content is published once and reused by later jobs. The snapshot directory is read-only, so the workload must write under `output_dir`. Use `include` for generated or untracked files the job needs. See [publish a code snapshot](shared-storage-access.md#publish-a-code-snapshot).
+
 A transfer copies directory contents and does not delete extra destination files. It can replace same-named files, so the preview is part of the safety check. Without a storage backend, planning still does not verify remote file existence or permissions; make the workload validate required inputs and write an observable result. See [shared storage access](shared-storage-access.md) for SSH authentication, exclusions, and transfer behavior.
 
 ## Check capacity and avoid accidental queues
@@ -83,7 +85,9 @@ Create a request with a meaningful `name` and `description`, the selected `kind`
 }
 ```
 
-Call `compute_plan(request)` and inspect the resolved kind, image, pool, mounts, working directory, output directory, resource fields, and advisories. Planning validates and renders locally; it does not prove that remote files, permissions, credentials, or live capacity are valid.
+Call `compute_plan(request)` and inspect the resolved kind, image, pool, mounts, working directory, output directory, resource fields, advisories, and `path_checks`. `path_checks` reports whether each bind mount, the working directory, an experiment's checkpoint directory, and the output directory exist when the MCP server can see them; `unverified` means it cannot see that path, not that the path is missing. A missing required path fails with `path_not_found` and names it in `details.missing_paths`. An experiment checkpoint directory is bind-mounted before the entrypoint runs, so when it does not exist yet, add `"create_directories": ["checkpoint_storage"]` (and `"output_dir"` if wanted); launch then creates it before submitting. Planning does not prove that permissions, credentials, or live capacity are valid.
+
+When the workload needs a particular GPU model, driver, count, or free-memory floor, add `gpu_admission`, for example `{"names": ["APPROVED_GPU_NAME*"], "min_free_mib": 16384}`, with values from the project or administrator. The task then checks its visible GPUs before the workload starts. See [GPU admission](compute-service.md#gpu-admission).
 
 Generate one stable, caller-controlled `request_id`, then call `compute_launch(request, request_id)`. Preserve the returned local `task_id` and remote ID in the work record. Repeating an identical request with the same request ID is idempotent; reusing it for different content is rejected.
 
@@ -94,6 +98,8 @@ If the launch result is uncertain, do not create a new request ID or submit agai
 Call `compute_status(task_id)` until the task reaches a terminal state, and use `compute_logs(task_id, tail)` to inspect progress and the final messages. Cancel a running task with `compute_cancel(task_id)` when the user no longer needs it.
 
 Call `compute_usage(task_id)` when you need to know how much CPU, memory, and GPU a running job uses, for example to spot near-zero GPU utilization or an idle allocation before proposing a resize, cancellation, or relaunch; for an ended task it reports the window before the task ended. It is read-only and requires the master's task-resources integration; `task_resources_disabled` or `task_resources_unsupported` means measurements are unavailable, not that the task is idle. Inspect `warnings` first. A null or missing value means no measurement, never zero, and an empty `series` list means no data for the window. Values are point samples taken every `step` seconds, and GPU metrics cover the whole assigned device, which can include other processes. An experiment reports its latest trial unless `trial_id` is given. `gpus` compares each allocation's GPUs even when `metrics` hides their series: a large `utilization_spread_percent`, a low mean on `least_utilized_gpu_uuid`, or a high `idle_fraction` points to idle or straggling GPUs, and a `gpu_count` below `requested_slots` means fewer GPUs returned a series than the allocation holds, not necessarily that the rest are unused. For an experiment, `trial.batches_per_second_lower_bound` is a lifetime floor, because its wall-clock denominator can also count image pull, startup, initialization, and allocations lost to restarts (not scheduler queue time or gaps between allocations); a `total_batches_processed` of 0 is expected when the workload does not report through Determined's Core API. Report what you observe; changing slots or pools remains an explicit workload decision. See [task usage measurements](compute-service.md#task-usage-measurements).
+
+With `gpu_admission`, the logs contain one `determined-compute gpu_admission: passed|failed ...` line and `output_dir` contains the JSON receipt and its `.jsonl` history. Exit code 86 means the GPU policy failed and the workload never started; report the receipt's `failures` and do not change the policy or pool without an explicit decision. In an experiment, each failed admission consumes a restart.
 
 A successful submission or a terminal state alone is not acceptance. Check the process exit information and the success criteria defined at the start. When storage access is configured, verify expected shared artifacts with `storage_check`; otherwise use workload output or another explicit task-level check. When a local copy is needed, configure storage access, preview `storage_fetch(shared_dir, local_dir, dry_run=true)`, review it, then execute with `dry_run=false` and inspect the fetched result.
 
@@ -121,6 +127,8 @@ Four values participate in task identity and access:
 | `owner` | Namespace within that database; it is not authentication |
 | Determined account | API identity and remote authorization selected by credentials |
 | Cluster identity | Actual remote cluster used to prevent cross-cluster task confusion |
+
+A submitted record is also bound to the compute profile and endpoint that submitted it. Status, logs, and usage stay available read-only from another profile on the same endpoint and cluster label: the service first verifies the task's owner and submission marker, and the result's `binding.mode` is `cross_profile` with `mutations_allowed: false`. Cancellation, reconciliation, and launch retries still require the original profile and return `binding_mismatch` otherwise; use that profile to cancel. `compute_list_tasks` shows each record's offline `binding`.
 
 Sessions share local records only when they use the same database and owner. Separate databases can adopt the same remote task independently. Keep the database on local durable disk rather than shared NFS. Sharing an owner does not share credentials, and changing credentials does not rename the owner namespace.
 

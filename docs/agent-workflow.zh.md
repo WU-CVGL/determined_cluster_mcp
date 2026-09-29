@@ -62,6 +62,8 @@ MCP 不接受 `kind: notebook`。
 4. 仅当预览正确时，以 `dry_run=false` 调用完全相同的操作。
 5. 对准备好的工作目录和所需输入再次调用 `storage_check`。
 
+对于运行已提交代码的持久任务，如果部署配置了 `snapshots.root`，优先使用 `storage_snapshot(repo_dir, revision)`：先预览，检查被排除的类似机密的文件和警告，再以 `dry_run=false` 重复调用，并把结果中的 `request_fields.workdir` 和 `request_fields.code_revision` 写入请求。相同内容只发布一次，之后的任务直接复用。快照目录是只读的，因此工作负载必须写入 `output_dir`。任务需要的生成文件或未跟踪文件可用 `include` 添加。参见[发布代码快照](shared-storage-access.zh.md#publish-a-code-snapshot)。
+
 传输会复制目录内容，不会删除目标中多余的文件；但可能覆盖同名文件，因此预览是安全检查的一部分。没有存储后端时，规划仍不会验证远端文件是否存在或权限是否有效；应让任务自身验证所需输入并写出可观察的结果。SSH 认证、排除规则和传输行为见[共享存储访问](shared-storage-access.zh.md)。
 
 <a id="check-capacity-and-avoid-accidental-queues"></a>
@@ -90,7 +92,9 @@ MCP 不接受 `kind: notebook`。
 }
 ```
 
-调用 `compute_plan(request)`，检查解析后的任务类型、镜像、资源池、挂载、工作目录、输出目录、资源字段和提示信息。规划只在本地验证并渲染配置，不能证明远端文件、权限、凭据或实时容量有效。
+调用 `compute_plan(request)`，检查解析后的任务类型、镜像、资源池、挂载、工作目录、输出目录、资源字段、提示信息和 `path_checks`。当 MCP server 能看到相应路径时，`path_checks` 报告每个 bind mount、工作目录、experiment 检查点目录和输出目录是否存在；`unverified` 表示看不到该路径，而不表示路径不存在。缺少必需路径时返回 `path_not_found`，并在 `details.missing_paths` 中列出。experiment 的检查点目录会在入口运行前被 bind mount，因此它尚不存在时，请添加 `"create_directories": ["checkpoint_storage"]`（需要时再加 `"output_dir"`），launch 会在提交前创建它。规划不能证明权限、凭据或实时容量有效。
+
+工作负载需要特定 GPU 型号、驱动、数量或空闲显存下限时，添加 `gpu_admission`，例如 `{"names": ["APPROVED_GPU_NAME*"], "min_free_mib": 16384}`，其中的值应来自项目或管理员。任务随后会在工作负载启动前检查可见 GPU。参见 [GPU 准入](compute-service.zh.md#gpu-admission)。
 
 生成一个稳定且由调用方控制的 `request_id`，再调用 `compute_launch(request, request_id)`。在工作记录中保留返回的本地 `task_id` 和远端 ID。相同请求使用同一 request ID 重试是幂等的；将该 ID 用于不同内容会被拒绝。
 
@@ -102,6 +106,8 @@ MCP 不接受 `kind: notebook`。
 调用 `compute_status(task_id)`，直到任务进入终态；使用 `compute_logs(task_id, tail)` 检查进度和最后的消息。用户不再需要运行中的任务时，调用 `compute_cancel(task_id)`。
 
 需要了解运行中的任务实际使用了多少 CPU、内存和 GPU 时，例如在提议调整资源、取消或重新提交之前确认 GPU 利用率是否接近零或 allocation 是否空闲，调用 `compute_usage(task_id)`；对于已结束的任务，它报告任务结束前的窗口。该工具只读，并要求 master 启用任务资源集成；`task_resources_disabled` 或 `task_resources_unsupported` 表示无法取得测量值，而不是任务空闲。先检查 `warnings`。null 或缺失值表示没有测量，绝不表示零；空的 `series` 列表表示该窗口没有数据。数值是每 `step` 秒一次的点采样，GPU 指标覆盖整块分配到的设备，可能包含其他进程。除非指定 `trial_id`，experiment 报告其最新 trial。即使 `metrics` 隐藏了 GPU 序列，`gpus` 仍会比较每个 allocation 的各块 GPU：`utilization_spread_percent` 较大、`least_utilized_gpu_uuid` 的均值很低或 `idle_fraction` 较高，都提示存在空闲或掉队的 GPU；`gpu_count` 小于 `requested_slots` 表示返回了序列的 GPU 少于该 allocation 持有的槽位，并不一定表示其余 GPU 未被使用。对于 experiment，`trial.batches_per_second_lower_bound` 是整个生命周期的下界，因为作为分母的挂钟时间还可能计入镜像拉取、启动、初始化以及因重启损失的 allocation 时间（不含调度排队时间和 allocation 之间的暂停间隔）；工作负载不通过 Determined 的 Core API 报告时，`total_batches_processed` 为 0 属于预期。只报告观察结果；更改槽位数或资源池仍需明确的任务决策。参见[任务用量测量](compute-service.zh.md#task-usage-measurements)。
+
+使用 `gpu_admission` 时，日志中有一行 `determined-compute gpu_admission: passed|failed ...`，`output_dir` 中有 JSON 回执及其 `.jsonl` 历史。退出码 86 表示 GPU 策略未通过，工作负载从未启动；请报告回执中的 `failures`，未经明确决策不要更改策略或资源池。在 experiment 中，每次准入失败都会消耗一次重启。
 
 提交成功或进入终态本身不等于验收通过。检查进程退出信息和任务开始时定义的成功判据。已经配置存储访问时，使用 `storage_check` 验证预期共享产物；否则使用任务输出或另一项明确的任务内检查。需要本地副本时，先配置存储访问，再调用 `storage_fetch(shared_dir, local_dir, dry_run=true)` 预览，审核后以 `dry_run=false` 执行，并检查取回的结果。
 
@@ -131,6 +137,8 @@ Reconcile 的用途更窄：`compute_reconcile` 通过核对提交标记，修�
 | `owner` | 该数据库中的命名空间；它不是身份认证 |
 | Determined 账户 | 由凭据选择的 API 身份和远端权限 |
 | 集群身份 | 用于避免跨集群任务混淆的实际远端集群 |
+
+submitted 记录还绑定提交它的计算配置和端点。在同一端点和集群标签下，其他配置仍可只读地查询状态、日志和用量：服务会先验证任务所有者和提交标记，结果中的 `binding.mode` 为 `cross_profile`，`mutations_allowed` 为 `false`。取消、调和与 launch 重试仍要求原来的配置，否则返回 `binding_mismatch`；请使用该配置取消任务。`compute_list_tasks` 会显示每条记录的离线 `binding`。
 
 只有使用相同数据库和 owner 的会话才共享本地记录。不同数据库可以分别登记同一个远端任务。数据库应放在本地持久磁盘，不要放在共享 NFS 中。共享 owner 不等于共享凭据，更换凭据也不会重命名 owner 命名空间。
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import uuid
+from dataclasses import fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -41,6 +42,7 @@ CREATE TABLE IF NOT EXISTS compute_tasks (
 CREATE INDEX IF NOT EXISTS compute_tasks_owner_created
     ON compute_tasks(owner, created_at DESC, task_id DESC);
 """
+_RECORD_FIELDS = frozenset(field.name for field in fields(TaskRecord))
 
 
 class SQLiteTaskStore:
@@ -100,7 +102,8 @@ class SQLiteTaskStore:
 
     @staticmethod
     def _record(row: sqlite3.Row) -> TaskRecord:
-        value = dict(row)
+        # Ignore columns added by a newer release that shares this database.
+        value = {key: row[key] for key in row.keys() if key in _RECORD_FIELDS}
         if value.get("origin") == "adopted":
             if value.get("workdir") == "":
                 value["workdir"] = None

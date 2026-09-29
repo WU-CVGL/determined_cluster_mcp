@@ -13,7 +13,7 @@ import yaml
 
 from determined_compute.compute import ComputeError, ComputeProfile, ComputeService, SQLiteTaskStore
 from determined_compute.core.api_client import APIError as ClientAPIError
-from determined_compute.core.api_client import DeterminedAPIClient
+from determined_compute.core.api_client import DeterminedAPIClient, resolve_api_url
 
 
 DEFAULT_DB_PATH = Path("~/.local/state/determined-compute/tasks.sqlite3").expanduser()
@@ -30,24 +30,53 @@ def normalize_owner(value: str) -> str:
 
 
 class _LazyClient:
-    """Construct the API client only when a service operation needs it."""
+    """Construct the API client only when a service operation needs it.
 
-    def __init__(self, factory: Callable[[], DeterminedAPIClient]) -> None:
+    With an ``api_url`` resolver, the endpoint is read once without credentials and the
+    factory receives that same endpoint, so a binding checked before construction is the
+    binding the constructed client uses. Without a resolver the factory takes no arguments.
+    """
+
+    def __init__(
+        self,
+        factory: Callable[..., DeterminedAPIClient],
+        api_url: Optional[Callable[[], str]] = None,
+    ) -> None:
         import threading
 
         self._factory = factory
+        self._api_url = api_url
+        self._resolved_api_url: Optional[str] = None
         self._client: Optional[DeterminedAPIClient] = None
         self._lock = threading.Lock()
+
+    def _endpoint_locked(self) -> str:
+        if self._resolved_api_url is None:
+            self._resolved_api_url = self._api_url()
+        return self._resolved_api_url
 
     def _resolve_client(self) -> DeterminedAPIClient:
         if self._client is None:
             with self._lock:
                 if self._client is None:
-                    client = self._factory()
+                    if self._api_url is None:
+                        client = self._factory()
+                    else:
+                        try:
+                            client = self._factory(self._endpoint_locked())
+                        except BaseException:
+                            # Like a failed client, a failed endpoint is read again next time.
+                            self._resolved_api_url = None
+                            raise
                     self._client = client
         return self._client
 
     def __getattr__(self, name: str) -> Any:
+        # The endpoint identifies task bindings; resolving it needs no credentials.
+        if name == "api_url" and self._client is None and self._api_url is not None:
+            with self._lock:
+                if self._client is None:
+                    return self._endpoint_locked()
         return getattr(self._resolve_client(), name)
 
 
@@ -57,7 +86,14 @@ def _json_dump(value: Any) -> None:
 
 def safe_error_details(exc: BaseException) -> dict[str, Any]:
     details = getattr(exc, "details", None)
-    allowed = {"task_id", "resource_pool", "requested_slots", "available", "candidate_pools"}
+    allowed = {
+        "task_id",
+        "resource_pool",
+        "requested_slots",
+        "available",
+        "candidate_pools",
+        "missing_paths",
+    }
     result = {key: value for key, value in details.items() if key in allowed} if isinstance(details, dict) else {}
     if "task_id" not in result and getattr(exc, "task_id", None):
         result["task_id"] = str(exc.task_id)
@@ -99,13 +135,38 @@ def _load_request(args: argparse.Namespace) -> dict[str, Any]:
     return value
 
 
-def _client_factory(args: argparse.Namespace) -> DeterminedAPIClient:
+def _client_factory(
+    args: argparse.Namespace, api_url: Optional[str] = None
+) -> DeterminedAPIClient:
     return DeterminedAPIClient(
-        api_url=args.api_url,
+        api_url=api_url or args.api_url,
         api_token=args.api_token,
         secrets_path=Path(args.secrets_file) if args.secrets_file else None,
         verify_ssl=args.verify_ssl,
     )
+
+
+def _secrets_path(args: argparse.Namespace) -> Optional[Path]:
+    return Path(args.secrets_file) if args.secrets_file else None
+
+
+def _api_url_resolver(args: argparse.Namespace) -> Callable[[], str]:
+    return lambda: resolve_api_url(args.api_url, _secrets_path(args))
+
+
+def _path_inspector(args: argparse.Namespace, profile: ComputeProfile) -> Any:
+    """Build the launch-path inspector; a bad storage config leaves paths unverified."""
+    from determined_compute.storage import PathInspector, StorageAccessConfig, StorageService
+
+    try:
+        access_path = args.storage_config or os.environ.get("DETERMINED_COMPUTE_STORAGE")
+        access = (
+            StorageAccessConfig.from_file(access_path) if access_path else StorageAccessConfig()
+        )
+        secrets_path = Path(args.secrets_file).expanduser() if args.secrets_file else None
+        return PathInspector(StorageService(profile, access, secrets_path))
+    except (ComputeError, OSError, ValueError):
+        return PathInspector(None, unavailable_reason="storage_config_unavailable")
 
 
 def _resolve_runtime(args: argparse.Namespace) -> tuple[ComputeService, str]:
@@ -114,9 +175,15 @@ def _resolve_runtime(args: argparse.Namespace) -> tuple[ComputeService, str]:
         raise ValueError("--profile or DETERMINED_COMPUTE_PROFILE is required")
 
     profile = ComputeProfile.from_file(profile_path)
-    client = _LazyClient(lambda: _client_factory(args))
+    client = _LazyClient(
+        lambda api_url: _client_factory(args, api_url), _api_url_resolver(args)
+    )
+    paths = _path_inspector(args, profile) if args.command in {"plan", "launch"} else None
     if args.command == "plan":
-        return ComputeService(client, SQLiteTaskStore(":memory:"), profile), ""
+        return (
+            ComputeService(client, SQLiteTaskStore(":memory:"), profile, path_inspector=paths),
+            "",
+        )
 
     db_path = Path(args.db or os.environ.get("DETERMINED_COMPUTE_DB") or DEFAULT_DB_PATH)
     if db_path == Path(":memory:"):
@@ -129,7 +196,7 @@ def _resolve_runtime(args: argparse.Namespace) -> tuple[ComputeService, str]:
         db_path.expanduser().parent.mkdir(parents=True, exist_ok=True)
         db_path = db_path.expanduser()
     store = SQLiteTaskStore(db_path)
-    return ComputeService(client, store, profile), owner
+    return ComputeService(client, store, profile, path_inspector=paths), owner
 
 
 def _resolve_storage(args: argparse.Namespace) -> Any:
@@ -148,6 +215,15 @@ def _dispatch_storage(args: argparse.Namespace) -> Any:
     service = _resolve_storage(args)
     if args.command == "storage-check":
         return service.check(args.path)
+    if args.command == "snapshot":
+        return service.snapshot(
+            args.repo_dir,
+            args.revision,
+            args.include,
+            args.exclude,
+            dry_run=not args.execute,
+            verify=args.verify,
+        )
     if args.command == "storage-sync":
         return service.sync(args.local_dir, args.shared_dir, dry_run=not args.execute)
     return service.fetch(args.shared_dir, args.local_dir, dry_run=not args.execute)
@@ -197,6 +273,11 @@ def build_parser() -> argparse.ArgumentParser:
     logs = commands.add_parser("logs", help="Fetch the tail of one task's logs")
     logs.add_argument("task_id")
     logs.add_argument("--tail", type=int, default=200)
+    logs.add_argument(
+        "--with-binding",
+        action="store_true",
+        help="Return {task_id, binding, logs} instead of the bare log list",
+    )
 
     usage = commands.add_parser(
         "usage", help="Summarize one task's measured CPU, memory, and GPU use"
@@ -251,6 +332,30 @@ def build_parser() -> argparse.ArgumentParser:
     fetch.add_argument("shared_dir", help="Source directory in the container namespace")
     fetch.add_argument("local_dir")
     fetch.add_argument("--execute", action="store_true", help="Perform the transfer instead of previewing")
+    snapshot = commands.add_parser(
+        "snapshot",
+        help="Preview publishing a git revision as a content-addressed shared workdir",
+    )
+    snapshot.add_argument("repo_dir", help="Local git work tree (its top level)")
+    snapshot.add_argument(
+        "--revision", default="HEAD", help="Git revision to publish (default: HEAD)"
+    )
+    snapshot.add_argument(
+        "--include",
+        action="append",
+        metavar="PATH",
+        help="Also publish this working-tree file or directory (repeatable)",
+    )
+    snapshot.add_argument(
+        "--exclude",
+        action="append",
+        metavar="GLOB",
+        help="Leave out tracked paths matching this pattern (repeatable)",
+    )
+    snapshot.add_argument("--execute", action="store_true", help="Publish instead of previewing")
+    snapshot.add_argument(
+        "--verify", action="store_true", help="Hash reused objects and trees in full"
+    )
     return parser
 
 
@@ -264,6 +369,8 @@ def _dispatch(args: argparse.Namespace, service: ComputeService, owner: str) -> 
     if args.command == "logs":
         if args.tail < 1:
             raise ValueError("--tail must be at least 1")
+        if args.with_binding:
+            return service.logs(args.task_id, owner, args.tail, include_binding=True)
         return service.logs(args.task_id, owner, args.tail)
     if args.command == "usage":
         return service.usage(
@@ -291,7 +398,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             from determined_compute.compute.admission import ResourceInspector
             _json_dump(_success_payload(ResourceInspector(_client_factory(args)).resources(args.slots, args.pool)))
             return 0
-        if args.command in {"storage-check", "storage-sync", "storage-fetch"}:
+        if args.command in {"storage-check", "storage-sync", "storage-fetch", "snapshot"}:
             _json_dump(_success_payload(_dispatch_storage(args)))
             return 0
         service, owner = _resolve_runtime(args)

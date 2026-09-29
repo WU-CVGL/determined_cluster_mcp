@@ -13,7 +13,7 @@ Check that the client uses the virtual environment's absolute executable path an
 /absolute/path/to/determined_cluster_mcp/.venv/bin/determined-compute --profile /absolute/path/to/profile.yaml plan --request-file /absolute/path/to/request.json
 ```
 
-The server uses stdout for MCP protocol frames and writes startup errors to stderr. Inspect the MCP client's server log for the exact error. After changing the installation or upgrading the service, restart every MCP process that shares the database so all processes load the same tools and schema.
+The server uses stdout for MCP protocol frames and writes startup errors to stderr. Inspect the MCP client's server log for the exact error. After changing the installation or upgrading the service, restart every MCP process that shares the database so all processes load the same tools and schema. Profile and storage files reject unknown keys, so add a key introduced by an upgrade, such as `snapshots`, only after every process that reads the file runs the new release.
 
 Compute tasks do not need `--storage-config`. Storage tools automatically use a local shared path when it matches the configured `host_path`. For a custom local mapping or login-node SSH, copy `cfg/storage-access.example.yaml` to `.local/storage.yaml`, edit it, and add `--storage-config /absolute/path/to/.local/storage.yaml`.
 
@@ -59,7 +59,11 @@ An unknown issuer is addressed by the correct CA chain. An expired certificate o
 
 Check which namespace the argument requires. Task `workdir` and `output_dir`, `storage_check.path`, and the `shared_dir` side of transfers use container paths from the compute profile. `mounts[].host_path` is a cluster-agent path. `local_dir` is an absolute path on the machine running the MCP server.
 
-Planning validates configured path boundaries but does not query remote files or permissions. Use `storage_check` when the MCP server has configured local or SSH access. If the workload is already present on shared storage and no client-side inspection or transfer is needed, compute operations can proceed without a storage configuration.
+Planning validates configured path boundaries. The CLI and MCP server also report `path_checks` for the bind mounts, working directory, experiment checkpoint directory, and output directory; see [launch-path checks](compute-service.md#launch-path-checks). `path_not_found` means a required path is known to be missing or not a directory; `details.missing_paths` names it. Create it, correct the request, or, for an output or experiment checkpoint directory, add `create_directories`. A missing experiment checkpoint `host_path` otherwise makes the task fail before its container starts, because Determined bind-mounts it at startup.
+
+An `unverified` status never fails and means only that the client could not decide: `not_locally_visible` (the host root is not mounted on the MCP machine; add a `local_mounts` entry if it is mounted elsewhere), `ssh_only_access`, `permission_denied`, `timeout` (the filesystem did not answer within 10 seconds), or `storage_config_unavailable` (the storage configuration could not be loaded; run `storage_check` or fix the file). `create_directories` then needs a local view or SSH access; otherwise launch returns `configuration_required` before submitting. When the shared root itself is not writable but a subdirectory is, map that subdirectory with `local_mounts`.
+
+Use `storage_check` when the MCP server has configured local or SSH access. If the workload is already present on shared storage and no client-side inspection or transfer is needed, compute operations can proceed without a storage configuration.
 
 A `read_only: true` mount permits reads and fetches but rejects a working directory, output directory, checkpoint destination, or sync target beneath that mount. See [shared storage access](shared-storage-access.md) for local mappings, SSH host keys, authentication, and rsync requirements.
 
@@ -70,6 +74,10 @@ Use a login-node `Host` alias that can access the configured cluster-agent host 
 With `auth: openssh`, the service inherits an existing agent. The stdio MCP process must inherit a usable `SSH_AUTH_SOCK`; a GUI client started earlier may not have it. With password or keyring authentication, follow the credential placement rules in [shared storage access](shared-storage-access.md#authentication-choices).
 
 Always repeat the dry run after correcting SSH, path, or permission errors. Do not turn a failed preview into an executed transfer without reviewing the new resolved endpoints and itemized changes.
+
+## GPU admission failed (exit code 86)
+
+A task with `gpu_admission` exits with code 86 when its visible GPUs do not satisfy the policy; the workload did not start. The logs contain one `determined-compute gpu_admission: failed: ...` line, and `output_dir` contains the receipt (`gpu-admission.json` by default) with `devices` and `failures`, plus a `.jsonl` line for every attempt. Typical causes are a GPU count that differs from `count`, a GPU name or driver outside the allowed patterns, free memory below `min_free_mib` because another process holds the device, or an image without a working `nvidia-smi`. Report the receipt; changing the policy, pool, or slots is an explicit workload decision. In an experiment, each failed admission consumes a restart, so set `max_restarts: 0` to stop after the first failure. See [GPU admission](compute-service.md#gpu-admission).
 
 ## Capacity is unavailable or unknown
 
@@ -108,6 +116,10 @@ An empty `series` list means no data for the window, not an idle task: the task 
 ## Cancellation is rejected
 
 On the Determined fork 0.40.1 or later with basic authorization, only a task's Determined owner or an administrator can kill or cancel it. For a task owned by another account, `compute_cancel` returns HTTP 403 for a command or shell and HTTP 404 `experiment '<id>' not found` for an experiment. This usually follows a credential change: submitted records bind to the profile and endpoint, not the account, so the service still sends the request. Restore the owning account's credentials or ask an administrator to cancel the task. An adopted record reports `ownership_mismatch` before any cancellation request is sent.
+
+## A task reports binding_mismatch
+
+Submitted records bind to the compute profile and endpoint that launched them. When only the profile changed, `binding_mismatch` from `compute_cancel` or `compute_reconcile` says that read-only status, logs, and usage remain available; use the task's original profile to cancel or reconcile it. When the endpoint or `cluster_identity` label differs, every operation is refused, because the record may describe a task on another master. `compute_list_tasks` shows each record's offline `binding` (`profile`, `cross_profile`, `mismatch`, `unknown`, or `adopted`). A cross-profile read that returns `identity_mismatch` or `ownership_mismatch` found a remote task whose submission marker or owner does not match the record; do not treat it as the same task. See [cross-profile observation](compute-service.md#cross-profile-observation).
 
 ## A transfer is partial or different from the preview
 

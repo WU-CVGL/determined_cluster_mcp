@@ -26,5 +26,6 @@
       "host_path": "/workspace/REPLACE_WITH_USER/compute/runs/example/0123456789abcdef/checkpoints"
     }
   },
+  "create_directories": ["checkpoint_storage"],
   "allow_queue": false
 }

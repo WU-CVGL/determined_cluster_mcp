@@ -46,6 +46,21 @@ def _normalize_api_url(api_url: Optional[str]) -> str:
     return url.rstrip("/")
 
 
+def _api_url_from(api_url: Optional[str], secrets: Dict[str, str]) -> str:
+    secret_master = secrets.get("DET_MASTER") or secrets.get("DET_MASTER_ADDR") or secrets.get("DET_MASTER_HOST")
+    environment_master = (
+        os.environ.get("DET_MASTER")
+        or os.environ.get("DET_MASTER_ADDR")
+        or os.environ.get("DET_MASTER_HOST")
+    )
+    return _normalize_api_url(api_url or environment_master or secret_master)
+
+
+def resolve_api_url(api_url: Optional[str] = None, secrets_path: Optional[Path] = None) -> str:
+    """Return the master URL a client would use, without resolving credentials."""
+    return _api_url_from(api_url, load_secrets(secrets_path))
+
+
 def _bool_env(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     return default if raw is None else raw.lower() in {"1", "true", "yes", "y", "on"}
@@ -106,13 +121,7 @@ class DeterminedAPIClient:
 
     def __init__(self, api_url: Optional[str] = None, api_token: Optional[str] = None, secrets_path: Optional[Path] = None, verify_ssl: Optional[bool] = None) -> None:
         secrets = load_secrets(secrets_path)
-        secret_master = secrets.get("DET_MASTER") or secrets.get("DET_MASTER_ADDR") or secrets.get("DET_MASTER_HOST")
-        environment_master = (
-            os.environ.get("DET_MASTER")
-            or os.environ.get("DET_MASTER_ADDR")
-            or os.environ.get("DET_MASTER_HOST")
-        )
-        self.api_url = _normalize_api_url(api_url or environment_master or secret_master)
+        self.api_url = _api_url_from(api_url, secrets)
         self.verify_ssl = _bool_env("DET_VERIFY_SSL", False) if verify_ssl is None else verify_ssl
         self.api_token = self._resolve_token(api_token, secrets)
         self.headers: Dict[str, str] = {}

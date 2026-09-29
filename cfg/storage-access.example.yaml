@@ -16,3 +16,9 @@ ssh:
   auth: openssh
 # password: SSH_USERNAME and SSH_PASSWORD come from --secrets-file.
 # keyring: set auth: keyring, user, and keyring_service (requires the keyring extra).
+
+# Optional content-addressed code snapshots. Add this only after every process that
+# reads this file runs a release that supports it.
+# snapshots:
+#   root: /run/determined/workdir/home/compute/snapshots  # container path, writable mount
+#   link_mode: auto  # auto, reflink, hardlink, or copy

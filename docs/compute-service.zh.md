@@ -12,7 +12,7 @@
 
 ```mermaid
 flowchart LR
-    U[Any local stdio MCP client] --> M[14 base MCP tools]
+    U[Any local stdio MCP client] --> M[15 base MCP tools]
     M --> C[ComputeService]
     C --> D[(local SQLite database)]
     C --> A[Determined API]
@@ -31,9 +31,9 @@ owner 参数。多个进程可以在同一个数据库中使用不同 owner；�
 调和。其本地 `task_id` 在服务重启后保持稳定，与 Determined 的 `remote_id` 不同。SQLite
 数据库应放在持久的本地存储上；源码、数据、包、检查点、日志和输出应放在映射的共享存储上。
 
-咨询后端默认为 `none`。此模式注册 14 个基础工具，不导入咨询 worker，不要求安装 Codex，
+咨询后端默认为 `none`。此模式注册 15 个基础工具，不导入咨询 worker，不要求安装 Codex，
 也不要求存在仓库 skill 目录。启用 Codex 后端会增加 `compute_consult` 和 `workflow_status`，
-总计 16 个工具。咨询只提供建议，不能提交或取消任务。
+总计 17 个工具。咨询只提供建议，不能提交或取消任务。
 
 <a id="compute-profile"></a>
 ## 计算配置
@@ -66,7 +66,9 @@ shell_inactivity_seconds: 7200
 服务本身不强制 shell 空闲超时。
 
 `cluster_identity` 是可选的运维标签。服务把本地提交记录绑定到配置指纹、解析后的 Determined
-端点和这个标签。改变该绑定后，不能再对这些记录执行状态、日志、用量、取消或调和操作。
+端点和这个标签。取消、调和与 launch 重试要求该绑定完全一致。如果只有配置改变，而端点和标签
+仍然一致，服务在验证远端所有者和提交标记后，仍可只读地查询状态、日志和用量；参见
+[跨配置只读观察](#cross-profile-observation)。端点或标签改变后，这些记录的所有操作都会被拒绝。
 
 <a id="request-object-and-planning"></a>
 ## 请求对象与规划
@@ -88,27 +90,95 @@ shell_inactivity_seconds: 7200
 | `pool`、`image` | 字符串 | 可选的配置默认值覆盖 |
 | `code_revision` | 字符串或 null | 调用方提供的版本或内容标识 |
 | `experiment_config` | 对象 | 额外的实验配置；要求 experiment 模式 |
+| `create_directories` | 由 `output_dir`、`checkpoint_storage` 组成的数组 | launch 在提交前创建的目录；默认不创建。见[启动路径检查](#launch-path-checks) |
+| `gpu_admission` | 对象、`false` 或 null | 可选的容器内 GPU 检查，在工作负载之前运行；见 [GPU 准入](#gpu-admission) |
 
 服务拒绝未知字段以及上传/context 字段。在 auto 模式中，`interactive` 优先选择 `shell`，
 其次由 `overnight` 或 `experiment_config` 选择 `experiment`，其余请求选择 `command`。
 显式 `kind` 会保留，所以 overnight command 仍是 command，并收到一条提示。
 
-规划完全离线，不做认证、容量检查、项目创建或任务提交。它返回 `kind`、`name`、
-`description`、`allow_queue`、渲染后的 `config`、`code_revision` 和 `advisories`。省略
+规划不访问 Determined：不做认证、容量检查、项目创建或任务提交。它返回 `kind`、`name`、
+`description`、`allow_queue`、渲染后的 `config`、`code_revision` 和 `advisories`；请求使用
+`create_directories` 或 `gpu_admission` 时还返回同名字段，经由 CLI 和 MCP server 调用时还返回
+`path_checks`。省略
 `name` 时，服务会生成名称并添加提示。command 和 shell 把名称放在 description 第一行；
 experiment 使用原生 name 字段。顶层显示元数据会覆盖同名的 experiment 字段。
 
 command 和 experiment 的入口先创建 `output_dir`，再切换到 `workdir`，最后通过
 `/bin/bash -lc` 运行命令。command 和 shell 配置使用 `resources.slots`，experiment 使用
 `resources.slots_per_trial`。服务提供配置中的 bind mount，并管理 `COMPUTE_WORKDIR`、
-`COMPUTE_OUTPUT_DIR`、`COMPUTE_CODE_REVISION` 和私有提交标记；请求不能覆盖这些环境变量或
-bind mount。
+`COMPUTE_OUTPUT_DIR`、`COMPUTE_CODE_REVISION`、`COMPUTE_GPU_ADMISSION*` 策略变量和私有提交
+标记；请求不能覆盖这些环境变量或 bind mount。
 
 experiment 必须提供 `command` 或 `experiment_config.entrypoint`，但不能同时提供。显式
 `checkpoint_storage` 必须使用 `type: shared_fs`、可写的映射 `host_path`，且可选的
 `storage_path` 必须留在该 host path 内。服务拒绝旧的 `checkpoint_path` 和
 `tensorboard_path` 别名。若省略 checkpoint storage，Determined 使用集群默认配置，离线规划
 无法检查该默认值。
+
+<a id="launch-path-checks"></a>
+### 启动路径检查
+
+CLI 和 MCP server 通过存储配置为规划提供共享存储的只读视图。此时规划结果增加
+`path_checks`，按集群 agent 主机命名空间为每个启动路径给出一个条目：每个配置 bind mount
+（`bind_mounts[i].host_path`）、command 或 experiment 的 `workdir`、experiment 的
+`experiment_config.checkpoint_storage.host_path`，以及 `output_dir`。每个条目包含 `field`、
+`host_path`、`container_path`（检查点路径未配置容器路径时为 null）、`required`、`status` 和
+`reason`。入口会创建 `output_dir`，因此除非 `create_directories` 包含它，否则它不是必需路径。
+
+只有通过可信的本地视图才能判定路径：存储配置中的显式 `local_mounts` 条目，或在 `auto`、
+`local` 模式下本机存在的配置主机根路径。`status` 为 `present`、`missing`、`not_directory`、
+`unverified` 或 `will_create`。客户端无法判定的路径为 `unverified`，`reason` 说明原因：
+`not_locally_visible`、`ssh_only_access`、`permission_denied`、`timeout`，或在无法加载存储
+配置时为 `storage_config_unavailable`。所有探测共享 10 秒期限，因此停滞的网络挂载不会让规划
+挂起。报告路径缺失之前，服务会列出其父目录并再检查一次，以刷新网络文件系统缓存的“不存在”
+结果。`unverified` 路径永远不会导致失败。必需路径为 `missing` 或 `not_directory` 时，
+`compute_plan` 和 `compute_launch` 返回 `path_not_found`，`details.missing_paths` 列出其
+`field`、`host_path` 和 `status`。`path_checks` 只是观察结果：它从不改变 `config` 或
+`advisories`，也不属于幂等载荷。
+
+launch 在查找 `request_id` 之后、检查容量之前执行同样的检查，因此检查失败时不会写入任务记录，
+也不会提交任务。已存在的 `request_id` 会原样返回且不做检查，即使之后某个路径已被删除。检查
+之后、同样在容量检查之前，launch 构建 Determined API 客户端，因此登录或客户端配置错误也不会
+留下任务记录或已创建的目录，使用同一 `request_id` 重试仍可提交。
+
+`create_directories` 显式要求 launch 创建 `output_dir`、`checkpoint_storage`（即 experiment
+的 `checkpoint_storage.host_path`；Determined 在容器启动时 bind mount 该路径，所以它必须在入口
+运行前存在），或两者都创建。服务从不隐式创建目录，规划时也不创建，只报告 `will_create`。
+launch 在容量检查之后、认领任务记录之前，以默认 umask 连同父目录创建每个目录：有本地视图时
+通过本地视图创建，否则在已配置的 SSH 登录节点上执行 `mkdir -p`，两者都没有时返回
+`configuration_required`。新提交的结果增加 `prepared_directories`，即
+`{field, host_path, created}` 列表。服务从不删除任何内容。`checkpoint_storage` 要求带有
+`checkpoint_storage` 的 experiment。非空列表属于幂等载荷；省略或空列表不会改变以前的载荷。
+
+<a id="gpu-admission"></a>
+### GPU 准入
+
+`gpu_admission` 添加一个可选的预检，它在容器内运行，时机是入口切换到 `workdir` 之后、工作
+负载启动之前。它适用于 command 和至少有一个 slot 的单节点 experiment；shell 没有受管入口，
+因此拒绝此字段。`false` 或 null 表示禁用。对象接受：
+
+| 字段 | 含义 |
+| --- | --- |
+| `count` | 正整数；可见 GPU 的数量必须与之相等。默认为请求的 slot 数 |
+| `names` | 最多 8 个 `fnmatch` 风格模式，每个最多 128 个可打印字符且不含 `\|`；每块可见 GPU 的名称都必须匹配其中之一 |
+| `driver_versions` | 相同形式的驱动版本模式 |
+| `min_free_mib`、`min_total_mib` | 非负整数，对每块可见 GPU 检查 |
+| `receipt` | `output_dir` 下的回执文件名，必须以 `.json` 结尾；默认为 `gpu-admission.json` |
+
+规划结果增加规范化的 `gpu_admission` 对象，config 增加受管的 `COMPUTE_GPU_ADMISSION*` 变量，
+入口变为
+`mkdir -p OUTPUT && cd WORKDIR && /bin/bash -c '<script v1>' determined-compute-gpu-admission && COMMAND`。
+带版本号的脚本只需要 bash、coreutils 和 `nvidia-smi`；有 `timeout` 时会用它运行
+`nvidia-smi`。脚本以原子方式写入回执，把同一条 JSON 记录作为一行追加到回执的 `.jsonl` 历史中，
+使 experiment 重启后仍保留以前的尝试，打印一行 `determined-compute gpu_admission: passed|failed ...`，
+失败时以退出码 86 结束，使工作负载不会启动。缺少 `nvidia-smi` 或其运行失败都视为准入失败。
+回执记录 `schema_version`（`determined-compute-gpu-admission-v1`）、`status`、`observed_at`、
+`policy`、`devices`（序号、UUID、名称、驱动版本以及总显存和空闲显存 MiB）、`failures`、
+`cuda_visible_devices`、`nvidia_visible_devices`、`hostname`，以及已设置的 Determined task、
+allocation 和 trial ID；不记录其他环境变量值。在 experiment 中，一次准入失败会消耗一次重启；
+若希望失败一次即停止，请在 `experiment_config` 中设置 `max_restarts: 0`。不含此字段的请求渲染
+结果与以前完全相同。
 
 <a id="start-the-mcp-server"></a>
 ## 启动 MCP server
@@ -141,24 +211,25 @@ CLI 的默认数据库路径是 `~/.local/state/determined-compute/tasks.sqlite3
 <a id="mcp-api"></a>
 ## MCP API
 
-基础 server 提供 14 个工具。下文的 `owner` 始终指启动时绑定的命名空间，不是工具参数。
+基础 server 提供 15 个工具。下文的 `owner` 始终指启动时绑定的命名空间，不是工具参数。
 
 | 工具 | 参数 | 返回值与作用 |
 | --- | --- | --- |
 | `compute_plan` | `request` | 离线规范化的规划；不访问集群或修改数据库 |
 | `compute_launch` | `request`、`request_id` | 持久化任务记录；最多提交一次 |
-| `compute_status` | `task_id` | 本地任务记录、刷新后的远端状态，以及绑定后取得的远端实体 |
-| `compute_logs` | `task_id`，可选 `tail=200` | 最新远端日志按时间正序排列的列表 |
+| `compute_status` | `task_id` | 本地任务记录、刷新后的远端状态、绑定后取得的远端实体，以及 `binding` |
+| `compute_logs` | `task_id`，可选 `tail=200`、`include_binding=false` | 最新远端日志按时间正序排列的列表；`include_binding=true` 时返回 `{task_id, binding, logs}` |
 | `compute_usage` | `task_id`，可选 `window_seconds=3600`、`allocation_id`、`trial_id`、`metrics`、`include_samples=false` | 一个任务实测 CPU、内存和 GPU 用量的只读摘要 |
 | `compute_cancel` | `task_id` | 更新后的记录、远端取消响应与确认标志 |
 | `compute_reconcile` | `task_id`、`remote_id` | 仅在验证标记后绑定的记录 |
-| `compute_list_tasks` | 无 | 已绑定 owner 命名空间内的本地记录 |
+| `compute_list_tasks` | 无 | 已绑定 owner 命名空间内的本地记录，每条附带离线 `binding` |
 | `compute_discover` | `kind`，可选 `limit=50`、`offset=0` | 当前账户的一页远端任务；不修改本地状态 |
 | `compute_adopt` | `kind`、`remote_id` | 幂等注册的本地记录；不提交远端任务 |
 | `compute_resources` | 可选 `slots=1`、`pool` | 当前调度容量和候选资源池 |
 | `storage_check` | `path` | 映射容器路径的访问情况 |
 | `storage_sync` | `local_dir`、`shared_dir`，可选 `dry_run=true` | 预览或把本地目录内容复制到共享存储 |
 | `storage_fetch` | `shared_dir`、`local_dir`，可选 `dry_run=true` | 预览或把共享目录内容复制到本地 |
+| `storage_snapshot` | `repo_dir`，可选 `revision="HEAD"`、`include`、`exclude`、`dry_run=true`、`verify=false` | 预览或把一个 git 版本发布为只读、按内容寻址的共享工作目录 |
 
 只有启用咨询后端时才会出现 `compute_consult(question, request_id, context?)` 和
 `workflow_status(workflow_id)`。其配置、生命周期和限制见[咨询后端](consultation.zh.md)。
@@ -166,7 +237,7 @@ CLI 的默认数据库路径是 `~/.local/state/determined-compute/tasks.sqlite3
 <a id="plan-capacity-and-launch"></a>
 ### 规划、容量与提交
 
-先调用 `compute_plan`，检查解析后的路径、模式、镜像、资源池、slot 和提示。
+先调用 `compute_plan`，检查解析后的路径、模式、镜像、资源池、slot、提示和 `path_checks`。
 `compute_resources` 返回实时快照，不保留资源。正 slot 数检查可调度的 agent slot；零检查辅助
 容器容量。候选资源池只是建议，服务不会自动替换。
 
@@ -186,6 +257,15 @@ CLI 的默认数据库路径是 `~/.local/state/determined-compute/tasks.sqlite3
 `remote_id`、`remote_state`、显示元数据、路径、版本、集群/账户绑定字段、可选的固定
 `error_code` 和时间戳。内部请求 hash、配置 hash 和提交标记不会公开。服务不会在任务记录中
 保存完整请求、生成的配置、API 响应、日志或原始异常文本。
+
+`compute_status`、`compute_usage` 以及 `include_binding=true` 的 `compute_logs` 会报告
+`binding`：`mode`（`profile`、`cross_profile` 或 `adopted`）、`profile_matches`（adopted 任务
+为 null）、`cluster_identity_matches`、`verified`（本次调用执行的检查：`profile` 为空，带
+remote ID 的 `cross_profile` 为 `remote_owner` 和 `submission_marker`，`adopted` 为
+`remote_cluster` 和 `remote_owner`）、`mutations_allowed` 和 `message`。`compute_list_tasks`
+为每行附加离线 `binding`，不访问 Determined；其中 `mode` 还可能是 `mismatch`（端点或标签
+不同）或 `unknown`（无法解析客户端配置），adopted 记录的 `mutations_allowed` 为 null，因为
+它们的检查需要实时进行。
 
 未绑定 remote ID 时，`compute_status` 只返回本地状态，不访问 Determined；绑定后会取得远端
 实体、更新 `remote_state`，并在 `remote` 中包含清理后的实体。过期的 `pending` 或
@@ -364,8 +444,21 @@ submitted 记录会原样返回，不会被替换。
 该标记把调和与接管隔离开：有匹配标记的不确定本地提交必须调和，独立创建的远端任务才可以
 接管。缺少证据时应继续调查，不要再次提交同一工作。
 
-本地 submitted 任务始终绑定原始配置指纹和端点；adopted 任务始终绑定实际集群 ID 和已认证
-用户 ID。这些检查避免改变配置或账户后操作无关任务。
+<a id="cross-profile-observation"></a>
+### 跨配置只读观察
+
+本地 submitted 任务的所有变更操作始终绑定原始配置指纹和端点。取消、调和以及返回 submitted
+记录的接管都要求两者一致，否则在任何远端调用之前返回 `binding_mismatch`；配置改变后的 launch
+重试返回 `idempotency_conflict`。状态、日志和用量是只读操作，当记录保存的端点和标签与当前
+一致时，也接受以其他配置提交的记录。读取任务数据之前，服务会调用 `/me` 并取得实体，要求其
+`userId` 是当前已认证账户（否则返回 `ownership_mismatch`），其 ID 等于记录的 remote ID，且其
+提交标记等于记录的标记；对于没有显示元数据的旧记录，则要求 description 第一行等于该标记
+（否则返回 `identity_mismatch`）。即使 master 在同一地址重装后 ID 重复，该标记也能证明远端
+任务就是这条记录的提交。这样的读取多一次 `/me` 调用，日志和用量还多一次实体读取；配置完全
+一致时不增加调用。跨配置的状态查询只写入缓存的 `remote_state`；没有 remote ID 的记录按存储
+内容原样返回，不访问远端，也不执行过期提交的状态转换。取消或调和请使用任务原来的配置。端点或
+标签改变后，所有操作仍会被拒绝。adopted 任务始终绑定实际集群 ID 和已认证用户 ID。这些检查
+避免改变配置或账户后操作无关任务。
 
 <a id="errors"></a>
 ### 错误
@@ -377,7 +470,7 @@ MCP 失败使用 `isError: true`；其文本内容是如下形式的紧凑 JSON�
 ```
 
 `retryable` 和 `details` 仅在可用时出现，structured content 为 null。安全 details 可包含本地
-task ID 和容量信息。认证、权限、传输和响应结构错误都会返回错误，而不是空结果。错误消息和
+task ID、容量信息，以及 `path_not_found` 的 `missing_paths`。认证、权限、传输和响应结构错误都会返回错误，而不是空结果。错误消息和
 报告可以包含清理后的命令、路径、ID、状态和错误类别，但不能包含凭据或 secrets 文件内容。
 
 Determined 的 HTTP 失败（包括 gRPC-gateway 错误响应体）显示为 `<status> <message>`。HTTP 429
@@ -411,9 +504,18 @@ determined-compute status TASK_ID
 determined-compute logs TASK_ID
 determined-compute usage TASK_ID --window-seconds 7200 --metric gpu_utilization_percent
 
+determined-compute logs TASK_ID --with-binding
+
 determined-compute discover command --limit 20 --offset 0
 determined-compute adopt command REMOTE_ID
+
+determined-compute --storage-config .local/storage.yaml snapshot "$PWD" --revision HEAD
 ```
+
+`plan` 和 `launch` 读取 `--storage-config` 或 `DETERMINED_COMPUTE_STORAGE` 用于
+[启动路径检查](#launch-path-checks)；无法加载该文件时，它们把路径报告为 `unverified` 并继续。
+`logs --with-binding` 返回 `{task_id, binding, logs}` 包装结构。`snapshot` 默认只预览，加
+`--execute` 才发布；参见[共享存储访问](shared-storage-access.zh.md#publish-a-code-snapshot)。
 
 文件暂存与取回见[共享存储指南](shared-storage-access.zh.md)。围绕这些确定性调用的完整 agent
 流程见 [Agent 工作流](agent-workflow.zh.md)。

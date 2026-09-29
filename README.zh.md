@@ -62,9 +62,9 @@ DET_API_TOKEN=replace-with-your-token
 ## 文档
 
 - [Agent 工作流](docs/agent-workflow.zh.md)：准备、规划、提交、跟踪和验收任务
-- [计算服务参考](docs/compute-service.zh.md)：配置、请求、工具、用量测量、任务身份与恢复
-- [共享存储访问](docs/shared-storage-access.zh.md)：本地挂载、SSH、预览和传输
+- [计算服务参考](docs/compute-service.zh.md)：配置、请求、启动路径检查、GPU 准入、工具、用量测量、任务身份与恢复
+- [共享存储访问](docs/shared-storage-access.zh.md)：本地挂载、SSH、预览、传输和代码快照
 - [可选咨询](docs/consultation.zh.md)：服务端 Codex 后端与模型配置
-- [故障排查](docs/troubleshooting.zh.md)：启动、认证、TLS、路径、容量、提交状态不确定、用量测量和取消
+- [故障排查](docs/troubleshooting.zh.md)：启动、认证、TLS、路径、GPU 准入、容量、提交状态不确定、用量测量、取消和绑定不匹配
 
 JSON CLI 用法可运行 `determined-compute --help` 查看。

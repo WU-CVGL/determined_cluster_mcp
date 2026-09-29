@@ -181,6 +181,15 @@ class ComputeProfile:
         self.validate_writable_host_path(host_path, field)
         return path
 
+    def host_path_for(self, value: Any, field: str = "path") -> str:
+        """Translate a container path to the cluster-agent host path of its mount."""
+        path = self.validate_container_path(value, field)
+        mount = next(
+            mount for mount in self.mounts if _is_within(path, mount.container_path)
+        )
+        relative = posixpath.relpath(path, mount.container_path)
+        return mount.host_path if relative == "." else posixpath.join(mount.host_path, relative)
+
     def validate_host_path(self, value: Any, field: str) -> str:
         path = _absolute_clean_path(value, field)
         if not any(_is_within(path, mount.host_path) for mount in self.mounts):

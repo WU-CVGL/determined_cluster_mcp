@@ -9,7 +9,7 @@ import signal
 import subprocess
 import threading
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from determined_compute.compute.profile import ComputeProfile, SharedMount
 from determined_compute.compute.models import ValidationError
@@ -66,6 +66,8 @@ class StorageService:
                 )
         if config.mode == "ssh" and config.ssh is None:
             raise StorageError("ssh mode requires ssh configuration", code="invalid_storage_config")
+        if config.snapshots is not None:
+            self._snapshot_mount()
 
     def check(self, path: str) -> Dict[str, Any]:
         mount, host_path = self._translate(path, "path")
@@ -207,6 +209,107 @@ class StorageService:
             excludes=(),
             preserve_permissions=self.config.preserve_permissions,
         )
+
+    def snapshot(
+        self,
+        repo_dir: str,
+        revision: str = "HEAD",
+        include: Optional[Sequence[str]] = None,
+        exclude: Optional[Sequence[str]] = None,
+        dry_run: bool = True,
+        verify: bool = False,
+    ) -> Dict[str, Any]:
+        """Publish an exact git revision as a read-only, content-addressed workdir."""
+        from .snapshot import create_snapshot
+
+        return create_snapshot(self, repo_dir, revision, include, exclude, dry_run, verify)
+
+    def _snapshot_mount(self) -> Tuple[str, SharedMount, str]:
+        """Validate the configured snapshot root against the compute profile."""
+        snapshots = self.config.snapshots
+        if snapshots is None:
+            raise StorageError(
+                "snapshots.root is not configured in the storage access configuration",
+                code="configuration_required",
+            )
+        try:
+            container_root = self.profile.validate_writable_container_path(
+                snapshots.root, "snapshots.root"
+            )
+        except (ValidationError, ValueError) as exc:
+            raise StorageError(str(exc), code="invalid_storage_config") from exc
+        mount, host_path = self._translate(container_root, "snapshots.root")
+        if host_path == mount.host_path:
+            raise StorageError(
+                "snapshots.root must be a subdirectory, not a shared mount root",
+                code="invalid_storage_config",
+            )
+        return container_root, mount, host_path
+
+    def _host_mount(self, host_path: str) -> Optional[SharedMount]:
+        """Return the most specific profile mount containing a host path."""
+        matches = [mount for mount in self.profile.mounts if _within(host_path, mount.host_path)]
+        return max(matches, key=lambda mount: len(mount.host_path)) if matches else None
+
+    def ensure_directories(self, entries: Sequence[Mapping[str, str]]) -> List[Dict[str, Any]]:
+        """Create each host directory (with parents) through a local view or SSH; never delete."""
+        results = []
+        for entry in entries:
+            field, host_path = entry["field"], entry["host_path"]
+            try:
+                host_path = self.profile.validate_writable_host_path(host_path, field)
+            except (ValidationError, ValueError) as exc:
+                raise StorageError(str(exc), code="read_only_storage") from exc
+            mount = self._host_mount(host_path)
+            assert mount is not None
+            if host_path == mount.host_path:
+                raise StorageError(
+                    f"{field} is a shared mount root and cannot be created",
+                    code="invalid_storage_path",
+                )
+            backend, local = self._select_backend(host_path, mount, write=True)
+            if backend == "local":
+                assert local is not None
+                target, root = self._safe_mapped_path(local, host_path)
+                existed = target.is_dir()
+                try:
+                    self._mkdir_beneath_root(target, root)
+                except OSError as exc:
+                    raise StorageError(
+                        f"cannot create {field} directory: {exc.strerror or exc}",
+                        code="storage_operation_failed",
+                    ) from exc
+                created = not existed
+            else:
+                created = self._ssh_mkdir(host_path)
+            results.append({"field": field, "host_path": host_path, "created": created})
+        return results
+
+    def _ssh_mkdir(self, host_path: str) -> bool:
+        ssh = self._require_ssh()
+        from determined_compute.storage.auth import ssh_auth
+
+        script = 'if [ -d "$1" ]; then echo existed; else mkdir -p -- "$1" && echo created; fi'
+        remote_command = "sh -c " + shlex.quote(script) + " sh " + shlex.quote(host_path)
+        with ssh_auth(ssh, self.secrets_path) as (env_overrides, auth_options):
+            argv = [
+                "ssh",
+                *auth_options,
+                "-o",
+                f"ConnectTimeout={self.config.connect_timeout_seconds}",
+                ssh.host,
+                remote_command,
+            ]
+            result = self._run(
+                argv, timeout=self.config.timeout_seconds, env_overrides=env_overrides
+            )
+        outcome = result["output"].strip().splitlines()[-1:] or [""]
+        if outcome[0] not in {"created", "existed"}:
+            raise StorageError(
+                "SSH directory creation returned an invalid response",
+                code="storage_operation_failed",
+            )
+        return outcome[0] == "created"
 
     def _translate(self, value: Any, field: str) -> Tuple[SharedMount, str]:
         if not isinstance(value, str) or ".." in PurePosixPath(value).parts:
