@@ -40,8 +40,15 @@ from determined_compute.utils.secrets import default_secrets_path
 PathLike = Union[str, "os.PathLike[str]"]
 
 # harness/determined/common/constants.py: the smaller of the HTTP and WebSocket limits (128 MiB),
-# less base64 overhead, less 1 MiB for the message envelope.
+# less base64 overhead, less 1 MiB for the message envelope. The harness counts only content.
 MAX_CONTEXT_SIZE = (128 * 1024 * 1024 // 8) * 6 - 1024 * 1024
+# master/internal/grpcutil/api.go: the master's gRPC server takes messages of at most 96 MiB,
+# and the create request (CreateExperimentRequest, LaunchCommandRequest) is one message that
+# holds every file record, paths and fields included, besides the config and a few scalars.
+# The files may use all of it but REQUEST_ALLOWANCE, which the rest of the request must fit.
+MAX_REQUEST_SIZE = 96 * 1024 * 1024
+REQUEST_ALLOWANCE = 1024 * 1024
+MAX_REQUEST_FILES_SIZE = MAX_REQUEST_SIZE - REQUEST_ALLOWANCE
 GIT_TIMEOUT_SECONDS = 120
 PROVENANCE_PATH = ".code-provenance.json"
 # Any fixed mtime makes payloads reproducible. This is the master's own archive default
@@ -155,7 +162,7 @@ class ContextCode:
     files: Tuple[Dict[str, Any], ...]
     manifest: Tuple[Dict[str, str], ...]
     content_digest: str
-    size: int  # as the harness counts it
+    size: int  # the file list as the harness counts it
     included: Tuple[str, ...]
     excluded: Tuple[Dict[str, str], ...]
     skipped: Tuple[Dict[str, str], ...]
@@ -706,29 +713,109 @@ def _matches_pointer(local: Path, oid: str, size: int) -> bool:
 # Context size
 
 
+_SIZE_HINT = "use code.source git, or keep large files on shared storage and read them from there"
+
+
 def harness_size(size: int) -> int:
-    """Bytes the harness counts for a file of ``size`` bytes: ``len(base64) // 4 * 3``."""
+    """Bytes the harness counts for content of ``size`` bytes: ``len(base64) // 4 * 3``."""
     return (size + 2) // 3 * 3
 
 
+def harness_payload_size(files: Iterable[Mapping[str, Any]]) -> int:
+    """Bytes the harness counts for a file list, as v1file_utils.v1File_size does.
+
+    Every record with content counts, a symlink's target included; a directory has none.
+    """
+    return sum(len(item["content"]) // 4 * 3 for item in files if item["content"])
+
+
+def _too_large(total: int, limit: int, sizes: Mapping[str, int]) -> CodeError:
+    largest = sorted(sizes.items(), key=lambda item: (-item[1], item[0]))[:10]
+    return CodeError(
+        f"the context counts {total:,} bytes, over the harness limit of {limit:,}",
+        code="context_too_large",
+        details={
+            "reason": "content_size",
+            "total": total,
+            "limit": limit,
+            "largest": [{"path": path, "bytes": size} for path, size in largest],
+            "hint": _SIZE_HINT,
+        },
+    )
+
+
 def check_context_size(sizes: Mapping[str, int], limit: int = MAX_CONTEXT_SIZE) -> int:
-    """Return the harness's count for regular files of these sizes, or raise above ``limit``.
+    """Return the harness's count for contents of these sizes, or raise above ``limit``.
 
     The harness rejects a context whose counted total is strictly greater than its limit
-    (harness/determined/common/context.py); directories and symlinks count nothing.
+    (harness/determined/common/context.py). ``sizes`` holds every record with content: files
+    and symlink targets.
     """
     total = sum(harness_size(size) for size in sizes.values())
     if total > limit:
-        largest = sorted(sizes.items(), key=lambda item: (-item[1], item[0]))[:10]
+        raise _too_large(total, limit, sizes)
+    return total
+
+
+def _varint_size(value: int) -> int:
+    """Bytes of a protobuf varint; a negative int32 or int64 is sign-extended to ten."""
+    if value < 0:
+        return 10
+    size = 1
+    while value >= 0x80:
+        value >>= 7
+        size += 1
+    return size
+
+
+def _decoded_length(encoded: str) -> int:
+    """The length of padded base64 content once decoded, without decoding or copying it."""
+    tail = encoded[-2:]
+    return len(encoded) // 4 * 3 - (len(tail) - len(tail.rstrip("=")))
+
+
+def request_size(files: Iterable[Mapping[str, Any]]) -> int:
+    """Bytes the files take in the create request, encoded as utilv1.File records.
+
+    util.proto numbers the fields path = 1, type = 2, content = 3 (the decoded bytes), mtime =
+    4, mode = 5, uid = 6 and gid = 7, so each present field costs a one-byte tag, and proto3
+    leaves out one that holds its default, 0 or empty. The repeated field that carries the
+    records (model_definition = 1, files = 3) adds a one-byte tag and a length to each.
+    """
+    total = 0
+    for item in files:
+        record = 0
+        for length in (len(item["path"].encode("utf-8")), _decoded_length(item["content"])):
+            if length:
+                record += 1 + _varint_size(length) + length
+        for value in (item["type"], int(item["mtime"]), item["mode"], item["uid"], item["gid"]):
+            if value:
+                record += 1 + _varint_size(value)
+        total += 1 + _varint_size(record) + record
+    return total
+
+
+def check_request_size(
+    files: Sequence[Mapping[str, Any]], limit: int = MAX_REQUEST_FILES_SIZE
+) -> int:
+    """Return the files' share of the create request, or raise above ``limit``.
+
+    The master fails a larger request opaquely. Paths and per-record fields count here, so
+    many small files can exceed it while their content fits the harness limit.
+    """
+    total = request_size(files)
+    if total > limit:
         raise CodeError(
-            f"the context counts {total:,} bytes, over the harness limit of {limit:,}",
+            f"the context's {len(files):,} file records take {total:,} bytes of the create "
+            f"request, over the {limit:,} left for them within the master's message limit",
             code="context_too_large",
             details={
+                "reason": "request_size",
                 "total": total,
                 "limit": limit,
-                "largest": [{"path": path, "bytes": size} for path, size in largest],
-                "hint": "use code.source git, or keep large files on shared storage and read "
-                "them from there",
+                "files": len(files),
+                "hint": "use code.source git, or pack many small files into fewer, larger "
+                "ones, or keep them on shared storage and read them from there",
             },
         )
     return total
@@ -1044,7 +1131,7 @@ class _Context:
             if dropped is not None:
                 self.exclude(path, *dropped)
             elif mode == "120000":
-                self.entries[path] = _Entry(SYMTYPE, oid=oid)
+                self.entries[path] = _Entry(SYMTYPE, size=size or 0, oid=oid)
             elif mode in {"100644", "100755"}:
                 self.entries[path] = _Entry(
                     REGTYPE, executable=mode == "100755", size=size or 0, oid=oid
@@ -1114,8 +1201,14 @@ class _Context:
             dirnames[:] = kept
 
     def _add_local(self, relative: str, local: Path, info: os.stat_result) -> None:
+        counted = relative != PROVENANCE_PATH and relative not in self.included
         if stat.S_ISLNK(info.st_mode):
-            entry = _Entry(SYMTYPE, target=os.readlink(local))
+            target = os.readlink(local)
+            # The payload carries the target as content, which the harness counts.
+            size = len(target.encode("utf-8", "surrogateescape"))
+            if counted:
+                self._count(harness_size(size))
+            entry = _Entry(SYMTYPE, size=size, target=target)
         elif (info.st_dev, info.st_ino) == self.secrets_identity:
             # Another name for the configured secrets file: a hard link, or a case variant
             # on a case-insensitive filesystem. A tracked copy at this path goes too.
@@ -1125,7 +1218,7 @@ class _Context:
             self.exclude(relative, "secret", "configured secrets file")
             return
         else:
-            if relative != PROVENANCE_PATH and relative not in self.included:
+            if counted:
                 self._count(harness_size(info.st_size))
             entry = _Entry(
                 REGTYPE,
@@ -1147,10 +1240,10 @@ class _Context:
                 f"the included working-tree files alone count over {self.limit:,} bytes",
                 code="context_too_large",
                 details={
+                    "reason": "content_size",
                     "total": self.local_total,
                     "limit": self.limit,
-                    "hint": "use code.source git, or keep large files on shared storage and "
-                    "read them from there",
+                    "hint": _SIZE_HINT,
                 },
             )
 
@@ -1163,13 +1256,15 @@ def plan_context(
     *,
     secrets_file: Optional[PathLike] = None,
     limit: int = MAX_CONTEXT_SIZE,
+    request_limit: int = MAX_REQUEST_FILES_SIZE,
     workdir: Optional[str] = None,
 ) -> ContextCode:
     """Build a ``context`` source: tracked files at ``revision`` plus working-tree includes.
 
     Every path a rule drops is listed in ``excluded``. The payload is deterministic: an
-    unchanged tree yields identical file entries and the same ``content_digest``. A
-    ``workdir`` must be a directory of the context.
+    unchanged tree yields identical file entries and the same ``content_digest``. The file
+    list must fit both the harness's content ``limit`` and ``request_limit``, the files' share
+    of the create request. A ``workdir`` must be a directory of the context.
     """
     revision = _revision(revision)
     workdir = _workdir(workdir)
@@ -1223,9 +1318,9 @@ def plan_context(
         json.dumps(provenance, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
     ).encode("utf-8")
 
-    # Fail on size before any content is read, then again on the bytes actually read, in case a
-    # working-tree file grew in between.
-    sizes = {path: entry.size for path, entry in entries.items() if entry.type == REGTYPE}
+    # Fail on size before any content is read, then on the final file list exactly as the
+    # harness counts it.
+    sizes = {path: entry.size for path, entry in entries.items()}
     sizes[PROVENANCE_PATH] = len(provenance_bytes)
     check_context_size(sizes, limit)
     contents = _read_contents(root, entries)
@@ -1241,7 +1336,6 @@ def plan_context(
         }
         _check_workdir(workdir, kinds, targets, "the context")
     contents[PROVENANCE_PATH] = provenance_bytes
-    size = check_context_size({path: len(contents[path]) for path in sizes}, limit)
 
     files: List[Dict[str, Any]] = []
     manifest: List[Dict[str, str]] = []
@@ -1275,8 +1369,16 @@ def plan_context(
                 "sha256": hashlib.sha256(data).hexdigest(),
             }
         )
+    size = harness_payload_size(files)
+    if size > limit:
+        raise _too_large(size, limit, {path: len(data) for path, data in contents.items()})
+    check_request_size(files, request_limit)
     canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    pointers = [path for path in sizes if _lfs_pointer(contents[path]) is not None]
+    pointers = [
+        path
+        for path, entry in entries.items()
+        if entry.type == REGTYPE and _lfs_pointer(contents[path]) is not None
+    ]
     return ContextCode(
         repo=str(root),
         commit=commit,

@@ -543,9 +543,7 @@ def test_context_payload_mirrors_the_harness_file_list(repo):
     )
     canonical = json.dumps(list(result.manifest), sort_keys=True, separators=(",", ":"))
     assert result.content_digest == hashlib.sha256(canonical.encode()).hexdigest()
-    assert result.size == sum(
-        harness_size(len(decoded(item))) for item in result.files if item["type"] == ord("0")
-    )
+    assert result.size == sum(len(f["content"]) // 4 * 3 for f in result.files if f["content"])
 
 
 def test_context_payload_extracts_as_the_tree(repo, tmp_path):
@@ -727,6 +725,148 @@ def test_context_size_counts_like_the_harness_at_its_limit():
     assert "git" in error.details["hint"]
     assert check_context_size({"a": 1, "b": 1, "c": 1}) == 9
     assert [harness_size(size) for size in range(5)] == [0, 3, 3, 3, 6]
+
+
+def test_context_size_counts_every_record_with_content_as_the_harness_does(repo):
+    # The fixture's scripts/train-link.py is a relative in-tree symlink.
+    result = plan_context(repo)
+    files = result.files
+    regular = sum(len(f["content"]) // 4 * 3 for f in files if f["type"] == ord("0"))
+
+    assert result.size == sum(len(f["content"]) // 4 * 3 for f in files if f["content"])
+    assert result.size == regular + harness_size(len(b"../train.py"))
+    # Exactly at the limit passes; the files alone, without the link's target, do not.
+    assert plan_context(repo, limit=result.size).size == result.size
+    error = raises("context_too_large", plan_context, repo, limit=result.size - 1)
+    assert error.details["reason"] == "content_size"
+    assert error.details["total"] == result.size
+    raises("context_too_large", plan_context, repo, limit=regular)
+
+
+def test_working_tree_symlinks_count_toward_the_early_limit(repo):
+    for index in range(4):
+        os.symlink("../train.py", repo / "scripts" / f"link-{index}.py")
+    once = plan_context(repo, include=["scripts"])
+
+    assert once.size == sum(len(f["content"]) // 4 * 3 for f in once.files if f["content"])
+    # The walk stops at the second link: 12 + 12 counted bytes are over 20.
+    error = raises("context_too_large", plan_context, repo, include=["scripts"], limit=20)
+    assert error.details == {**error.details, "reason": "content_size", "total": 24}
+
+
+def test_many_small_files_fit_the_content_limit_but_not_the_request(repo):
+    for index in range(300):
+        write(repo / "many" / f"{index:03}.txt", "x")
+    result = plan_context(repo, include=["many"])
+    request = code.request_size(result.files)
+
+    # A one-byte file counts 3 bytes to the harness and over 20 in the request.
+    assert request > result.size + 300 * 20
+    exact = plan_context(repo, include=["many"], limit=result.size, request_limit=request)
+    assert (exact.size, code.request_size(exact.files)) == (result.size, request)
+    error = raises(
+        "context_too_large",
+        plan_context,
+        repo,
+        include=["many"],
+        limit=result.size,
+        request_limit=request - 1,
+    )
+    assert error.details == {
+        **error.details,
+        "reason": "request_size",
+        "total": request,
+        "limit": request - 1,
+        "files": len(result.files),
+    }
+
+
+def test_the_request_limit_applies_at_the_master_message_size():
+    assert code.MAX_REQUEST_FILES_SIZE == 96 * 1024 * 1024 - 1024 * 1024
+    item = {
+        "path": "d/" + "p" * 998,
+        "type": ord("0"),
+        "content": "eA==",
+        "mtime": "1501632000",
+        "mode": 0o644,
+        "uid": 0,
+        "gid": 0,
+    }
+    # 1 + 2 + 1000 path, 2 type, 1 + 1 + 1 content, 1 + 5 mtime, 1 + 2 mode, 1 + 2 embedding.
+    record = code.request_size([item])
+    assert record == 1020
+    files = [item] * (code.MAX_REQUEST_FILES_SIZE // record + 1)
+
+    assert code.harness_payload_size(files) < MAX_CONTEXT_SIZE // 100
+    error = raises("context_too_large", code.check_request_size, files)
+    assert error.details["reason"] == "request_size"
+    assert code.check_request_size(files[:-1]) == record * (len(files) - 1)
+
+
+def test_request_size_is_the_protobuf_encoding(repo):
+    pytest.importorskip("google.protobuf")
+    from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
+
+    # utilv1.File as util.proto defines it, and the two create requests that carry it.
+    proto = descriptor_pb2.FileDescriptorProto(
+        name="compute_test_util.proto", package="compute_test", syntax="proto3"
+    )
+    fields = descriptor_pb2.FieldDescriptorProto
+    record = proto.message_type.add(name="File")
+    for number, (name, kind) in enumerate(
+        [
+            ("path", fields.TYPE_STRING),
+            ("type", fields.TYPE_INT32),
+            ("content", fields.TYPE_BYTES),
+            ("mtime", fields.TYPE_INT64),
+            ("mode", fields.TYPE_INT32),
+            ("uid", fields.TYPE_INT32),
+            ("gid", fields.TYPE_INT32),
+        ],
+        start=1,
+    ):
+        record.field.add(name=name, number=number, type=kind, label=fields.LABEL_OPTIONAL)
+    for request, name, number in (
+        ("CreateExperimentRequest", "model_definition", 1),
+        ("LaunchCommandRequest", "files", 3),
+    ):
+        proto.message_type.add(name=request).field.add(
+            name=name,
+            number=number,
+            type=fields.TYPE_MESSAGE,
+            label=fields.LABEL_REPEATED,
+            type_name=".compute_test.File",
+        )
+    pool = descriptor_pool.DescriptorPool()
+    pool.Add(proto)
+
+    def message(name):
+        return message_factory.GetMessageClass(pool.FindMessageTypeByName(f"compute_test.{name}"))
+
+    # Multi-byte lengths, a non-ASCII path, a directory, a symlink and an empty file.
+    write(repo / "extra" / "big.bin", bytes(range(256)) * 80)
+    write(repo / "extra" / f"{'é' * 70}.txt", "x" * 200)
+    write(repo / "extra" / "empty.txt", "")
+    result = plan_context(repo, include=["extra"])
+    records = [
+        message("File")(
+            path=item["path"],
+            type=item["type"],
+            content=base64.b64decode(item["content"]),
+            mtime=int(item["mtime"]),
+            mode=item["mode"],
+            uid=item["uid"],
+            gid=item["gid"],
+        )
+        for item in result.files
+    ]
+
+    for name, field in (
+        ("CreateExperimentRequest", "model_definition"),
+        ("LaunchCommandRequest", "files"),
+    ):
+        encoded = message(name)(**{field: records}).SerializeToString()
+        assert len(encoded) == code.request_size(result.files)
 
 
 def test_context_size_limit_applies_to_real_files(repo):
