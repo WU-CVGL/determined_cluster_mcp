@@ -171,9 +171,12 @@ transfers.
 
 `repo_dir` is the top level of a git work tree on the machine running the service. The
 revision is resolved to a full commit, and files are read from the git object database,
-not the working tree, so the snapshot equals that commit. `include` adds working-tree files
-or directories, such as generated or untracked files, and overrides tracked paths; each
-must stay inside the repository and cannot be or traverse a symlink. Executable bits are
+not the working tree, so without includes the snapshot equals that commit. `include` adds
+working-tree files or directories, such as generated or untracked files, and overrides
+tracked paths with their working-tree content; each must stay inside the repository and
+cannot be or traverse a symlink. Inside an included directory, a symlink that git tracks
+with the same target is kept from the revision, and any other symlink or special file is
+`invalid_include` unless an exclusion below skips its directory. Executable bits are
 kept. Relative symlinks that stay inside the tree, also when resolved through the
 snapshot's other symlinks, are recreated. A symlink that leaves the tree, directly or
 through such a chain, or that loops, fails with `unsafe_symlink`; a preview already
@@ -182,15 +185,28 @@ A `.git` file or directory inside an included directory, as in a git worktree or
 submodule checkout, is skipped and reported with reason `git_metadata`; naming a path
 inside `.git` as an include is `invalid_include`.
 
-Secret-like tracked files are left out: names matched by the transfer exclusions above,
-the configured secrets file when it lies in the repository, names containing `credential`
-or `secret`, and files named `token`, `.token`, or `*.token`. Cache directories and `*.pyc`
-from the same exclusion list are also left out, but an explicit include restores them. An
-include that matches a secret-like rule fails with `secret_like_include` instead of being
-dropped. `exclude` adds rsync-style patterns matched per path component: a trailing `/`
-matches directories and a leading `/` anchors at the repository root. Every excluded path
-is reported with its `reason` and `rule`. Review the preview before publishing to shared
-storage.
+Secret-like files are left out under two kinds of rules. Credential stores are never
+snapshotted: the configured secrets file when it lies in the repository, `.ssh/`, `.aws/`,
+`.config/gcloud/`, `.netrc`, `.npmrc`, `.pypirc`, and `id_rsa*`, `id_ed25519*`, and
+`id_ecdsa*`. A tracked one is excluded, and an include that reaches one, by name or inside
+an included directory, fails with `secret_like_include`. Name heuristics cover the other
+transfer exclusions above (such as `.env*`, `*.env`, `*.key`, `*.pem`, `.secrets*`, and
+`credentials/`), any path component containing `credential` or `secret`, and files named
+`token`, `.token`, or `*.token`. They exclude tracked files and files found in an included
+directory, but an include that names the file itself overrides them, for example for a
+`secrets.py` module: its include source in the manifest records `included_despite` with the
+rule, and a `secret_like_included` warning names it. Confirm that such a file holds no
+secret before publishing.
+
+Cache directories and `*.pyc` from the same exclusion list are also left out. Inside an
+included directory they apply only below the directory named, so including `mylib/cache`
+restores a `cache/` package while its `__pycache__/` stays out, and an include that names a
+file always restores it. `exclude` adds rsync-style patterns matched per path component
+against the repository-relative path, also inside included directories: a trailing `/`
+matches directories and a leading `/` anchors at the repository root. An excluded
+directory inside an included directory is not walked and is reported once as `path/`.
+Every excluded path is reported with its `reason` and `rule`. Review the preview before
+publishing to shared storage.
 
 `content_id` is the SHA-256 of the canonical list of files (path, SHA-256, size, and mode)
 and symlink targets, and the workdir is `<root>/trees/<content_id>`, so identical content is
@@ -202,24 +218,40 @@ records a remote URL. Repeating a snapshot returns the existing manifest with th
 the tree.
 
 Files are stored once under `<root>/objects/sha256/`, executables separately with a `.x`
-suffix because hard links share one mode, and linked into each tree. `auto` probes reflink,
-then hard link, then copy. A file that cannot be linked, for example at a link limit or
-across devices, is copied; the result reports `link_mode` and `link_fallbacks`. `copy`
-skips the object store and deduplicates whole trees only. Objects, trees, and manifests are
-written under temporary names and never modified or deleted afterwards, and concurrent
-snapshots of the same content publish one tree. An existing tree is checked by size, and
-by full hash with `verify`, before reuse; a mismatch returns `snapshot_corrupt` and is
-never repaired. Trees are read-only, so a job must write under its `output_dir`. A hard
-link shares its inode with the object store, and on a network mount with squashed
-ownership, mode bits do not stop a determined writer; use `verify` or `link_mode: copy`
-where that matters.
+suffix because hard links share one mode, and cloned or linked into each tree. `auto` uses
+reflink when the filesystem supports it and copies otherwise. `hardlink` is used only when
+configured: it saves space without reflink support, but each tree file is then the same
+inode as its object and as that file in every other tree, so one in-place write changes
+all of them and later snapshots too. A file that cannot be cloned or linked, for example
+at a link limit or across devices, is copied; the result reports `link_mode` and
+`link_fallbacks`. `copy` skips the object store and deduplicates whole trees only.
+Objects, trees, and manifests are written under temporary names, published without
+replacing an existing name, and never modified or deleted afterwards, and concurrent
+snapshots of the same content publish one tree. Only on a filesystem that supports
+neither hard links nor `renameat2` with `RENAME_NOREPLACE` can a manifest published
+concurrently for the same `snapshot_key` be replaced by an equivalent one that differs in
+`created_utc`; each caller then reports the bytes it reads back.
+
+An existing tree is checked by file size before reuse. With `verify`, the whole tree is
+checked instead: no unrecorded entries, the type of each entry, symlink targets,
+executable bits, sizes, and the SHA-256 of every file; each existing object is also hashed
+before a new tree reuses it. A mismatch returns `snapshot_corrupt` and is never repaired.
+Trees are read-only only through mode bits, so a job must write under its `output_dir`;
+a task running as root on storage without root squashing, or the owner after `chmod`, can
+still change them. There, prefer a reflink-capable filesystem or `link_mode: copy`, and
+use `verify` before reusing a tree. To recover from `snapshot_corrupt`, remove the damaged
+tree or object (make its directory writable first) and publish again; with hard links,
+every tree that shares a damaged object is damaged too.
 
 The result reports `dry_run`, `revision`, `tree`, `content_id`, `snapshot_key`, `workdir`
 (a container path), `host_path`, `local_path`, `manifest_path` and `manifest_sha256` (null
 in a preview unless already published), `existing` (the manifest already existed),
 `tree_existing`, the `files`, `symlinks`, and `bytes` totals, `new_objects`, `new_bytes`,
 `link_mode`, `link_fallbacks`, `excluded`, `skipped`, `warnings`, and `request_fields`,
-whose `workdir` and `code_revision` go directly into a compute request.
+whose `workdir` and `code_revision` go directly into a compute request. `code_revision` is
+the commit, or `<commit>+<snapshot_key>` when includes added or replaced files, because the
+content then differs from the commit; it also names the manifest. The `content_id` in
+`workdir` identifies the content itself.
 
 ```bash
 determined-compute snapshot "$PWD"                   # preview; writes nothing

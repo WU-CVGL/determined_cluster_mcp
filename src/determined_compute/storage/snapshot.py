@@ -2,13 +2,16 @@
 
 A snapshot materializes the exact tracked content of one git revision, plus explicitly
 included working-tree files, as a read-only tree named by its content. Identical files
-are stored once in an object store and linked into each tree when the filesystem
-supports it. Existing objects, trees, and manifests are never modified or deleted.
+are stored once in an object store and cloned (or, when configured, hard-linked) into each
+tree when the filesystem supports it. Existing objects, trees, and manifests are never
+modified or deleted.
 """
 
 from __future__ import annotations
 
+import ctypes
 import errno
+import functools
 import hashlib
 import json
 import os
@@ -37,8 +40,22 @@ _GIT_TIMEOUT_SECONDS = 300
 _MAX_SYMLINK_HOPS = 40
 _LFS_POINTER = b"version https://git-lfs.github.com/spec/"
 # Rules from the transfer exclusions that describe caches rather than secrets. They drop
-# tracked files and expanded include directories, but never block an explicit include.
+# tracked files and cache-like paths below an included directory, but never the include
+# root itself or a file named explicitly.
 _CACHE_RULES = {".git/", ".cache/", "cache/", ".venv/", "__pycache__/", ".pytest_cache/", "*.pyc"}
+# Credential stores that are never snapshotted, even when named explicitly. Every other
+# secret-like rule is a name heuristic that an explicit file include may override.
+_HARD_SECRET_RULES = (
+    ".ssh/",
+    ".aws/",
+    ".config/gcloud/",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "id_rsa*",
+    "id_ed25519*",
+    "id_ecdsa*",
+)
 _LINK_FALLBACK_ERRNOS = {
     errno.EMLINK,
     errno.EXDEV,
@@ -46,6 +63,17 @@ _LINK_FALLBACK_ERRNOS = {
     errno.ENOTSUP,
     errno.EOPNOTSUPP,
     errno.ENOSYS,
+}
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
+# EPERM is what some container seccomp profiles return for an unknown system call; a real
+# permission problem fails the plain rename that follows as well.
+_NOREPLACE_UNSUPPORTED_ERRNOS = {
+    errno.EINVAL,
+    errno.ENOSYS,
+    errno.ENOTSUP,
+    errno.EOPNOTSUPP,
+    errno.EPERM,
 }
 
 
@@ -91,16 +119,17 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _pattern_matches(pattern: str, path: str) -> bool:
+def _pattern_matches(pattern: str, path: str, directory: bool = False) -> bool:
     """Match an rsync-style pattern component-wise against a relative path.
 
     A trailing ``/`` matches directories only, a leading ``/`` anchors the pattern at the
     repository root, and otherwise the pattern may match at any depth. Each component
-    uses case-sensitive ``fnmatch`` rules.
+    uses case-sensitive ``fnmatch`` rules. With ``directory`` the path itself names a
+    directory, so its last component may match a trailing-``/`` pattern too.
     """
     parts = path.split("/")
     wanted = pattern.strip("/").split("/")
-    limit = len(parts) - 1 if pattern.endswith("/") else len(parts)
+    limit = len(parts) - 1 if pattern.endswith("/") and not directory else len(parts)
     starts = [0] if pattern.startswith("/") else range(limit - len(wanted) + 1)
     return any(
         start + len(wanted) <= limit
@@ -109,11 +138,20 @@ def _pattern_matches(pattern: str, path: str) -> bool:
     )
 
 
-def _secret_rule(path: str, secrets_file: Optional[str]) -> Optional[str]:
+def _hard_secret_rule(
+    path: str, secrets_file: Optional[str], directory: bool = False
+) -> Optional[str]:
     if secrets_file is not None and path == secrets_file:
         return "configured secrets file"
+    return next(
+        (rule for rule in _HARD_SECRET_RULES if _pattern_matches(rule, path, directory)), None
+    )
+
+
+def _soft_secret_rule(path: str, directory: bool = False) -> Optional[str]:
+    """Return the secret-like name heuristic a path matches; check hard rules first."""
     for pattern in _SYNC_EXCLUDES:
-        if pattern not in _CACHE_RULES and _pattern_matches(pattern, path):
+        if pattern not in _CACHE_RULES and _pattern_matches(pattern, path, directory):
             return pattern
     for part in path.split("/"):
         lowered = part.lower()
@@ -126,8 +164,10 @@ def _secret_rule(path: str, secrets_file: Optional[str]) -> Optional[str]:
     return None
 
 
-def _cache_rule(path: str) -> Optional[str]:
-    return next((rule for rule in sorted(_CACHE_RULES) if _pattern_matches(rule, path)), None)
+def _cache_rule(path: str, directory: bool = False) -> Optional[str]:
+    return next(
+        (rule for rule in sorted(_CACHE_RULES) if _pattern_matches(rule, path, directory)), None
+    )
 
 
 def _string_list(value: Any, field: str, limit: int, length: int) -> List[str]:
@@ -358,14 +398,30 @@ def _hash_include(path: Path) -> _Blob:
     return _Blob(digest.hexdigest(), size, source=path)
 
 
+def _secret_include(path: str, rule: str) -> StorageError:
+    return StorageError(
+        f"include {path} matches the secret rule {rule!r} and is never snapshotted; "
+        "rename or move it",
+        code="secret_like_include",
+    )
+
+
 def _expand_include(
-    repo: Path, value: str, skip: Callable[[str, str], None]
+    repo: Path,
+    value: str,
+    skip: Callable[[str, str], None],
+    prune: Callable[[str, str, bool], bool],
+    tracked_links: Dict[str, str],
 ) -> Iterator[Tuple[str, Path, bool]]:
     """Yield (relative path, local path, explicitly named) for one include argument.
 
     A ``.git`` entry of any type found while walking an included directory (a repository,
     worktree, or submodule checkout) is reported through ``skip`` and never copied;
-    naming a path inside ``.git`` explicitly is an error.
+    naming a path inside ``.git`` explicitly is an error. While walking, ``prune`` is
+    called with the repository-relative path, the path below the include root, and
+    whether the entry is a directory; it returns True for an entry it excluded, which is
+    then neither descended into nor checked further. A symlink that git already tracks
+    with the same target is left to the tracked copy; any other symlink is an error.
     """
     candidate = Path(value).expanduser()
     if ".." in candidate.parts:
@@ -395,25 +451,45 @@ def _expand_include(
         return
     if not stat.S_ISDIR(info.st_mode):
         raise _invalid(f"include {value} is not a regular file or directory", "invalid_include")
+
+    def tracked_link(path: Path, text: str) -> bool:
+        return text in tracked_links and os.readlink(path) == tracked_links[text]
+
     for directory, dirnames, filenames in os.walk(candidate):
         if ".git" in dirnames or ".git" in filenames:
             skip(Path(directory, ".git").relative_to(repo).as_posix(), "git_metadata")
-        dirnames[:] = sorted(name for name in dirnames if name != ".git")
-        filenames = [name for name in filenames if name != ".git"]
-        for name in dirnames:
-            if os.path.islink(os.path.join(directory, name)):
+        kept = []
+        for name in sorted(dirnames):
+            path = Path(directory, name)
+            if name == ".git":
+                continue
+            text = relative(path)
+            if prune(text, path.relative_to(candidate).as_posix(), True):
+                continue
+            if os.path.islink(path):
+                if tracked_link(path, text):
+                    continue
                 raise _invalid(
                     f"include {value} contains the symlink {name}", "invalid_include"
                 )
+            kept.append(name)
+        dirnames[:] = kept
         for name in sorted(filenames):
             path = Path(directory, name)
+            if name == ".git":
+                continue
+            text = relative(path)
+            if prune(text, path.relative_to(candidate).as_posix(), False):
+                continue
             mode = os.lstat(path).st_mode
+            if stat.S_ISLNK(mode) and tracked_link(path, text):
+                continue
             if not stat.S_ISREG(mode):
                 raise _invalid(
                     f"include {value} contains {name}, which is not a regular file",
                     "invalid_include",
                 )
-            yield relative(path), path, False
+            yield text, path, False
 
 
 def _reflink(source: Path, destination: Path) -> None:
@@ -424,27 +500,61 @@ def _reflink(source: Path, destination: Path) -> None:
 
 
 def _resolve_link_mode(configured: str, tmp_dir: Path) -> str:
+    """Resolve ``auto`` to reflink when the filesystem clones files, otherwise to copy.
+
+    Hard links are used only when configured explicitly: a hard-linked tree file is the
+    same inode as its object and as that file in every other tree, so one in-place write
+    would change all of them.
+    """
     if configured != "auto":
         return configured
     token = uuid.uuid4().hex
     probe = tmp_dir / f"probe-{token}"
     clone = tmp_dir / f"probe-{token}.clone"
-    link = tmp_dir / f"probe-{token}.link"
     probe.write_bytes(b"probe\n")
     try:
-        try:
-            _reflink(probe, clone)
-            return "reflink"
-        except OSError:
-            pass
-        try:
-            os.link(probe, link)
-            return "hardlink"
-        except OSError:
-            return "copy"
+        _reflink(probe, clone)
+        return "reflink"
+    except OSError:
+        return "copy"
     finally:
-        for path in (probe, clone, link):
+        for path in (probe, clone):
             path.unlink(missing_ok=True)
+
+
+@functools.lru_cache(maxsize=1)
+def _renameat2() -> Optional[Callable[..., int]]:
+    try:
+        function = ctypes.CDLL(None, use_errno=True).renameat2
+    except (AttributeError, OSError):
+        return None
+    path, descriptor = ctypes.c_char_p, ctypes.c_int
+    function.argtypes = [descriptor, path, descriptor, path, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    return function
+
+
+def _rename_noreplace(source: Path, destination: Path) -> bool:
+    """Rename without replacing an existing destination; return False when it exists.
+
+    Uses ``renameat2(RENAME_NOREPLACE)``. Only where the kernel, C library, or filesystem
+    lacks it does this fall back to a check followed by a plain rename, which a concurrent
+    writer of the same name can still overtake.
+    """
+    function = _renameat2()
+    if function is not None:
+        paths = (_AT_FDCWD, os.fsencode(source), _AT_FDCWD, os.fsencode(destination))
+        if function(*paths, _RENAME_NOREPLACE) == 0:
+            return True
+        code = ctypes.get_errno()
+        if code == errno.EEXIST:
+            return False
+        if code not in _NOREPLACE_UNSUPPORTED_ERRNOS:
+            raise OSError(code, os.strerror(code), str(destination))
+    if os.path.lexists(destination):
+        return False
+    os.rename(source, destination)
+    return True
 
 
 def _object_path(objects: Path, blob: _Blob, executable: bool) -> Path:
@@ -452,14 +562,18 @@ def _object_path(objects: Path, blob: _Blob, executable: bool) -> Path:
     return objects / blob.sha256[:2] / (blob.sha256 + (".x" if executable else ""))
 
 
-def _check_existing_file(path: Path, blob: _Blob, verify: bool, label: str) -> None:
+def _check_existing_file(path: Path, file: _File, verify: bool, label: str) -> None:
     try:
         info = os.lstat(path)
     except OSError as exc:
         raise _corrupt(f"{label} is missing") from exc
-    if not stat.S_ISREG(info.st_mode) or info.st_size != blob.size:
+    if not stat.S_ISREG(info.st_mode) or info.st_size != file.blob.size:
         raise _corrupt(f"{label} does not have the recorded size")
-    if verify and _file_sha256(path) != blob.sha256:
+    if not verify:
+        return
+    if bool(info.st_mode & stat.S_IXUSR) != file.executable:
+        raise _corrupt(f"{label} does not have the recorded mode {file.mode}")
+    if _file_sha256(path) != file.blob.sha256:
         raise _corrupt(f"{label} does not have the recorded content")
 
 
@@ -470,7 +584,7 @@ def _store_object(
     final = _object_path(objects, file.blob, file.executable)
     label = f"object {final.name}"
     if final.exists():
-        _check_existing_file(final, file.blob, verify, label)
+        _check_existing_file(final, file, verify, label)
         return False
     final.parent.mkdir(parents=True, exist_ok=True)
     temporary = tmp_dir / uuid.uuid4().hex
@@ -483,16 +597,14 @@ def _store_object(
         try:
             os.link(temporary, final)
         except FileExistsError:
-            _check_existing_file(final, file.blob, verify, label)
+            _check_existing_file(final, file, verify, label)
             return False
         except OSError as exc:
             if exc.errno not in _LINK_FALLBACK_ERRNOS:
                 raise
-            if final.exists():
-                _check_existing_file(final, file.blob, verify, label)
+            if not _rename_noreplace(temporary, final):
+                _check_existing_file(final, file, verify, label)
                 return False
-            # A concurrent writer of the same name wrote identical content.
-            os.rename(temporary, final)
         return True
     finally:
         temporary.unlink(missing_ok=True)
@@ -534,18 +646,45 @@ def _remove_tree(tree: Path) -> None:
     shutil.rmtree(tree)
 
 
+def _check_tree_entries(tree: Path, files: Dict[str, _File], symlinks: Dict[str, str]) -> None:
+    """Require the tree to hold exactly the recorded entries, each of the recorded type."""
+    directories = {
+        "/".join(parts[:index])
+        for parts in (path.split("/") for path in [*files, *symlinks])
+        for index in range(1, len(parts))
+    }
+    pending = [""]
+    while pending:
+        prefix = pending.pop()
+        with os.scandir(tree.joinpath(*prefix.split("/")) if prefix else tree) as entries:
+            for entry in entries:
+                path = f"{prefix}/{entry.name}" if prefix else entry.name
+                if entry.is_symlink():
+                    expected = path in symlinks
+                elif entry.is_dir(follow_symlinks=False):
+                    expected = path in directories
+                    pending.append(path)
+                else:
+                    expected = path in files and entry.is_file(follow_symlinks=False)
+                if not expected:
+                    raise _corrupt(f"snapshot entry {path} is not recorded with this type")
+
+
 def _verify_tree(
     tree: Path, files: Dict[str, _File], symlinks: Dict[str, str], verify: bool
 ) -> None:
+    """Check an existing tree before reuse: sizes always, the whole tree with ``verify``."""
     if tree.is_symlink() or not tree.is_dir():
         raise _corrupt(f"snapshot tree {tree.name} is not a directory")
     for path, file in files.items():
         target = tree.joinpath(*path.split("/"))
-        _check_existing_file(target, file.blob, verify, f"snapshot file {path}")
+        _check_existing_file(target, file, verify, f"snapshot file {path}")
     for path, target_text in symlinks.items():
         link = tree.joinpath(*path.split("/"))
         if not link.is_symlink() or os.readlink(link) != target_text:
             raise _corrupt(f"snapshot symlink {path} does not match")
+    if verify:
+        _check_tree_entries(tree, files, symlinks)
 
 
 def _publish_manifest(path: Path, tmp_dir: Path, manifest: Dict[str, Any]) -> bytes:
@@ -567,9 +706,9 @@ def _publish_manifest(path: Path, tmp_dir: Path, manifest: Dict[str, Any]) -> by
         except OSError as exc:
             if exc.errno not in _LINK_FALLBACK_ERRNOS:
                 raise
-            if path.exists():
-                return path.read_bytes()
-            os.rename(temporary, path)
+            _rename_noreplace(temporary, path)
+            # Return what is published, which a racing plain-rename fallback may have set.
+            return path.read_bytes()
         return payload
     finally:
         temporary.unlink(missing_ok=True)
@@ -641,7 +780,7 @@ def create_snapshot(
         if mode == "160000":
             skipped.append({"path": path, "reason": "submodule"})
             continue
-        rule = _secret_rule(path, secrets_file)
+        rule = _hard_secret_rule(path, secrets_file) or _soft_secret_rule(path)
         reason = "secret_like"
         if rule is None:
             rule, reason = _cache_rule(path), "cache"
@@ -700,28 +839,39 @@ def create_snapshot(
         if entry not in skipped:
             skipped.append(entry)
 
+    def prune(relative: str, below: str, directory: bool) -> bool:
+        """Exclude an entry found below an included directory; the root itself is kept.
+
+        Exclude patterns and secret rules see the repository-relative path, cache rules only
+        the part below the include root, so naming a cache-like directory restores it.
+        """
+        rule = next(
+            (item for item in exclude_patterns if _pattern_matches(item, relative, directory)),
+            None,
+        )
+        reason = "exclude_pattern"
+        if rule is None:
+            rule, reason = _cache_rule(below, directory), "cache"
+        if rule is None:
+            hard = _hard_secret_rule(relative, secrets_file, directory)
+            if hard is not None:
+                raise _secret_include(relative, hard)
+            rule, reason = _soft_secret_rule(relative, directory), "secret_like"
+        if rule is None:
+            return False
+        key = f"{relative}/" if directory else relative
+        if relative not in files and relative not in symlinks:
+            excluded.setdefault(key, {"path": key, "reason": reason, "rule": rule})
+        return True
+
     for value in includes:
-        for relative, local_path, explicit in _expand_include(repo, value, skip):
-            if not explicit:
-                rule = next(
-                    (item for item in exclude_patterns if _pattern_matches(item, relative)), None
-                )
-                reason = "exclude_pattern"
-                if rule is None:
-                    rule, reason = _cache_rule(relative), "cache"
-                if rule is not None:
-                    if relative not in files and relative not in symlinks:
-                        excluded.setdefault(
-                            relative, {"path": relative, "reason": reason, "rule": rule}
-                        )
-                    continue
-            secret = _secret_rule(relative, secrets_file)
-            if secret is not None:
-                raise StorageError(
-                    f"include {relative} matches the secret-like rule {secret!r} and is "
-                    "never snapshotted; rename or move it",
-                    code="secret_like_include",
-                )
+        for relative, local_path, explicit in _expand_include(repo, value, skip, prune, symlinks):
+            overridden = None
+            if explicit:
+                hard = _hard_secret_rule(relative, secrets_file)
+                if hard is not None:
+                    raise _secret_include(relative, hard)
+                overridden = _soft_secret_rule(relative)
             blob = _hash_include(local_path)
             symlinks.pop(relative, None)
             excluded.pop(relative, None)
@@ -733,7 +883,20 @@ def create_snapshot(
                 "bytes": blob.size,
                 "overrides": relative in tracked_paths,
             }
+            if overridden is not None:
+                included[relative]["included_despite"] = overridden
     sources.extend(included[path] for path in sorted(included))
+    warnings.extend(
+        {
+            "code": "secret_like_included",
+            "path": path,
+            "rule": included[path]["included_despite"],
+            "message": "an explicit include overrides a secret-like name rule; confirm the "
+            "file holds no secret",
+        }
+        for path in sorted(included)
+        if "included_despite" in included[path]
+    )
 
     entries = set(files) | set(symlinks)
     if not entries:
@@ -771,6 +934,9 @@ def create_snapshot(
         "exclude_patterns": exclude_patterns,
     })
 
+    # Included working-tree files make the content differ from the commit, so the revision
+    # also names the manifest, <root>/manifests/<snapshot_key>.json.
+    code_revision = f"{commit}+{snapshot_key}" if included else commit
     tree_path = root / "trees" / content_id
     manifest_path = root / "manifests" / f"{snapshot_key}.json"
     objects = root / "objects" / "sha256"
@@ -803,7 +969,7 @@ def create_snapshot(
         "excluded": excluded_list,
         "skipped": skipped,
         "warnings": warnings,
-        "request_fields": {"workdir": workdir, "code_revision": commit},
+        "request_fields": {"workdir": workdir, "code_revision": code_revision},
     }
 
     if dry_run:

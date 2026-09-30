@@ -77,15 +77,16 @@ rsync -a --safe-links \
   --exclude 'id_rsa' \
   --exclude '.credentials/' \
   --exclude 'credentials/' \
-  --exclude '*credentials*' \
-  --exclude '*token*' \
+  --exclude 'token' \
+  --exclude '.token' \
+  --exclude '*.token' \
   --exclude '__pycache__/' \
   --exclude '.pytest_cache/' \
   --exclude '*.pyc' \
   <source>/ <shared-task-directory>/repo/
 ```
 
-Review project-specific secret filenames before copying. Never use an experiment `modelDefinition`, project archive, or upload option; the Determined payload should contain mapped paths only.
+Review project-specific secret filenames, such as `credentials.json` or `secrets.yaml`, and exclude them before copying. Never use an experiment `modelDefinition`, project archive, or upload option; the Determined payload should contain mapped paths only.
 
 ## Failure handling
 
