@@ -100,18 +100,18 @@ def test_command_plan_renders_policy_variables_and_preflight(service):
         "/bin/bash",
         "-lc",
         "mkdir -p /shared/container/out && cd /shared/container/code && "
-        f"{step} && python evaluate.py",
+        f"{step} || exit $?\npython evaluate.py",
     ]
     assert plan["advisories"] == []
 
 
 def test_experiment_plan_appends_policy_after_managed_variables(service):
-    plan = service.plan(
-        experiment_request(
-            slots=2,
-            gpu_admission={"names": ["NVIDIA *", "Tesla *"], "min_free_mib": 1024},
-        )
+    request = experiment_request(
+        slots=2,
+        gpu_admission={"names": ["NVIDIA *", "Tesla *"], "min_free_mib": 1024},
     )
+    request["experiment_config"]["resources"] = {"is_single_node": True}
+    plan = service.plan(request)
 
     assert plan["config"]["environment"]["environment_variables"] == [
         "USER_SETTING=1",
@@ -119,9 +119,10 @@ def test_experiment_plan_appends_policy_after_managed_variables(service):
         "COMPUTE_OUTPUT_DIR=/shared/container/out",
         *POLICY_VARIABLES,
     ]
+    assert plan["config"]["resources"]["is_single_node"] is True
     assert plan["config"]["entrypoint"] == (
         "mkdir -p /shared/container/out && cd /shared/container/code && "
-        f"{gpu_admission.entrypoint_step()} && python train.py"
+        f"{gpu_admission.entrypoint_step()} || exit $?\npython train.py"
     )
 
 
@@ -162,6 +163,22 @@ def test_disabled_admission_leaves_plan_and_hash_unchanged(service, disabled):
             ),
             {},
             "single-node",
+        ),
+        (
+            lambda: experiment_request(
+                slots=2, experiment_config={"resources": {"is_single_node": False}}
+            ),
+            {},
+            "single-node",
+        ),
+        (lambda: experiment_request(slots=2), {}, "is_single_node: true"),
+        (lambda: experiment_request(slots=2, experiment_config=None), {}, "is_single_node: true"),
+        (
+            lambda: experiment_request(
+                slots=2, experiment_config={"resources": {"is_single_node": None}}
+            ),
+            {},
+            "is_single_node: true",
         ),
     ],
 )
@@ -243,7 +260,7 @@ def _run_script(tmp_path, tools, **policy):
     ("policy", "status", "failure"),
     [
         ({"count": "2", "names": "NVIDIA Example*", "min_free_mib": "16000"}, "passed", None),
-        ({"count": "1"}, "failed", "2 GPUs are visible but the policy requires 1"),
+        ({"count": "1"}, "failed", "nvidia-smi reports 2 GPUs but the policy requires 1"),
         (
             {"count": "2", "names": "Other*|Another*"},
             "failed",
@@ -273,6 +290,7 @@ def test_script_evaluates_policy_and_writes_receipt(tmp_path, policy, status, fa
     assert receipt["observed_at"].endswith("Z")
     assert [device["memory_free_mib"] for device in receipt["devices"]] == [24000, 20000]
     assert receipt["devices"][0]["uuid"] == "GPU-00000000-0000-0000-0000-000000000000"
+    assert receipt["unparsed_lines"] == []
     assert receipt["determined"] == {"task_id": "task-1", "allocation_id": None, "trial_id": None}
     if failure is None:
         assert receipt["failures"] == []
@@ -303,11 +321,83 @@ def test_script_appends_history_and_fails_without_nvidia_smi(tmp_path):
     assert not list(output.glob(".*.tmp"))
 
 
+WARNING = "WARNING: infoROM is corrupted at gpu 0000:81:00.0"
+
+
 @pytestmark_bash
-@pytest.mark.parametrize(("min_free", "exit_code", "ran"), [(1000, 0, True), (99999, 86, False)])
+def test_script_counts_only_rows_shaped_like_a_gpu(tmp_path):
+    tools = _toolbox(tmp_path)
+    _fake_smi(
+        tools,
+        f"echo '{WARNING}'\n"
+        + GPUS
+        + "echo '2, GPU-2, too few fields'\n"
+        + "echo '3, GPU-3, NVIDIA Example 24GB, 555.10, 24564, 24000, extra'\n",
+    )
+
+    completed, output = _run_script(tmp_path, tools, count="2", min_free_mib="16000")
+
+    assert completed.returncode == 0, completed.stdout
+    receipt = json.loads((output / "gpu-admission.json").read_text())
+    assert receipt["status"] == "passed"
+    assert [device["index"] for device in receipt["devices"]] == [0, 1]
+    assert receipt["unparsed_lines"] == [
+        WARNING,
+        "2, GPU-2, too few fields",
+        "3, GPU-3, NVIDIA Example 24GB, 555.10, 24564, 24000, extra",
+    ]
+
+
+@pytestmark_bash
+def test_script_fails_closed_when_no_row_parses(tmp_path):
+    tools = _toolbox(tmp_path)
+    _fake_smi(tools, f"echo '{WARNING}'\n")
+
+    completed, output = _run_script(tmp_path, tools, count="1")
+
+    assert completed.returncode == 86
+    receipt = json.loads((output / "gpu-admission.json").read_text())
+    assert receipt["devices"] == []
+    assert receipt["unparsed_lines"] == [WARNING]
+    assert receipt["failures"] == ["nvidia-smi reports 0 GPUs but the policy requires 1"]
+
+
+# Each workload writes marker files under $COMPUTE_OUTPUT_DIR. The value is the command,
+# its exit code when admission passes, and the markers it leaves behind.
+_OUT = '"$COMPUTE_OUTPUT_DIR"'
+WORKLOADS = {
+    "single": (f"echo x > {_OUT}/a", 0, {"a"}),
+    "semicolon": (f"echo x > {_OUT}/a; echo x > {_OUT}/b; exit 7", 7, {"a", "b"}),
+    "newline": (f"echo x > {_OUT}/a\necho x > {_OUT}/b\nexit 7", 7, {"a", "b"}),
+    "or": (f"false || {{ echo x > {_OUT}/b; exit 7; }}", 7, {"b"}),
+    "heredoc": (f"cat > {_OUT}/a <<EOF\nx=1\nEOF\necho x > {_OUT}/b", 0, {"a", "b"}),
+    "set_e": (f"set -e; echo x > {_OUT}/a; false; echo x > {_OUT}/b", 1, {"a"}),
+    "background": (f"echo x > {_OUT}/a & echo x > {_OUT}/b; wait; exit 7", 7, {"a", "b"}),
+    "list": ([BASH or "bash", "-c", f"echo x > {_OUT}/a; exit 7"], 7, {"a"}),
+}
+DASH = shutil.which("dash")
+
+
+@pytestmark_bash
+@pytest.mark.parametrize("workload", sorted(WORKLOADS))
+@pytest.mark.parametrize(
+    ("kind", "shell"),
+    [
+        ("command", "bash -lc"),
+        # Determined starts an experiment's string entrypoint with `sh -c`.
+        ("experiment", "bash --posix -c"),
+        pytest.param(
+            "experiment",
+            "dash -c",
+            marks=pytest.mark.skipif(DASH is None, reason="dash is not installed"),
+        ),
+    ],
+)
+@pytest.mark.parametrize("admitted", [True, False])
 def test_rendered_entrypoint_runs_workload_only_after_admission(
-    tmp_path, min_free, exit_code, ran
+    tmp_path, kind, shell, workload, admitted
 ):
+    command, exit_code, markers = WORKLOADS[workload]
     host = tmp_path / "shared"
     (host / "code").mkdir(parents=True)
     profile = ComputeProfile.from_dict(
@@ -317,33 +407,60 @@ def test_rendered_entrypoint_runs_workload_only_after_admission(
         }
     )
     service = ComputeService(FakeClient(), SQLiteTaskStore(":memory:"), profile)
-    plan = service.plan(
-        {
-            "name": "admitted",
-            "command": 'echo ran > "$COMPUTE_OUTPUT_DIR/workload.txt"',
-            "workdir": str(host / "code"),
-            "output_dir": str(host / "out"),
-            "slots": 2,
-            "gpu_admission": {"min_free_mib": min_free},
-        }
-    )
+    request = {
+        "name": "admitted",
+        "kind": kind,
+        "command": command,
+        "workdir": str(host / "code"),
+        "output_dir": str(host / "out"),
+        "slots": 2,
+        "gpu_admission": {"min_free_mib": 1000 if admitted else 99999},
+    }
+    if kind == "experiment":
+        request["experiment_config"] = {"resources": {"is_single_node": True}}
+    plan = service.plan(request)
     tools = _toolbox(tmp_path)
     _fake_smi(tools, GPUS)
-    environment = {"PATH": str(tools)}
+    environment = {"PATH": str(tools), "HOME": str(tmp_path)}
     environment.update(
         item.split("=", 1) for item in plan["config"]["environment"]["environment_variables"]
     )
-    shell, _login, script = plan["config"]["entrypoint"]
-    assert shell == "/bin/bash"
+    if kind == "command":
+        executable, flags, script = plan["config"]["entrypoint"]
+        assert (executable, flags) == ("/bin/bash", "-lc")
+        # Skip login profiles so the host's PATH setup cannot shadow the fake tools.
+        argv = [BASH, "--noprofile", flags, script]
+    elif shell == "dash -c":
+        argv = [DASH, "-c", plan["config"]["entrypoint"]]
+    else:
+        argv = [BASH, "--posix", "-c", plan["config"]["entrypoint"]]
 
-    # Run without a login profile so the host's PATH setup cannot shadow the fake tools.
     completed = subprocess.run(
-        [BASH, "-c", script], env=environment, capture_output=True, text=True, timeout=30
+        argv, env=environment, cwd=tmp_path, capture_output=True, text=True, timeout=30
     )
 
-    assert completed.returncode == exit_code, completed.stderr
-    assert (host / "out" / "workload.txt").exists() is ran
-    assert json.loads((host / "out" / "gpu-admission.json").read_text())["policy"]["count"] == 2
+    output = host / "out"
+    left = {path.name for path in output.iterdir() if not path.name.startswith("gpu-admission")}
+    receipt = json.loads((output / "gpu-admission.json").read_text())
+    # The fake nvidia-smi answered, not a real one or none.
+    assert [device["uuid"][:12] for device in receipt["devices"]] == [
+        "GPU-00000000",
+        "GPU-11111111",
+    ]
+    assert receipt["policy"]["count"] == 2
+    if admitted:
+        assert completed.returncode == exit_code, completed.stderr
+        assert left == markers
+        if workload == "heredoc":
+            assert (output / "a").read_text() == "x=1\n"
+        assert receipt["status"] == "passed"
+        assert completed.stdout.startswith("determined-compute gpu_admission: passed")
+    else:
+        assert completed.returncode == 86, completed.stderr
+        assert left == set()
+        assert receipt["status"] == "failed"
+        assert completed.stdout.startswith("determined-compute gpu_admission: failed")
+    assert list((host / "code").iterdir()) == []
 
 
 def test_experiment_entrypoint_survives_the_yaml_submission_encoding(service):

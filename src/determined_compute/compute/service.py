@@ -677,12 +677,12 @@ class ComputeService:
             rendered = " ".join(shlex.quote(part) for part in command)
         else:
             raise ValidationError("command must be a string or string-list")
-        # The optional GPU admission step exits 86 so that the workload never starts.
-        preflight = f"{gpu_admission.entrypoint_step()} && " if admission else ""
-        return (
-            f"mkdir -p {shlex.quote(output_dir)} && "
-            f"cd {shlex.quote(workdir)} && {preflight}{rendered}"
-        )
+        prefix = f"mkdir -p {shlex.quote(output_dir)} && cd {shlex.quote(workdir)}"
+        if not admission:
+            return f"{prefix} && {rendered}"
+        # The command starts on its own line, so a failed mkdir, cd, or preflight (exit 86)
+        # ends the shell before any statement of it runs, whatever ';', '&', or '||' it has.
+        return f"{prefix} && {gpu_admission.entrypoint_step()} || exit $?\n{rendered}"
 
     def _path_entries(
         self, rendered: Mapping[str, Any], request: Mapping[str, Any]

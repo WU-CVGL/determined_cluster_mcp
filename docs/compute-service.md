@@ -176,29 +176,49 @@ payload; an absent or empty list leaves earlier payloads unchanged.
 `gpu_admission` adds an optional preflight that runs inside the container after the
 entrypoint changes to `workdir` and before the workload starts. It applies to commands
 and single-node experiments with at least one slot; a shell has no managed entrypoint and
-rejects it. `false` or null disables it. The object accepts:
+rejects it. An experiment with more than one slot must set
+`experiment_config.resources.is_single_node: true`, because Determined's default lets a
+trial span several agents and each container would then see only its own agent's GPUs.
+`false` or null disables it. The object accepts:
 
 | Field | Meaning |
 | --- | --- |
-| `count` | Positive integer; the number of visible GPUs must equal it. Default: the requested slots |
-| `names` | Up to 8 `fnmatch`-style patterns of at most 128 printable characters without `\|`; every visible GPU name must match one |
+| `count` | Positive integer; the number of GPUs that `nvidia-smi` reports must equal it. Default: the requested slots |
+| `names` | Up to 8 `fnmatch`-style patterns of at most 128 printable characters without `\|`; every reported GPU name must match one |
 | `driver_versions` | Patterns of the same form for the driver version |
-| `min_free_mib`, `min_total_mib` | Non-negative integers checked for every visible GPU |
+| `min_free_mib`, `min_total_mib` | Non-negative integers checked for every reported GPU |
 | `receipt` | Receipt file name under `output_dir`, ending in `.json`; default `gpu-admission.json` |
+
+The checks apply to the GPUs that `nvidia-smi` reports inside the container. They do not
+apply `CUDA_VISIBLE_DEVICES`, which the receipt records only for diagnosis. On a resource
+manager that restricts GPUs only through `CUDA_VISIBLE_DEVICES` (for example Slurm without
+cgroup device constraints), set `count` and the memory floors for the whole node or do
+not use `gpu_admission`.
 
 The plan gains the normalized `gpu_admission` object, the config gains the managed
 `COMPUTE_GPU_ADMISSION*` variables, and the entrypoint becomes
-`mkdir -p OUTPUT && cd WORKDIR && /bin/bash -c '<script v1>' determined-compute-gpu-admission && COMMAND`.
-The versioned script needs only bash, coreutils, and `nvidia-smi`, which it runs under
-`timeout` when available. It atomically writes the receipt, appends the same JSON record
-as one line to the receipt's `.jsonl` history so experiment restarts keep earlier
-attempts, prints one `determined-compute gpu_admission: passed|failed ...` line, and exits
-86 on failure so the workload never starts. A missing or failing `nvidia-smi` fails
-admission. The receipt records `schema_version` (`determined-compute-gpu-admission-v1`),
-`status`, `observed_at`, `policy`, `devices` (index, UUID, name, driver version, and
-total and free MiB), `failures`, `cuda_visible_devices`, `nvidia_visible_devices`,
+`mkdir -p OUTPUT && cd WORKDIR && /bin/bash -c '<script v1>' determined-compute-gpu-admission || exit $?`
+with `COMMAND` on the next line, so a failed step ends the shell before any statement of
+`COMMAND` runs. The versioned script needs only bash, coreutils, and `nvidia-smi`, which
+it runs under `timeout` when available. Only output lines shaped like a GPU row (a
+numeric index and six fields) count as GPUs; other lines are recorded in `unparsed_lines`.
+It atomically writes the receipt, appends the same JSON record as one line to the
+receipt's `.jsonl` history so experiment restarts keep earlier attempts, prints one
+`determined-compute gpu_admission: passed|failed ...` line, and exits 86 on failure so
+the workload never starts. A missing or failing `nvidia-smi` fails admission. The receipt
+records `schema_version` (`determined-compute-gpu-admission-v1`), `status`,
+`observed_at`, `policy`, `devices` (index, UUID, name, driver version, and total and free
+MiB), `unparsed_lines`, `failures`, `cuda_visible_devices`, `nvidia_visible_devices`,
 `hostname`, and the Determined task, allocation, and trial IDs when set; it records no
-other environment value. In an experiment, a failed admission consumes a restart; set
+other environment value.
+
+The receipt holds the latest record from any task or trial that uses the same
+`output_dir` and `receipt`, so concurrent trials of one experiment overwrite each other's.
+The `.jsonl` line whose `determined.allocation_id` matches the attempt is authoritative;
+give tasks or experiments that run at the same time separate `output_dir` or `receipt`
+values. A workload can also exit 86 by itself, so exit code 86 alone is only a hint:
+confirm a failed admission by the `determined-compute gpu_admission: failed` log line or
+by the matching record. In an experiment, a failed admission consumes a restart; set
 `max_restarts: 0` in `experiment_config` to stop after one failure. A request without
 the field renders exactly as before.
 

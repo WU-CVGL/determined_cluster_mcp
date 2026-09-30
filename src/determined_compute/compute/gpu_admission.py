@@ -50,6 +50,7 @@ matches() { local IFS='|' pat pats; read -r -a pats <<<"$2"; for pat in "${pats[
 atleast() { case $1 in ''|*[!0-9]*) return 1 ;; esac; [ "$((10#$1))" -ge "$2" ]; }
 failures=()
 devices=
+unparsed=
 n=0
 query=(nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total,memory.free --format=csv,noheader,nounits)
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -61,9 +62,11 @@ fi
 if [ "$rc" = 0 ]; then
   while IFS= read -r line; do
     [ -n "$(trim "$line")" ] || continue
-    IFS=, read -r index uuid name driver total free <<<"$line"
+    IFS=, read -r index uuid name driver total free extra <<<"$line"
     index=$(trim "$index"); uuid=$(trim "$uuid"); name=$(trim "$name")
     driver=$(trim "$driver"); total=$(trim "$total"); free=$(trim "$free")
+    case $index in ''|*[!0-9]*) row= ;; *) row=1 ;; esac
+    if [ -z "$row" ] || [ -n "$extra" ] || [ -z "$free" ]; then unparsed="$unparsed${unparsed:+,}$(js "$line")"; continue; fi
     n=$((n + 1))
     devices="$devices${devices:+,}{\"index\":$(jn "$index"),\"uuid\":$(jo "$uuid"),\"name\":$(jo "$name"),\"driver_version\":$(jo "$driver"),\"memory_total_mib\":$(jn "$total"),\"memory_free_mib\":$(jn "$free")}"
     if [ -n "$names" ] && ! matches "$name" "$names"; then failures+=("GPU $index name $name is not allowed"); fi
@@ -71,14 +74,14 @@ if [ "$rc" = 0 ]; then
     if [ -n "$min_free" ] && ! atleast "$free" "$min_free"; then failures+=("GPU $index has ${free:-unknown} MiB free, below $min_free MiB"); fi
     if [ -n "$min_total" ] && ! atleast "$total" "$min_total"; then failures+=("GPU $index has ${total:-unknown} MiB total, below $min_total MiB"); fi
   done <<<"$raw"
-  if [ -n "$count" ] && [ "$n" != "$count" ]; then failures+=("$n GPUs are visible but the policy requires $count"); fi
+  if [ -n "$count" ] && [ "$n" != "$count" ]; then failures+=("nvidia-smi reports $n GPUs but the policy requires $count"); fi
 fi
 status=passed
 [ "${#failures[@]}" = 0 ] || status=failed
 fl=
 for f in "${failures[@]}"; do fl="$fl${fl:+,}$(js "$f")"; done
 host=$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null)
-record="{\"schema_version\":\"determined-compute-gpu-admission-v1\",\"status\":\"$status\",\"observed_at\":$(jo "$(date -u +%FT%TZ 2>/dev/null)"),\"policy\":{\"count\":$(jn "$count"),\"names\":$(jl "$names"),\"min_free_mib\":$(jn "$min_free"),\"min_total_mib\":$(jn "$min_total"),\"driver_versions\":$(jl "$drivers")},\"devices\":[$devices],\"failures\":[$fl],\"cuda_visible_devices\":$(jo "${CUDA_VISIBLE_DEVICES:-}"),\"nvidia_visible_devices\":$(jo "${NVIDIA_VISIBLE_DEVICES:-}"),\"hostname\":$(jo "$host"),\"determined\":{\"task_id\":$(jo "${DET_TASK_ID:-}"),\"allocation_id\":$(jo "${DET_ALLOCATION_ID:-}"),\"trial_id\":$(jo "${DET_TRIAL_ID:-}")}}"
+record="{\"schema_version\":\"determined-compute-gpu-admission-v1\",\"status\":\"$status\",\"observed_at\":$(jo "$(date -u +%FT%TZ 2>/dev/null)"),\"policy\":{\"count\":$(jn "$count"),\"names\":$(jl "$names"),\"min_free_mib\":$(jn "$min_free"),\"min_total_mib\":$(jn "$min_total"),\"driver_versions\":$(jl "$drivers")},\"devices\":[$devices],\"unparsed_lines\":[$unparsed],\"failures\":[$fl],\"cuda_visible_devices\":$(jo "${CUDA_VISIBLE_DEVICES:-}"),\"nvidia_visible_devices\":$(jo "${NVIDIA_VISIBLE_DEVICES:-}"),\"hostname\":$(jo "$host"),\"determined\":{\"task_id\":$(jo "${DET_TASK_ID:-}"),\"allocation_id\":$(jo "${DET_ALLOCATION_ID:-}"),\"trial_id\":$(jo "${DET_TRIAL_ID:-}")}}"
 tmp="$out/.$receipt.$$.tmp"
 if printf '%s\n' "$record" >"$tmp" 2>/dev/null && mv -f "$tmp" "$out/$receipt" 2>/dev/null; then :; else rm -f "$tmp" 2>/dev/null; echo "determined-compute gpu_admission: cannot write $out/$receipt" >&2; fi
 printf '%s\n' "$record" >>"$out/${receipt%.json}.jsonl" 2>/dev/null || echo "determined-compute gpu_admission: cannot append $out/${receipt%.json}.jsonl" >&2
@@ -147,8 +150,16 @@ def normalize_policy(
         raise ValidationError("gpu_admission requires at least one slot")
     if kind == "experiment":
         resources = (experiment_config or {}).get("resources")
-        if isinstance(resources, Mapping) and resources.get("is_single_node") is False:
+        single_node = resources.get("is_single_node") if isinstance(resources, Mapping) else None
+        if single_node is False:
             raise ValidationError("gpu_admission supports single-node experiments only")
+        # Determined's default (null) may split a multi-slot trial across agents, and each
+        # container would then see only its own agent's GPUs.
+        if slots > 1 and single_node is not True:
+            raise ValidationError(
+                "gpu_admission for an experiment with more than one slot requires "
+                "experiment_config.resources.is_single_node: true"
+            )
     count = value.get("count", slots)
     if isinstance(count, bool) or not isinstance(count, int) or count < 1:
         raise ValidationError("gpu_admission.count must be a positive integer")

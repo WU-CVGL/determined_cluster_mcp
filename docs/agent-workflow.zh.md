@@ -94,7 +94,7 @@ MCP 不接受 `kind: notebook`。
 
 调用 `compute_plan(request)`，检查解析后的任务类型、镜像、资源池、挂载、工作目录、输出目录、资源字段、提示信息和 `path_checks`。当 MCP server 能看到相应路径时，`path_checks` 报告每个 bind mount、工作目录、experiment 检查点目录和输出目录是否存在；`unverified` 表示看不到该路径，而不表示路径不存在。缺少必需路径时返回 `path_not_found`，并在 `details.missing_paths` 中列出。experiment 的检查点目录会在入口运行前被 bind mount，因此它尚不存在时，请添加 `"create_directories": ["checkpoint_storage"]`（需要时再加 `"output_dir"`），launch 会在提交前创建它。规划不能证明权限、凭据或实时容量有效。
 
-工作负载需要特定 GPU 型号、驱动、数量或空闲显存下限时，添加 `gpu_admission`，例如 `{"names": ["APPROVED_GPU_NAME*"], "min_free_mib": 16384}`，其中的值应来自项目或管理员。任务随后会在工作负载启动前检查可见 GPU。参见 [GPU 准入](compute-service.zh.md#gpu-admission)。
+工作负载需要特定 GPU 型号、驱动、数量或空闲显存下限时，添加 `gpu_admission`，例如 `{"names": ["APPROVED_GPU_NAME*"], "min_free_mib": 16384}`，其中的值应来自项目或管理员。任务随后会在工作负载启动前检查 `nvidia-smi` 在容器内报告的 GPU。slot 多于一个的 experiment 还需要设置 `experiment_config.resources.is_single_node: true`。参见 [GPU 准入](compute-service.zh.md#gpu-admission)。
 
 生成一个稳定且由调用方控制的 `request_id`，再调用 `compute_launch(request, request_id)`。在工作记录中保留返回的本地 `task_id` 和远端 ID。相同请求使用同一 request ID 重试是幂等的；将该 ID 用于不同内容会被拒绝。
 
@@ -107,7 +107,7 @@ MCP 不接受 `kind: notebook`。
 
 需要了解运行中的任务实际使用了多少 CPU、内存和 GPU 时，例如在提议调整资源、取消或重新提交之前确认 GPU 利用率是否接近零或 allocation 是否空闲，调用 `compute_usage(task_id)`；对于已结束的任务，它报告任务结束前的窗口。该工具只读，并要求 master 启用任务资源集成；`task_resources_disabled` 或 `task_resources_unsupported` 表示无法取得测量值，而不是任务空闲。先检查 `warnings`。null 或缺失值表示没有测量，绝不表示零；空的 `series` 列表表示该窗口没有数据。数值是每 `step` 秒一次的点采样，GPU 指标覆盖整块分配到的设备，可能包含其他进程。除非指定 `trial_id`，experiment 报告其最新 trial。即使 `metrics` 隐藏了 GPU 序列，`gpus` 仍会比较每个 allocation 的各块 GPU：`utilization_spread_percent` 较大、`least_utilized_gpu_uuid` 的均值很低或 `idle_fraction` 较高，都提示存在空闲或掉队的 GPU；`gpu_count` 小于 `requested_slots` 表示返回了序列的 GPU 少于该 allocation 持有的槽位，并不一定表示其余 GPU 未被使用。对于 experiment，`trial.batches_per_second_lower_bound` 是整个生命周期的下界，因为作为分母的挂钟时间还可能计入镜像拉取、启动、初始化以及因重启损失的 allocation 时间（不含调度排队时间和 allocation 之间的暂停间隔）；工作负载不通过 Determined 的 Core API 报告时，`total_batches_processed` 为 0 属于预期。只报告观察结果；更改槽位数或资源池仍需明确的任务决策。参见[任务用量测量](compute-service.zh.md#task-usage-measurements)。
 
-使用 `gpu_admission` 时，日志中有一行 `determined-compute gpu_admission: passed|failed ...`，`output_dir` 中有 JSON 回执及其 `.jsonl` 历史。退出码 86 表示 GPU 策略未通过，工作负载从未启动；请报告回执中的 `failures`，未经明确决策不要更改策略或资源池。在 experiment 中，每次准入失败都会消耗一次重启。
+使用 `gpu_admission` 时，日志中有一行 `determined-compute gpu_admission: passed|failed ...`，`output_dir` 中有 JSON 回执及其 `.jsonl` 历史。策略未通过时，预检会在工作负载启动前以退出码 86 结束；但工作负载自身也可能以 86 退出，因此退出码只能作为提示：请通过 `determined-compute gpu_admission: failed` 日志行，或 `determined.allocation_id` 与该任务 allocation 相符的 `.jsonl` 记录确认准入失败（`compute_usage` 列出每个 allocation 的 `allocation_id` 和 `exit_reason`）。请报告该记录中的 `failures`，因为 `.json` 回执只保存最近一条记录，可能属于共享同一 `output_dir` 的其他 trial 或任务。未经明确决策不要更改策略或资源池。在 experiment 中，每次准入失败都会消耗一次重启。
 
 提交成功或进入终态本身不等于验收通过。检查进程退出信息和任务开始时定义的成功判据。已经配置存储访问时，使用 `storage_check` 验证预期共享产物；否则使用任务输出或另一项明确的任务内检查。需要本地副本时，先配置存储访问，再调用 `storage_fetch(shared_dir, local_dir, dry_run=true)` 预览，审核后以 `dry_run=false` 执行，并检查取回的结果。
 

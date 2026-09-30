@@ -156,29 +156,44 @@ launch 在容量检查之后、认领任务记录之前，以默认 umask 连同
 
 `gpu_admission` 添加一个可选的预检，它在容器内运行，时机是入口切换到 `workdir` 之后、工作
 负载启动之前。它适用于 command 和至少有一个 slot 的单节点 experiment；shell 没有受管入口，
-因此拒绝此字段。`false` 或 null 表示禁用。对象接受：
+因此拒绝此字段。slot 多于一个的 experiment 必须设置
+`experiment_config.resources.is_single_node: true`，因为 Determined 默认允许一个 trial 跨越
+多个 agent，此时每个容器只能看到自己所在 agent 的 GPU。`false` 或 null 表示禁用。对象接受：
 
 | 字段 | 含义 |
 | --- | --- |
-| `count` | 正整数；可见 GPU 的数量必须与之相等。默认为请求的 slot 数 |
-| `names` | 最多 8 个 `fnmatch` 风格模式，每个最多 128 个可打印字符且不含 `\|`；每块可见 GPU 的名称都必须匹配其中之一 |
+| `count` | 正整数；`nvidia-smi` 报告的 GPU 数量必须与之相等。默认为请求的 slot 数 |
+| `names` | 最多 8 个 `fnmatch` 风格模式，每个最多 128 个可打印字符且不含 `\|`；报告的每块 GPU 的名称都必须匹配其中之一 |
 | `driver_versions` | 相同形式的驱动版本模式 |
-| `min_free_mib`、`min_total_mib` | 非负整数，对每块可见 GPU 检查 |
+| `min_free_mib`、`min_total_mib` | 非负整数，对报告的每块 GPU 检查 |
 | `receipt` | `output_dir` 下的回执文件名，必须以 `.json` 结尾；默认为 `gpu-admission.json` |
+
+检查针对 `nvidia-smi` 在容器内报告的 GPU，不应用 `CUDA_VISIBLE_DEVICES`；回执记录该变量仅供
+诊断。如果资源管理器只通过 `CUDA_VISIBLE_DEVICES` 限制 GPU（例如未启用 cgroup 设备约束的
+Slurm），请按整个节点设置 `count` 和显存下限，或不要使用 `gpu_admission`。
 
 规划结果增加规范化的 `gpu_admission` 对象，config 增加受管的 `COMPUTE_GPU_ADMISSION*` 变量，
 入口变为
-`mkdir -p OUTPUT && cd WORKDIR && /bin/bash -c '<script v1>' determined-compute-gpu-admission && COMMAND`。
+`mkdir -p OUTPUT && cd WORKDIR && /bin/bash -c '<script v1>' determined-compute-gpu-admission || exit $?`，
+下一行是 `COMMAND`，因此任一步骤失败都会在 `COMMAND` 的任何语句运行之前结束 shell。
 带版本号的脚本只需要 bash、coreutils 和 `nvidia-smi`；有 `timeout` 时会用它运行
-`nvidia-smi`。脚本以原子方式写入回执，把同一条 JSON 记录作为一行追加到回执的 `.jsonl` 历史中，
-使 experiment 重启后仍保留以前的尝试，打印一行 `determined-compute gpu_admission: passed|failed ...`，
-失败时以退出码 86 结束，使工作负载不会启动。缺少 `nvidia-smi` 或其运行失败都视为准入失败。
-回执记录 `schema_version`（`determined-compute-gpu-admission-v1`）、`status`、`observed_at`、
-`policy`、`devices`（序号、UUID、名称、驱动版本以及总显存和空闲显存 MiB）、`failures`、
+`nvidia-smi`。只有形如 GPU 行（数字序号加六个字段）的输出行才计为 GPU；其他行记录在
+`unparsed_lines` 中。脚本以原子方式写入回执，把同一条 JSON 记录作为一行追加到回执的 `.jsonl`
+历史中，使 experiment 重启后仍保留以前的尝试，打印一行
+`determined-compute gpu_admission: passed|failed ...`，失败时以退出码 86 结束，使工作负载不会
+启动。缺少 `nvidia-smi` 或其运行失败都视为准入失败。回执记录 `schema_version`
+（`determined-compute-gpu-admission-v1`）、`status`、`observed_at`、`policy`、`devices`（序号、
+UUID、名称、驱动版本以及总显存和空闲显存 MiB）、`unparsed_lines`、`failures`、
 `cuda_visible_devices`、`nvidia_visible_devices`、`hostname`，以及已设置的 Determined task、
-allocation 和 trial ID；不记录其他环境变量值。在 experiment 中，一次准入失败会消耗一次重启；
-若希望失败一次即停止，请在 `experiment_config` 中设置 `max_restarts: 0`。不含此字段的请求渲染
-结果与以前完全相同。
+allocation 和 trial ID；不记录其他环境变量值。
+
+回执保存使用相同 `output_dir` 和 `receipt` 的任意任务或 trial 最近写入的记录，因此同一
+experiment 中并发运行的 trial 会互相覆盖回执。`determined.allocation_id` 与该次尝试相符的
+`.jsonl` 行才是权威记录；同时运行的任务或 experiment 应使用不同的 `output_dir` 或 `receipt`。
+工作负载自身也可能以 86 退出，因此退出码 86 本身只是一个提示：请通过
+`determined-compute gpu_admission: failed` 日志行或相符的记录确认准入失败。在 experiment 中，
+一次准入失败会消耗一次重启；若希望失败一次即停止，请在 `experiment_config` 中设置
+`max_restarts: 0`。不含此字段的请求渲染结果与以前完全相同。
 
 <a id="start-the-mcp-server"></a>
 ## 启动 MCP server
