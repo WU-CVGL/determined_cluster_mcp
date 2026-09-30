@@ -7,7 +7,8 @@ rendered text is POSIX sh with one shape for every code source::
     <command>
 
 The prelude is a single ``&&`` list, so a failure anywhere in it exits with that status
-before the shell reads the first user statement, whatever the command's form.
+before the shell reads the first user statement, whatever the command's form. git delivery is
+one subshell in that list, so what it changes to isolate git never reaches the command.
 """
 
 from __future__ import annotations
@@ -42,12 +43,31 @@ CODE_ROOT = "/run/determined/workdir"
 GIT_CODE_ROOT = "/run/determined/code"
 
 # A missing git-lfs must fail the checkout instead of leaving pointer files behind, and
-# neither GIT_LFS_SKIP_SMUDGE nor fetch filters from the image or env may skip a download.
+# neither GIT_LFS_SKIP_SMUDGE nor fetch filters from the image, env or .lfsconfig may skip a
+# download.
 _LFS_ENV = "GIT_LFS_SKIP_SMUDGE=0 "
 _LFS_OPTIONS = (
     "-c filter.lfs.process='git-lfs filter-process' -c filter.lfs.required=true"
     " -c lfs.fetchinclude= -c lfs.fetchexclude="
 )
+# git takes its repository, work tree, index, object store, exec path and configuration from
+# GIT_* variables, which TaskSpec.env, the image or a startup hook may set for the workload;
+# with them, a clone and checkout can succeed while the code lands elsewhere. Delivery runs in
+# a subshell that unsets every exported GIT_* name and leaves the workload's environment alone.
+# POSIX sh cannot list exported names, so they come from `env`. sed emits only names made of
+# [A-Za-z0-9_], so the text is safe to eval, and a value spanning lines can at worst unset a
+# name that is not set. The probe proves that env and sed ran, since without them nothing
+# would be unset.
+_UNSET_GIT = (
+    "export GIT_COMPUTE_UNSET=1"
+    " && eval \"$(env | sed -n 's/^\\(GIT_[A-Za-z0-9_]*\\)=.*/unset \\1 \\&\\&/p') :\""
+    ' && test -z "${GIT_COMPUTE_UNSET+x}"'
+)
+# GIT_CONFIG_GLOBAL needs git 2.32, which an image may lack. Nothing can create a path below
+# /dev/null, and git reads a config file there as missing, so no user config applies either.
+_NO_GIT_CONFIG = "export HOME=/dev/null/home XDG_CONFIG_HOME=/dev/null/home GIT_CONFIG_NOSYSTEM=1"
+# One line on stderr names the failed step; the subshell's status fails the prelude.
+_GIT_FAIL = "fail() { printf '%s\\n' \"compute: git code delivery failed: $1\" >&2; exit 1; }"
 _FULL_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 # The harness rewrites an entrypoint of this form into a trial-class launch before running
 # it, so any prefix breaks it (harness/determined/util.py, match_legacy_trial_class).
@@ -333,7 +353,8 @@ def render_prelude(
 
     ``location`` is the container repository for git and the directory for path. A context
     ignores it: its repository is a local path that must not reach the task config.
-    Submodules are never recursed.
+    Submodules are never recursed. A failed git delivery prints one ``compute:`` line to
+    stderr.
     """
 
     if uses_lfs and source != "git":
@@ -353,15 +374,36 @@ def render_prelude(
     commit = _full_sha(commit, source)
     if source == "context":
         return f"{make_output} && cd -- {shlex.quote(_under(CODE_ROOT, workdir))}"
-    repo = shlex.quote(container_path(location or ""))
-    root = shlex.quote(GIT_CODE_ROOT)
     enter = f"cd -- {shlex.quote(_under(GIT_CODE_ROOT, workdir))}"
+    delivery = _git_delivery(container_path(location or ""), commit, uses_lfs)
+    return f"{delivery} && {make_output} && {enter}"
+
+
+def _git_delivery(repo: str, commit: str, uses_lfs: bool) -> str:
+    """Return the subshell that clones ``repo`` and checks out ``commit`` in isolation."""
+
+    source = shlex.quote(repo)
+    root = shlex.quote(GIT_CODE_ROOT)
     lfs_env, lfs = (_LFS_ENV, f" {_LFS_OPTIONS}") if uses_lfs else ("", "")
-    return (
-        f"git -c safe.directory={repo} clone -q --shared --no-checkout -- {repo} {root}"
-        f" && {lfs_env}git -C {root}{lfs} checkout -q --detach {shlex.quote(commit)}"
-        f" && {make_output} && {enter}"
-    )
+
+    def fail(message: str) -> str:
+        return f"fail {shlex.quote(message)}"
+
+    steps = [
+        _GIT_FAIL,
+        f"{_UNSET_GIT} || {fail('cannot unset the GIT_ variables; the image needs env and sed')}",
+        _NO_GIT_CONFIG,
+        f"git -c safe.directory={source} clone -q --shared --no-checkout -- {source} {root}"
+        f" || {fail('cannot clone the repository')}",
+        f"{lfs_env}git -C {root}{lfs} checkout -q --detach {commit}"
+        f" || {fail(f'cannot check out {commit}')}",
+        # The environment is clean by now; these also catch what it cannot reach, such as a
+        # core.worktree that an image's clone template writes, and prove what the command runs.
+        f'test "$(git -C {root} rev-parse --show-toplevel)" = "$(cd -- {root} && pwd -P)"'
+        f" || {fail(f'the work tree is not {GIT_CODE_ROOT}')}",
+        f'test "$(git -C {root} rev-parse HEAD)" = {commit} || {fail(f"HEAD is not {commit}")}',
+    ]
+    return f"( {'; '.join(steps)} )"
 
 
 def render_entrypoint(prelude: str, command: str) -> str:

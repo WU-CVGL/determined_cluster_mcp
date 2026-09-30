@@ -325,10 +325,6 @@ def test_invalid_specs_are_rejected(fields: Dict[str, Any], message: str) -> Non
 
 # Rendering
 
-GIT_CLONE = (
-    "git -c safe.directory=/shared/repo clone -q --shared --no-checkout -- /shared/repo "
-    "/run/determined/code && "
-)
 CHECKOUT = "git -C /run/determined/code "
 LFS = (
     "-c filter.lfs.process='git-lfs filter-process' -c filter.lfs.required=true "
@@ -337,32 +333,52 @@ LFS = (
 LFS_CHECKOUT = "GIT_LFS_SKIP_SMUDGE=0 " + CHECKOUT + LFS
 
 
+def delivery(repo: str, checkout: str = CHECKOUT) -> str:
+    """The isolated git delivery subshell for ``repo``, already quoted, at SHA."""
+
+    root = "/run/determined/code"
+    return (
+        "( fail() { printf '%s\\n' \"compute: git code delivery failed: $1\" >&2; exit 1; }; "
+        'export GIT_COMPUTE_UNSET=1 && eval "$(env | sed -n '
+        "'s/^\\(GIT_[A-Za-z0-9_]*\\)=.*/unset \\1 \\&\\&/p') :\" "
+        '&& test -z "${GIT_COMPUTE_UNSET+x}" '
+        "|| fail 'cannot unset the GIT_ variables; the image needs env and sed'; "
+        "export HOME=/dev/null/home XDG_CONFIG_HOME=/dev/null/home GIT_CONFIG_NOSYSTEM=1; "
+        f"git -c safe.directory={repo} clone -q --shared --no-checkout -- {repo} {root} "
+        "|| fail 'cannot clone the repository'; "
+        f"{checkout}checkout -q --detach {SHA} || fail 'cannot check out {SHA}'; "
+        f'test "$(git -C {root} rev-parse --show-toplevel)" = "$(cd -- {root} && pwd -P)" '
+        f"|| fail 'the work tree is not {root}'; "
+        f"test \"$(git -C {root} rev-parse HEAD)\" = {SHA} || fail 'HEAD is not {SHA}' )"
+    )
+
+
+GIT_DELIVERY = delivery("/shared/repo")
+LFS_DELIVERY = delivery("/shared/repo", LFS_CHECKOUT)
+
+
 @pytest.mark.parametrize(
     "workdir, uses_lfs, expected",
     [
         (
             ".",
             False,
-            GIT_CLONE + CHECKOUT + f"checkout -q --detach {SHA} && mkdir -p -- /shared/out "
-            "&& cd -- /run/determined/code",
+            GIT_DELIVERY + " && mkdir -p -- /shared/out && cd -- /run/determined/code",
         ),
         (
             ".",
             True,
-            GIT_CLONE + LFS_CHECKOUT + f"checkout -q --detach {SHA} && mkdir -p -- /shared/out "
-            "&& cd -- /run/determined/code",
+            LFS_DELIVERY + " && mkdir -p -- /shared/out && cd -- /run/determined/code",
         ),
         (
             "src/pkg",
             False,
-            GIT_CLONE + CHECKOUT + f"checkout -q --detach {SHA} && mkdir -p -- /shared/out "
-            "&& cd -- /run/determined/code/src/pkg",
+            GIT_DELIVERY + " && mkdir -p -- /shared/out && cd -- /run/determined/code/src/pkg",
         ),
         (
             "./src//pkg/",
             True,
-            GIT_CLONE + LFS_CHECKOUT + f"checkout -q --detach {SHA} && mkdir -p -- /shared/out "
-            "&& cd -- /run/determined/code/src/pkg",
+            LFS_DELIVERY + " && mkdir -p -- /shared/out && cd -- /run/determined/code/src/pkg",
         ),
     ],
 )
@@ -425,8 +441,7 @@ def test_awkward_values_are_quoted() -> None:
     quoted_repo = "'/srv/it'\"'\"'s a $repo; x\ny'"
     quoted_output = "'/out/$(touch pwned); rm -rf ~'"
     assert git == (
-        f"git -c safe.directory={quoted_repo} clone -q --shared --no-checkout -- "
-        f"{quoted_repo} /run/determined/code && {LFS_CHECKOUT}checkout -q --detach {SHA} "
+        f"{delivery(quoted_repo, LFS_CHECKOUT)} "
         f"&& mkdir -p -- {quoted_output} && cd -- '/run/determined/code/sub dir/\"q\"'"
     )
     assert context == (
@@ -549,7 +564,22 @@ def isolated_env(tmp_path: Path, *programs: str) -> Dict[str, str]:
 
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
-    return {"PATH": search_path("sh", "touch", "mkdir", "cat", *programs), "HOME": str(home)}
+    tools = ("sh", "touch", "mkdir", "cat", "env", "sed", *programs)
+    return {"PATH": search_path(*tools), "HOME": str(home)}
+
+
+def wrapped_tools(tmp_path: Path, *programs: str) -> str:
+    """A directory of wrappers for exactly ``programs``, each at its real location."""
+
+    tools = tmp_path / "tools"
+    tools.mkdir(exist_ok=True)
+    for program in programs:
+        found = shutil.which(program)
+        assert found is not None, program
+        wrapper = tools / program
+        wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(found)} "$@"\n')
+        wrapper.chmod(0o755)
+    return str(tools)
 
 
 def git_env(tmp_path: Path, *programs: str) -> Dict[str, str]:
@@ -588,6 +618,10 @@ def marker_command(form: str, marks: Path) -> str:
     return FORMS[form].format(a=shlex.quote(str(marks / "a")), b=shlex.quote(str(marks / "b")))
 
 
+def compute_lines(result: subprocess.CompletedProcess) -> list:
+    return [line for line in result.stderr.splitlines() if line.startswith("compute:")]
+
+
 @pytest.mark.parametrize("shell", SHELLS)
 @pytest.mark.parametrize("form", sorted(FORMS))
 @pytest.mark.parametrize("source", ["path", "context", pytest.param("git", marks=needs_git)])
@@ -616,6 +650,10 @@ def test_failed_prelude_runs_no_user_statement(
     assert prelude_status != 0
     assert result.returncode == prelude_status, result.stderr
     assert sorted(marks.iterdir()) == []
+    if source == "git":
+        assert compute_lines(result) == [
+            "compute: git code delivery failed: cannot clone the repository"
+        ]
 
 
 @pytest.mark.parametrize("shell", SHELLS)
@@ -703,6 +741,7 @@ def _source_repository(tmp_path: Path, env: Dict[str, str]) -> Tuple[Path, str]:
     repo = tmp_path / "shared repo's"
     (repo / "pkg").mkdir(parents=True)
     git(env, repo, "init", "-q", "-b", "main")
+    (repo / "main.py").write_text("print('pinned')\n")
     (repo / "pkg" / "data.txt").write_text("first\n")
     git(env, repo, "add", "-A")
     git(env, repo, "commit", "-q", "-m", "first")
@@ -760,6 +799,141 @@ def test_git_prelude_ignores_what_hooks_left_in_the_workdir(
     assert result.returncode == 0, result.stderr
     assert result.stdout == "first\n"
     assert (root / "pkg" / "data.txt").read_text() == "first\n"
+
+
+# Each makes git work on another repository, work tree, index, object store or exec path, or
+# run hooks and config from elsewhere, if the task environment reaches the delivery. git reads
+# core.worktree from the repository's own config only, so the config variables add a hook.
+HOSTILE_GIT_ENV = {
+    "work-tree": {"GIT_WORK_TREE": "{elsewhere}"},
+    "git-dir": {"GIT_DIR": "{elsewhere}/.git"},
+    "index-file": {"GIT_INDEX_FILE": "{elsewhere}/.git/index"},
+    "object-directory": {"GIT_OBJECT_DIRECTORY": "{elsewhere}/.git/objects"},
+    "config-parameters": {
+        "GIT_CONFIG_PARAMETERS": "'core.worktree'='{elsewhere}' 'core.hookspath'='{hooks}'"
+    },
+    "config-count": {
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "core.worktree",
+        "GIT_CONFIG_VALUE_0": "{elsewhere}",
+        "GIT_CONFIG_KEY_1": "core.hooksPath",
+        "GIT_CONFIG_VALUE_1": "{hooks}",
+    },
+    "exec-path": {"GIT_EXEC_PATH": "{elsewhere}"},
+    "template-dir": {"GIT_TEMPLATE_DIR": "{templates}"},
+}
+
+
+@needs_git
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("hostile", sorted(HOSTILE_GIT_ENV))
+def test_git_delivery_ignores_the_task_git_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell: Shell, hostile: str
+) -> None:
+    root = _git_root(tmp_path, monkeypatch)
+    env = git_env(tmp_path)
+    repo, pinned = _source_repository(tmp_path, env)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    git(env, elsewhere, "init", "-q", "-b", "main")
+    templates = tmp_path / "templates"
+    (templates / "hooks").mkdir(parents=True)
+    (templates / "config").write_text(f"[core]\n\tworktree = {elsewhere}\n")
+    hook = templates / "hooks" / "post-checkout"
+    hook.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(tmp_path / 'hooked'))}\n")
+    hook.chmod(0o755)
+    hostile_env = {
+        key: value.format(elsewhere=elsewhere, templates=templates, hooks=templates / "hooks")
+        for key, value in HOSTILE_GIT_ENV[hostile].items()
+    }
+    task_env = {**env, **hostile_env}
+    marks = tmp_path / "marks"
+    marks.mkdir()
+    prelude = render_prelude(
+        "git", output_dir=str(tmp_path / "out"), location=str(repo), commit=pinned
+    )
+    command = f"env > {shlex.quote(str(marks / 'env'))}; pwd -P > {shlex.quote(str(marks / 'pwd'))}"
+
+    result = run_shell(shell, render_entrypoint(prelude, command), task_env, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert (root / "main.py").read_text() == "print('pinned')\n"
+    assert git(env, root, "rev-parse", "HEAD") == pinned
+    assert git(env, root, "status", "--porcelain") == ""
+    assert not (elsewhere / "main.py").exists() and not (tmp_path / "hooked").exists()
+    assert (marks / "pwd").read_text().strip() == os.path.realpath(root)
+    # The workload still gets its own environment.
+    seen = dict(
+        line.split("=", 1) for line in (marks / "env").read_text().splitlines() if "=" in line
+    )
+    assert {key: seen.get(key) for key in hostile_env} == hostile_env
+    assert seen["HOME"] == task_env["HOME"]
+
+
+@needs_git
+@pytest.mark.parametrize("shell", SHELLS)
+def test_git_delivery_reads_no_user_config_without_git_config_global(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell: Shell
+) -> None:
+    root = _git_root(tmp_path, monkeypatch)
+    env = git_env(tmp_path)
+    repo, pinned = _source_repository(tmp_path, env)
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    hook = hooks / "post-checkout"
+    hook.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(tmp_path / 'hooked'))}\n")
+    hook.chmod(0o755)
+    home, xdg = tmp_path / "user-home", tmp_path / "xdg"
+    (xdg / "git").mkdir(parents=True)
+    home.mkdir()
+    for config in (home / ".gitconfig", xdg / "git" / "config"):
+        config.write_text(f"[core]\n\thooksPath = {hooks}\n")
+    # As git before 2.32 sees it: GIT_CONFIG_GLOBAL is not set, so HOME and XDG apply.
+    task_env = {**isolated_env(tmp_path, "git"), "HOME": str(home), "XDG_CONFIG_HOME": str(xdg)}
+    control = tmp_path / "control"
+    git(task_env, tmp_path, "clone", "-q", "--no-checkout", str(repo), str(control))
+    git(task_env, control, "checkout", "-q", "--detach", pinned)
+    assert (tmp_path / "hooked").exists()  # the user config applies to a plain checkout
+    (tmp_path / "hooked").unlink()
+    prelude = render_prelude(
+        "git", output_dir=str(tmp_path / "out"), location=str(repo), commit=pinned
+    )
+
+    result = run_shell(shell, render_entrypoint(prelude, 'printf %s "$HOME"'), task_env, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == str(home)
+    assert (root / "main.py").exists()
+    assert not (tmp_path / "hooked").exists()
+
+
+@needs_git
+def test_git_delivery_fails_closed_without_sed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _git_root(tmp_path, monkeypatch)
+    env = git_env(tmp_path)
+    repo, pinned = _source_repository(tmp_path, env)
+    marks = tmp_path / "marks"
+    marks.mkdir()
+    prelude = render_prelude(
+        "git", output_dir=str(tmp_path / "out"), location=str(repo), commit=pinned
+    )
+    tools = wrapped_tools(tmp_path, "git", "mkdir", "touch", "env")
+
+    result = run_shell(
+        ("sh", "-c"),
+        render_entrypoint(prelude, marker_command("sequence", marks)),
+        {**env, "PATH": tools, "GIT_WORK_TREE": str(tmp_path)},
+        tmp_path,
+    )
+
+    assert result.returncode != 0
+    assert compute_lines(result) == [
+        "compute: git code delivery failed: cannot unset the GIT_ variables; "
+        "the image needs env and sed"
+    ]
+    assert sorted(marks.iterdir()) == [] and not root.exists()
 
 
 def _lfs_repository(tmp_path: Path, env: Dict[str, str]) -> Tuple[Path, str]:
@@ -823,12 +997,7 @@ def test_git_prelude_fails_without_git_lfs(tmp_path: Path, monkeypatch: pytest.M
     if shutil.which("git-lfs", path=exec_path):
         pytest.skip("git-lfs is installed in git's exec path")
     # Wrappers keep each tool's real location, and leave git-lfs off PATH.
-    tools = tmp_path / "tools"
-    tools.mkdir()
-    for program in ("git", "mkdir", "touch"):
-        wrapper = tools / program
-        wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(shutil.which(program))} "$@"\n')
-        wrapper.chmod(0o755)
+    tools = wrapped_tools(tmp_path, "git", "mkdir", "touch", "env", "sed")
     marks = tmp_path / "marks"
     marks.mkdir()
     prelude = render_prelude(
@@ -838,12 +1007,15 @@ def test_git_prelude_fails_without_git_lfs(tmp_path: Path, monkeypatch: pytest.M
     result = run_shell(
         ("sh", "-c"),
         render_entrypoint(prelude, marker_command("sequence", marks)),
-        {**env, "PATH": str(tools)},
+        {**env, "PATH": tools},
         tmp_path,
     )
 
     assert result.returncode != 0
     assert "git-lfs" in result.stderr
+    assert compute_lines(result) == [
+        f"compute: git code delivery failed: cannot check out {pinned}"
+    ]
     assert sorted(marks.iterdir()) == []
     assert not (root / "model.bin").exists()
 
