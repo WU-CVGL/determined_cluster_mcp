@@ -1,8 +1,9 @@
 """Optional in-container GPU admission preflight for command and experiment tasks.
 
-The preflight is a versioned bash script that runs before the workload inside the
-task container. It needs only bash, coreutils, and ``nvidia-smi``. The script is part
-of the rendered, hashed task config, so any change to it requires a new version.
+The preflight is a versioned Python script that runs before the workload inside the
+task container. It needs ``python3`` (3.6 or newer) and the ``nvidia-ml-py`` package,
+whose ``pynvml`` module binds NVIDIA's NVML library. The script is part of the
+rendered, hashed task config, so any change to it requires a new version.
 """
 
 from __future__ import annotations
@@ -31,68 +32,115 @@ _MAX_PATTERNS = 8
 _MAX_PATTERN_LENGTH = 128
 _RECEIPT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,122}\.json")
 
-# Version v1. Reads the policy from COMPUTE_GPU_ADMISSION_* variables, writes an
-# atomically replaced JSON receipt plus one JSON line of history under
-# COMPUTE_OUTPUT_DIR, prints one summary line, and exits 86 when the policy fails.
-SCRIPT_V1 = r'''out=${COMPUTE_OUTPUT_DIR:-.}
-receipt=${COMPUTE_GPU_ADMISSION_RECEIPT:-gpu-admission.json}
-count=${COMPUTE_GPU_ADMISSION_COUNT:-}
-names=${COMPUTE_GPU_ADMISSION_NAMES:-}
-drivers=${COMPUTE_GPU_ADMISSION_DRIVERS:-}
-min_free=${COMPUTE_GPU_ADMISSION_MIN_FREE_MIB:-}
-min_total=${COMPUTE_GPU_ADMISSION_MIN_TOTAL_MIB:-}
-js() { local s; s=$(printf '%s' "$1" | tr -d '\000-\037\177'); s=${s//\\/\\\\}; s=${s//\"/\\\"}; printf '"%s"' "$s"; }
-jn() { case $1 in ''|*[!0-9]*) printf null ;; *) printf '%s' "$((10#$1))" ;; esac; }
-jo() { if [ -n "$1" ]; then js "$1"; else printf null; fi; }
-jl() { local IFS='|' first=1 item items; printf '['; if [ -n "$1" ]; then read -r -a items <<<"$1"; for item in "${items[@]}"; do [ "$first" = 1 ] || printf ','; first=0; js "$item"; done; fi; printf ']'; }
-trim() { local v=$1; v=${v#"${v%%[![:space:]]*}"}; v=${v%"${v##*[![:space:]]}"}; printf '%s' "$v"; }
-matches() { local IFS='|' pat pats; read -r -a pats <<<"$2"; for pat in "${pats[@]}"; do case $1 in $pat) return 0 ;; esac; done; return 1; }
-atleast() { case $1 in ''|*[!0-9]*) return 1 ;; esac; [ "$((10#$1))" -ge "$2" ]; }
-failures=()
-devices=
-unparsed=
-n=0
-query=(nvidia-smi --query-gpu=index,uuid,name,driver_version,memory.total,memory.free --format=csv,noheader,nounits)
-if command -v nvidia-smi >/dev/null 2>&1; then
-  if command -v timeout >/dev/null 2>&1; then raw=$(timeout 60 "${query[@]}" 2>/dev/null); rc=$?; else raw=$("${query[@]}" 2>/dev/null); rc=$?; fi
-  if [ "$rc" != 0 ]; then failures+=("nvidia-smi failed with exit code $rc"); raw=; fi
-else
-  rc=127; raw=; failures+=("nvidia-smi is unavailable")
-fi
-if [ "$rc" = 0 ]; then
-  while IFS= read -r line; do
-    [ -n "$(trim "$line")" ] || continue
-    IFS=, read -r index uuid name driver total free extra <<<"$line"
-    index=$(trim "$index"); uuid=$(trim "$uuid"); name=$(trim "$name")
-    driver=$(trim "$driver"); total=$(trim "$total"); free=$(trim "$free")
-    case $index in ''|*[!0-9]*) row= ;; *) row=1 ;; esac
-    if [ -z "$row" ] || [ -n "$extra" ] || [ -z "$free" ]; then unparsed="$unparsed${unparsed:+,}$(js "$(printf '%s' "$line" | LC_ALL=C tr -cd '\040-\176')")"; continue; fi
-    n=$((n + 1))
-    devices="$devices${devices:+,}{\"index\":$(jn "$index"),\"uuid\":$(jo "$uuid"),\"name\":$(jo "$name"),\"driver_version\":$(jo "$driver"),\"memory_total_mib\":$(jn "$total"),\"memory_free_mib\":$(jn "$free")}"
-    if [ -n "$names" ] && ! matches "$name" "$names"; then failures+=("GPU $index name $name is not allowed"); fi
-    if [ -n "$drivers" ] && ! matches "$driver" "$drivers"; then failures+=("GPU $index driver $driver is not allowed"); fi
-    if [ -n "$min_free" ] && ! atleast "$free" "$min_free"; then failures+=("GPU $index has ${free:-unknown} MiB free, below $min_free MiB"); fi
-    if [ -n "$min_total" ] && ! atleast "$total" "$min_total"; then failures+=("GPU $index has ${total:-unknown} MiB total, below $min_total MiB"); fi
-  done <<<"$raw"
-  if [ -n "$count" ] && [ "$n" != "$count" ]; then failures+=("nvidia-smi reports $n GPUs but the policy requires $count"); fi
-fi
-status=passed
-[ "${#failures[@]}" = 0 ] || status=failed
-fl=
-for f in "${failures[@]}"; do fl="$fl${fl:+,}$(js "$f")"; done
-host=$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null)
-record="{\"schema_version\":\"determined-compute-gpu-admission-v1\",\"status\":\"$status\",\"observed_at\":$(jo "$(date -u +%FT%TZ 2>/dev/null)"),\"policy\":{\"count\":$(jn "$count"),\"names\":$(jl "$names"),\"min_free_mib\":$(jn "$min_free"),\"min_total_mib\":$(jn "$min_total"),\"driver_versions\":$(jl "$drivers")},\"devices\":[$devices],\"unparsed_lines\":[$unparsed],\"failures\":[$fl],\"cuda_visible_devices\":$(jo "${CUDA_VISIBLE_DEVICES:-}"),\"nvidia_visible_devices\":$(jo "${NVIDIA_VISIBLE_DEVICES:-}"),\"hostname\":$(jo "$host"),\"determined\":{\"task_id\":$(jo "${DET_TASK_ID:-}"),\"allocation_id\":$(jo "${DET_ALLOCATION_ID:-}"),\"trial_id\":$(jo "${DET_TRIAL_ID:-}")}}"
-tmp="$out/.$receipt.$$.tmp"
-if printf '%s\n' "$record" >"$tmp" 2>/dev/null && mv -f "$tmp" "$out/$receipt" 2>/dev/null; then :; else rm -f "$tmp" 2>/dev/null; echo "determined-compute gpu_admission: cannot write $out/$receipt" >&2; fi
-printf '%s\n' "$record" >>"$out/${receipt%.json}.jsonl" 2>/dev/null || echo "determined-compute gpu_admission: cannot append $out/${receipt%.json}.jsonl" >&2
-if [ "$status" = passed ]; then
-  echo "determined-compute gpu_admission: passed: $n GPUs; receipt $out/$receipt"
-  exit 0
-fi
-joined=$(printf '%s; ' "${failures[@]}")
-echo "determined-compute gpu_admission: failed: ${joined%; }; receipt $out/$receipt"
-exit 86
-'''
+# Version v1. Reads the policy from COMPUTE_GPU_ADMISSION_* variables, queries NVML
+# through pynvml with a 60 second limit, writes an atomically replaced JSON receipt plus
+# one JSON line of history under COMPUTE_OUTPUT_DIR, prints one summary line, and exits
+# 86 when the policy fails or NVML is unusable. It drops the working directory from
+# sys.path so workload files cannot shadow the modules it imports. It is passed as one
+# shell-quoted argument, so it stays small, contains no single quote, and runs on
+# Python 3.6; pynvml may return bytes or str.
+SCRIPT_V1 = r"""import fnmatch, json, os, socket, sys, threading, time
+sys.path[:] = [p for p in sys.path if p]
+E = os.environ
+F, D, Q = [], [], []
+def env(k):
+    return E.get("COMPUTE_GPU_ADMISSION_" + k, "")
+def num(k):
+    v = env(k)
+    if v and not v.strip("0123456789"):
+        return int(v)
+    if v:
+        F.append("COMPUTE_GPU_ADMISSION_%s is not a non-negative integer" % k)
+def text(v):
+    return v.decode("utf-8", "replace") if isinstance(v, bytes) else str(v)
+def allowed(v, patterns):
+    return not patterns or any(fnmatch.fnmatchcase(v, p) for p in patterns)
+def opt(k):
+    return E.get(k) or None
+def say(f, m):
+    m = "determined-compute gpu_admission: %s\n" % m
+    f.buffer.write(m.encode("utf-8", "surrogateescape"))
+    f.flush()
+def query():
+    step = "import"
+    try:
+        import pynvml as N
+        step = "initialisation"
+        N.nvmlInit()
+        step = "query"
+        driver = text(N.nvmlSystemGetDriverVersion())
+        for i in range(N.nvmlDeviceGetCount()):
+            h = N.nvmlDeviceGetHandleByIndex(i)
+            m = N.nvmlDeviceGetMemoryInfo(h)
+            D.append({"index": i, "uuid": text(N.nvmlDeviceGetUUID(h)),
+                      "name": text(N.nvmlDeviceGetName(h)), "driver_version": driver,
+                      "memory_total_mib": m.total >> 20, "memory_free_mib": m.free >> 20})
+        step = None
+        N.nvmlShutdown()
+    except Exception as e:  # pynvml.NVMLError or anything unexpected fails closed
+        if step == "import" and isinstance(e, ImportError):
+            Q.append("nvidia-ml-py (pynvml) is not installed in the task image")
+        elif step:
+            Q.append("NVML %s failed: %s: %s" % (step, type(e).__name__, e))
+count, free, total = num("COUNT"), num("MIN_FREE_MIB"), num("MIN_TOTAL_MIB")
+names, drivers = [[p for p in env(k).split("|") if p] for k in ("NAMES", "DRIVERS")]
+t = threading.Thread(target=query)
+t.daemon = True
+t.start()
+t.join(60)
+hung = t.is_alive()
+devices = [] if hung else list(D)
+F.extend(["NVML did not answer within 60 seconds"] if hung else Q)
+if not (hung or Q) and count is not None and len(devices) != count:
+    F.append("NVML reports %d GPUs but the policy requires %d" % (len(devices), count))
+for d in devices:
+    g = "GPU %d" % d["index"]
+    if not allowed(d["name"], names):
+        F.append("%s name %s is not allowed" % (g, d["name"]))
+    if not allowed(d["driver_version"], drivers):
+        F.append("%s driver %s is not allowed" % (g, d["driver_version"]))
+    if free is not None and d["memory_free_mib"] < free:
+        F.append("%s has %d MiB free, below %d MiB" % (g, d["memory_free_mib"], free))
+    if total is not None and d["memory_total_mib"] < total:
+        F.append("%s has %d MiB total, below %d MiB" % (g, d["memory_total_mib"], total))
+record = json.dumps({
+    "schema_version": "determined-compute-gpu-admission-v1",
+    "status": "failed" if F else "passed",
+    "observed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    "policy": {"count": count, "names": names, "min_free_mib": free,
+               "min_total_mib": total, "driver_versions": drivers},
+    "devices": devices, "failures": F,
+    "cuda_visible_devices": opt("CUDA_VISIBLE_DEVICES"),
+    "nvidia_visible_devices": opt("NVIDIA_VISIBLE_DEVICES"),
+    "hostname": socket.gethostname() or None,
+    "determined": {"task_id": opt("DET_TASK_ID"), "allocation_id": opt("DET_ALLOCATION_ID"),
+                   "trial_id": opt("DET_TRIAL_ID")},
+}, separators=(",", ":")) + "\n"
+out, name = E.get("COMPUTE_OUTPUT_DIR") or ".", env("RECEIPT") or "gpu-admission.json"
+path = os.path.join(out, name)
+tmp = os.path.join(out, ".%s.%d.tmp" % (name, os.getpid()))
+try:
+    with open(tmp, "w") as f:
+        f.write(record)
+    os.replace(tmp, path)
+except OSError:
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    say(sys.stderr, "cannot write " + path)
+history = (path[:-5] if path.endswith(".json") else path) + ".jsonl"
+try:
+    with open(history, "a") as f:
+        f.write(record)
+except OSError:
+    say(sys.stderr, "cannot append " + history)
+if F:
+    say(sys.stdout, "failed: %s; receipt %s" % ("; ".join(F), path))
+else:
+    say(sys.stdout, "passed: %d GPUs; receipt %s" % (len(devices), path))
+os._exit(86 if F else 0)  # a hung NVML thread must not delay the exit
+"""
 
 
 def _patterns(value: Any, field: str) -> List[str]:
@@ -202,7 +250,7 @@ def environment_variables(policy: Mapping[str, Any]) -> List[str]:
 
 def entrypoint_step() -> str:
     """Return the shell step inserted before the workload command."""
-    return f"/bin/bash -c {shlex.quote(SCRIPT_V1)} determined-compute-gpu-admission"
+    return f"python3 -c {shlex.quote(SCRIPT_V1)} determined-compute-gpu-admission"
 
 
 __all__ = [

@@ -178,32 +178,35 @@ launch 在容量检查之后、认领任务记录之前，以默认 umask 连同
 
 | 字段 | 含义 |
 | --- | --- |
-| `count` | 正整数；`nvidia-smi` 报告的 GPU 数量必须与之相等。默认为请求的 slot 数 |
-| `names` | 最多 8 个 `fnmatch` 风格模式，每个最多 128 个可打印字符且不含 `\|`；报告的每块 GPU 的名称都必须匹配其中之一 |
+| `count` | 正整数；NVML 报告的 GPU 数量必须与之相等。默认为请求的 slot 数 |
+| `names` | 最多 8 个区分大小写的 `fnmatch` 风格模式，每个最多 128 个可打印字符且不含 `\|`；报告的每块 GPU 的名称都必须匹配其中之一 |
 | `driver_versions` | 相同形式的驱动版本模式 |
 | `min_free_mib`、`min_total_mib` | 非负整数，对报告的每块 GPU 检查 |
 | `receipt` | `output_dir` 下的回执文件名，必须以 `.json` 结尾；默认为 `gpu-admission.json` |
 
-检查针对 `nvidia-smi` 在容器内报告的 GPU，不应用 `CUDA_VISIBLE_DEVICES`；回执记录该变量仅供
-诊断。如果资源管理器只通过 `CUDA_VISIBLE_DEVICES` 限制 GPU（例如未启用 cgroup 设备约束的
-Slurm），请按整个节点设置 `count` 和显存下限，或不要使用 `gpu_admission`。
+检查针对 NVML 在容器内报告的 GPU，即 `nvidia-smi` 在容器内会列出的那些设备，不应用
+`CUDA_VISIBLE_DEVICES`；回执记录该变量仅供诊断。如果资源管理器只通过
+`CUDA_VISIBLE_DEVICES` 限制 GPU（例如未启用 cgroup 设备约束的 Slurm），请按整个节点设置
+`count` 和显存下限，或不要使用 `gpu_admission`。
 
 规划结果增加规范化的 `gpu_admission` 对象，config 增加受管的 `COMPUTE_GPU_ADMISSION*` 变量，
 入口变为
-`mkdir -p OUTPUT && cd WORKDIR && /bin/bash -c '<script v1>' determined-compute-gpu-admission || exit $?`，
+`mkdir -p OUTPUT && cd WORKDIR && python3 -c '<script v1>' determined-compute-gpu-admission || exit $?`，
 下一行是 `COMMAND`，因此任一步骤失败都会在 `COMMAND` 的任何语句运行之前结束 shell。
 由于 `COMMAND` 自成一行，只含注释的 `COMMAND` 在准入通过后什么也不做并以 0 退出；空白的
-`COMMAND` 无论是否启用准入都会被拒绝。带版本号的脚本只需要 bash、coreutils 和
-`nvidia-smi`；有 `timeout` 时会用它运行 `nvidia-smi`。只有形如 GPU 行（数字序号加六个字段）
-的输出行才计为 GPU；其他行只保留可打印 ASCII 字符后记录在 `unparsed_lines` 中。脚本以原子
-方式写入回执，把同一条 JSON 记录作为一行追加到回执的 `.jsonl` 历史中，使 experiment 重启后
-仍保留以前的尝试，打印一行
+`COMMAND` 无论是否启用准入都会被拒绝。
+
+任务镜像必须提供 `python3`（3.6 或更新版本）和 `nvidia-ml-py` 包，后者提供 `pynvml` 模块
+（例如用 `pip install nvidia-ml-py` 安装）。带版本号的脚本通过 NVML 读取驱动版本以及每块 GPU
+的序号、UUID、名称、总显存和空闲显存，最多等待 60 秒。脚本以原子方式写入回执，把同一条 JSON
+记录作为一行追加到回执的 `.jsonl` 历史中，使 experiment 重启后仍保留以前的尝试，打印一行
 `determined-compute gpu_admission: passed|failed ...`，失败时以退出码 86 结束，使工作负载不会
-启动。缺少 `nvidia-smi` 或其运行失败都视为准入失败。回执记录 `schema_version`
-（`determined-compute-gpu-admission-v1`）、`status`、`observed_at`、`policy`、`devices`（序号、
-UUID、名称、驱动版本以及总显存和空闲显存 MiB）、`unparsed_lines`、`failures`、
-`cuda_visible_devices`、`nvidia_visible_devices`、`hostname`，以及已设置的 Determined task、
-allocation 和 trial ID；不记录其他环境变量值。
+启动。缺少 `nvidia-ml-py`、NVML 库或驱动无法初始化、NVML 查询失败或 60 秒内没有应答都视为
+准入失败。`PATH` 中没有 `python3` 时，shell 以退出码 127 结束任务且不写回执，工作负载同样
+不会启动。回执记录 `schema_version`（`determined-compute-gpu-admission-v1`）、`status`、
+`observed_at`、`policy`、`devices`（序号、UUID、名称、驱动版本以及向下取整的总显存和空闲显存
+MiB）、`failures`、`cuda_visible_devices`、`nvidia_visible_devices`、`hostname`，以及已设置的
+Determined task、allocation 和 trial ID；不记录其他环境变量值。
 
 回执保存使用相同 `output_dir` 和 `receipt` 的任意任务或 trial 最近写入的记录，因此同一
 experiment 中并发运行的 trial 会互相覆盖回执。`determined.allocation_id` 与该次尝试相符的

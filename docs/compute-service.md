@@ -208,37 +208,42 @@ trial span several agents and each container would then see only its own agent's
 
 | Field | Meaning |
 | --- | --- |
-| `count` | Positive integer; the number of GPUs that `nvidia-smi` reports must equal it. Default: the requested slots |
-| `names` | Up to 8 `fnmatch`-style patterns of at most 128 printable characters without `\|`; every reported GPU name must match one |
+| `count` | Positive integer; the number of GPUs that NVML reports must equal it. Default: the requested slots |
+| `names` | Up to 8 case-sensitive `fnmatch`-style patterns of at most 128 printable characters without `\|`; every reported GPU name must match one |
 | `driver_versions` | Patterns of the same form for the driver version |
 | `min_free_mib`, `min_total_mib` | Non-negative integers checked for every reported GPU |
 | `receipt` | Receipt file name under `output_dir`, ending in `.json`; default `gpu-admission.json` |
 
-The checks apply to the GPUs that `nvidia-smi` reports inside the container. They do not
-apply `CUDA_VISIBLE_DEVICES`, which the receipt records only for diagnosis. On a resource
-manager that restricts GPUs only through `CUDA_VISIBLE_DEVICES` (for example Slurm without
-cgroup device constraints), set `count` and the memory floors for the whole node or do
-not use `gpu_admission`.
+The checks apply to the GPUs that NVML reports inside the container, which are the
+devices that `nvidia-smi` would list there. They do not apply `CUDA_VISIBLE_DEVICES`,
+which the receipt records only for diagnosis. On a resource manager that restricts GPUs
+only through `CUDA_VISIBLE_DEVICES` (for example Slurm without cgroup device
+constraints), set `count` and the memory floors for the whole node or do not use
+`gpu_admission`.
 
 The plan gains the normalized `gpu_admission` object, the config gains the managed
 `COMPUTE_GPU_ADMISSION*` variables, and the entrypoint becomes
-`mkdir -p OUTPUT && cd WORKDIR && /bin/bash -c '<script v1>' determined-compute-gpu-admission || exit $?`
+`mkdir -p OUTPUT && cd WORKDIR && python3 -c '<script v1>' determined-compute-gpu-admission || exit $?`
 with `COMMAND` on the next line, so a failed step ends the shell before any statement of
 `COMMAND` runs. Because `COMMAND` is its own line, a `COMMAND` of only comments does
 nothing and exits 0 once admission passes; a blank `COMMAND` is rejected with or without
-admission. The versioned script needs only bash, coreutils, and `nvidia-smi`, which it
-runs under `timeout` when available. Only output lines shaped like a GPU row (a numeric
-index and six fields) count as GPUs; other lines are recorded in `unparsed_lines`,
-reduced to printable ASCII.
-It atomically writes the receipt, appends the same JSON record as one line to the
-receipt's `.jsonl` history so experiment restarts keep earlier attempts, prints one
+admission.
+
+The task image must provide `python3` (3.6 or newer) and the `nvidia-ml-py` package,
+which supplies the `pynvml` module (for example `pip install nvidia-ml-py`). The
+versioned script reads the driver version and each GPU's index, UUID, name, and total and
+free memory through NVML, and waits at most 60 seconds for the answer. It atomically
+writes the receipt, appends the same JSON record as one line to the receipt's `.jsonl`
+history so experiment restarts keep earlier attempts, prints one
 `determined-compute gpu_admission: passed|failed ...` line, and exits 86 on failure so
-the workload never starts. A missing or failing `nvidia-smi` fails admission. The receipt
-records `schema_version` (`determined-compute-gpu-admission-v1`), `status`,
-`observed_at`, `policy`, `devices` (index, UUID, name, driver version, and total and free
-MiB), `unparsed_lines`, `failures`, `cuda_visible_devices`, `nvidia_visible_devices`,
-`hostname`, and the Determined task, allocation, and trial IDs when set; it records no
-other environment value.
+the workload never starts. A missing `nvidia-ml-py`, an NVML library or driver that
+cannot initialise, a failed NVML query, or no answer within 60 seconds fails admission.
+Without `python3` on `PATH`, the shell ends the task with exit code 127 and no receipt;
+the workload still does not start. The receipt records `schema_version`
+(`determined-compute-gpu-admission-v1`), `status`, `observed_at`, `policy`, `devices`
+(index, UUID, name, driver version, and total and free MiB, rounded down), `failures`,
+`cuda_visible_devices`, `nvidia_visible_devices`, `hostname`, and the Determined task,
+allocation, and trial IDs when set; it records no other environment value.
 
 The receipt holds the latest record from any task or trial that uses the same
 `output_dir` and `receipt`, so concurrent trials of one experiment overwrite each other's.

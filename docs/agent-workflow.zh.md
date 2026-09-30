@@ -94,7 +94,7 @@ MCP 不接受 `kind: notebook`。
 
 调用 `compute_plan(request)`，检查解析后的任务类型、镜像、资源池、挂载、工作目录、输出目录、资源字段、提示信息和 `path_checks`。当 MCP server 能看到相应路径时，`path_checks` 报告每个 bind mount、工作目录、experiment 检查点目录和输出目录是否存在；`unverified` 表示看不到该路径，而不表示路径不存在。缺少必需路径时返回 `path_not_found`，并在 `details.missing_paths` 中列出。experiment 的检查点目录会在入口运行前被 bind mount，因此它尚不存在时，请添加 `"create_directories": ["checkpoint_storage"]`（需要时再加 `"output_dir"`），launch 会在提交前创建它。规划不能证明权限、凭据或实时容量有效。
 
-工作负载需要特定 GPU 型号、驱动、数量或空闲显存下限时，添加 `gpu_admission`，例如 `{"names": ["APPROVED_GPU_NAME*"], "min_free_mib": 16384}`，其中的值应来自项目或管理员。任务随后会在工作负载启动前检查 `nvidia-smi` 在容器内报告的 GPU。slot 多于一个的 experiment 还需要设置 `experiment_config.resources.is_single_node: true`。参见 [GPU 准入](compute-service.zh.md#gpu-admission)。
+工作负载需要特定 GPU 型号、驱动、数量或空闲显存下限时，添加 `gpu_admission`，例如 `{"names": ["APPROVED_GPU_NAME*"], "min_free_mib": 16384}`，其中的值应来自项目或管理员。任务随后会在工作负载启动前检查 NVML 在容器内报告的 GPU，因此任务镜像需要提供 `python3` 和 `nvidia-ml-py` 包。slot 多于一个的 experiment 还需要设置 `experiment_config.resources.is_single_node: true`。参见 [GPU 准入](compute-service.zh.md#gpu-admission)。
 
 生成一个稳定且由调用方控制的 `request_id`，再调用 `compute_launch(request, request_id)`。在工作记录中保留返回的本地 `task_id` 和远端 ID。相同请求使用同一 request ID 重试是幂等的；将该 ID 用于不同内容会被拒绝。
 
