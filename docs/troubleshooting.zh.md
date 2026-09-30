@@ -12,10 +12,9 @@
 
 ```bash
 /absolute/path/to/determined_cluster_mcp/.venv/bin/determined-compute-mcp --help
-/absolute/path/to/determined_cluster_mcp/.venv/bin/determined-compute --profile /absolute/path/to/profile.yaml plan --request-file /absolute/path/to/request.json
 ```
 
-服务使用 stdout 传输 MCP 协议帧，启动错误写入 stderr。请在 MCP 客户端的服务日志中查看准确错误。更改安装或升级服务后，重启共享该数据库的所有 MCP 进程，使其加载相同的工具和数据库结构。
+客户端列出工具后，用一个请求调用 `compute_plan` 检查 profile 和路径；它不需要访问集群。服务使用 stdout 传输 MCP 协议帧，启动错误写入 stderr。请在 MCP 客户端的服务日志中查看准确错误。更改安装或升级服务后，重启共享该数据库的所有 MCP 进程，使其加载相同的工具和数据库结构。
 
 计算任务不需要 `--storage-config`。共享路径与已配置的 `host_path` 在本机一致时，存储工具会自动使用该本地路径。需要自定义本地映射或登录节点 SSH 时，将 `cfg/storage-access.example.yaml` 复制为 `.local/storage.yaml`，编辑后再添加 `--storage-config /absolute/path/to/.local/storage.yaml`。
 

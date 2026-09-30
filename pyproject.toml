@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "determined-compute"
-version = "0.5.0"
+version = "0.6.0"
 description = "Persistent shared-storage compute service and MCP tools for Determined"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -41,7 +41,6 @@ dev = [
 ]
 
 [project.scripts]
-determined-compute = "determined_compute.compute_cli:main"
 determined-compute-mcp = "determined_compute.mcp_server:main"
 
 [tool.setuptools]

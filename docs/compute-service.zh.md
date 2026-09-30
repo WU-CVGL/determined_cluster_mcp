@@ -4,15 +4,14 @@
 [English](compute-service.md) | [简体中文](compute-service.zh.md)
 
 本文说明本地 Determined 计算服务的配置和公开 MCP 接口。准备、提交和检查任务的通用 agent
-流程见 [Agent 工作流](agent-workflow.zh.md)；可选的服务端建议 worker 见
-[咨询后端](consultation.zh.md)。
+流程见 [Agent 工作流](agent-workflow.zh.md)。
 
 <a id="architecture-and-trust-boundary"></a>
 ## 架构与信任边界
 
 ```mermaid
 flowchart LR
-    U[Any local stdio MCP client] --> M[14 base MCP tools]
+    U[Any local stdio MCP client] --> M[14 MCP tools]
     M --> C[ComputeService]
     C --> D[(local SQLite database)]
     C --> A[Determined API]
@@ -20,7 +19,6 @@ flowchart LR
     P[compute profile] --> C
     M --> S[shared-storage adapter]
     S --> H[mapped shared storage]
-    M -. optional: 2 more tools .-> W[read-only consultation worker]
 ```
 
 MCP server 是供一个可信用户使用的本地 stdio 服务。进程启动时绑定 `owner`，所有工具都不接受
@@ -30,10 +28,6 @@ owner 参数。多个进程可以在同一个数据库中使用不同 owner；�
 `ComputeService` 负责规划、幂等提交、状态、日志、用量测量、取消、发现、接管以及保守的
 调和。其本地 `task_id` 在服务重启后保持稳定，与 Determined 的 `remote_id` 不同。SQLite
 数据库应放在持久的本地存储上；源码、数据、包、检查点、日志和输出应放在映射的共享存储上。
-
-咨询后端默认为 `none`。此模式注册 14 个基础工具，不导入咨询 worker，不要求安装 Codex，
-也不要求存在仓库 skill 目录。启用 Codex 后端会增加 `compute_consult` 和 `workflow_status`，
-总计 16 个工具。咨询只提供建议，不能提交或取消任务。
 
 <a id="compute-profile"></a>
 ## 计算配置
@@ -131,7 +125,7 @@ determined-compute-mcp \
 `DET_VERIFY_SSL`。凭据应放在现有凭据提供方或 secrets 文件中，不要写入配置、数据库、工具
 参数或报告。
 
-CLI 的默认数据库路径是 `~/.local/state/determined-compute/tasks.sqlite3`，但 MCP 部署应显式
+默认数据库路径是 `~/.local/state/determined-compute/tasks.sqlite3`，但 MCP 部署应显式
 指定本地绝对路径。MCP 拒绝 `:memory:`。服务升级后，应重启共用该数据库的所有 MCP 进程，
 使它们加载同一套工具和新增式 schema。
 
@@ -141,7 +135,7 @@ CLI 的默认数据库路径是 `~/.local/state/determined-compute/tasks.sqlite3
 <a id="mcp-api"></a>
 ## MCP API
 
-基础 server 提供 14 个工具。下文的 `owner` 始终指启动时绑定的命名空间，不是工具参数。
+server 提供 14 个工具。下文的 `owner` 始终指启动时绑定的命名空间，不是工具参数。
 
 | 工具 | 参数 | 返回值与作用 |
 | --- | --- | --- |
@@ -159,9 +153,6 @@ CLI 的默认数据库路径是 `~/.local/state/determined-compute/tasks.sqlite3
 | `storage_check` | `path` | 映射容器路径的访问情况 |
 | `storage_sync` | `local_dir`、`shared_dir`，可选 `dry_run=true` | 预览或把本地目录内容复制到共享存储 |
 | `storage_fetch` | `shared_dir`、`local_dir`，可选 `dry_run=true` | 预览或把共享目录内容复制到本地 |
-
-只有启用咨询后端时才会出现 `compute_consult(question, request_id, context?)` 和
-`workflow_status(workflow_id)`。其配置、生命周期和限制见[咨询后端](consultation.zh.md)。
 
 <a id="plan-capacity-and-launch"></a>
 ### 规划、容量与提交
@@ -203,7 +194,7 @@ cancel endpoint。它要求任务已绑定 remote ID；API 调用完成后返回
 
 对于正在运行的 shell，应使用已清理的 `reconnectCommand`，当前为
 `det shell show_ssh_command <remote-id>`。适配器会移除 `privateKey`；不要把私钥材料写入任务
-记录、咨询 context 或报告。
+记录或报告。
 
 <a id="task-usage-measurements"></a>
 ### 任务用量测量
@@ -389,31 +380,3 @@ Determined 的 HTTP 失败（包括 gRPC-gateway 错误响应体）显示为 `<s
 `compute_cancel` 对 command 或 shell 返回 HTTP 403，对 experiment 返回 HTTP 404
 `experiment '<id>' not found`。submitted 记录绑定配置和端点而不是账户，所以把凭据切换到
 另一个账户后可能遇到这些错误。应使用拥有该任务的账户取消，或联系管理员。
-
-<a id="cli-equivalents"></a>
-## CLI 等价命令
-
-JSON CLI 使用相同的服务边界，并可与 MCP 共用数据库和 owner。请求可以以内联 JSON/YAML 或
-文件提供；成功结果包装为 `{"ok":true,"result":...}`，失败包装为
-`{"ok":false,"error":...}`。以下是完整的短配置；请把 `TASK_ID` 和 `REMOTE_ID` 替换为实际
-返回的标识：
-
-```bash
-export DETERMINED_COMPUTE_PROFILE="$PWD/.local/profile.yaml"
-export DETERMINED_COMPUTE_DB="$PWD/.local/tasks.sqlite3"
-export DETERMINED_COMPUTE_OWNER="$USER"
-export DETERMINED_COMPUTE_SECRETS="$PWD/.local/credentials.env"
-export DET_VERIFY_SSL=true
-
-determined-compute plan --request-file .local/request.json
-determined-compute launch --request-file .local/request.json --request-id my-job-001
-determined-compute status TASK_ID
-determined-compute logs TASK_ID
-determined-compute usage TASK_ID --window-seconds 7200 --metric gpu_utilization_percent
-
-determined-compute discover command --limit 20 --offset 0
-determined-compute adopt command REMOTE_ID
-```
-
-文件暂存与取回见[共享存储指南](shared-storage-access.zh.md)。围绕这些确定性调用的完整 agent
-流程见 [Agent 工作流](agent-workflow.zh.md)。

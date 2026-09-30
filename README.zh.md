@@ -3,7 +3,7 @@
 
 [English](README.md) | [简体中文](README.zh.md)
 
-通过本地 stdio MCP 服务运行 Determined `command`、`shell` 和 `experiment` 任务。代码、数据、检查点和输出都保存在映射的共享存储中。任何能启动本地 stdio 服务的 MCP 客户端都可以使用本服务；客户端模型与可选的服务端咨询后端彼此独立。
+通过本地 stdio MCP 服务运行 Determined `command`、`shell` 和 `experiment` 任务。代码、数据、检查点和输出都保存在映射的共享存储中。任何能启动本地 stdio 服务的 MCP 客户端都可以使用本服务，并使用自己的模型。
 
 <a id="install"></a>
 ## 安装
@@ -64,7 +64,4 @@ DET_API_TOKEN=replace-with-your-token
 - [Agent 工作流](docs/agent-workflow.zh.md)：准备、规划、提交、跟踪和验收任务
 - [计算服务参考](docs/compute-service.zh.md)：配置、请求、工具、用量测量、任务身份与恢复
 - [共享存储访问](docs/shared-storage-access.zh.md)：本地挂载、SSH、预览和传输
-- [可选咨询](docs/consultation.zh.md)：服务端 Codex 后端与模型配置
 - [故障排查](docs/troubleshooting.zh.md)：启动、认证、TLS、路径、容量、提交状态不确定、用量测量和取消
-
-JSON CLI 用法可运行 `determined-compute --help` 查看。

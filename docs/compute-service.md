@@ -4,14 +4,13 @@
 
 This document describes the configuration and public MCP interface of the local
 Determined compute service. For an agent-neutral sequence for preparing, launching,
-and checking work, see [Agent workflow](agent-workflow.md). For the optional
-server-side advice worker, see [Consultation backend](consultation.md).
+and checking work, see [Agent workflow](agent-workflow.md).
 
 ## Architecture and trust boundary
 
 ```mermaid
 flowchart LR
-    U[Any local stdio MCP client] --> M[14 base MCP tools]
+    U[Any local stdio MCP client] --> M[14 MCP tools]
     M --> C[ComputeService]
     C --> D[(local SQLite database)]
     C --> A[Determined API]
@@ -19,7 +18,6 @@ flowchart LR
     P[compute profile] --> C
     M --> S[shared-storage adapter]
     S --> H[mapped shared storage]
-    M -. optional: 2 more tools .-> W[read-only consultation worker]
 ```
 
 The MCP server is a local stdio service for one trusted user. It binds `owner` at
@@ -33,11 +31,6 @@ cancellation, discovery, adoption, and conservative reconciliation. Its local `t
 remains stable across restarts and is distinct from the Determined `remote_id`. Keep the
 SQLite database on durable local storage. Keep source, data, packages, checkpoints,
 logs, and outputs on mapped shared storage.
-
-The default consultation backend is `none`. That mode registers 14 base tools and does
-not import the consultation worker, require Codex, or require a repository skill
-directory. Enabling the Codex backend adds `compute_consult` and `workflow_status`, for
-16 tools in total. Consultation is advisory and cannot submit or cancel work.
 
 ## Compute profile
 
@@ -142,9 +135,8 @@ determined-compute-mcp \
 `DET_MASTER`, `DET_API_TOKEN`, and `DET_VERIFY_SSL`; keep credentials in the existing
 provider or secrets file rather than the profile, database, tool arguments, or reports.
 
-The default database path used by the CLI is
-`~/.local/state/determined-compute/tasks.sqlite3`, but MCP deployments should specify
-an absolute local path. MCP rejects `:memory:`. After an upgrade, restart every MCP
+The default database path is `~/.local/state/determined-compute/tasks.sqlite3`, but
+MCP deployments should specify an absolute local path. MCP rejects `:memory:`. After an upgrade, restart every MCP
 process that shares the database so all processes load the same tool set and additive
 schema.
 
@@ -153,7 +145,7 @@ storage configuration. See [Shared-storage access](shared-storage-access.md).
 
 ## MCP API
 
-The base server exposes 14 tools. The `owner` below is always the startup-bound
+The server exposes 14 tools. The `owner` below is always the startup-bound
 namespace and never a tool argument.
 
 | Tool | Arguments | Return value and effect |
@@ -172,10 +164,6 @@ namespace and never a tool argument.
 | `storage_check` | `path` | Access information for a mapped container path |
 | `storage_sync` | `local_dir`, `shared_dir`, optional `dry_run=true` | Preview or copy local directory contents to shared storage |
 | `storage_fetch` | `shared_dir`, `local_dir`, optional `dry_run=true` | Preview or copy shared directory contents locally |
-
-`compute_consult(question, request_id, context?)` and
-`workflow_status(workflow_id)` appear only with an enabled consultation backend. Their
-configuration, lifecycle, and limits are in [Consultation backend](consultation.md).
 
 ### Plan, capacity, and launch
 
@@ -222,7 +210,7 @@ does not prove success; inspect exit information and expected shared-storage art
 
 For a running shell, use the sanitized `reconnectCommand`, currently
 `det shell show_ssh_command <remote-id>`. The adapter removes `privateKey`; never put
-private key material in task records, consultation context, or reports.
+private key material in task records or reports.
 
 ### Task usage measurements
 
@@ -449,32 +437,3 @@ HTTP 403 for a command or shell and HTTP 404 `experiment '<id>' not found` for a
 experiment. Submitted records bind to the profile and endpoint rather than the account,
 so switching credentials to another account can produce these errors. Cancel with the
 owning account or ask an administrator.
-
-## CLI equivalents
-
-The JSON CLI uses the same service boundaries and can share the database and owner with
-MCP. It accepts request JSON/YAML inline or from a file and wraps success as
-`{"ok":true,"result":...}` and failure as `{"ok":false,"error":...}`. The
-following is a complete short setup; replace `TASK_ID` and `REMOTE_ID` with returned
-identifiers:
-
-```bash
-export DETERMINED_COMPUTE_PROFILE="$PWD/.local/profile.yaml"
-export DETERMINED_COMPUTE_DB="$PWD/.local/tasks.sqlite3"
-export DETERMINED_COMPUTE_OWNER="$USER"
-export DETERMINED_COMPUTE_SECRETS="$PWD/.local/credentials.env"
-export DET_VERIFY_SSL=true
-
-determined-compute plan --request-file .local/request.json
-determined-compute launch --request-file .local/request.json --request-id my-job-001
-determined-compute status TASK_ID
-determined-compute logs TASK_ID
-determined-compute usage TASK_ID --window-seconds 7200 --metric gpu_utilization_percent
-
-determined-compute discover command --limit 20 --offset 0
-determined-compute adopt command REMOTE_ID
-```
-
-For file staging and retrieval, use the separate
-[shared-storage guide](shared-storage-access.md). For the full agent sequence around
-these deterministic calls, use [Agent workflow](agent-workflow.md).

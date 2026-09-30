@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh.md)
 
-Run Determined `command`, `shell`, and `experiment` tasks through a local stdio MCP server. Code, data, checkpoints, and outputs stay on mapped shared storage. Any MCP client that can start a local stdio server can use the service; the client's model is independent of the optional server-side consultation backend.
+Run Determined `command`, `shell`, and `experiment` tasks through a local stdio MCP server. Code, data, checkpoints, and outputs stay on mapped shared storage. Any MCP client that can start a local stdio server can use the service with its own model.
 
 ## Install
 
@@ -59,7 +59,4 @@ The `owner` is a local task namespace, not authentication. The credentials selec
 - [Agent workflow](docs/agent-workflow.md): prepare, plan, launch, monitor, and accept work
 - [Compute service reference](docs/compute-service.md): profiles, requests, tools, usage measurements, task identity, and recovery
 - [Shared storage access](docs/shared-storage-access.md): local mounts, SSH, dry runs, and transfers
-- [Optional consultation](docs/consultation.md): server-side Codex backend and model configuration
 - [Troubleshooting](docs/troubleshooting.md): startup, authentication, TLS, paths, capacity, uncertain submissions, usage measurements, and cancellation
-
-For JSON CLI usage, run `determined-compute --help`.
