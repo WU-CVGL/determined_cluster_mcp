@@ -230,11 +230,29 @@ class PathCode(_Model):
 Code = Annotated[Union[GitCode, ContextCode, PathCode], Field(discriminator="source")]
 
 
+# Experiment settings that TaskSpec carries as top-level fields. The config is rendered from
+# those, so a second value in the config would leave the choice to a merge order.
+_EXPERIMENT_DUPLICATES = {
+    ("resources", "resource_pool"): "pool",
+    ("resources", "slots_per_trial"): "slots",
+    ("environment", "image"): "image",
+    ("environment", "environment_variables"): "env",
+}
+
+
 def _check_experiment(config: Mapping[str, Any]) -> None:
     if "entrypoint" in config:
         raise ValueError("entrypoint is rendered from command; set command instead")
     if "bind_mounts" in config:
         raise ValueError("bind_mounts is not allowed; the administrator mounts every bind source")
+    for (section, key), field in _EXPERIMENT_DUPLICATES.items():
+        value = config.get(section)
+        if value is not None and not isinstance(value, Mapping):
+            raise ValueError(f"{section} must be an object")
+        if value is not None and key in value:
+            raise ValueError(
+                f"{section}.{key} duplicates the top-level {field}; set {field} instead"
+            )
     storage = config.get("checkpoint_storage")
     if storage is not None:
         if not isinstance(storage, Mapping):
@@ -275,7 +293,14 @@ def _check_experiment(config: Mapping[str, Any]) -> None:
 
 
 class TaskSpec(_Model):
-    """A command, shell, or experiment request, published as the plan tool's input schema."""
+    """A command, shell, or experiment request, published as the plan tool's input schema.
+
+    ``experiment`` is validated only in part: it may not set what the MCP renders or never
+    allows, including the settings of ``pool``, ``slots``, ``image`` and ``env``. Full expconf
+    typing, the merge order with the rendered fields (``name``, ``workspace`` and ``project``
+    among them) and the pool policy apply when the spec is wired to the master, in the M3
+    wiring PR. ``frozen`` only makes an instance immutable; it is not a persisted plan.
+    """
 
     kind: Literal["command", "shell", "experiment"]
     name: Name

@@ -165,8 +165,21 @@ def test_legacy_looking_command_is_fine_outside_experiments() -> None:
         {"checkpoint_storage": {"storage_path": "runs/a"}},
         {"checkpoint_storage": {"type": "shared_fs", "storage_path": ".", "save_trial_best": 1}},
         {"checkpoint_storage": None, "searcher": None, "max_restarts": 0},
+        {
+            "resources": {"max_slots": 4, "priority": 10},
+            "environment": {"force_pull_image": True},
+        },
+        {"resources": None, "environment": None},
     ],
-    ids=["single", "search", "storage-path", "shared-fs", "nulls"],
+    ids=[
+        "single",
+        "search",
+        "storage-path",
+        "shared-fs",
+        "nulls",
+        "other-settings",
+        "null-sections",
+    ],
 )
 def test_experiment_accepts_valid_config(experiment: Dict[str, Any]) -> None:
     task = build(**experiment_fields(experiment=experiment))
@@ -302,6 +315,32 @@ INVALID = [
         "checkpoint_storage must be an object",
     ),
     (experiment_fields(experiment={"searcher": "random"}), "searcher must be an object"),
+    (
+        experiment_fields(experiment={"resources": {"resource_pool": "gpu"}}),
+        "resources.resource_pool duplicates the top-level pool; set pool instead",
+    ),
+    (
+        experiment_fields(experiment={"resources": {"slots_per_trial": 2}}),
+        "resources.slots_per_trial duplicates the top-level slots; set slots instead",
+    ),
+    (
+        experiment_fields(experiment={"environment": {"image": "registry.example/x:1"}}),
+        "environment.image duplicates the top-level image; set image instead",
+    ),
+    (
+        experiment_fields(experiment={"environment": {"image": {"cuda": "x", "cpu": "y"}}}),
+        "environment.image duplicates the top-level image; set image instead",
+    ),
+    (
+        experiment_fields(experiment={"environment": {"environment_variables": ["A=1"]}}),
+        "environment.environment_variables duplicates the top-level env; set env instead",
+    ),
+    (
+        experiment_fields(pool="gpu", experiment={"resources": {"resource_pool": "gpu"}}),
+        "resources.resource_pool duplicates the top-level pool; set pool instead",
+    ),
+    (experiment_fields(experiment={"resources": "gpu"}), "resources must be an object"),
+    (experiment_fields(experiment={"environment": []}), "environment must be an object"),
     (experiment_fields(experiment={"searcher": {"metric": "loss"}}), "searcher.name is required"),
 ]
 for _limit in (DROP, 0, True, "2", None, 1.5):

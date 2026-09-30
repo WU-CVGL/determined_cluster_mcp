@@ -5,6 +5,10 @@
 includes, into the task context; ``path`` runs a shared directory in place and is never pinned.
 Every check here is read-only: git runs without user configuration or filter commands, and
 nothing contacts the master or a remote. Planning needs git 2.32 or later.
+
+``content_digest`` identifies the code as this module planned it. It is computed locally and
+is not the master's request_digest, which covers the whole create request; it must never be
+presented as one.
 """
 
 from __future__ import annotations
@@ -151,7 +155,7 @@ class GitCode:
     commit: str
     uses_lfs: bool
     warnings: Tuple[CodeWarning, ...] = ()
-    content_digest: str  # the commit
+    content_digest: str  # the commit; local, not the master's request_digest
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -164,7 +168,7 @@ class ContextCode:
     dirty: bool
     files: Tuple[Dict[str, Any], ...]
     manifest: Tuple[Dict[str, str], ...]
-    content_digest: str
+    content_digest: str  # of the manifest; local, not the master's request_digest
     size: int  # the file list as the harness counts it
     included: Tuple[str, ...]
     excluded: Tuple[Dict[str, str], ...]
