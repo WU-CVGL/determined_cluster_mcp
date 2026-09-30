@@ -131,21 +131,10 @@ def _classify(reason: str, message: str, call: _Call) -> APIError:
         or (reason == "InvalidArgument" and "immediate admission" in message)
     ):
         return APIError(message, code="admission_unsupported")
-    # Every experiment config error is Internal; before anything is created it is a plan error.
-    if reason in {"InvalidArgument", "FailedPrecondition", "OutOfRange"} or (
-        call.dry_run and reason in {"Internal", "Unknown"}
-    ):
+    # The master reports a request to fix, including an invalid experiment config, as
+    # InvalidArgument before it writes anything.
+    if reason in {"InvalidArgument", "FailedPrecondition", "OutOfRange"}:
         return APIError(message, code="invalid_request")
-    if (
-        call.keyed
-        and reason in {"Internal", "Unknown"}
-        and message.startswith("invalid experiment configuration")
-    ):
-        # The master raises this only while it parses a create, before anything is written.
-        return APIError(
-            message + "; nothing was created, so fix the request and plan again",
-            code="invalid_request",
-        )
     if reason == "NotFound":
         return APIError(message, code="not_found")
     if reason in {"Unauthenticated", "PermissionDenied"}:

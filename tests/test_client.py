@@ -487,14 +487,19 @@ def test_experiment_immediate_admission_and_config_errors(monkeypatch):
         client().submit("experiment", {}, dry_run=True, admission="immediate")
     assert caught.value.code == "admission_unsupported"
 
-    # Every experiment config error is Internal; on a dry run it is a plan error.
-    invalid = gateway_error(500, 13, "Internal", "invalid experiment configuration: <config>."
-                            "searcher: is not an object")
+    invalid = gateway_error(400, 3, "InvalidArgument", "invalid experiment configuration: "
+                            "<config>.searcher: is not an object")
     master.route("POST", "/api/v1/experiments", invalid)
     with pytest.raises(APIError) as caught:
         client().submit("experiment", {}, dry_run=True)
     assert (caught.value.code, caught.value.retryable) == ("invalid_request", False)
     assert "searcher" in str(caught.value)
+
+    # A master failure during a dry run is not a request to fix.
+    master.route("POST", "/api/v1/experiments", gateway_error(500, 13, "Internal", "db down"))
+    with pytest.raises(APIError) as caught:
+        client().submit("experiment", {}, dry_run=True)
+    assert caught.value.code == "internal"
 
 
 @pytest.mark.parametrize(
@@ -542,14 +547,13 @@ def test_an_invalid_experiment_config_at_launch_created_nothing(monkeypatch):
     # A workspace or master default that changed after the plan can break the merged config.
     master = Master(monkeypatch)
     invalid = "invalid experiment configuration: <config>.searcher: is not an object"
-    master.route("POST", "/api/v1/experiments", gateway_error(500, 13, "Internal", invalid))
+    master.route("POST", "/api/v1/experiments", gateway_error(400, 3, "InvalidArgument", invalid))
 
     with pytest.raises(APIError) as caught:
         client().submit("experiment", {}, idempotency_key="k1", expected_digest=DIGEST)
 
     assert (caught.value.code, caught.value.retryable) == ("invalid_request", False)
-    assert str(caught.value).startswith(invalid)
-    assert "nothing was created" in str(caught.value)
+    assert str(caught.value) == invalid
 
 
 def test_replay_asks_the_master_for_the_job_of_a_key_with_a_keyed_dry_run(monkeypatch):

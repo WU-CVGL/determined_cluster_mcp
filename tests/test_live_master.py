@@ -241,12 +241,12 @@ def test_an_experiment_plans_launches_and_cancels(tools):
     bogus = {"searcher": {"name": "bogus", "max_concurrent_trials": 1}}
     broken = spec(tag, kind="experiment", experiment=bogus)
     refused("invalid_request", tools.plan, broken)
-    # The same error on a keyed create comes from parsing, before anything is written.
+    # The master reports it as InvalidArgument on a keyed create too, before it writes anything.
     fresh = str(uuid.uuid4())
     config = {"name": f"live-{tag}", "entrypoint": "true", **bogus}
     created = refused("invalid_request", tools.client.submit, "experiment", config,
                       idempotency_key=fresh)
-    assert created.retryable is False and "nothing was created" in str(created)
+    assert created.retryable is False and "invalid experiment configuration" in str(created)
     assert fresh not in request_ids(tools)
 
     # The master resolves the workspace and project names of an experiment.
