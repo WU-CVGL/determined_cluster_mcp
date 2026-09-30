@@ -171,7 +171,8 @@ transfers.
 
 `repo_dir` is the top level of a git work tree on the machine running the service. The
 revision is resolved to a full commit, and files are read from the git object database,
-not the working tree, so without includes the snapshot equals that commit. `include` adds
+not the working tree, so without includes the snapshot is that commit's tracked content
+minus the exclusions below. `include` adds
 working-tree files or directories, such as generated or untracked files, and overrides
 tracked paths with their working-tree content; each must stay inside the repository and
 cannot be or traverse a symlink. Inside an included directory, a symlink that git tracks
@@ -187,11 +188,14 @@ inside `.git` as an include is `invalid_include`.
 
 Secret-like files are left out under two kinds of rules. Credential stores are never
 snapshotted: the configured secrets file when it lies in the repository, `.ssh/`, `.aws/`,
-`.config/gcloud/`, `.netrc`, `.npmrc`, `.pypirc`, and `id_rsa*`, `id_ed25519*`, and
-`id_ecdsa*`. A tracked one is excluded, and an include that reaches one, by name or inside
-an included directory, fails with `secret_like_include`. Name heuristics cover the other
-transfer exclusions above (such as `.env*`, `*.env`, `*.key`, `*.pem`, `.secrets*`, and
-`credentials/`), any path component containing `credential` or `secret`, and files named
+`.config/gcloud/`, `.netrc`, `.npmrc`, `.pypirc`, and the private-key names `id_rsa`,
+`id_ed25519`, `id_ecdsa`, and `id_dsa`. A tracked one is excluded, and an include that
+reaches one fails with `secret_like_include`: drop an include that names it, and skip one
+inside an included directory with the anchored `exclude` pattern that the error suggests.
+Name heuristics cover the other transfer exclusions above (such as `.env*`, `*.env`,
+`*.key`, `*.pem`, `.secrets*`, and `credentials/`), names that start with a private-key name
+(`id_rsa*`, `id_ed25519*`, `id_ecdsa*`, and `id_dsa*`, such as `id_ed25519.pub` or
+`id_rsa_parser.py`), any path component containing `credential` or `secret`, and files named
 `token`, `.token`, or `*.token`. They exclude tracked files and files found in an included
 directory, but an include that names the file itself overrides them, for example for a
 `secrets.py` module: its include source in the manifest records `included_despite` with the
@@ -217,14 +221,16 @@ records a remote URL. Repeating a snapshot returns the existing manifest with th
 `manifest_sha256`; another revision with the same content gets its own manifest and shares
 the tree.
 
-Files are stored once under `<root>/objects/sha256/`, executables separately with a `.x`
-suffix because hard links share one mode, and cloned or linked into each tree. `auto` uses
-reflink when the filesystem supports it and copies otherwise. `hardlink` is used only when
+With reflink or hard links, files are stored once under `<root>/objects/sha256/`,
+executables separately with a `.x` suffix because hard links share one mode, and cloned or
+linked into each tree. `auto` uses reflink when the filesystem supports it and copies
+otherwise. `hardlink` is used only when
 configured: it saves space without reflink support, but each tree file is then the same
 inode as its object and as that file in every other tree, so one in-place write changes
 all of them and later snapshots too. A file that cannot be cloned or linked, for example
 at a link limit or across devices, is copied; the result reports `link_mode` and
-`link_fallbacks`. `copy` skips the object store and deduplicates whole trees only.
+`link_fallbacks`. `copy`, which `auto` becomes without reflink support, skips the object
+store: each new tree is a full copy, and only identical trees are shared.
 Objects, trees, and manifests are written under temporary names, published without
 replacing an existing name, and never modified or deleted afterwards, and concurrent
 snapshots of the same content publish one tree. Only on a filesystem that supports
@@ -248,10 +254,20 @@ The result reports `dry_run`, `revision`, `tree`, `content_id`, `snapshot_key`, 
 in a preview unless already published), `existing` (the manifest already existed),
 `tree_existing`, the `files`, `symlinks`, and `bytes` totals, `new_objects`, `new_bytes`,
 `link_mode`, `link_fallbacks`, `excluded`, `skipped`, `warnings`, and `request_fields`,
-whose `workdir` and `code_revision` go directly into a compute request. `code_revision` is
-the commit, or `<commit>+<snapshot_key>` when includes added or replaced files, because the
-content then differs from the commit; it also names the manifest. The `content_id` in
-`workdir` identifies the content itself.
+whose `workdir` and `code_revision` go directly into a compute request. A preview writes
+nothing, so it cannot tell whether `auto` will find reflink support: it reports the
+configured `link_mode`, and under `auto` or `copy` it estimates a copy, with `new_objects` at
+0 and `new_bytes` equal to `bytes`, or both 0 when the tree already exists. That is an upper
+bound for `auto`; on reflink storage the publish writes less, because it stores only
+missing objects and clones them into the tree.
+
+`code_revision` is the commit when no include supplied a file, and
+`<commit>+<snapshot_key>` when an include supplied any file, even one identical to the
+tracked file. The suffix names the manifest, which also records exclusions, so it can change
+while the content stays the same, for example when only an excluded `__pycache__/` appears
+below an included directory. Compare content by the `content_id` in `workdir`, and retry a
+launch with the recorded request unchanged, not with fields from a new snapshot, which can
+return `idempotency_conflict`.
 
 ```bash
 determined-compute snapshot "$PWD"                   # preview; writes nothing

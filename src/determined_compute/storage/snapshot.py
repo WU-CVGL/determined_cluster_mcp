@@ -1,10 +1,10 @@
 """Content-addressed, add-only code snapshots on mapped shared storage.
 
 A snapshot materializes the exact tracked content of one git revision, plus explicitly
-included working-tree files, as a read-only tree named by its content. Identical files
-are stored once in an object store and cloned (or, when configured, hard-linked) into each
-tree when the filesystem supports it. Existing objects, trees, and manifests are never
-modified or deleted.
+included working-tree files, as a read-only tree named by its content, so identical content
+is published once. With reflink (or, when configured, hard links), identical files are
+stored once in an object store and cloned or linked into each tree; otherwise each new tree
+is a full copy. Existing objects, trees, and manifests are never modified or deleted.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import functools
+import glob
 import hashlib
 import json
 import os
@@ -52,10 +53,14 @@ _HARD_SECRET_RULES = (
     ".netrc",
     ".npmrc",
     ".pypirc",
-    "id_rsa*",
-    "id_ed25519*",
-    "id_ecdsa*",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    "id_dsa",
 )
+# Names that often hold a private key (id_rsa.bak) but also match public keys and ordinary
+# modules (id_ed25519.pub, id_rsa_parser.py): excluded unless an include names the file.
+_SOFT_KEY_RULES = ("id_rsa*", "id_ed25519*", "id_ecdsa*", "id_dsa*")
 _LINK_FALLBACK_ERRNOS = {
     errno.EMLINK,
     errno.EXDEV,
@@ -152,6 +157,9 @@ def _soft_secret_rule(path: str, directory: bool = False) -> Optional[str]:
     """Return the secret-like name heuristic a path matches; check hard rules first."""
     for pattern in _SYNC_EXCLUDES:
         if pattern not in _CACHE_RULES and _pattern_matches(pattern, path, directory):
+            return pattern
+    for pattern in _SOFT_KEY_RULES:
+        if _pattern_matches(pattern, path, directory):
             return pattern
     for part in path.split("/"):
         lowered = part.lower()
@@ -398,10 +406,21 @@ def _hash_include(path: Path) -> _Blob:
     return _Blob(digest.hexdigest(), size, source=path)
 
 
-def _secret_include(path: str, rule: str) -> StorageError:
+def _secret_include(
+    path: str, rule: str, walked: bool = False, directory: bool = False
+) -> StorageError:
+    """Refuse a credential store that an include named or that a directory walk reached."""
+    if walked:
+        # Exclude patterns are checked before secret rules while walking, so an anchored
+        # pattern for exactly this entry lets the rest of the directory be included.
+        pattern = "/" + glob.escape(path) + ("/" if directory else "")
+        subject = f"{path} in an included directory"
+        advice = f"add {pattern!r} to exclude to skip it"
+    else:
+        subject = f"include {path}"
+        advice = "remove it from include"
     return StorageError(
-        f"include {path} matches the secret rule {rule!r} and is never snapshotted; "
-        "rename or move it",
+        f"{subject} matches the secret rule {rule!r} and is never snapshotted; {advice}",
         code="secret_like_include",
     )
 
@@ -855,7 +874,7 @@ def create_snapshot(
         if rule is None:
             hard = _hard_secret_rule(relative, secrets_file, directory)
             if hard is not None:
-                raise _secret_include(relative, hard)
+                raise _secret_include(relative, hard, walked=True, directory=directory)
             rule, reason = _soft_secret_rule(relative, directory), "secret_like"
         if rule is None:
             return False
@@ -934,8 +953,9 @@ def create_snapshot(
         "exclude_patterns": exclude_patterns,
     })
 
-    # Included working-tree files make the content differ from the commit, so the revision
-    # also names the manifest, <root>/manifests/<snapshot_key>.json.
+    # Once an include supplies any file, even one identical to the tracked file, the revision
+    # also names the manifest, <root>/manifests/<snapshot_key>.json. The key covers the
+    # exclusions too, so it can change while content_id stays the same.
     code_revision = f"{commit}+{snapshot_key}" if included else commit
     tree_path = root / "trees" / content_id
     manifest_path = root / "manifests" / f"{snapshot_key}.json"
@@ -973,10 +993,14 @@ def create_snapshot(
     }
 
     if dry_run:
+        # A preview writes nothing, so it cannot probe for reflink: `auto` is estimated as
+        # its copy fallback, which writes every file. That is an upper bound; with reflink,
+        # the publish stores only missing objects and clones them.
+        copies = configured in {"auto", "copy"}
         if tree_existing:
             missing: List[_File] = []
-        elif configured == "copy":
-            missing = list(unique.values())
+        elif copies:
+            missing = list(files.values())
         else:
             missing = [
                 file for file in unique.values()
@@ -989,7 +1013,7 @@ def create_snapshot(
                 if manifest_existing
                 else None
             ),
-            "new_objects": 0 if configured == "copy" else len(missing),
+            "new_objects": 0 if copies else len(missing),
             "new_bytes": sum(file.blob.size for file in missing),
             "link_mode": configured,
             "link_fallbacks": 0,

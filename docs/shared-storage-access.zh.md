@@ -173,7 +173,8 @@ Rsync 退出码 23 表示部分文件或属性未能传输，目标中可能已�
 `configuration_required`。与传输一样，默认只预览。
 
 `repo_dir` 是运行服务的机器上某个 git 工作树的顶层目录。revision 会解析为完整提交，文件从 git
-对象库而不是工作树读取，因此没有 include 时快照与该提交完全一致。`include` 添加工作树中的
+对象库而不是工作树读取，因此没有 include 时，快照就是该提交中被跟踪的内容减去下文的
+排除项。`include` 添加工作树中的
 文件或目录（例如生成的或未跟踪的文件），并以工作树内容覆盖同名的已跟踪路径；它们必须位于
 仓库内，本身不能是符号链接，也不能经过符号链接。在 include 的目录中，git 以相同目标跟踪的
 符号链接按 revision 保留；其他符号链接或特殊文件返回 `invalid_include`，除非下文的排除规则
@@ -184,11 +185,14 @@ Rsync 退出码 23 表示部分文件或属性未能传输，目标中可能已�
 报告；把 `.git` 内的路径作为 include 返回 `invalid_include`。
 
 类似机密的文件按两类规则排除。凭据存储从不进入快照：位于仓库内的已配置 secrets 文件、
-`.ssh/`、`.aws/`、`.config/gcloud/`、`.netrc`、`.npmrc`、`.pypirc`，以及 `id_rsa*`、
-`id_ed25519*` 和 `id_ecdsa*`。已跟踪的此类文件会被排除；include 无论直接指定还是在 include
-的目录中遇到此类文件，都返回 `secret_like_include`。名称启发式规则包括上文传输排除规则中的
-其余名称（例如 `.env*`、`*.env`、`*.key`、`*.pem`、`.secrets*` 和 `credentials/`）、任一
-路径分量含 `credential` 或 `secret` 的路径，以及名为 `token`、`.token` 或 `*.token` 的文件。
+`.ssh/`、`.aws/`、`.config/gcloud/`、`.netrc`、`.npmrc`、`.pypirc`，以及私钥文件名
+`id_rsa`、`id_ed25519`、`id_ecdsa` 和 `id_dsa`。已跟踪的此类文件会被排除；include 遇到此类
+文件时返回 `secret_like_include`：直接指定它的 include 应当去掉；在 include 的目录中遇到的，
+可用错误信息建议的锚定 `exclude` 模式跳过。名称启发式规则包括上文传输排除规则中的其余名称
+（例如 `.env*`、`*.env`、`*.key`、`*.pem`、`.secrets*` 和 `credentials/`）、以私钥文件名开头
+的名称（`id_rsa*`、`id_ed25519*`、`id_ecdsa*` 和 `id_dsa*`，例如 `id_ed25519.pub` 或
+`id_rsa_parser.py`）、任一路径分量含 `credential` 或 `secret` 的路径，以及名为 `token`、
+`.token` 或 `*.token` 的文件。
 它们会排除已跟踪文件和 include 的目录中找到的文件，但直接指定该文件的 include 可以覆盖它们，
 例如 `secrets.py` 模块：manifest 中该 include 来源以 `included_despite` 记录被覆盖的规则，
 并产生指明该文件的 `secret_like_included` 警告。发布前应确认此类文件不含机密。
@@ -207,12 +211,14 @@ include 的目录中被排除的子目录不会被遍历，并以 `path/` 的形
 会返回已有 manifest 和相同的 `manifest_sha256`；内容相同的其他 revision 会得到自己的
 manifest，并共用同一棵树。
 
-文件在 `<root>/objects/sha256/` 下只存储一次（可执行文件因硬链接共用同一模式而单独存储，带
-`.x` 后缀），再克隆或链接到每棵树中。`auto` 在文件系统支持 reflink 时使用 reflink，否则复制。
+使用 reflink 或硬链接时，文件在 `<root>/objects/sha256/` 下只存储一次（可执行文件因硬链接
+共用同一模式而单独存储，带 `.x` 后缀），再克隆或链接到每棵树中。`auto` 在文件系统支持
+reflink 时使用 reflink，否则复制。
 只有显式配置时才使用 `hardlink`：在不支持 reflink 的文件系统上它节省空间，但树中每个文件都与
 其对象以及其他树中的同一文件共用 inode，一次原地写入会同时改变它们以及之后的快照。无法克隆
 或链接的文件（例如达到链接数上限或跨设备）改为复制，结果会报告 `link_mode` 和
-`link_fallbacks`。`copy` 不使用对象库，只对整棵树去重。对象、树和 manifest 都先写入临时
+`link_fallbacks`。`copy`（`auto` 在不支持 reflink 时即为此模式）不使用对象库：每棵新树都是
+完整副本，只有相同的整棵树才会共用。对象、树和 manifest 都先写入临时
 名称，以不替换已有名称的方式发布，之后从不修改或删除；并发发布相同内容只会产生一棵树。只有在
 既不支持硬链接、也不支持带 `RENAME_NOREPLACE` 的 `renameat2` 的文件系统上，同一
 `snapshot_key` 并发发布的 manifest 才可能被仅 `created_utc` 不同的等价 manifest 替换；此时
@@ -230,9 +236,16 @@ manifest，并共用同一棵树。
 `host_path`、`local_path`、`manifest_path` 和 `manifest_sha256`（预览时为 null，除非已经
 发布）、`existing`（manifest 已存在）、`tree_existing`、`files`、`symlinks` 和 `bytes` 总计、
 `new_objects`、`new_bytes`、`link_mode`、`link_fallbacks`、`excluded`、`skipped`、`warnings`，
-以及 `request_fields`；其中的 `workdir` 和 `code_revision` 可直接写入计算请求。
-`code_revision` 为该提交；当 include 添加或替换了文件时，内容已与该提交不同，它改为
-`<commit>+<snapshot_key>`，同时指明 manifest。`workdir` 中的 `content_id` 标识内容本身。
+以及 `request_fields`；其中的 `workdir` 和 `code_revision` 可直接写入计算请求。预览不写入
+任何内容，因此无法判断 `auto` 是否会用上 reflink：它报告配置的 `link_mode`，并在 `auto` 或
+`copy` 下按复制估算，`new_objects` 为 0，`new_bytes` 等于 `bytes`；树已存在时两者都为 0。
+对 `auto` 而言这是上限；在支持 reflink 的存储上，发布只存储缺少的对象并克隆到树中，写入量更少。
+
+没有 include 提供文件时，`code_revision` 为该提交；只要 include 提供了任何文件（即使与已跟踪
+文件完全相同），它就是 `<commit>+<snapshot_key>`。后缀指明 manifest，而 manifest 也记录排除项，
+因此内容不变时它也可能变化，例如 include 的目录下只新出现了被排除的 `__pycache__/`。比较内容
+应使用 `workdir` 中的 `content_id`；重试启动时应原样使用已记录的请求，而不是改用新快照的
+字段，否则可能返回 `idempotency_conflict`。
 
 ```bash
 determined-compute snapshot "$PWD"                   # 预览；不写入任何内容

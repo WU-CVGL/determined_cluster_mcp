@@ -213,6 +213,43 @@ def test_auto_mode_copies_instead_of_hard_linking(tmp_path, repo, monkeypatch):
     assert os.stat(tree / "shared.txt").st_ino != os.stat(tree / "docs" / "notes.md").st_ino
 
 
+@pytest.mark.parametrize("link_mode", ["auto", "copy"])
+def test_preview_estimates_a_copy_of_every_file(tmp_path, repo, monkeypatch, link_mode):
+    def no_reflink(*_args, **_kwargs):
+        raise OSError(errno.EOPNOTSUPP, "Operation not supported")
+
+    monkeypatch.setattr(snapshot_module, "_reflink", no_reflink)
+    storage = storage_for(tmp_path, link_mode=link_mode)
+
+    preview = storage.snapshot(str(repo))
+    wrote_nothing = not snapshot_root(tmp_path).exists()
+    published = storage.snapshot(str(repo), dry_run=False)
+    again = storage.snapshot(str(repo))
+
+    assert wrote_nothing
+    assert preview["link_mode"] == link_mode and published["link_mode"] == "copy"
+    # shared.txt and docs/notes.md hold the same content, and a copy writes both.
+    assert preview["new_objects"] == published["new_objects"] == 0
+    assert preview["new_bytes"] == published["new_bytes"] == preview["bytes"]
+    assert again["new_objects"] == again["new_bytes"] == 0
+
+
+def test_auto_preview_is_an_upper_bound_on_reflink_storage(tmp_path, repo, monkeypatch):
+    def clone(source, destination):
+        shutil.copyfile(source, destination)
+
+    monkeypatch.setattr(snapshot_module, "_reflink", clone)
+    storage = storage_for(tmp_path, link_mode="auto")
+
+    preview = storage.snapshot(str(repo))
+    published = storage.snapshot(str(repo), dry_run=False)
+
+    assert preview["link_mode"] == "auto" and published["link_mode"] == "reflink"
+    assert preview["new_objects"] == 0 and preview["new_bytes"] == preview["bytes"]
+    assert published["new_objects"] == 4
+    assert published["new_bytes"] < preview["new_bytes"]
+
+
 def test_link_limit_falls_back_to_copies(tmp_path, repo, monkeypatch):
     def refuse(*_args, **_kwargs):
         raise OSError(errno.EMLINK, "Too many links")
@@ -242,18 +279,84 @@ def test_secret_like_and_cache_paths_are_excluded_and_reported(tmp_path, repo):
 
 
 @pytest.mark.parametrize(
-    "path",
-    [".ssh/config", ".aws/credentials", "id_rsa", "id_ed25519.pub", ".netrc", "cluster.conf"],
+    ("path", "skip"),
+    [
+        (".ssh/config", "/.ssh/"),
+        (".aws/credentials", "/.aws/"),
+        ("id_rsa", "/id_rsa"),
+        ("keys/id_ed25519", "/keys/id_ed25519"),
+        ("keys[1]/id_ecdsa", "/keys[[]1]/id_ecdsa"),
+        ("id_dsa", "/id_dsa"),
+        (".netrc", "/.netrc"),
+        ("cluster.conf", "/cluster.conf"),
+    ],
 )
-def test_hard_secret_rules_refuse_every_include(tmp_path, repo, path):
+def test_hard_secret_rules_refuse_every_include(tmp_path, repo, path, skip):
     write(repo / path, "not-real\n")
     storage = storage_for(tmp_path)
     storage.secrets_path = repo / "cluster.conf"
 
-    for include in ([path], ["."]):
-        with pytest.raises(StorageError) as caught:
-            storage.snapshot(str(repo), include=include)
-        assert caught.value.code == "secret_like_include"
+    with pytest.raises(StorageError) as named:
+        storage.snapshot(str(repo), include=[path])
+    with pytest.raises(StorageError) as walked:
+        storage.snapshot(str(repo), include=["."])
+    # The exclude that the error suggests skips just that entry inside the directory.
+    skipped = storage.snapshot(str(repo), include=["."], exclude=[skip])
+
+    assert named.value.code == walked.value.code == "secret_like_include"
+    assert "remove it from include" in str(named.value)
+    assert f"add {skip!r} to exclude" in str(walked.value)
+    assert {"path": skip[1:].replace("[[]", "["), "reason": "exclude_pattern", "rule": skip} in (
+        skipped["excluded"]
+    )
+    assert skipped["files"] == 5
+
+
+def test_key_like_names_are_soft_rules(tmp_path, plain_repo):
+    write(plain_repo / "src" / "main.py", "import id_rsa_parser\n")
+    write(plain_repo / "src" / "id_rsa_parser.py", "def parse():\n    return None\n")
+    write(plain_repo / "tests" / "fixtures" / "id_ed25519.pub", "ssh-ed25519 AAAA test\n")
+    git(plain_repo, "add", "-A")
+    git(plain_repo, "commit", "-q", "-m", "key-like names")
+    write(plain_repo / "keys" / "id_rsa_deploy", "not-real\n")
+    storage = storage_for(tmp_path)
+    parser = {"path": "src/id_rsa_parser.py", "reason": "secret_like", "rule": "id_rsa*"}
+    fixture = {
+        "path": "tests/fixtures/id_ed25519.pub", "reason": "secret_like", "rule": "id_ed25519*"
+    }
+    deploy = {"path": "keys/id_rsa_deploy", "reason": "secret_like", "rule": "id_rsa*"}
+
+    default = storage.snapshot(str(plain_repo))
+    walked = {
+        value: storage.snapshot(str(plain_repo), include=[value])
+        for value in ("src", "tests", "keys", ".")
+    }
+    explicit = storage.snapshot(
+        str(plain_repo),
+        include=["src/id_rsa_parser.py", "tests/fixtures/id_ed25519.pub"],
+        dry_run=False,
+    )
+
+    # Tracked and walked matches are excluded and reported, never an error.
+    for result in (default, *walked.values()):
+        assert parser in result["excluded"] and fixture in result["excluded"]
+        assert result["warnings"] == []
+    assert deploy in walked["keys"]["excluded"] and deploy in walked["."]["excluded"]
+    # An include that names the file restores it, with a warning and a manifest record.
+    tree = Path(explicit["local_path"])
+    assert (tree / "src" / "id_rsa_parser.py").read_text() == "def parse():\n    return None\n"
+    assert (tree / "tests" / "fixtures" / "id_ed25519.pub").exists()
+    assert parser not in explicit["excluded"] and fixture not in explicit["excluded"]
+    assert [(item["code"], item["path"], item["rule"]) for item in explicit["warnings"]] == [
+        ("secret_like_included", "src/id_rsa_parser.py", "id_rsa*"),
+        ("secret_like_included", "tests/fixtures/id_ed25519.pub", "id_ed25519*"),
+    ]
+    manifest_file = snapshot_root(tmp_path) / "manifests" / f"{explicit['snapshot_key']}.json"
+    sources = json.loads(manifest_file.read_text())["sources"]
+    assert {item["path"]: item["included_despite"] for item in sources[1:]} == {
+        "src/id_rsa_parser.py": "id_rsa*",
+        "tests/fixtures/id_ed25519.pub": "id_ed25519*",
+    }
 
 
 def test_soft_secret_rules_exclude_expanded_includes(tmp_path, repo):

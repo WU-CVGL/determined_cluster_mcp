@@ -62,7 +62,7 @@ MCP 不接受 `kind: notebook`。
 4. 仅当预览正确时，以 `dry_run=false` 调用完全相同的操作。
 5. 对准备好的工作目录和所需输入再次调用 `storage_check`。
 
-对于运行已提交代码的持久任务，如果部署配置了 `snapshots.root`，优先使用 `storage_snapshot(repo_dir, revision)`：先预览，检查被排除的类似机密的文件和警告，再以 `dry_run=false` 重复调用，并把结果中的 `request_fields.workdir` 和 `request_fields.code_revision` 写入请求。使用 include 时，内容已不再等于该提交，因此 `code_revision` 为 `<commit>+<snapshot_key>`。相同内容只发布一次，之后的任务直接复用。快照目录是只读的，因此工作负载必须写入 `output_dir`。任务需要的生成文件或未跟踪文件可用 `include` 添加。参见[发布代码快照](shared-storage-access.zh.md#publish-a-code-snapshot)。
+对于运行已提交代码的持久任务，如果部署配置了 `snapshots.root`，优先使用 `storage_snapshot(repo_dir, revision)`：先预览，检查被排除的类似机密的文件和警告，再以 `dry_run=false` 重复调用，并把结果中的 `request_fields.workdir` 和 `request_fields.code_revision` 写入请求。只要 include 提供了任何文件，`code_revision` 就是 `<commit>+<snapshot_key>`，用于指明快照 manifest。manifest 也记录排除项，因此内容不变时该值也可能变化；重试启动时应原样使用已记录的请求，而不是改用新快照的字段。相同内容只发布一次，之后的任务直接复用。快照目录是只读的，因此工作负载必须写入 `output_dir`。任务需要的生成文件或未跟踪文件可用 `include` 添加。参见[发布代码快照](shared-storage-access.zh.md#publish-a-code-snapshot)。
 
 传输会复制目录内容，不会删除目标中多余的文件；但可能覆盖同名文件，因此预览是安全检查的一部分。没有存储后端时，规划仍不会验证远端文件是否存在或权限是否有效；应让任务自身验证所需输入并写出可观察的结果。SSH 认证、排除规则和传输行为见[共享存储访问](shared-storage-access.zh.md)。
 

@@ -44,7 +44,7 @@ Configured shared roots may include `/SSD`, `/SSD_home`, `/SSD_datasets`, `/SSD3
 
 Translate paths by replacing the matching host prefix with its container prefix. Do not assume that old image names, pool names, master addresses, or site paths are current; read them from the deployment profile or the user.
 
-For an unattended or durable run, publish the exact revision with `storage_snapshot(repo_dir, revision)` (CLI: `determined-compute snapshot REPO_DIR --revision REV`) when the storage configuration sets `snapshots.root`. Preview first, review `excluded` and `warnings`, then publish with `dry_run=false` (`--execute`) and copy `request_fields.workdir` and `request_fields.code_revision` into the request. The snapshot reads tracked files from git, stores identical files once, and is read-only, so write results under `output_dir`; add generated or untracked inputs with `include`. Without a snapshot root, check out the exact revision into a revision-specific directory such as `/workspace/<user>/compute/runs/<project>/<revision>/repo` and record the revision in the request. Reserve a mutable directory such as `/workspace/<user>/compute/debug/<project>` for interactive shells.
+For an unattended or durable run, publish the exact revision with `storage_snapshot(repo_dir, revision)` (CLI: `determined-compute snapshot REPO_DIR --revision REV`) when the storage configuration sets `snapshots.root`. Preview first, review `excluded` and `warnings`, then publish with `dry_run=false` (`--execute`) and copy `request_fields.workdir` and `request_fields.code_revision` into the request. The snapshot reads tracked files from git, reuses an existing tree when the content is identical, and is read-only, so write results under `output_dir`; add generated or untracked inputs with `include`. With the default `link_mode: auto` on storage without reflink support, each new tree is a full copy; identical files are stored once only with reflink or an explicitly configured `hardlink`, which shares inodes across trees. Without a snapshot root, check out the exact revision into a revision-specific directory such as `/workspace/<user>/compute/runs/<project>/<revision>/repo` and record the revision in the request. Reserve a mutable directory such as `/workspace/<user>/compute/debug/<project>` for interactive shells.
 
 When the client does not mount shared storage, use `storage_check`, then preview `storage_sync` or `storage_fetch`. Shared paths use the container namespace. Execute only after checking the resolved endpoints and exclusions. Read [the shared-storage access guide](../../../docs/shared-storage-access.md) for the separate storage config, SSH agent/password/keyring setup, and connection reuse.
 
@@ -77,6 +77,7 @@ rsync -a --safe-links \
   --exclude 'id_rsa' \
   --exclude '.credentials/' \
   --exclude 'credentials/' \
+  --exclude '*credential*' \
   --exclude 'token' \
   --exclude '.token' \
   --exclude '*.token' \
@@ -86,7 +87,7 @@ rsync -a --safe-links \
   <source>/ <shared-task-directory>/repo/
 ```
 
-Review project-specific secret filenames, such as `credentials.json` or `secrets.yaml`, and exclude them before copying. Never use an experiment `modelDefinition`, project archive, or upload option; the Determined payload should contain mapped paths only.
+Review project-specific secret filenames, such as `secrets.yaml`, and exclude them before copying; `*credential*` also leaves out source files such as `test_credentials_parser.py`, so copy those separately if the workload needs them. Never use an experiment `modelDefinition`, project archive, or upload option; the Determined payload should contain mapped paths only.
 
 ## Failure handling
 
