@@ -4,11 +4,17 @@ connect_timeout_seconds: 10
 timeout_seconds: 120
 preserve_permissions: true  # Set false only for a mount that rejects owner/group/perms preservation.
 
-# Optional mappings when the client mounts storage at a different local path.
+# Optional mappings from compute-profile host paths to local paths. Add one when the client
+# mounts storage at a different local path. Launch-path checks and create_directories also
+# need one for a host root that exists here at the same path but is not detected as a mount
+# point, such as a directory below a network mount or a bind mount from the same
+# filesystem; map such a root to itself.
 local_mounts: []
 # local_mounts:
 #   - host_path: /SSD_home
 #     local_path: /Volumes/SSD_home
+#   - host_path: /workspace/REPLACE_WITH_USER  # same path, below a network mount
+#     local_path: /workspace/REPLACE_WITH_USER
 
 # An existing OpenSSH Host alias for a login node with access to shared storage.
 ssh:

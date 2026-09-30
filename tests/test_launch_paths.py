@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import threading
 import time
 import uuid
@@ -568,7 +569,7 @@ def test_same_named_local_directory_that_is_not_a_mount_is_unverified(tmp_path):
     with pytest.raises(StorageError) as caught:
         service.launch(request, "request-1", "session-a")
     assert caught.value.code == "configuration_required"
-    assert "not a mount point" in str(caught.value)
+    assert "not detected as a mount point" in str(caught.value)
     assert sorted(path.name for path in root.iterdir()) == ["code"]
     assert service.store.list_owned("session-a") == []
     assert client.launches == []
@@ -741,3 +742,60 @@ def test_ssh_never_creates_a_mount_root(monkeypatch, output, created):
     else:
         assert service.ensure_directories([entry]) == [{**entry, "created": created}]
     assert "mkdir" not in shlex.split(calls[0][-1])[2]
+
+
+def install_fake_ssh(tmp_path, monkeypatch, body):
+    """Put an ``ssh`` stand-in first on PATH; it never contacts a network."""
+    tools = tmp_path / "fake-tools"
+    tools.mkdir(exist_ok=True)
+    script = tools / "ssh"
+    script.write_text("#!/bin/sh\n" + body + "\n")
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tools) + os.pathsep + os.environ.get("PATH", ""))
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or not os.path.exists("/bin/sh") or shutil.which("sleep") is None,
+    reason="the fake ssh needs a POSIX shell and sleep",
+)
+def test_ssh_directory_creation_timeout_is_retryable(tmp_path, monkeypatch):
+    root = tmp_path / "SSD"
+    access = StorageAccessConfig.from_dict(
+        {"mode": "ssh", "timeout_seconds": 1, "ssh": {"host": "storage.example"}}
+    )
+    service, client, _admission = make_service(tmp_path, root, access=access)
+    request = experiment(root, create_directories=["checkpoint_storage"])
+    install_fake_ssh(tmp_path, monkeypatch, "exec sleep 30")
+
+    started = time.monotonic()
+    with pytest.raises(StorageError) as caught:
+        service.launch(request, "request-1", "session-a")
+    elapsed = time.monotonic() - started
+
+    assert caught.value.code == "storage_timeout"
+    assert caught.value.retryable is True
+    assert compute_cli._error_payload(caught.value)["error"]["retryable"] is True
+    assert elapsed < 10
+    assert service.store.list_owned("session-a") == []
+    assert client.launches == []
+    assert not root.exists()
+
+    # Only directory creation is marked retryable; other SSH operations such as a check
+    # keep the non-retryable timeout.
+    with pytest.raises(StorageError) as check_timeout:
+        service.path_inspector.storage.check("/shared/code")
+    assert check_timeout.value.code == "storage_timeout"
+    assert check_timeout.value.retryable is False
+
+    # Nothing was claimed, so a retry with the same request_id submits exactly once.
+    install_fake_ssh(tmp_path, monkeypatch, "echo created")
+    retried = service.launch(request, "request-1", "session-a")
+    assert retried["state"] == "submitted"
+    assert retried["prepared_directories"] == [
+        {
+            "field": "experiment_config.checkpoint_storage.host_path",
+            "host_path": str(root / "checkpoints"),
+            "created": True,
+        }
+    ]
+    assert len(client.launches) == 1

@@ -36,7 +36,7 @@ DET_API_TOKEN=replace-with-your-token
 
 也支持 `DET_USERNAME` 和 `DET_PASSWORD`。不要提交凭据文件。使用管理员提供的镜像、资源池、计算节点宿主机路径和容器挂载路径填写 `profile.yaml`。任务请求使用容器路径。SQLite 数据库应保存在本地持久磁盘上，不要放在共享 NFS 中。
 
-计算任务不需要客户端存储配置。共享路径与已配置的 `host_path` 在本机一致时，存储工具会自动使用该本地路径。需要自定义本地映射或登录节点 SSH 时，将 `cfg/storage-access.example.yaml` 复制为 `.local/storage.yaml`，编辑后再把 `--storage-config /absolute/path/to/.local/storage.yaml` 加入 MCP 参数。
+计算任务不需要客户端存储配置，除非请求使用 `create_directories` 且其配置主机根目录在本机未被检测为挂载点；此时请用 `local_mounts` 映射该根目录（路径相同时映射到自身），或配置 SSH。共享路径与已配置的 `host_path` 在本机一致时，存储工具会自动使用该本地路径。需要自定义本地映射或登录节点 SSH 时，将 `cfg/storage-access.example.yaml` 复制为 `.local/storage.yaml`，编辑后再把 `--storage-config /absolute/path/to/.local/storage.yaml` 加入 MCP 参数。
 
 <a id="connect-a-stdio-mcp-client"></a>
 ## 接入 stdio MCP 客户端

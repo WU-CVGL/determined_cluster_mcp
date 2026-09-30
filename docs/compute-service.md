@@ -140,17 +140,19 @@ because the entrypoint creates it, unless `create_directories` names it.
 
 A path is decided only through a trusted local view: an explicit `local_mounts` entry of
 the storage configuration, which is trusted as configured, or, in `auto` or `local` mode,
-a profile host root that exists locally and is itself a mount point. A same-named local
-directory that is not a mount point may be an unrelated disk, so it is not trusted; when
-a profile host root lies below a mount point, map it with `local_mounts` (to itself when
-the local path is the same). When a `local_mounts` entry covers a path but its local path
-is missing or unreadable, the service does not fall back to the host root.
+a profile host root that exists locally and is detected as a mount point on this machine
+(a same-filesystem bind mount and a directory below a mount are not detected; map such a
+root to itself with `local_mounts`). A same-named local directory that is not detected as
+a mount point may be an unrelated disk, so it is not trusted. When a `local_mounts` entry
+covers a path but its local path is missing or unreadable, the service does not fall back
+to the host root.
 
 `status` is `present`, `missing`, `not_directory`, `unverified`, or `will_create`. Decide
 on `status`; `reason` is diagnostic and open-ended, so new values can appear. A path the
 client cannot decide is `unverified`; its reasons include `not_locally_visible`,
 `local_mount_unavailable` (the covering `local_mounts` entry is not usable),
-`local_view_unconfirmed` (the host root exists locally but is not a mount point),
+`local_view_unconfirmed` (the host root exists locally but is not detected as a mount
+point),
 `ssh_only_access`, `permission_denied`, `timeout`, `storage_config_unavailable` (the
 storage configuration cannot be loaded), `invalid_storage_path` (the local view resolves
 through a symlink outside its mapped root), and `os_error:<ERRNO>` such as
@@ -184,9 +186,11 @@ otherwise with `mkdir -p` on the configured SSH login node in `auto` or `ssh` mo
 otherwise it fails with `configuration_required`. It never creates through an untrusted
 same-named directory or an unusable `local_mounts` entry. Each local creation has the same
 10-second deadline and otherwise fails with the retryable `storage_timeout`; a directory
-that appears after the deadline is reported with `created: false` on retry. A directory
-that is itself a profile mount root is never created: an existing root is reported with
-`created: false`, and a missing one fails with `invalid_storage_path`. A new submission's
+that appears after the deadline is reported with `created: false` on retry. Creation over
+SSH is bounded by the storage `timeout_seconds` and likewise fails with the retryable
+`storage_timeout`. A directory that is itself a profile mount root is never created: an
+existing root is reported with `created: false`, and a missing one fails the launch, with
+`invalid_storage_path` when it is checked over SSH. A new submission's
 result gains `prepared_directories`, a list of `{field, host_path, created}`. Nothing is
 ever deleted. `checkpoint_storage` requires an experiment with `checkpoint_storage`. A
 non-empty list is part of the idempotency payload; an absent or empty list leaves earlier

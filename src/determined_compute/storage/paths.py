@@ -35,9 +35,10 @@ class PathInspector:
 
     A path is decided only through a local view that the storage configuration trusts:
     an explicit ``local_mounts`` entry, or, in ``auto`` or ``local`` mode, a compute-profile
-    host root that exists locally and is itself a mount point. Anything else, including an
-    unusable ``local_mounts`` entry, SSH-only access, a permission error, or a filesystem
-    that does not answer in time, is ``unverified``.
+    host root that exists locally and is detected as a mount point (a same-filesystem bind
+    mount or a root below a mount is not; map it with ``local_mounts``). Anything else,
+    including an unusable ``local_mounts`` entry, SSH-only access, a permission error, or a
+    filesystem that does not answer in time, is ``unverified``.
     """
 
     def __init__(

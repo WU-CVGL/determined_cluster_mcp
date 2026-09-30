@@ -50,14 +50,18 @@ _NO_LOCAL_VIEW = {
     "not_locally_visible": "shared storage for {field} is not locally accessible",
     "local_mount_unavailable": "the local_mounts entry for {field} is unavailable or not writable",
     "local_view_unconfirmed": (
-        "the profile host root for {field} exists locally but is not a mount point, "
-        "so it may not be the cluster's filesystem"
+        "the host root covering {field} exists locally but is not detected as a mount "
+        "point, so it may not be the cluster's filesystem"
     ),
 }
 
 
 def _is_mount_point(path: Path) -> bool:
-    """Whether a local directory is itself a mounted filesystem (after resolving symlinks)."""
+    """Whether a local directory is detected as a mount point (after resolving symlinks).
+
+    ``os.path.ismount`` compares the directory with its parent, so a bind mount from the
+    same filesystem, or a directory below a mount, is not detected.
+    """
     return os.path.ismount(os.path.realpath(path))
 
 
@@ -303,8 +307,9 @@ class StorageService:
 
         An explicit ``local_mounts`` entry is trusted as configured, and a covering entry
         that is unusable never falls back to the host root. The implicit host root is
-        trusted only when it is itself a mount point: a same-named local directory is not
-        evidence of the agents' filesystem.
+        trusted only when it is detected as a mount point here: a same-named local directory
+        is not evidence of the agents' filesystem. A same-filesystem bind mount or a root
+        below a mount is not detected, so such a root needs a ``local_mounts`` entry.
         """
 
         mapping = self._local_mapping(host_path, profile_mount, write=write)
@@ -398,9 +403,15 @@ class StorageService:
                 ssh.host,
                 remote_command,
             ]
-            result = self._run(
-                argv, timeout=self.config.timeout_seconds, env_overrides=env_overrides
-            )
+            try:
+                result = self._run(
+                    argv, timeout=self.config.timeout_seconds, env_overrides=env_overrides
+                )
+            except StorageError as exc:
+                if exc.code == "storage_timeout":
+                    # Launch claims nothing before this, and both scripts are idempotent.
+                    exc.retryable = True
+                raise
         outcome = result["output"].strip().splitlines()[-1:] or [""]
         if outcome[0] not in ({"created", "existed"} if create else {"existed", "missing"}):
             raise StorageError(

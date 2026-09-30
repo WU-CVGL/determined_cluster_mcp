@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 
 import pytest
+import yaml
 
 from determined_compute.compute import ComputeProfile
 from determined_compute.storage import StorageAccessConfig, StorageError, StorageService
@@ -67,6 +68,24 @@ def test_storage_config_defaults_and_strict_validation(tmp_path):
         )
     with pytest.raises(StorageError, match="must be a boolean"):
         StorageAccessConfig.from_dict({"preserve_permissions": "false"})
+
+
+def test_storage_example_loads_and_its_commented_local_mounts_fit_the_example_profile():
+    cfg = Path(__file__).resolve().parents[1] / "cfg"
+    example = cfg / "storage-access.example.yaml"
+    assert StorageAccessConfig.from_file(example).local_mounts == ()
+
+    lines = example.read_text(encoding="utf-8").splitlines()
+    block = []
+    for line in lines[lines.index("# local_mounts:") :]:
+        if not line.startswith("#"):
+            break
+        block.append(line[2:])
+    config = StorageAccessConfig.from_dict(yaml.safe_load("\n".join(block)))
+    example_profile = ComputeProfile.from_file(cfg / "compute-profile.example.yaml")
+    StorageService(example_profile, config)
+    identity = [m for m in config.local_mounts if str(m.local_path) == m.host_path]
+    assert [m.host_path for m in identity] == [example_profile.mounts[0].host_path]
 
 
 def test_check_translates_container_to_host_then_explicit_local_path(tmp_path):

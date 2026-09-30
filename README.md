@@ -33,7 +33,7 @@ DET_API_TOKEN=replace-with-your-token
 
 `DET_USERNAME` and `DET_PASSWORD` are also supported. Do not commit the credentials file. Fill `profile.yaml` with the administrator-provided image, resource pool, cluster-agent host paths, and container mount paths. Use container paths in task requests. Keep the SQLite database on local durable disk, not shared NFS.
 
-Compute tasks do not need a client storage configuration. Storage tools automatically use a local shared path when it matches the configured `host_path`. For a custom local mapping or login-node SSH, copy `cfg/storage-access.example.yaml` to `.local/storage.yaml`, edit it, and add `--storage-config /absolute/path/to/.local/storage.yaml` to the MCP arguments.
+Compute tasks do not need a client storage configuration unless a request uses `create_directories` and its profile host root is not detected as a mount point on this machine; then map that root with `local_mounts`, to itself if the path is the same, or configure SSH. Storage tools automatically use a local shared path when it matches the configured `host_path`. For a custom local mapping or login-node SSH, copy `cfg/storage-access.example.yaml` to `.local/storage.yaml`, edit it, and add `--storage-config /absolute/path/to/.local/storage.yaml` to the MCP arguments.
 
 ## Connect a stdio MCP client
 
