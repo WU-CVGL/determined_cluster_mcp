@@ -184,7 +184,7 @@ def test_construction_touches_no_network_and_reads_the_secrets_file(tmp_path, mo
 def test_protocol_gate_reads_the_master_without_credentials(monkeypatch):
     master = Master(monkeypatch)
 
-    assert client().check_protocol() == {"submission_protocol": 1, "version": "0.41.0-dev"}
+    assert client().check_protocol() == {"submission_protocol": 1}
     assert master.calls[0]["path"] == "/api/v1/master"
     assert master.calls[0]["headers"] == {}
 

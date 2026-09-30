@@ -573,7 +573,7 @@ class Client:
     def _headers(self) -> Dict[str, str]:
         with self._lock:
             if self._protocol is None:
-                self._protocol = self._check_protocol(MIN_SUBMISSION_PROTOCOL)
+                self._protocol = self._check_protocol()
             if self._token is None and self._login is not None:
                 self._token = self._log_in(*self._login)
             token = self._token
@@ -636,20 +636,19 @@ class Client:
 
     # Protocol gate
 
-    def check_protocol(self, minimum: int = MIN_SUBMISSION_PROTOCOL) -> Dict[str, Any]:
+    def check_protocol(self) -> Dict[str, Any]:
         """Read the master's submission protocol without logging in, and refuse an old one.
 
-        Returns ``{"submission_protocol", "version"}``. The release string is never the gate:
-        local builds report the previous tag and release candidates the next one.
+        Returns ``{"submission_protocol"}``. The release string is never the gate, and appears
+        only in the refusal: local builds report the previous tag and release candidates the
+        next one.
         """
 
         with self._lock:
-            result = self._check_protocol(minimum)
-            if minimum == MIN_SUBMISSION_PROTOCOL:
-                self._protocol = result
-        return result
+            self._protocol = self._check_protocol()
+        return self._protocol
 
-    def _check_protocol(self, minimum: int) -> Dict[str, Any]:
+    def _check_protocol(self) -> Dict[str, Any]:
         try:
             response = requests.get(self._url("api/v1/master"), timeout=15, verify=self.verify_ssl)
         except requests.RequestException as exc:
@@ -659,6 +658,7 @@ class Client:
         info = self._json(response, _Call())
         version = info.get("version") if isinstance(info.get("version"), str) else "unknown"
         protocol = info.get("submissionProtocol")
+        minimum = MIN_SUBMISSION_PROTOCOL
         if isinstance(protocol, bool) or not isinstance(protocol, int):
             raise APIError(
                 f"the Determined master (release {version}) has no submission protocol; this "
@@ -673,7 +673,7 @@ class Client:
                 code="protocol_unsupported",
                 details={"required": minimum, "found": protocol, "version": version},
             )
-        return {"submission_protocol": protocol, "version": version}
+        return {"submission_protocol": protocol}
 
     # Submissions
 
