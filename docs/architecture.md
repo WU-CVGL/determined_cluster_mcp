@@ -317,8 +317,8 @@ message Submission {
   job row, returns an ended job unchanged, and otherwise sets `cancel_requested_at`. After
   commit it signals the current attempt through the allocation service, not the command
   registry, or kills the experiment; a missing allocation is not an error. Every
-  allocation start (first dispatch, restore, system retry, experiment start) checks the
-  flag after it registers the allocation, so one of the two always sees the other. A
+  allocation start (first dispatch, restore, experiment start, and any later system retry)
+  checks the flag after it registers the allocation, so one of the two always sees the other. A
   GENERIC task with no live allocation, such as a paused one, is ended `CANCELED`
   directly. `KillCommand`, `KillShell`, and `KillGenericTask` take the same path; today the
   first two fail with `NotFound` when the registry misses (`api_command.go:259-262`,
@@ -650,7 +650,7 @@ explicitly:
   the agent resource manager, which today sets it only for Kubernetes and the dispatcher
   (`kubernetesrm/spec.go:137`, `dispatcher_task.go:800`). A workload that uses W&B records
   these in the run config, groups runs by job, and derives a stable run ID from the cluster
-  and the trial (or the task for commands), so a system retry resumes the same run. A
+  and the trial (or the task for commands), so a restarted trial resumes the same run. A
   multi-trial experiment maps to several runs; trials are never mixed into one run.
 - **Code provenance.** The run records the code the MCP pinned: the commit for `git`, the
   manifest digest from `.code-provenance.json` for `context`, or the unpinned directory
