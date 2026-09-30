@@ -235,6 +235,136 @@ def test_objects_missing_from_the_store_are_code_errors(repo, tmp_path):
     raises("git_failed", plan_context, repo)
 
 
+def _unreachable_partial_clone(repo, tmp_path):
+    """A blob:none clone whose promisor remote is gone; any contact with it leaves a mark."""
+    git(repo, "config", "uploadpack.allowFilter", "true")
+    clone = tmp_path / "partial"
+    git(tmp_path, "clone", "-q", "--filter=blob:none", repo.as_uri(), str(clone))
+    contacted = tmp_path / "contacted"
+    upload = tmp_path / "upload-pack"
+    upload.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(contacted))}\nexit 1\n")
+    upload.chmod(0o755)
+    git(clone, "config", "remote.origin.url", (tmp_path / "gone.git").as_uri())
+    git(clone, "config", "remote.origin.uploadpack", str(upload))
+    return clone, contacted
+
+
+def _as_older_git(monkeypatch, trace=None):
+    """Drop GIT_NO_LAZY_FETCH, which git before 2.44 ignores, and optionally trace git."""
+    environment = code._git_environment
+
+    def older():
+        result = {k: v for k, v in environment().items() if k != "GIT_NO_LAZY_FETCH"}
+        return {**result, "GIT_TRACE": str(trace)} if trace else result
+
+    monkeypatch.setattr(code, "_git_environment", older)
+
+
+def test_a_missing_blob_is_reported_without_attempting_a_fetch(repo, tmp_path, monkeypatch):
+    write(repo / "train.py", "print('newer')\n")
+    commit_all(repo, "newer")
+    clone, contacted = _unreachable_partial_clone(repo, tmp_path)
+    trace = tmp_path / "trace"
+    _as_older_git(monkeypatch, trace)
+
+    # The clone never fetched the older train.py.
+    error = raises("git_failed", plan_context, clone, revision="HEAD~1")
+
+    assert "missing" in str(error) and error.details["count"] == 1
+    lines = trace.read_text().splitlines()
+    assert any("rev-list" in line for line in lines)
+    assert [line for line in lines if "run_command:" in line and " fetch " in line] == []
+    assert not contacted.exists()
+    assert plan_context(clone).commit == git(repo, "rev-parse", "HEAD")
+
+
+def test_a_commit_missing_from_a_partial_clone_contacts_no_remote(repo, tmp_path, monkeypatch):
+    clone, contacted = _unreachable_partial_clone(repo, tmp_path)
+    write(repo / "train.py", "print('later')\n")
+    later = commit_all(repo, "later")  # never fetched into the clone
+    _as_older_git(monkeypatch)
+
+    # Resolving it reads the missing commit; git starts a lazy fetch that no transport allows.
+    raises("revision_not_found", plan_context, clone, revision=later)
+
+    assert not contacted.exists()
+
+
+@pytest.fixture
+def git_reporting(tmp_path, monkeypatch):
+    """Put first on PATH a git that reports a chosen version and otherwise runs the real one."""
+    real = shutil.which("git")
+    directory = tmp_path / "fake-git"
+    directory.mkdir()
+    monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{os.environ['PATH']}")
+
+    def install(reported):
+        script = directory / "git"
+        script.write_text(
+            "#!/bin/sh\n"
+            f"if [ \"$1\" = --version ]; then printf '%s\\n' {shlex.quote(reported)}; exit 0; fi\n"
+            f'exec {shlex.quote(real)} "$@"\n'
+        )
+        script.chmod(0o755)
+        code._git_version.cache_clear()
+
+    yield install
+    code._git_version.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "reported, found",
+    [
+        ("git version 2.31.1", "2.31.1"),
+        ("git version 2.31.8.vendor.2 (Distro Git-1)", "2.31.8.vendor.2 (Distro Git-1)"),
+        ("git version 2.4.0", "2.4.0"),  # compared as numbers, not text
+        ("git version 1.99.0", "1.99.0"),
+        ("not a version", "not a version"),
+    ],
+)
+def test_planning_requires_git_2_32(repo, git_reporting, reported, found):
+    git_reporting(reported)
+
+    for plan in (lambda: plan_git(repo, "/shared/repo", ROOTS), lambda: plan_context(repo)):
+        error = raises("git_too_old", plan)
+        assert error.details == {"found": found, "required": "2.32"}
+        assert f"needs git 2.32 or later; found {found}" in str(error)
+    # Observing a path source is best effort, so it reports nothing instead.
+    assert plan_path("/shared/repo", repo).observed_commit is None
+
+
+@pytest.mark.parametrize(
+    "reported",
+    [
+        "git version 2.32.0",
+        "git version 2.39.3 (Apple Git-145)",
+        "git version 2.45.1.windows.1",
+        "git version 3.0.0",
+    ],
+)
+def test_git_2_32_and_later_with_vendor_suffixes_are_accepted(repo, git_reporting, reported):
+    git_reporting(reported)
+
+    assert plan_git(repo, "/shared/repo", ROOTS).commit == git(repo, "rev-parse", "HEAD")
+
+
+def test_the_git_version_is_read_once_per_process(repo, git_reporting, monkeypatch):
+    git_reporting("git version 2.32.0")
+    calls = []
+    real_run = subprocess.run
+
+    def record(argv, **kwargs):
+        calls.append(argv)
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(code.subprocess, "run", record)
+    plan_git(repo, "/shared/repo", ROOTS)
+    plan_context(repo)
+
+    assert [argv for argv in calls if argv[1:] == ["--version"]] == [["git", "--version"]]
+    assert all("protocol.allow=never" in argv for argv in calls if argv[1:] != ["--version"])
+
+
 def test_git_rejects_a_partial_clone(repo, tmp_path):
     git(repo, "config", "uploadpack.allowFilter", "true")
     clone = tmp_path / "partial"

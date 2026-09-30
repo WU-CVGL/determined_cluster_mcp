@@ -4,12 +4,13 @@
 ``--shared``; ``context`` packs the tracked files at a revision, plus explicit working-tree
 includes, into the task context; ``path`` runs a shared directory in place and is never pinned.
 Every check here is read-only: git runs without user configuration or filter commands, and
-nothing contacts the master.
+nothing contacts the master or a remote. Planning needs git 2.32 or later.
 """
 
 from __future__ import annotations
 
 import base64
+import functools
 import hashlib
 import json
 import ntpath
@@ -50,6 +51,8 @@ MAX_REQUEST_SIZE = 96 * 1024 * 1024
 REQUEST_ALLOWANCE = 1024 * 1024
 MAX_REQUEST_FILES_SIZE = MAX_REQUEST_SIZE - REQUEST_ALLOWANCE
 GIT_TIMEOUT_SECONDS = 120
+# GIT_CONFIG_GLOBAL, which hides the user's configuration from planning, arrived in git 2.32.
+MIN_GIT_VERSION = (2, 32)
 PROVENANCE_PATH = ".code-provenance.json"
 # Any fixed mtime makes payloads reproducible. This is the master's own archive default
 # (pkg.DeterminedBirthday, 2017-08-02T00:00:00Z); a date after 1980 keeps zip and wheel builds
@@ -199,11 +202,56 @@ def _git_environment() -> Dict[str, str]:
         "GIT_PAGER": "cat",
         # Status-like commands must not refresh the index of a repository they only read.
         "GIT_OPTIONAL_LOCKS": "0",
-        # A partial clone would otherwise fetch missing objects over the network.
+        # A partial clone would otherwise fetch missing objects over the network. Only git
+        # 2.44 and later honour this, so it is defense in depth: _tree lists missing objects
+        # without fetching before anything reads them, and run_git allows no transport.
         "GIT_NO_LAZY_FETCH": "1",
         # The container clone never fetches refs/replace, so the plan must not honour it either.
         "GIT_NO_REPLACE_OBJECTS": "1",
     }
+
+
+def _execute(
+    argv: Sequence[str],
+    environment: Mapping[str, str],
+    input: Optional[bytes],
+    timeout: float,
+    name: str,
+) -> subprocess.CompletedProcess:
+    feed: Dict[str, Any] = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
+    try:
+        return subprocess.run(
+            list(argv), capture_output=True, env=dict(environment), timeout=timeout, **feed
+        )
+    except FileNotFoundError as exc:
+        raise CodeError("git is not installed", code="git_unavailable") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise CodeError(f"git {name} timed out after {timeout:g}s", code="git_timeout") from exc
+
+
+@functools.lru_cache(maxsize=1)
+def _git_version() -> Tuple[Optional[Tuple[int, int]], str]:
+    """Return (major, minor) of the git on PATH, or None, and its version text; run once."""
+    completed = _execute(
+        ["git", "--version"], _git_environment(), None, GIT_TIMEOUT_SECONDS, "--version"
+    )
+    text = completed.stdout.decode("utf-8", "replace")
+    # Vendors append to the number: "2.39.3 (Apple Git-145)", "2.45.1.windows.1".
+    match = re.search(r"\bgit version ((\d+)\.(\d+)[^\n]*)", text)
+    if completed.returncode or match is None:
+        return None, text.strip()[:100]
+    return (int(match.group(2)), int(match.group(3))), match.group(1).strip()[:100]
+
+
+def _require_git() -> None:
+    version, found = _git_version()
+    if version is None or version < MIN_GIT_VERSION:
+        required = ".".join(map(str, MIN_GIT_VERSION))
+        raise CodeError(
+            f"planning needs git {required} or later; found {found or 'no version'}",
+            code="git_too_old",
+            details={"found": found, "required": required},
+        )
 
 
 def run_git(
@@ -222,8 +270,11 @@ def run_git(
     status outside ``ok`` raises ``code``; a missing git or a timeout have codes of their own.
     ``trust`` accepts a repository owned by another user; ``config`` applies to this call only.
     """
+    _require_git()
     # core.fsmonitor names a command in the repository's config; scanning is enough here.
-    argv = ["git", "--no-pager", "-c", "core.fsmonitor=false"]
+    # protocol.allow=never refuses every transport, so a lazy fetch that some command starts
+    # in a partial clone fails before it contacts anything, on any git version.
+    argv = ["git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never"]
     if trust:
         # safe.directory is read only from protected config, which the fresh environment
         # hides, and a shared repository may belong to another uid; the container clone
@@ -239,15 +290,7 @@ def run_git(
         for index, (key, value) in enumerate(config.items()):
             environment[f"GIT_CONFIG_KEY_{index}"] = key
             environment[f"GIT_CONFIG_VALUE_{index}"] = value
-    feed: Dict[str, Any] = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
-    try:
-        completed = subprocess.run(
-            argv, capture_output=True, env=environment, timeout=timeout, **feed
-        )
-    except FileNotFoundError as exc:
-        raise CodeError("git is not installed", code="git_unavailable") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise CodeError(f"git {args[0]} timed out after {timeout:g}s", code="git_timeout") from exc
+    completed = _execute(argv, environment, input, timeout, args[0])
     if completed.returncode not in ok:
         lines = completed.stderr.decode("utf-8", "replace").strip().splitlines()
         detail = f": {lines[0][:300]}" if lines else ""
@@ -411,10 +454,33 @@ def _check_on_ref(repo: Path, commit: str, where: str) -> None:
         )
 
 
+def _check_objects(repo: Path, commit: str, *, trust: bool = False) -> None:
+    """Require every object of ``commit``'s tree in the store, without fetching any.
+
+    A partial clone, broken alternates or corruption can leave objects out, and reading one
+    in a partial clone starts a lazy fetch. rev-list never fetches with ``--missing=print``,
+    on every git version, and prints each missing object as ``?<oid>``; gitlinks are not
+    objects of this repository and are not listed. This runs before ls-tree -l or cat-file
+    read anything at the commit.
+    """
+    _, output = run_git(
+        repo, "rev-list", "--objects", "--missing=print", "--no-walk", commit, trust=trust
+    )
+    missing = [line[1:].decode("ascii") for line in output.splitlines() if line.startswith(b"?")]
+    if missing:
+        raise CodeError(
+            f"git object {missing[0]} at {commit} is missing from {repo}"
+            + (f", with {len(missing) - 1} more" if len(missing) > 1 else ""),
+            code="git_failed",
+            details={"commit": commit, "count": len(missing), "objects": list(_bounded(missing))},
+        )
+
+
 def _tree(
     repo: Path, commit: str, *, trust: bool = False
 ) -> List[Tuple[str, str, str, Optional[int]]]:
     """List (path, mode, object, size) for every entry at ``commit``; gitlinks have no size."""
+    _check_objects(repo, commit, trust=trust)
     _, output = run_git(repo, "ls-tree", "-r", "-l", "-z", "--full-tree", commit, trust=trust)
     entries = []
     for record in output.split(b"\0"):
@@ -424,8 +490,7 @@ def _tree(
         mode, _kind, oid, size = meta.decode("ascii").split()
         path = raw_path.decode("utf-8", "surrogateescape")
         if size != "-" and not size.isdigit():
-            # ls-tree -l prints BAD for an object missing from the store (a partial clone,
-            # broken alternates, corruption); lazy fetching is off while planning.
+            # ls-tree -l prints BAD for an object that went missing since the check above.
             raise CodeError(
                 f"git object {oid} for {path!r} is missing from {repo}", code="git_failed"
             )
