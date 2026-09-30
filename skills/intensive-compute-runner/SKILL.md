@@ -35,7 +35,7 @@ If the client lacks cluster mounts, read [the shared-storage access guide](../..
 2. Call `compute_resources` for the requested slots and pool. Capacity is a snapshot, not a reservation; do not switch pool or location automatically.
 3. Keep `allow_queue: false` unless queueing is approved for this call. Resolve unsafe or unknown capacity before launch.
 4. Call `compute_launch` with a stable `request_id`. Keep its local `task_id`, which differs from the remote ID.
-5. Observe with `compute_status`, `compute_logs`, and `compute_list_tasks`; use `compute_usage` to check measured CPU, memory, and GPU use before proposing a resize. These reads also work read-only for a task submitted with another profile on the same endpoint (`binding.mode: cross_profile`); cancel with the task's original profile. Cancel only the intended task.
+5. Observe with `compute_status`, `compute_logs`, and `compute_list_tasks`; use `compute_usage` to check measured CPU, memory, and GPU use before proposing a resize. These reads also work read-only for a task submitted with another profile on the same endpoint (`binding.mode: cross_profile`) while Determined still returns the task; after an ended command or shell is dropped (24 hours after it ends, or on a master restart) they return `cross_profile_unverifiable`, and only the original profile can read it. Cancel with the task's original profile. Cancel only the intended task.
 
 Never include credentials in requests, configs, logs, or reports. A launch with `allow_queue: false` performs admission checking and rejects busy or unknown capacity without submitting; `true` explicitly permits scheduler queueing.
 
