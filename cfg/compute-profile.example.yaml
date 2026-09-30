@@ -1,7 +1,9 @@
-# Copy this file outside version control and replace every placeholder.
-# Values describe one deployment; old image and pool examples are not defaults.
-cluster_identity: "REPLACE_WITH_CLUSTER_NAME"
-
+# The policy for one deployment. Copy this file outside version control and replace every
+# placeholder; old image and pool examples are not defaults.
+#
+# mounts maps each container path to the host path that the administrator binds on every agent
+# (task_container_defaults.bind_mounts). The MCP never sends a bind mount; it uses this map to
+# check paths and to reach shared storage through storage access.
 mounts:
   - host_path: "/workspace/REPLACE_WITH_USER"
     container_path: "/run/determined/workdir/home"
@@ -23,10 +25,17 @@ mounts:
   - host_path: "/UNSAFE_SSD4"
     container_path: "/UNSAFE_SSD4"
 
+# Pool and slots are always sent explicitly, from these defaults unless a request sets them.
 defaults:
   image: "REPLACE_WITH_VERIFIED_IMAGE"
   pool: "REPLACE_WITH_VERIFIED_POOL"
   slots: 1
 
-# Advisory deployment convention. Determined itself does not guarantee this.
-shell_inactivity_seconds: 7200
+# Pools a request may name; only the default pool when omitted.
+# pools: ["REPLACE_WITH_VERIFIED_POOL"]
+
+# The most slots one request may hold: slots per trial times concurrent trials.
+# max_slots: 8
+
+# Whether storage_sync and storage_fetch may replace existing files.
+allow_overwrite: false

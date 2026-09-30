@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from determined_compute.policy import Mount, MountMap, Policy, PolicyError, Resources
@@ -155,3 +157,12 @@ def test_root_host_mount_translates_without_a_double_slash():
 
     assert mounts.to_host("/host/etc")[1] == "/etc"
     assert mounts.to_host("/host")[1] == "/"
+
+
+def test_the_example_policy_loads():
+    example = Path(__file__).resolve().parents[1] / "cfg" / "compute-profile.example.yaml"
+
+    policy = Policy.from_file(example)
+
+    assert policy.pools == frozenset({policy.pool})
+    assert policy.allow_overwrite is False

@@ -1,30 +1,23 @@
 {
-  "name": "train-baseline",
-  "description": "Train the baseline configuration with checkpoints and outputs on shared storage.",
   "kind": "experiment",
-  "overnight": true,
-  "command": [
-    "bash",
-    "-lc",
-    "python train.py --config configs/train.yaml --output \"$COMPUTE_OUTPUT_DIR/train\""
-  ],
-  "workdir": "/run/determined/workdir/home/compute/runs/example/0123456789abcdef/repo",
-  "output_dir": "/run/determined/workdir/home/compute/runs/example/0123456789abcdef/results",
+  "name": "train-baseline",
+  "command": "python train.py --config configs/train.yaml --output \"$COMPUTE_OUTPUT_DIR/train\"",
+  "code": {
+    "source": "git",
+    "repo": "/SSD_home/REPLACE_WITH_USER/repos/project",
+    "revision": "main"
+  },
+  "output_dir": "/SSD_home/REPLACE_WITH_USER/runs/train-baseline",
   "slots": 1,
-  "code_revision": "0123456789abcdef",
-  "experiment_config": {
+  "experiment": {
     "searcher": {
       "name": "single",
       "metric": "validation_loss",
-      "smaller_is_better": true,
-      "max_length": {
-        "batches": 1000
-      }
+      "smaller_is_better": true
     },
     "checkpoint_storage": {
       "type": "shared_fs",
-      "host_path": "/workspace/REPLACE_WITH_USER/compute/runs/example/0123456789abcdef/checkpoints"
+      "storage_path": "train-baseline/checkpoints"
     }
-  },
-  "allow_queue": false
+  }
 }

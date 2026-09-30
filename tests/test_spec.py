@@ -1786,3 +1786,10 @@ def test_resolve_pins_the_revision_and_fills_the_resources() -> None:
     assert in_place.code == path.code
     # The resolved spec round-trips through JSON as a tool argument.
     assert TaskSpec.model_validate(json.loads(pinned.model_dump_json())) == pinned
+
+
+@pytest.mark.parametrize("name", ["command", "experiment", "shell"])
+def test_the_example_requests_are_task_specs(name: str) -> None:
+    example = Path(__file__).resolve().parents[1] / "cfg" / "examples" / f"{name}_request.json"
+
+    assert TaskSpec.model_validate(json.loads(example.read_text())).kind == name

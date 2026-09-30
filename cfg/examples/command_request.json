@@ -1,15 +1,12 @@
 {
-  "name": "evaluate-checkpoint",
-  "description": "Evaluate the selected checkpoint and write results to the shared output directory.",
   "kind": "command",
-  "command": [
-    "bash",
-    "-lc",
-    "python scripts/evaluate.py --output \"$COMPUTE_OUTPUT_DIR/eval.json\""
-  ],
-  "workdir": "/run/determined/workdir/home/compute/runs/example/0123456789abcdef/repo",
-  "output_dir": "/run/determined/workdir/home/compute/runs/example/0123456789abcdef/results",
-  "slots": 1,
-  "code_revision": "0123456789abcdef",
-  "allow_queue": false
+  "name": "evaluate-checkpoint",
+  "command": "python scripts/evaluate.py --output \"$COMPUTE_OUTPUT_DIR/eval.json\"",
+  "code": {
+    "source": "git",
+    "repo": "/SSD_home/REPLACE_WITH_USER/repos/project",
+    "revision": "main"
+  },
+  "output_dir": "/SSD_home/REPLACE_WITH_USER/runs/evaluate-checkpoint",
+  "slots": 1
 }
