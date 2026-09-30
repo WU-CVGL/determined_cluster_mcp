@@ -1828,15 +1828,27 @@ class ComputeService:
         except APIError as exc:
             if exc.code != 404:
                 raise
-            # Only the live entity carries the owner and marker; the task's logs and
-            # measurements outlive it, but reading them unverified would trust the ID alone.
-            raise ConflictError(
-                "Determined no longer returns this task's entity (an ended command or shell "
-                "is dropped 24 hours after it ends and on a master restart), so its owner "
-                "and submission marker cannot be verified from another compute profile; "
-                "logs and usage remain readable with the task's original compute profile",
-                code="cross_profile_unverifiable",
-            ) from exc
+            # Only the live entity carries the owner and marker. A dropped command's or
+            # shell's logs and measurements outlive it, but reading them unverified would
+            # trust the ID alone. An experiment is never dropped: its 404 means it was
+            # deleted, together with its logs, or is not visible to this account.
+            if record.kind == "experiment":
+                detail = (
+                    "Determined returned HTTP 404 for this experiment (it was deleted or is "
+                    "not visible to this account; deleting an experiment also deletes its "
+                    "logs), so its owner and submission marker cannot be verified from "
+                    "another compute profile; if the experiment still exists, read its logs "
+                    "and usage with the task's original compute profile"
+                )
+            else:
+                detail = (
+                    "Determined no longer returns this task's entity (an ended command or "
+                    "shell is dropped 24 hours after it ends and on a master restart), so its "
+                    "owner and submission marker cannot be verified from another compute "
+                    "profile; logs and usage remain readable with the task's original compute "
+                    "profile"
+                )
+            raise ConflictError(detail, code="cross_profile_unverifiable") from exc
         self._verify_cross_profile(record, entity, user_id, binding)
         return entity
 

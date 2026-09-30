@@ -257,15 +257,20 @@ SHELL_REQUEST = {
     "kind": "shell",
     "interactive": True,
 }
-DROPPED = {"command": (REQUEST, COMMAND_ID), "shell": (SHELL_REQUEST, SHELL_ID)}
+DROPPED = {
+    "command": (REQUEST, COMMAND_ID),
+    "shell": (SHELL_REQUEST, SHELL_ID),
+    "experiment": ({**REQUEST, "kind": "experiment"}, "41"),
+}
 
 
 @pytest.mark.parametrize("operation", ["status", "logs", "usage"])
-@pytest.mark.parametrize("kind", ["command", "shell"])
+@pytest.mark.parametrize("kind", ["command", "shell", "experiment"])
 def test_cross_profile_read_of_a_dropped_entity_is_unverifiable(tmp_path, kind, operation):
     request, remote_id = DROPPED[kind]
     client, store, task = submitted(tmp_path, request)
-    # Determined drops an ended command or shell 24 hours after it ends or on a restart.
+    # Determined drops an ended command or shell 24 hours after it ends or on a restart;
+    # an experiment returns 404 once it is deleted or when it is not visible.
     client.entity_errors[(kind, remote_id)] = APIError("404 not found", code=404)
     before = rows(tmp_path)
 
@@ -280,6 +285,32 @@ def test_cross_profile_read_of_a_dropped_entity_is_unverifiable(tmp_path, kind, 
     # No task logs, task info or resource series are read without verification.
     assert client.calls == [("GET", "api/v1/me"), ("GET", f"api/v1/{kind}s/{remote_id}")]
     assert rows(tmp_path) == before
+
+
+@pytest.mark.parametrize("kind", ["command", "shell", "experiment"])
+def test_unverifiable_message_matches_the_task_kind(tmp_path, kind):
+    request, remote_id = DROPPED[kind]
+    client, store, task = submitted(tmp_path, request)
+    client.entity_errors[(kind, remote_id)] = APIError("404 not found", code=404)
+
+    with pytest.raises(ConflictError) as caught:
+        other_profile_service(client, store).logs(task["task_id"], "session-a")
+
+    message = str(caught.value)
+    if kind == "experiment":
+        # Experiments are never dropped on a timer, and deleting one deletes its logs.
+        assert "deleted or is not visible to this account" in message
+        assert "deleting an experiment also deletes its logs" in message
+        assert "if the experiment still exists" in message
+        assert "24 hours" not in message
+        assert "remain readable" not in message
+    else:
+        assert message == (
+            "Determined no longer returns this task's entity (an ended command or shell "
+            "is dropped 24 hours after it ends and on a master restart), so its owner "
+            "and submission marker cannot be verified from another compute profile; "
+            "logs and usage remain readable with the task's original compute profile"
+        )
 
 
 @pytest.mark.parametrize("operation", ["status", "logs", "usage"])

@@ -138,7 +138,7 @@ Reconcile 的用途更窄：`compute_reconcile` 通过核对提交标记，修�
 | Determined 账户 | 由凭据选择的 API 身份和远端权限 |
 | 集群身份 | 用于避免跨集群任务混淆的实际远端集群 |
 
-submitted 记录还绑定提交它的计算配置和端点。在同一端点和集群标签下，其他配置仍可只读地查询状态、日志和用量：服务会先验证任务所有者和提交标记，结果中的 `binding.mode` 为 `cross_profile`，`mutations_allowed` 为 `false`。取消与调和仍要求原来的配置，否则返回 `binding_mismatch`；配置改变后的 launch 重试返回 `idempotency_conflict`，因为配置指纹是请求哈希的一部分。请使用原来的配置取消、调和或重试。当 Determined 不再提供任务实体时（例如 command 或 shell 结束超过 24 小时，或 master 重启之后），跨配置读取返回 `cross_profile_unverifiable`；请使用原来的配置读取其日志和用量。`compute_list_tasks` 会显示每条记录的离线 `binding`。
+submitted 记录还绑定提交它的计算配置和端点。在同一端点和集群标签下，其他配置仍可只读地查询状态、日志和用量：服务会先验证任务所有者和提交标记，结果中的 `binding.mode` 为 `cross_profile`，`mutations_allowed` 为 `false`。取消与调和仍要求原来的配置，否则返回 `binding_mismatch`；配置改变后的 launch 重试返回 `idempotency_conflict`，因为配置指纹是请求哈希的一部分。请使用原来的配置取消、调和或重试。当 Determined 不再提供任务实体时，跨配置读取返回 `cross_profile_unverifiable`。对于结束超过 24 小时或经历 master 重启的 command 或 shell，请使用原来的配置读取其日志和用量；处于这种情况的 experiment 已连同其日志被删除，或对该账户不可见。`compute_list_tasks` 会显示每条记录的离线 `binding`。
 
 只有使用相同数据库和 owner 的会话才共享本地记录。不同数据库可以分别登记同一个远端任务。数据库应放在本地持久磁盘，不要放在共享 NFS 中。共享 owner 不等于共享凭据，更换凭据也不会重命名 owner 命名空间。
 
