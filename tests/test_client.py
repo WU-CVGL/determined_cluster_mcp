@@ -483,8 +483,7 @@ def test_an_unknown_launch_outcome_is_retried_with_the_same_key(monkeypatch, ans
 
     assert caught.value.retryable is True
     assert caught.value.code in {"internal", "unavailable", "invalid_response"}
-    if caught.value.code != "invalid_response":
-        assert "same idempotency key" in str(caught.value)
+    assert "same idempotency key" in str(caught.value)
 
 
 def test_a_dry_run_transport_failure_is_retryable_without_a_key_hint(monkeypatch):

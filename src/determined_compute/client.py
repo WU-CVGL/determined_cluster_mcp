@@ -89,7 +89,10 @@ class APIError(RuntimeError):
 
 
 def _malformed(what: str, *, retryable: bool = False) -> APIError:
+    """A malformed answer; ``retryable`` only for a keyed create, whose replay is safe."""
     message = f"Determined returned a malformed {what}"
+    if retryable:
+        message += _RETRY_SAME_KEY
     return APIError(message, code="invalid_response", retryable=retryable)
 
 
