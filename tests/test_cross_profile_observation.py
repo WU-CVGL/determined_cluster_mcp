@@ -17,6 +17,7 @@ from determined_compute.compute import (
 )
 
 COMMAND_ID = "12345678-1234-5678-9234-567812345678"
+SHELL_ID = "87654321-4321-4765-8321-876543218765"
 
 
 class FakeClient:
@@ -25,18 +26,19 @@ class FakeClient:
     def __init__(self):
         self.calls = []
         self.entities = {}
+        self.entity_errors = {}
         self.user = {"id": "7", "username": "alice"}
 
     def launch_task(self, kind, config):
         self.calls.append(("POST", f"api/v1/{kind}s"))
-        remote_id = COMMAND_ID if kind == "command" else "41"
+        remote_id = {"command": COMMAND_ID, "shell": SHELL_ID}.get(kind, "41")
         marker = next(
             item.partition("=")[2]
             for item in config["environment"]["environment_variables"]
             if item.startswith("COMPUTE_SUBMISSION_MARKER=")
         )
         self.entities[(kind, remote_id)] = {
-            "id": remote_id if kind == "command" else int(remote_id),
+            "id": int(remote_id) if kind == "experiment" else remote_id,
             "userId": 7,
             "state": "RUNNING",
             "startTime": "2026-09-20T00:00:00Z",
@@ -54,6 +56,8 @@ class FakeClient:
 
     def get_task(self, kind, remote_id):
         self.calls.append(("GET", f"api/v1/{kind}s/{remote_id}"))
+        if (kind, remote_id) in self.entity_errors:
+            raise self.entity_errors[(kind, remote_id)]
         return copy.deepcopy(self.entities[(kind, remote_id)])
 
     def task_logs(self, kind, remote_id, tail):
@@ -246,6 +250,76 @@ def test_cross_profile_verification_fails_before_logs_or_usage(
     assert caught.value.code == code
     assert client.calls == [("GET", "api/v1/me"), ("GET", f"api/v1/commands/{COMMAND_ID}")]
     assert rows(tmp_path) == before
+
+
+SHELL_REQUEST = {
+    **{key: value for key, value in REQUEST.items() if key != "command"},
+    "kind": "shell",
+    "interactive": True,
+}
+DROPPED = {"command": (REQUEST, COMMAND_ID), "shell": (SHELL_REQUEST, SHELL_ID)}
+
+
+@pytest.mark.parametrize("operation", ["status", "logs", "usage"])
+@pytest.mark.parametrize("kind", ["command", "shell"])
+def test_cross_profile_read_of_a_dropped_entity_is_unverifiable(tmp_path, kind, operation):
+    request, remote_id = DROPPED[kind]
+    client, store, task = submitted(tmp_path, request)
+    # Determined drops an ended command or shell 24 hours after it ends or on a restart.
+    client.entity_errors[(kind, remote_id)] = APIError("404 not found", code=404)
+    before = rows(tmp_path)
+
+    with pytest.raises(ConflictError) as caught:
+        getattr(other_profile_service(client, store), operation)(task["task_id"], "session-a")
+
+    assert caught.value.code == "cross_profile_unverifiable"
+    assert caught.value.retryable is False
+    assert "original compute profile" in str(caught.value)
+    assert isinstance(caught.value.__cause__, APIError)
+    assert caught.value.__cause__.code == 404
+    # No task logs, task info or resource series are read without verification.
+    assert client.calls == [("GET", "api/v1/me"), ("GET", f"api/v1/{kind}s/{remote_id}")]
+    assert rows(tmp_path) == before
+
+
+@pytest.mark.parametrize("operation", ["status", "logs", "usage"])
+@pytest.mark.parametrize(
+    "error",
+    [
+        APIError("503 unavailable", code=503, retryable=True),
+        APIError("403 forbidden", code=403),
+        APIError("timed out", code="transport_error", retryable=True),
+    ],
+)
+def test_cross_profile_entity_errors_other_than_404_propagate_unchanged(
+    tmp_path, operation, error
+):
+    client, store, task = submitted(tmp_path)
+    client.entity_errors[("command", COMMAND_ID)] = error
+
+    with pytest.raises(APIError) as caught:
+        getattr(other_profile_service(client, store), operation)(task["task_id"], "session-a")
+
+    assert caught.value is error
+    assert client.calls == [("GET", "api/v1/me"), ("GET", f"api/v1/commands/{COMMAND_ID}")]
+
+
+def test_exact_profile_reads_of_a_dropped_entity_are_unchanged(tmp_path):
+    client, store, task = submitted(tmp_path)
+    client.entity_errors[("command", COMMAND_ID)] = APIError("404 not found", code=404)
+    service = ComputeService(client, store, profile())
+
+    with pytest.raises(APIError) as status:
+        service.status(task["task_id"], "session-a")
+    logs = service.logs(task["task_id"], "session-a", 5, include_binding=True)
+    usage = service.usage(task["task_id"], "session-a")
+
+    assert type(status.value) is APIError
+    assert status.value.code == 404
+    assert logs["logs"] == [{"message": "remote log"}]
+    assert logs["binding"]["mode"] == "profile"
+    assert usage["binding"]["mode"] == "profile"
+    assert usage["resource_pool"] is None
 
 
 def test_legacy_description_marker_is_accepted_only_for_legacy_records(tmp_path):

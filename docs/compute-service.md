@@ -534,23 +534,31 @@ again.
 ### Cross-profile observation
 
 Submitted local tasks remain bound to the original profile fingerprint and endpoint for
-every mutation. Cancellation, reconciliation, and adoption that returns a submitted record
-require both and otherwise return `binding_mismatch` before any remote call; a launch
-retry with a changed profile returns `idempotency_conflict`. Status, logs, and usage are
-read-only and also accept a record submitted with another profile when its stored
-endpoint and label equal the current ones. Before reading task data, the service calls
-`/me`, fetches the entity, and requires its `userId` to be the authenticated account
-(`ownership_mismatch` otherwise), its ID to equal the record's remote ID, and its
-submission marker to equal the record's marker, or, for a legacy record without display
-metadata, its first description line (`identity_mismatch` otherwise). The marker proves
-that the remote task is this record's submission even if IDs repeat after a master is
-reinstalled at the same address. Such a read costs one `/me` call, plus one entity read
-for logs and usage; the exact-profile path makes no extra call. A cross-profile status
-writes only the cached `remote_state`, and a record without a remote ID is returned as
-stored, without remote calls or the stale-submission transition. To cancel or reconcile,
-use the task's original profile. A changed endpoint or label still blocks every
-operation. Adopted tasks remain bound to the actual cluster ID and authenticated user ID.
-These checks prevent a changed profile or account from operating on an unrelated task.
+every mutation. Cancellation and reconciliation require both and otherwise return
+`binding_mismatch` before any remote call. Adoption that resolves to a submitted record
+returns `binding_mismatch` after its read-only cluster, account, and entity lookups. A
+launch retry with a changed profile returns `idempotency_conflict`, because the profile
+fingerprint is part of the request hash. Status, logs, and usage are read-only and also
+accept a record submitted with another profile when its stored endpoint and label equal
+the current ones. Before reading task data, the service calls `/me`, fetches the entity,
+and requires its `userId` to be the authenticated account (`ownership_mismatch`
+otherwise), its ID to equal the record's remote ID, and its submission marker to equal
+the record's marker, or, for a legacy record without display metadata, its first
+description line (`identity_mismatch` otherwise). The marker proves that the remote task
+is this record's submission even if IDs repeat after a master is reinstalled at the same
+address. A cross-profile read therefore needs the live entity. Determined drops an ended
+command or shell 24 hours after it ends and on a master restart; when the entity read
+returns HTTP 404, the read fails with `cross_profile_unverifiable` before any task data
+is read, and the task's original profile can still read its logs and usage. Other
+entity-read errors are returned unchanged. Such a read costs one `/me` call, plus one
+entity read for logs; usage moves its usual entity read before the measurements and
+requires it to succeed. The exact-profile path makes no extra call. A cross-profile
+status writes only the cached `remote_state`, and a record without a remote ID is
+returned as stored, without remote calls or the stale-submission transition. To cancel,
+reconcile, or retry a launch, use the task's original profile. A changed endpoint or
+label still blocks every operation. Adopted tasks remain bound to the actual cluster ID
+and authenticated user ID. These checks prevent a changed profile or account from
+operating on an unrelated task.
 
 ### Errors
 

@@ -132,7 +132,7 @@ HTTP 503 表示测量后端繁忙或不可用；每个 master 同时最多运行
 <a id="a-task-reports-binding_mismatch"></a>
 ## 任务返回 binding_mismatch
 
-submitted 记录绑定提交它的计算配置和端点。如果只有配置改变，`compute_cancel` 或 `compute_reconcile` 返回的 `binding_mismatch` 会说明状态、日志和用量仍可只读查询；请使用任务原来的配置取消或调和。如果端点或 `cluster_identity` 标签不同，所有操作都会被拒绝，因为该记录可能描述的是另一个 master 上的任务。`compute_list_tasks` 显示每条记录的离线 `binding`（`profile`、`cross_profile`、`mismatch`、`unknown` 或 `adopted`）。跨配置读取返回 `identity_mismatch` 或 `ownership_mismatch` 时，表示找到的远端任务的提交标记或所有者与记录不符；不要把它当作同一个任务。参见[跨配置只读观察](compute-service.zh.md#cross-profile-observation)。
+submitted 记录绑定提交它的计算配置和端点。如果只有配置改变，`compute_cancel` 或 `compute_reconcile` 返回的 `binding_mismatch` 会说明状态、日志和用量仍可只读查询；请使用任务原来的配置取消或调和。如果端点或 `cluster_identity` 标签不同，所有操作都会被拒绝，因为该记录可能描述的是另一个 master 上的任务。`compute_list_tasks` 显示每条记录的离线 `binding`（`profile`、`cross_profile`、`mismatch`、`unknown` 或 `adopted`）。跨配置读取返回 `identity_mismatch` 或 `ownership_mismatch` 时，表示找到的远端任务的提交标记或所有者与记录不符；不要把它当作同一个任务。跨配置读取返回 `cross_profile_unverifiable` 时，表示任务实体的读取收到 HTTP 404，因此无法验证所有者和提交标记：Determined 会在已结束的 command 或 shell 结束 24 小时后、以及 master 重启时丢弃其实体。该错误不可重试，也不表示任务日志已经丢失；请使用任务原来的配置读取其日志和用量。参见[跨配置只读观察](compute-service.zh.md#cross-profile-observation)。
 
 <a id="a-transfer-is-partial-or-different-from-the-preview"></a>
 ## 传输不完整或与预览不同

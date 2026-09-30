@@ -948,12 +948,12 @@ class ComputeService:
         if record.remote_id is None:
             result["binding"] = binding
             return result
-        user_id = self._current_user_id() if cross_profile else None
-        entity = self.client.get_task(record.kind, record.remote_id)
-        if record.origin == "adopted":
-            self._check_adopted_entity(record, entity)
-        elif cross_profile:
-            self._verify_cross_profile(record, entity, user_id, binding)
+        if cross_profile:
+            entity = self._cross_profile_entity(record, binding)
+        else:
+            entity = self.client.get_task(record.kind, record.remote_id)
+            if record.origin == "adopted":
+                self._check_adopted_entity(record, entity)
         state = _remote_state(entity)
         if state != record.remote_state:
             record = self.store.update_remote_state(record.task_id, state)
@@ -979,9 +979,7 @@ class ComputeService:
                     record, self.client.get_task(record.kind, record.remote_id)
                 )
             elif binding["mode"] == "cross_profile":
-                user_id = self._current_user_id()
-                entity = self.client.get_task(record.kind, record.remote_id)
-                self._verify_cross_profile(record, entity, user_id, binding)
+                self._cross_profile_entity(record, binding)
             result = self.client.task_logs(record.kind, record.remote_id, tail)
             if not isinstance(result, list):
                 raise APIError("task log response was not a list", code="invalid_api_response")
@@ -1049,9 +1047,7 @@ class ComputeService:
             entity = self.client.get_task(record.kind, record.remote_id)
             self._check_adopted_entity(record, entity)
         elif binding["mode"] == "cross_profile":
-            user_id = self._current_user_id()
-            entity = self.client.get_task(record.kind, record.remote_id)
-            self._verify_cross_profile(record, entity, user_id, binding)
+            entity = self._cross_profile_entity(record, binding)
         if not self.client.task_resources_enabled():
             raise APIError(
                 "task resource monitoring is not enabled on this Determined master",
@@ -1806,6 +1802,26 @@ class ComputeService:
             raise APIError(
                 "Remote account identity is unavailable", code="invalid_response"
             ) from exc
+
+    def _cross_profile_entity(self, record: TaskRecord, binding: Dict[str, Any]) -> Any:
+        """Fetch a cross-profile record's entity and verify it before any task data is read."""
+        user_id = self._current_user_id()
+        try:
+            entity = self.client.get_task(record.kind, record.remote_id)
+        except APIError as exc:
+            if exc.code != 404:
+                raise
+            # Only the live entity carries the owner and marker; the task's logs and
+            # measurements outlive it, but reading them unverified would trust the ID alone.
+            raise ConflictError(
+                "Determined no longer returns this task's entity (an ended command or shell "
+                "is dropped 24 hours after it ends and on a master restart), so its owner "
+                "and submission marker cannot be verified from another compute profile; "
+                "logs and usage remain readable with the task's original compute profile",
+                code="cross_profile_unverifiable",
+            ) from exc
+        self._verify_cross_profile(record, entity, user_id, binding)
+        return entity
 
     def _verify_cross_profile(
         self, record: TaskRecord, entity: Any, user_id: str, binding: Dict[str, Any]
