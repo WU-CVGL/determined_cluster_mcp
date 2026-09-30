@@ -64,9 +64,9 @@ GUI 应用可能不会继承终端中导出的变量。应在客户端的 MCP �
 
 先确认参数要求哪一种路径空间。任务的 `workdir` 和 `output_dir`、`storage_check.path`，以及传输的 `shared_dir` 一侧，都使用计算 profile 中的容器路径。`mounts[].host_path` 是集群计算节点路径。`local_dir` 是运行 MCP 服务的机器上的绝对路径。
 
-规划会检查配置的路径边界。CLI 和 MCP 服务还会为 bind mount、工作目录、experiment 检查点目录和输出目录报告 `path_checks`；参见[启动路径检查](compute-service.zh.md#launch-path-checks)。`path_not_found` 表示已知某个必需路径不存在或不是目录，`details.missing_paths` 会列出该路径。请创建它、修正请求，或对输出目录和 experiment 检查点目录使用 `create_directories`。否则，缺失的 experiment 检查点 `host_path` 会让任务在容器启动前失败，因为 Determined 在启动时 bind mount 该路径。
+规划会检查配置的路径边界。CLI 和 MCP 服务还会为 bind mount、工作目录、experiment 检查点目录和输出目录报告 `path_checks`；参见[启动路径检查](compute-service.zh.md#launch-path-checks)。`path_not_found` 表示通过可信本地视图（`local_mounts` 条目，或在 MCP 所在机器上已挂载的配置主机根目录）看到某个必需路径不存在或不是目录，`details.missing_paths` 会列出该路径。如果该路径在集群上存在，请确认本地挂载或 `local_mounts` 条目显示的是集群的文件系统。请创建它、修正请求，或对输出目录和 experiment 检查点目录使用 `create_directories`。否则，缺失的 experiment 检查点 `host_path` 会让任务在容器启动前失败，因为 Determined 在启动时 bind mount 该路径。
 
-`unverified` 状态永远不会导致失败，只表示客户端无法判定：`not_locally_visible`（MCP 所在机器没有挂载该主机根目录；若挂载在其他位置，请添加 `local_mounts` 条目）、`ssh_only_access`、`permission_denied`、`timeout`（文件系统未在 10 秒内响应）或 `storage_config_unavailable`（无法加载存储配置；请运行 `storage_check` 或修正该文件）。此时 `create_directories` 需要本地视图或 SSH 访问，否则 launch 会在提交前返回 `configuration_required`。如果共享根目录本身不可写，但其子目录可写，请用 `local_mounts` 映射该子目录。
+`unverified` 状态永远不会导致失败，只表示客户端无法判定。请依据 `status` 判断；`reason` 的取值是开放的。常见原因有：`not_locally_visible`（MCP 所在机器没有挂载该主机根目录；若挂载在其他位置，请添加 `local_mounts` 条目）、`local_mount_unavailable`（覆盖该路径的 `local_mounts` 条目不存在或不可读；请重新挂载或修正该条目）、`local_view_unconfirmed`（本机存在同名主机根目录，但它不是挂载点；如果它确实是集群的文件系统，例如位于网络挂载之下的目录，请用 `local_mounts` 把它映射到自身）、`ssh_only_access`、`permission_denied`、`timeout`（文件系统未在 10 秒内响应）、`storage_config_unavailable`（无法加载存储配置；请运行 `storage_check` 或修正该文件）、`invalid_storage_path`（本地视图经由符号链接解析到映射根目录之外），以及 `os_error:<ERRNO>`，例如 `os_error:ESTALE`。此时 `create_directories` 需要可信本地视图或 SSH 访问，否则 launch 会在认领任务记录之前返回 `configuration_required`。launch 返回 `storage_timeout` 表示待创建的目录或其创建过程未在 10 秒内响应；此时没有写入记录，也没有提交任务，文件系统恢复响应后请用同一 `request_id` 重试。如果共享根目录本身不可写，但其子目录可写，请用 `local_mounts` 映射该子目录。
 
 MCP 服务具有已配置的本地或 SSH 访问方式时，可以使用 `storage_check`。如果任务文件已经位于共享存储，而且不需要从客户端检查或传输，计算操作可以不配置存储访问。
 

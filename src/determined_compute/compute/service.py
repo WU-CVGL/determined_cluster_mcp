@@ -795,7 +795,24 @@ class ComputeService:
             self._validate_idempotent_payload(existing, payload_hash, request, plan)
             return self._public(existing)
         if self.path_inspector is not None:
-            self._check_paths(plan, request)
+            checks = self._check_paths(plan, request)
+            stalled = [
+                check["field"]
+                for check in checks
+                if check["status"] == "will_create" and check["reason"] == "timeout"
+            ]
+            if stalled:
+                # Creating through a mount that just failed to answer could block launch.
+                from determined_compute.storage.config import StorageError
+
+                error = StorageError(
+                    "shared storage did not answer in time for "
+                    + ", ".join(stalled)
+                    + "; retry when the filesystem responds",
+                    code="storage_timeout",
+                )
+                error.retryable = True
+                raise error
         # Bind the submit call before any durable write: a lazily built client that fails
         # (for example a login error) must fail before directories exist or the id is claimed.
         launch_task = self.client.launch_task

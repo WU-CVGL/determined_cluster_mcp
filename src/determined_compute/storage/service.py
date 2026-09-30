@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import posixpath
 import shlex
@@ -9,7 +10,7 @@ import signal
 import subprocess
 import threading
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from determined_compute.compute.profile import ComputeProfile, SharedMount
 from determined_compute.compute.models import ValidationError
@@ -44,6 +45,50 @@ _SYNC_EXCLUDES = (
     ".credentials/",
     "credentials/",
 )
+
+_NO_LOCAL_VIEW = {
+    "not_locally_visible": "shared storage for {field} is not locally accessible",
+    "local_mount_unavailable": "the local_mounts entry for {field} is unavailable or not writable",
+    "local_view_unconfirmed": (
+        "the profile host root for {field} exists locally but is not a mount point, "
+        "so it may not be the cluster's filesystem"
+    ),
+}
+
+
+def _is_mount_point(path: Path) -> bool:
+    """Whether a local directory is itself a mounted filesystem (after resolving symlinks)."""
+    return os.path.ismount(os.path.realpath(path))
+
+
+def _with_deadline(
+    operation: Callable[[], Any], timeout_seconds: Optional[float], subject: str
+) -> Any:
+    """Run filesystem work that a stalled network mount could block, up to a deadline."""
+    if timeout_seconds is None:
+        return operation()
+    outcome: Dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            outcome["value"] = operation()
+        except BaseException as exc:  # re-raised on the caller's thread
+            outcome["error"] = exc
+
+    # A daemon thread cannot hold up process exit; if it finishes late, a retry sees the result.
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout_seconds)
+    if worker.is_alive():
+        error = StorageError(
+            f"{subject} did not answer within {timeout_seconds:g} seconds",
+            code="storage_timeout",
+        )
+        error.retryable = True
+        raise error
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
 
 
 class StorageService:
@@ -251,8 +296,36 @@ class StorageService:
         matches = [mount for mount in self.profile.mounts if _within(host_path, mount.host_path)]
         return max(matches, key=lambda mount: len(mount.host_path)) if matches else None
 
-    def ensure_directories(self, entries: Sequence[Mapping[str, str]]) -> List[Dict[str, Any]]:
-        """Create each host directory (with parents) through a local view or SSH; never delete."""
+    def _launch_view(
+        self, host_path: str, profile_mount: SharedMount, *, write: bool = False
+    ) -> Tuple[Optional[LocalMount], Optional[str]]:
+        """Return the local view launch paths may trust, or why there is none.
+
+        An explicit ``local_mounts`` entry is trusted as configured, and a covering entry
+        that is unusable never falls back to the host root. The implicit host root is
+        trusted only when it is itself a mount point: a same-named local directory is not
+        evidence of the agents' filesystem.
+        """
+
+        mapping = self._local_mapping(host_path, profile_mount, write=write)
+        configured = [m for m in self.config.local_mounts if _within(host_path, m.host_path)]
+        if configured:
+            return (mapping, None) if mapping in configured else (None, "local_mount_unavailable")
+        if mapping is None:
+            return None, "not_locally_visible"
+        if not _is_mount_point(mapping.local_path):
+            return None, "local_view_unconfirmed"
+        return mapping, None
+
+    def ensure_directories(
+        self, entries: Sequence[Mapping[str, str]], *, timeout_seconds: Optional[float] = None
+    ) -> List[Dict[str, Any]]:
+        """Create each host directory (with parents) through a trusted local view or SSH.
+
+        Nothing is deleted, and an existing mount root is reported rather than created.
+        ``timeout_seconds`` bounds each entry's local filesystem work; SSH has its own limits.
+        """
+
         results = []
         for entry in entries:
             field, host_path = entry["field"], entry["host_path"]
@@ -262,34 +335,59 @@ class StorageService:
                 raise StorageError(str(exc), code="read_only_storage") from exc
             mount = self._host_mount(host_path)
             assert mount is not None
-            if host_path == mount.host_path:
-                raise StorageError(
-                    f"{field} is a shared mount root and cannot be created",
-                    code="invalid_storage_path",
+            created: Optional[bool] = None
+            if self.config.mode != "ssh":
+                created, reason = _with_deadline(
+                    functools.partial(self._create_locally, field, host_path, mount),
+                    timeout_seconds,
+                    f"the local shared view for {field}",
                 )
-            backend, local = self._select_backend(host_path, mount, write=True)
-            if backend == "local":
-                assert local is not None
-                target, root = self._safe_mapped_path(local, host_path)
-                existed = target.is_dir()
-                try:
-                    self._mkdir_beneath_root(target, root)
-                except OSError as exc:
+                if created is None and (self.config.mode == "local" or self.config.ssh is None):
+                    remedy = "a usable local_mounts entry"
+                    if self.config.mode == "auto":
+                        remedy += " or ssh"
                     raise StorageError(
-                        f"cannot create {field} directory: {exc.strerror or exc}",
-                        code="storage_operation_failed",
-                    ) from exc
-                created = not existed
-            else:
-                created = self._ssh_mkdir(host_path)
+                        f"{_NO_LOCAL_VIEW[reason].format(field=field)}; configure {remedy}",
+                        code="configuration_required",
+                    )
+            if created is None:
+                created = self._ssh_mkdir(host_path, field, create=host_path != mount.host_path)
             results.append({"field": field, "host_path": host_path, "created": created})
         return results
 
-    def _ssh_mkdir(self, host_path: str) -> bool:
+    def _create_locally(
+        self, field: str, host_path: str, mount: SharedMount
+    ) -> Tuple[Optional[bool], Optional[str]]:
+        local, reason = self._launch_view(host_path, mount, write=True)
+        if local is None:
+            return None, reason
+        target, root = self._safe_mapped_path(local, host_path)
+        if host_path == mount.host_path:
+            # A mount root is never created, but an existing one satisfies the request.
+            if not target.is_dir():
+                raise StorageError(
+                    f"{field} is a shared mount root that does not exist",
+                    code="invalid_storage_path",
+                )
+            return False, None
+        existed = target.is_dir()
+        try:
+            self._mkdir_beneath_root(target, root)
+        except OSError as exc:
+            raise StorageError(
+                f"cannot create {field} directory: {exc.strerror or exc}",
+                code="storage_operation_failed",
+            ) from exc
+        return not existed, None
+
+    def _ssh_mkdir(self, host_path: str, field: str, *, create: bool = True) -> bool:
         ssh = self._require_ssh()
         from determined_compute.storage.auth import ssh_auth
 
-        script = 'if [ -d "$1" ]; then echo existed; else mkdir -p -- "$1" && echo created; fi'
+        if create:
+            script = 'if [ -d "$1" ]; then echo existed; else mkdir -p -- "$1" && echo created; fi'
+        else:
+            script = 'if [ -d "$1" ]; then echo existed; else echo missing; fi'
         remote_command = "sh -c " + shlex.quote(script) + " sh " + shlex.quote(host_path)
         with ssh_auth(ssh, self.secrets_path) as (env_overrides, auth_options):
             argv = [
@@ -304,10 +402,15 @@ class StorageService:
                 argv, timeout=self.config.timeout_seconds, env_overrides=env_overrides
             )
         outcome = result["output"].strip().splitlines()[-1:] or [""]
-        if outcome[0] not in {"created", "existed"}:
+        if outcome[0] not in ({"created", "existed"} if create else {"existed", "missing"}):
             raise StorageError(
                 "SSH directory creation returned an invalid response",
                 code="storage_operation_failed",
+            )
+        if outcome[0] == "missing":
+            raise StorageError(
+                f"{field} is a shared mount root that does not exist",
+                code="invalid_storage_path",
             )
         return outcome[0] == "created"
 

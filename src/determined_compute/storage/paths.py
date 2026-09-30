@@ -35,8 +35,9 @@ class PathInspector:
 
     A path is decided only through a local view that the storage configuration trusts:
     an explicit ``local_mounts`` entry, or, in ``auto`` or ``local`` mode, a compute-profile
-    host root that exists locally. Anything else, including SSH-only access, a
-    permission error, or a filesystem that does not answer in time, is ``unverified``.
+    host root that exists locally and is itself a mount point. Anything else, including an
+    unusable ``local_mounts`` entry, SSH-only access, a permission error, or a filesystem
+    that does not answer in time, is ``unverified``.
     """
 
     def __init__(
@@ -85,9 +86,9 @@ class PathInspector:
         mount = storage._host_mount(host_path)
         if mount is None:
             return "unverified", "outside_profile_roots"
-        mapping = storage._local_mapping(host_path, mount, write=False)
+        mapping, reason = storage._launch_view(host_path, mount, write=False)
         if mapping is None:
-            return "unverified", "not_locally_visible"
+            return "unverified", reason
         try:
             target, _root = storage._safe_mapped_path(mapping, host_path)
         except StorageError as exc:
@@ -103,12 +104,13 @@ class PathInspector:
         return observation
 
     def ensure_directories(self, entries: Sequence[Mapping[str, str]]) -> List[Dict[str, Any]]:
+        """Create directories through the same trusted view, with local work bounded alike."""
         if self.storage is None:
             raise StorageError(
                 "creating directories requires a readable storage access configuration",
                 code="configuration_required",
             )
-        return self.storage.ensure_directories(entries)
+        return self.storage.ensure_directories(entries, timeout_seconds=self.timeout_seconds)
 
 
 __all__ = ["PathInspector"]

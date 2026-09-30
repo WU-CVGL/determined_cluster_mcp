@@ -38,7 +38,11 @@ Without a storage file, the service uses empty `auto` configuration. A storage o
 The CLI and MCP server also use this file when planning and launching: it decides which
 launch paths can be checked locally and how directories named in a request's
 `create_directories` are created, through the local view or with `mkdir -p` on the SSH
-login node. See [launch-path checks](compute-service.md#launch-path-checks). Older releases
+login node. These launch paths trust only an explicit `local_mounts` entry, without
+falling back to the host root when that entry is unavailable, or a same-named host root
+that is itself a mount point on this machine. To check or create paths under a host root
+that lies below a mount point, map it with `local_mounts`, to itself if the local path is
+the same. See [launch-path checks](compute-service.md#launch-path-checks). Older releases
 reject unknown keys, so add `snapshots` only after every process that reads this file,
 including every MCP server that shares the task database, runs a release that supports it.
 

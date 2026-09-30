@@ -39,7 +39,9 @@ preserve_permissions: true # 仅在确认文件系统不兼容时设为 false
 
 CLI 和 MCP server 在规划和提交时也使用此文件：它决定哪些启动路径可以在本地检查，以及如何创建
 请求中 `create_directories` 指定的目录（通过本地视图，或在 SSH 登录节点上执行 `mkdir -p`）。
-参见[启动路径检查](compute-service.zh.md#launch-path-checks)。旧版本会拒绝未知字段，因此只有在
+这些启动路径只信任显式的 `local_mounts` 条目（该条目不可用时不会回退到主机根目录），或本身就是
+本机挂载点的同名主机根目录。若要检查或创建位于某个挂载点之下的主机根目录中的路径，请用
+`local_mounts` 映射它（本地路径相同时映射到自身）。参见[启动路径检查](compute-service.zh.md#launch-path-checks)。旧版本会拒绝未知字段，因此只有在
 读取此文件的所有进程（包括共用任务数据库的每个 MCP server）都已运行支持 `snapshots` 的版本后，
 才能添加该字段。
 

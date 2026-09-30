@@ -126,30 +126,45 @@ CLI 和 MCP server 通过存储配置为规划提供共享存储的只读视图�
 `host_path`、`container_path`（检查点路径未配置容器路径时为 null）、`required`、`status` 和
 `reason`。入口会创建 `output_dir`，因此除非 `create_directories` 包含它，否则它不是必需路径。
 
-只有通过可信的本地视图才能判定路径：存储配置中的显式 `local_mounts` 条目，或在 `auto`、
-`local` 模式下本机存在的配置主机根路径。`status` 为 `present`、`missing`、`not_directory`、
-`unverified` 或 `will_create`。客户端无法判定的路径为 `unverified`，`reason` 说明原因：
-`not_locally_visible`、`ssh_only_access`、`permission_denied`、`timeout`，或在无法加载存储
-配置时为 `storage_config_unavailable`。所有探测共享 10 秒期限，因此停滞的网络挂载不会让规划
-挂起。报告路径缺失之前，服务会列出其父目录并再检查一次，以刷新网络文件系统缓存的“不存在”
-结果。`unverified` 路径永远不会导致失败。必需路径为 `missing` 或 `not_directory` 时，
-`compute_plan` 和 `compute_launch` 返回 `path_not_found`，`details.missing_paths` 列出其
-`field`、`host_path` 和 `status`。`path_checks` 只是观察结果：它从不改变 `config` 或
+只有通过可信的本地视图才能判定路径：存储配置中的显式 `local_mounts` 条目（按配置直接信任），
+或在 `auto`、`local` 模式下本机存在且本身就是挂载点的配置主机根路径。不是挂载点的同名本地目录
+可能是另一块无关的磁盘，因此不被信任；如果配置主机根路径位于某个挂载点之下，请用 `local_mounts`
+映射它（本地路径相同时映射到自身）。某个 `local_mounts` 条目覆盖某路径、但其本地路径不存在或
+不可读时，服务不会回退到主机根路径。
+
+`status` 为 `present`、`missing`、`not_directory`、`unverified` 或 `will_create`。请依据
+`status` 做判断；`reason` 仅用于诊断，取值是开放的，将来可能出现新值。客户端无法判定的路径为
+`unverified`，其原因包括 `not_locally_visible`、`local_mount_unavailable`（覆盖该路径的
+`local_mounts` 条目不可用）、`local_view_unconfirmed`（主机根路径在本机存在但不是挂载点）、
+`ssh_only_access`、`permission_denied`、`timeout`、`storage_config_unavailable`（无法加载存储
+配置）、`invalid_storage_path`（本地视图经由符号链接解析到映射根目录之外），以及
+`os_error:<ERRNO>`，例如 `os_error:ESTALE` 或 `os_error:ELOOP`；其他意外的探测错误以其异常名
+报告。`missing` 路径可能带有 `parent_not_directory`，`will_create` 带有 `missing` 或之前的
+`unverified` 原因。所有探测共享 10 秒期限，因此停滞的网络挂载不会让规划挂起。报告路径缺失之前，
+服务会列出其父目录并再检查一次，以刷新网络文件系统缓存的“不存在”结果。`unverified` 路径永远
+不会导致失败。必需路径为 `missing` 或 `not_directory` 时，`compute_plan` 和 `compute_launch`
+返回 `path_not_found`，`details.missing_paths` 列出其 `field`、`host_path` 和 `status`。
+`path_checks` 只是观察结果：规划只读取文件系统，`path_checks` 从不改变 `config` 或
 `advisories`，也不属于幂等载荷。
 
 launch 在查找 `request_id` 之后、检查容量之前执行同样的检查，因此检查失败时不会写入任务记录，
-也不会提交任务。已存在的 `request_id` 会原样返回且不做检查，即使之后某个路径已被删除。检查
-之后、同样在容量检查之前，launch 构建 Determined API 客户端，因此登录或客户端配置错误也不会
-留下任务记录或已创建的目录，使用同一 `request_id` 重试仍可提交。
+也不会提交任务。已存在的 `request_id` 会原样返回且不做检查，即使之后某个路径已被删除。
+`create_directories` 指定的目录未在期限内响应时，launch 在此处返回可重试的 `storage_timeout`，
+而不会通过停滞的挂载创建目录。检查之后、同样在容量检查之前，launch 构建 Determined API 客户端，
+因此登录或客户端配置错误也不会留下任务记录或已创建的目录，使用同一 `request_id` 重试仍可提交。
 
 `create_directories` 显式要求 launch 创建 `output_dir`、`checkpoint_storage`（即 experiment
 的 `checkpoint_storage.host_path`；Determined 在容器启动时 bind mount 该路径，所以它必须在入口
 运行前存在），或两者都创建。服务从不隐式创建目录，规划时也不创建，只报告 `will_create`。
-launch 在容量检查之后、认领任务记录之前，以默认 umask 连同父目录创建每个目录：有本地视图时
-通过本地视图创建，否则在已配置的 SSH 登录节点上执行 `mkdir -p`，两者都没有时返回
-`configuration_required`。新提交的结果增加 `prepared_directories`，即
-`{field, host_path, created}` 列表。服务从不删除任何内容。`checkpoint_storage` 要求带有
-`checkpoint_storage` 的 experiment。非空列表属于幂等载荷；省略或空列表不会改变以前的载荷。
+launch 在容量检查之后、认领任务记录之前，以默认 umask 连同父目录创建每个目录：有可信本地视图时
+通过该视图创建，否则在 `auto` 或 `ssh` 模式下于已配置的 SSH 登录节点上执行 `mkdir -p`，两者都
+没有时返回 `configuration_required`。服务从不通过不可信的同名目录或不可用的 `local_mounts`
+条目创建目录。每次本地创建同样有 10 秒期限，超时返回可重试的 `storage_timeout`；期限过后才出现
+的目录会在重试时报告为 `created: false`。本身就是配置挂载根路径的目录从不创建：已存在的根路径
+报告为 `created: false`，不存在时返回 `invalid_storage_path`。新提交的结果增加
+`prepared_directories`，即 `{field, host_path, created}` 列表。服务从不删除任何内容。
+`checkpoint_storage` 要求带有 `checkpoint_storage` 的 experiment。非空列表属于幂等载荷；省略或
+空列表不会改变以前的载荷。
 
 <a id="gpu-admission"></a>
 ### GPU 准入
