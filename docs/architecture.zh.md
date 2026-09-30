@@ -120,7 +120,7 @@ message SubmitResult {
 由一个共享的 `submission` 包为全部四个 handler 实现以下顺序。
 
 1. **摘要。** 规范化客户端请求并计算摘要。此时不运行任何有副作用的操作。
-2. **重放。** 如果提供了键，查找 `(owner_id, key)`。设置了 `expected_digest` 时，把已存储的摘要与它比较，否则与计算出的摘要比较。二者相等时，对已存储的 job 检查读取授权，并以 `replayed=true` 返回该 job；不相等时，返回 `ALREADY_EXISTS`，并指明已有的 `job_id`。
+2. **重放。** 如果提供了键，查找 `(owner_id, key)`。设置了 `expected_digest` 时，把已存储的摘要与它比较，否则与计算出的摘要比较。二者相等时，对已存储的 job 检查读取授权，把它传给 `dispatch`（第 7 步），并以 `replayed=true` 返回该 job；不相等时，返回 `ALREADY_EXISTS`，并指明已有的 `job_id`。
 3. **规划检查。** 如果设置了 `expected_digest`，且它与计算出的摘要不同，返回带 `plan_changed` 的 `FAILED_PRECONDITION`。不写入任何内容，键仍未被占用。
 4. **解析。** 解析、合并、授权并应用配置策略。会话签发和 shell 密钥生成移到第 5 步之后。目前它们运行得过早：
    - `master/internal/core_experiment.go:401`，早于 `api_experiment.go:1655` 处的 `ValidateOnly` 返回；
@@ -133,13 +133,13 @@ message SubmitResult {
    - 对于任务：task 行、context 目录、`allocation_workspace_info`、状态为 `PENDING` 的第一条 allocation 行，以及 `command_state`（包括 `generic_task_spec`）。目前 `command_state` 在 `StartAllocation` 之后才写入（`command/command.go:181-186`、`api_generic_tasks.go:378`），两者之间发生崩溃会留下一个永远不会被恢复的任务。由于该行现在已经存在，`requestResources` 改为加载它，而不是插入它（`task/allocation.go:523-529`）。
    - 对于 `activate=true` 的 experiment：experiment 行，以 `ACTIVE` 状态提交。
 
-   遇到唯一索引冲突时，回滚事务，删除已签发的会话和 `GroupPriorityChangeRegistry` 条目（`command/command.go:117-119`），然后回到第 2 步。起保护作用的是索引，而不是 `cs.mu`。
-7. **启动。** 调用 `StartAllocation` 或 `e.Start`，然后重新读取 `cancel_requested_at`，如果它已设置则终止该作业。如果启动在进程内失败，以 `INFRASTRUCTURE_FAILED` 关闭 `PENDING` allocation 并设置 `tasks.end_time`，或把 experiment 标记为 `ERROR`。此后的重放会返回一条终态记录。
+   遇到唯一索引冲突时，回滚事务，删除已签发的会话和 `GroupPriorityChangeRegistry` 条目（`command/command.go:117-119`），然后回到第 2 步。起保护作用的是索引，而不是 `cs.mu`。使事务提交结果未知的错误（例如 `COMMIT` 期间连接断开）不算回滚：不清理任何内容，handler 重新查找该键。如果该作业存在，就继续执行第 7 步；否则返回可重试的 `UNAVAILABLE`。
+7. **分派。** 把作业传给 `dispatch(job_id)`。它脱离请求的上下文运行，因此在事务提交之后断开连接的客户端无法中止它。`dispatch` 是幂等的，并按作业串行执行。它读取 `command_state` 指向的尝试（或 experiment），如果该尝试已经结束，或已在 allocation service 中注册（对于 experiment，已在 experiment registry 中运行），则什么也不做。否则它调用 `StartAllocation` 或 `e.Start`，然后重新读取 `cancel_requested_at`，如果它已设置则终止该作业。allocation service 拒绝对同一 allocation ID 的第二次注册，因此每个 ID 至多有一个运行时实例。如果启动在进程内失败，`dispatch` 以 `INFRASTRUCTURE_FAILED` 关闭 `PENDING` allocation 并设置 `tasks.end_time`，或把 experiment 标记为 `ERROR`，因此重放会返回一条终态记录。它有三个调用方：事务提交之后的 handler、每次重放，以及一个由 master 负责的扫描，该扫描每 30 秒分派一次当前尝试处于 `PENDING`、尚未注册且存在时间超过该间隔的已提交作业。因此，已完成事务提交的提交请求总会继续推进，无需重启 master。
 8. **等待（仅 IMMEDIATE）。** 启动调用返回后，在 `cs.mu`（`command/command_service.go:95`）之外，通过 allocation service 的读锁轮询该 allocation，直到它离开 `PENDING`。等待上限为 5 秒，超时后结果为 `PENDING`。
 
 **恢复。** 放置就是 allocation 自身的 `ASSIGNED` 写入（`task/allocation.go:630`），它总是早于容器启动（`:723`）。`start_time` 无论如何都不能作为证据：它只在 Pulling 时设置（`:749-753`），而 `CloseOpenAllocations` 会在未关闭的行上写入它（`db/postgres_tasks.go:314-315`）。`RestoreAllCommands` 和 `restoreGenericTasks`（`command/command_service.go:55-72`、`core.go:880-955`）根据持久化的 `allocations.state` 决定如何处理一个未结束的尝试：
 
-- **`PENDING`：从未被放置。** 删除该尝试的 `allocation_resources` 行（级联删除 `resourcemanagers_agent_containers`），因为 agent RM 会在 allocation 确认这些行之前的 tick 中写入它们（`rm/agentrm/resource_pool.go:443-454`）。然后 QUEUE 以同一个 allocation ID 重新发起请求，IMMEDIATE 则以 `PLACEMENT_UNSATISFIED` 结束它。如果设置了 `cancel_requested_at`，则改为结束该任务。
+- **`PENDING`：从未被放置。** 删除该尝试的 `allocation_resources` 行（级联删除 `resourcemanagers_agent_containers`），因为 agent RM 会在 allocation 确认这些行之前的 tick 中写入它们（`rm/agentrm/resource_pool.go:443-454`）。然后，标记为 `immediate` 的 allocation 以 `PLACEMENT_UNSATISFIED` 结束，其他 allocation 则以同一个 allocation ID 重新发起请求。如果设置了 `cancel_requested_at`，则改为结束该任务。
 - **任何更靠后的状态：已放置**，即使 `start_time` 为 NULL。它以 `Restore=true` 恢复，并通过 agent 重新挂接进行调和；如果设置了 `cancel_requested_at`，注册之后的取消检查会终止它。它从不被重新请求，也从不以 `PLACEMENT_UNSATISFIED` 结束。如果它没有被重新挂接，则以 `INFRASTRUCTURE_FAILED` 结束。
 
 `RestoreAllCommands` 经由 `command_state` 以 `tasks.end_time IS NULL` 选择任务，而不是经由未关闭的 allocation，并取 `command_state` 指向的那个尝试。那里还适用另外两种情况：
@@ -176,7 +176,7 @@ message Submission {
   optional string request_digest = 10;       // owner and admins only
   Admission admission = 11;
   google.protobuf.Timestamp submitted_at = 12; optional google.protobuf.Timestamp ended_at = 13;
-  State state = 14;        // QUEUED RUNNING PAUSED COMPLETED FAILED CANCELED DELETED
+  State state = 14;        // QUEUED RUNNING PAUSED COMPLETED FAILED CANCELED DELETED; F3b adds ADMITTING
   ExitClass exit_class = 15; string exit_reason = 16;   // from the allocation that ended the job
   repeated SubmissionTask tasks = 17;        // task_id, optional trial_id, repeated taskv1.Allocation
 }
@@ -186,11 +186,12 @@ message Submission {
 
 - **来源。** `master/static/srv/` 下的一个命名查询，只读取数据库。它把 `jobs` 与 task 或 experiment、allocation 以及 `allocation_accelerators` 连接，并过滤 `job_type IN (COMMAND, SHELL, GENERIC, EXPERIMENT)`。
 - **Workspace** 通过推导得到，不单独存储：experiment 经由 project 推导（experiment 可以移动），任务经由 `command_state` 推导。
-- **任务状态。** 任务所属的作业恰好在 `tasks.end_time` 被设置时结束，但处于 `PAUSED` 或 `STOPPING_PAUSED` 的 GENERIC 任务为 `PAUSED`，因为暂停会写入 `end_time`（`db/postgres_tasks.go:145-156`）。当 `command_state` 指向的尝试已被放置且尚未结束时，存活的任务为 `RUNNING`，否则为 `QUEUED`，包括两次尝试之间以及 unpause 期间。尝试的 `end_time` 已设置或其状态为 `TERMINATED` 时，该尝试已结束。设置了 `cancel_requested_at` 的已结束作业为 `CANCELED`；取消从不在已结束的作业上设置它。否则，作业状态取自其最后一次尝试的类别：`NONE` 为 `COMPLETED`，失败类别为 `FAILED`，升级前的 `UNSPECIFIED` 仅在 allocation 记录了 `exit_error` 时为 `FAILED`。每条结束任务的路径都会写入 `end_time`：退出决策、恢复、恢复失败以及取消。
+- **任务状态。** 任务所属的作业恰好在 `tasks.end_time` 被设置时结束，但处于 `PAUSED` 或 `STOPPING_PAUSED` 的 GENERIC 任务为 `PAUSED`，因为暂停会写入 `end_time`（`db/postgres_tasks.go:145-156`）。当 `command_state` 指向的尝试已被放置且尚未结束时，存活的任务为 `RUNNING`，立即准入的尝试在等待其首次决策期间为 `ADMITTING`，否则为 `QUEUED`，包括两次尝试之间以及 unpause 期间。尝试的 `end_time` 已设置或其状态为 `TERMINATED` 时，该尝试已结束。设置了 `cancel_requested_at` 的已结束作业为 `CANCELED`；取消从不在已结束的作业上设置它。否则，作业状态取自其最后一次尝试的类别：`NONE` 为 `COMPLETED`，失败类别为 `FAILED`，升级前的 `UNSPECIFIED` 仅在 allocation 记录了 `exit_error` 时为 `FAILED`。每条结束任务的路径都会写入 `end_time`：退出决策、恢复、恢复失败以及取消。
 - **Experiment 状态**来自 `experiments.state`。已删除的 experiment 为 `DELETED`，因为 `DeleteExperiments` 会保留 job 行（`db/postgres_experiments.go:783-806`）。
 - **授权。** 每一行都要通过现有的按类型读取授权。`DELETED` experiment 已经没有 experiment 行可供检查（`db/postgres_experiments.go:800-803`），因此只有其 owner 和管理员能看到它。
 - **`get_task.sql`** 还会选取 `slots`、`exit_reason` 和 `status_code`。这些是现有的 `taskv1.Allocation` 字段（`proto/src/determined/task/v1/task.proto:93-98`）。
 - **`CancelSubmission`** 先持久化。它根据数据库进行授权（`jobs.owner_id`，以及经由 `command_state` 或 project 得到的 workspace），锁定 job 行，对已结束的作业原样返回，否则设置 `cancel_requested_at`。事务提交后，它通过 allocation service（而不是 command registry）向当前尝试发送信号，或终止 experiment；allocation 不存在不算错误。每次 allocation 启动（首次分派、恢复、系统重试、experiment 启动）都会在注册 allocation 之后检查该标志，因此两者中总有一方能看到另一方。没有存活 allocation 的 GENERIC 任务（例如已暂停的任务）直接以 `CANCELED` 结束。`KillCommand`、`KillShell` 和 `KillGenericTask` 走同一路径；目前前两者在 registry 未命中时会以 `NotFound` 失败（`api_command.go:259-262`、`api_shell.go:126-129`）。退出决策和取消锁定同一 job 行，因此迟到的取消永远不会把 `COMPLETED` 变成 `CANCELED`。
+- **GENERIC 取消。** 每个 GENERIC 任务（无论是父任务还是子任务）都有自己的作业，取消其中一个会覆盖该任务及其所有后代，与目前的 `KillGenericTask` 一致（`api_generic_tasks.go`、`generic_task_resume.go`）。它解析出子树，在做任何改动之前对每个成员进行授权，并跳过已经 `COMPLETED` 或 `CANCELED` 的成员。一个事务在每个成员的作业上设置 `cancel_requested_at`，并取消这些成员未完成的 `generic_task_resume` 行。事务提交后，它向每个成员当前的或预定的 allocation 发送信号。两者都没有的成员（例如其 `no_pause` 子任务仍在运行的已暂停父任务）直接以 `CANCELED` 结束，同时子任务被终止。带 `kill_from_root` 的 `KillGenericTask` 解析出根任务，并以同样的方式取消根任务的作业。恢复从不继续其任务已设置 `cancel_requested_at` 的 resume；它以 `CANCELED` 结束该任务。
 
 <a id="scheduling-evaluation"></a>
 ### 调度评估
@@ -230,7 +231,8 @@ message SchedulingEvaluation {
   - 未出现在试算 `toAllocate` 中的请求会被移除，并以 `ResourcesFailedError{PlacementUnsatisfied}` 发布，detail 为 `static` 或 `busy`。
   - 兜底：在本次 tick 中已决策、但真实调度轮次没有放置的请求同样会被拒绝。
 - **拒绝路径。** 拒绝走现有的异步退出路径（`allocation.go:265-266,894-921`），该路径会为 `PENDING` 行设置 `end_time`（`:913-919`）。
-- **范围。** IMMEDIATE 适用于提交本身创建的每个 allocation，包括系统重试。之后由用户触发的 allocation（例如 generic 任务的 resume）会排队。
+- **范围。** IMMEDIATE 适用于提交本身创建的每个 allocation，包括系统重试。之后由用户触发的 allocation（例如 generic 任务的 resume）会排队。每个 allocation 在 `allocations.immediate boolean NOT NULL DEFAULT false` 中记录自己的准入方式，在插入时设置。恢复和状态推导读取的是它，从不读取 `jobs.admission`，因此 IMMEDIATE 作业的排队 resume 会以排队方式恢复。
+- **状态。** 在首次决策之前，立即准入的尝试读作 `ADMITTING`。它从不读作 `QUEUED`：它要么被放置，要么以 `PLACEMENT_UNSATISFIED` 结束。
 - **提交时拒绝。** 每个 experiment（包括只有单个 trial 的 experiment）都得到 `INVALID_ARGUMENT`（见[准入](#admission)），provider 支持的资源池得到 `FAILED_PRECONDITION`。
 
 <a id="exit-classes"></a>
@@ -248,7 +250,11 @@ enum ExitClass {
 }
 ```
 
-`allocations` 增加 `exit_class text` 和 `exit_detail jsonb`，由 `SetExitStatus`（`task/allocation.go:1074-1095`）写入。启动时先执行恢复，然后关闭恢复没有保留的所有 allocation（`core.go:1432-1444`）。恢复为它所决定的尝试分类。`closeOpenAllocations`（`core.go:957-963`）在关闭其余 allocation 的同一条 UPDATE 中按状态为它们分类：`PENDING` 为 `NONE`（通常是被恢复替换掉的、排队中的 trial allocation，`trial.go:806-808`），任何更靠后的状态为 `INFRASTRUCTURE_FAILED`。类别描述的是结果而不是原因：是谁要求停止作业只记录一次，即 `jobs.cancel_requested_at`。分类器覆盖所有情况：
+`allocations` 增加 `exit_class text` 和 `exit_detail jsonb`。
+
+**退出记录。** `finalize` 在改动其他任何内容之前，用一条 UPDATE 写入完整的退出记录：`state = TERMINATED`、`end_time`、`exit_reason`、`exit_error`、`status_code`、`exit_class` 和 `exit_detail`。只有在这条 UPDATE 提交之后，它才清除并释放可恢复的资源，此后才运行任务级的退出决策。清除、释放和退出通知都可以重复执行，因此在任何时刻崩溃，留下的要么是由恢复处理的未关闭 allocation，要么是一条完整的记录。目前 `finalize` 先写入 `TERMINATED`，再清除，最后写入退出状态（`task/allocation.go:584-588,1074-1095`）；在两者之间崩溃会留下一个没有类别的已终止 allocation，而其证据已经不复存在。
+
+启动时先执行恢复，然后关闭恢复没有保留的所有 allocation（`core.go:1432-1444`）。恢复为它所决定的尝试分类。`closeOpenAllocations`（`core.go:957-963`）在关闭其余 allocation 的同一条 UPDATE 中按状态为它们分类：`PENDING` 为 `NONE`（通常是被恢复替换掉的、排队中的 trial allocation，`trial.go:806-808`），任何更靠后的状态为 `INFRASTRUCTURE_FAILED`。类别描述的是结果而不是原因：是谁要求停止作业只记录一次，即 `jobs.cancel_requested_at`。分类器覆盖所有情况：
 
 | 退出情况 | 类别 |
 |---|---|
@@ -276,7 +282,7 @@ F5 以同样的方式、一次性贯穿所有层加入 `aproto.SpecRejected`。�
 - **RPC。** `PostAllocationWorkloadStarted{allocation_id, resources_id}`，其授权方式与 `AllocationReady`（`api.proto:921`）相同。它只设置一次时间，重复调用时返回 OK。对于未知或已关闭的 allocation，或属于其他 allocation 的资源，它会失败。
 - **由谁发送。** `prep_container --workload-start`，作为该调用在 startup hook 之前的最后一步，出现在每个调用 `prep_container` 的 entrypoint 中：`master/static/srv/command-entrypoint.sh:11`、`shell-entrypoint.sh:7`、`generic-task-entrypoint.sh:13`、`entrypoint.sh:9`、`notebook-entrypoint.sh:14`、`tensorboard-entrypoint.sh:12` 和 `gc-checkpoints-entrypoint.sh:7`。该标志是显式的，因为 Slurm 的 `task-setup.sh:40` 会更早调用 `prep_container`。trial 之后的 `--rendezvous` 调用不发送。hook 属于用户代码。
 - **失败即阻断。** 发送失败会抛出异常，`prep_container` 以非零状态退出，而每个调用点都已开启的 `set -e` 会在 hook 之前终止脚本。来自镜像的、早于 F4 的 harness（`DET_SKIP_PIP_INSTALL`、`task-setup.sh:26-33`）会拒绝该标志，并以同样的方式失败；这类镜像必须携带 F4 的 harness。已提交但丢失响应的发送以 `WORKLOAD_FAILED` 结束，它永远不会重新运行用户代码。
-- **何时设定类别。** 目前 `finalize` 在 `purgeRestorableResources` 之后才调用 `SetExitStatus`（`allocation.go:584-588`）；类别改为在清除之前计算。这些行的生命周期与 allocation 完全一致，因为启动时只清除已关闭 allocation 的行（`taskmodel/resources.go:53-63`）。
+- **何时设定类别。** 类别在写入退出记录之前根据 `workload_started_at` 计算，这些行只在该记录提交之后才被清除（见[退出类别](#exit-classes)）。这些行的生命周期与 allocation 完全一致，因为启动时只清除已关闭 allocation 的行（`taskmodel/resources.go:53-63`）。
 
 <a id="system-retries"></a>
 ### 系统重试
@@ -286,7 +292,9 @@ F5 以同样的方式、一次性贯穿所有层加入 `aproto.SpecRejected`。�
 - **屏蔽节点。** 只有 `NODE_PREFLIGHT_FAILED` 会把 `(task, node, "preflight:<check>")` 写入现有的屏蔽节点表；该表以 task ID 为键，没有 FK（`logpattern/logpattern.go:133-159`）。
 - **停止。** 预算耗尽，或屏蔽节点导致不再存在静态适配时，重试停止。
 - **Trial。** 在 `trial.go:612` 与 `:621` 之间新增一个分支，重新分配 allocation 且不增加 `restarts`。`:603` 处的不可恢复检查先执行，因此被拒绝的 spec 会使 trial 以 `ERROR` 结束，且不增加 `restarts`。
-- **Command 与 shell。** 它们通过 `OnExit` 中的单一退出决策获得重新分配能力。一个事务锁定 job 行，读取已结束尝试的类别（它已经持久化，因为 `finalize` 在 `onExit` 之前运行 `SetExitStatus`）和预算，然后要么把 `<task>.<n+1>` 以 `PENDING` 状态插入，连同其 workspace 记录和屏蔽节点行，并让 `command_state` 指向它，要么设置 `tasks.end_time`。只有在 `cancel_requested_at` 为 NULL 时才会重试。新尝试只在事务提交后启动，加载已存在的行，然后检查取消标志。重试的退出会保留会话 token 和 registry 条目，也不安排垃圾回收；只有结束分支运行目前的 `OnExit` 收尾部分（`command.go:239-279`）。在任何时刻崩溃，留下的状态都会由恢复完成。
+- **Command 与 shell。** 它们通过 `OnExit` 中的单一退出决策获得重新分配能力。一个事务锁定 job 行，读取已结束尝试的类别（它已经持久化，因为退出记录在 `onExit` 之前提交）和预算，然后要么把 `<task>.<n+1>` 以 `PENDING` 状态插入，连同其 workspace 记录和屏蔽节点行，并让 `command_state` 指向它，要么设置 `tasks.end_time`。只有在 `cancel_requested_at` 为 NULL 时才会重试。新尝试只在事务提交后启动，加载已存在的行，然后检查取消标志。重试的退出会保留会话 token 和 registry 条目，也不安排垃圾回收；只有结束分支运行目前的 `OnExit` 收尾部分（`command.go:239-279`）。在任何时刻崩溃，留下的状态都会由恢复完成。
+- **资格按 allocation 判定。** 系统重试要求该 allocation 报告工作负载启动，且它的任何资源都没有 `workload_started_at`。退出决策首先让该 allocation 不再接受工作负载启动通知的发送（allocation 进入退出过程后，该 RPC 会失败），因此决策之后不会再有资源越过边界。如果已有资源越过边界，该 allocation 保留其类别（取自失败的资源），但不进行系统重试：command 和 shell 结束，trial 遵循 `max_restarts`。因此，第一个节点已运行其 startup hook 的多节点 allocation 永远不会作为初始化重试重新运行。
+- **决策范围。** 只有当 `command_state`（或 trial 的当前 allocation）指向已结束的 allocation 时，退出决策才会生效。`.2` 已存在之后，`.1` 迟到或重复的退出不产生任何作用：它既不会结束 `.2`，也不会插入 `.3`。预算根据行统计，因此不会重复消耗。
 - **保持不变。** `INFRASTRUCTURE_FAILED` 保留现有的瞬时处理（`sproto/resources.go:353-371`）。generic 任务与目前一样以其类别结束（`spec_util.go:151-160`）。
 
 <a id="placement-constraints"></a>
@@ -305,6 +313,7 @@ F5 以同样的方式、一次性贯穿所有层加入 `aproto.SpecRejected`。�
 - **调度器。** `FittingRequirements`（`sproto/scheduler.go:4-7`）增加 `DeviceModels` 和 `MinDeviceMemoryMiB`。一个 `deviceSatisfied` 硬约束同时加入两个内联列表（`fitting.go:123`、`:227`）。
   - 在 v1 中，agent 的所有已启用设备都必须匹配，因为 `allocateFreeDevices` 没有设备过滤（`agent_state.go:158-186`）。
   - 新字段接入 `trial.go:412,459`、`command.go:162`、`api_generic_tasks.go:358` 和 `generic_task_resume.go:371`。
+- **升级门槛。** 只有当 agent 的 `AgentStarted.Version`（`master/pkg/aproto/master_message.go:80`）支持设备显存和预检时，它才适配带 `accelerators` 的请求。较旧的 agent 永远不会收到这类请求，`dry_run` 把它们列在 `blocked_nodes` 中，原因为 `agent_upgrade_pending`，因此启用加速器无需整个资源池同时切换。
 - **检测。** nvidia-smi 查询增加 `memory.total`，因此解析器的字段数从 3 变为 4（`agent/internal/detect/nvidia.go:25-27,92-94`）。MIG 设备报告 0。显存信息在设备旁边传递，即 `AgentStarted.DeviceMemoryMiB map[device.ID]int`，保存在每个 `slot` 上，并在每次 `AgentStarted` 时替换。`device.Device`（`master/pkg/device/device.go:43-48`）保持不变，因为它是 `agentState.Devices`（`agent_state.go:49`）的键，并且会持久化到容器快照中，恢复时按值查找（`:526-530`）。因此重连比较（`agent_state.go:261-292`）也保持不变。
 
 <a id="agent-preflight"></a>
@@ -358,11 +367,12 @@ F5 以同样的方式、一次性贯穿所有层加入 `aproto.SpecRejected`。�
 - **范围。** 键的范围是 `(jobs.owner_id, key)`，因此同一用户的所有客户端共享它。键永不过期，正如 job 行永不删除。
 - **绑定。** dry run 从不绑定键。事务提交前出现的错误不绑定任何内容，包括 `plan_changed`。任何已完成事务提交的提交请求都会消耗该键，包括以 `PLACEMENT_UNSATISFIED` 结束的请求，因此新的尝试需要新的键。
 - **规划绑定。** 启动请求把规划的摘要作为 `expected_digest` 携带，master 拒绝摘要不同的请求。该检查在重放之后运行，因此对响应丢失的启动请求进行重试时，即使工作树此后已经改变，仍会返回其作业。
+- **规划绑定的内容。** `expected_digest` 绑定客户端请求、代码和模板的内容。master 和资源池默认值（例如 `task_container_defaults`）不被绑定：它们是管理员策略，规划与启动之间的改动会应用于这次启动。因此，规划把其生效配置标注为规划时观察到的值，而不是冻结的值。
 - **摘要。** 摘要是对客户端请求的 master 规范 JSON（键排序、UTF-8、不做 HTML 转义）计算的 SHA-256，在应用 master 默认值之前计算。只有 master 计算它，因此客户端无需复现这一形式，也不需要规范化库。合并后的 spec 不能作为身份：petname、sshd 端口、SSH 密钥、会话 token 和资源池默认值在完全相同的请求之间也会变化。
 
   | 包含 | 排除 |
   |---|---|
-  | kind、workspace、project、模板名称 | `idempotency_key`、`dry_run`、`expected_digest` |
+  | kind、workspace、project、模板名称与内容 | `idempotency_key`、`dry_run`、`expected_digest` |
   | config，从 YAML 或 Struct 解析后再规范化 | 文件 `mtime`、`uid`、`gid` |
   | 文件清单 `{path, type, mode, sha256}` | master 默认值与合并后的值 |
   | parent、fork、inherit、`no_pause`、`activate`、`admission` | |
@@ -416,7 +426,7 @@ owner 是已认证的用户，记录在 `jobs.owner_id` 中。MCP 的 `--owner` 
   - `path`：`mkdir -p -- OUT && cd -- DIR/WD`。
 
   无论命令采用何种形式（`a; b`、`a & b`、多行），失败的前导命令都会在任何用户语句之前终止作业。在 `main` 上，`mkdir -p OUT && cd WD && CMD` 在失败后仍会运行后续语句，并可能以 0 退出（`compute/service.py:585-599`）。前导命令在初始化边界之后运行，因此它的失败分类为 `WORKLOAD_FAILED`，永远不会被系统重试；MCP 根据退出码和日志把它们报告为代码交付失败。shell 运行 `sshd`，没有命令，因此只接受 `context` 和 `path`，也没有前导命令。旧式的 `module:Class` experiment entrypoint 会被拒绝，因为任何前缀都会破坏它（`launch.py:32-40`）。
-- **`git` 的规划检查。** `compute_plan` 通过配置的存储访问方式（本地挂载或 SSH）对仓库运行只读的 `git`。`repo` 必须位于某个 bind mount 目标之下。`revision` 必须解析为一个提交，该提交被固定为完整 SHA。该提交必须包含在某个分支或 tag 中（`commit_not_on_ref`），因为克隆通过 alternates 借用对象，而源仓库中的 `git gc` 会清除不可达的对象。partial clone 会被拒绝，因为延迟获取需要网络；linked worktree 和带 alternates 的仓库也会被拒绝，因为它们的对象可能位于容器无法解析的路径。缺失的 LFS 对象是错误（`lfs_object_missing`），submodule 会得到 `submodule_not_checked_out` 警告。镜像必须提供 `git`，容器用户必须能读取该仓库；规划无法检查这两点。
+- **`git` 的规划检查。** `compute_plan` 通过配置的存储访问方式（本地挂载或 SSH）对仓库运行只读的 `git`。`repo` 必须位于某个 bind mount 目标之下。`revision` 必须解析为一个提交，该提交被固定为完整 SHA。固定确定的是代码的身份，并不保证该提交的对象一直可用（风险 11）。该提交必须包含在某个分支或 tag 中（`commit_not_on_ref`），因为克隆通过 alternates 借用对象，而源仓库中的 `git gc` 会清除不可达的对象。partial clone 会被拒绝，因为延迟获取需要网络；linked worktree 和带 alternates 的仓库也会被拒绝，因为它们的对象可能位于容器无法解析的路径。缺失的 LFS 对象是错误（`lfs_object_missing`），submodule 会得到 `submodule_not_checked_out` 警告。镜像必须提供 `git`，容器用户必须能读取该仓库；规划无法检查这两点。
 - **只读规划。** 规划以参数列表运行 `git`，不读取用户或系统配置，清空所有 filter 驱动并禁用延迟获取，因此不会运行仓库配置的任何命令。它像容器克隆一样通过 `safe.directory` 信任该仓库，并需要 git 2.31 或更高版本。
 - **`context` 的规划检查。** 大小按 harness 的方式计算：每个文件的大小向上取整到 3 的倍数，即其 base64 内容长度乘以 3/4（`harness/determined/common/v1file_utils.py:9-13`），求和后超过 99,614,720 字节即拒绝（`context.py:19-28`、`constants.py:5-18`）。master 只强制执行 96 MiB 的 gRPC 消息限制（`master/internal/grpcutil/api.go:81-85`），失败时原因不明确，因此 MCP 先行检查，并返回 `context_too_large`，附带总大小、限制、最大的几个路径，以及改用 `git` 或共享存储的提示。解析后仍位于树内的相对符号链接会被保留；绝对的或越出树的符号链接是规划错误（`unsafe_symlink`），因为 harness 会在初始化时拒绝整个归档（`harness/determined/common/tarfile_utils.py:38-76`）。harness 会丢弃归档中的所有权信息，并把权限模式屏蔽为 0755（`tarfile_utils.py:78-89`）。命中硬性 secret 规则的文件从不上传，命中软性规则的文件只有在 `include` 中点名时才上传，两者都列为 `excluded`。LFS 指针会得到 `lfs_pointer` 警告，被跟踪的根目录 `startup-hook.sh`（Determined 会在命令之前 source 它）会得到 `startup_hook`。任何能读取该作业的人都能读取 context；在 basic authz 下，这意味着 experiment 的任何查看者（`experiment/authz_basic_impl.go:26-30`）。这就是 secret 规则只适用于 `context` 的原因。
 - **来源信息。** 配置携带 `COMPUTE_CODE_SOURCE`、`COMPUTE_CODE_ROOT`，对于 `git` 和 `context` 还有 `COMPUTE_CODE_COMMIT`。它们取代 `COMPUTE_WORKDIR` 和 `COMPUTE_CODE_REVISION`（`compute/service.py:426-431`）。`context` 还会附带 `.code-provenance.json`，内容为 `{commit, dirty, included, excluded, skipped}`，不含时间戳，因此未改变的树会渲染出相同的摘要。对于 `path`，规划报告它观察到的 HEAD 和 dirty 状态，并标注为未经验证。
@@ -445,6 +455,7 @@ owner 是已认证的用户，记录在 `jobs.owner_id` 中。MCP 的 `--owner` 
 身份、owner、状态、放置和退出类别都是权威信息，`cross_profile_unverifiable` 已不复存在。以下各项仍未经验证，并在它们出现的每个地方加以标注：
 
 - 评估，它是 `evaluated_at` 时刻的快照；
+- 规划的生效配置，其中的 master 默认值可能在启动前改变；
 - 预检通过，它不预留任何资源；
 - 升级前的 job，它们没有键或摘要，无法重放；
 - F4 之前创建的 allocation，其初始化边界为 `unknown`；
@@ -460,6 +471,7 @@ owner 是已认证的用户，记录在 `jobs.owner_id` 中。MCP 的 `--owner` 
 | 创建 API | 在四个 RPC 上加 envelope，不使用 `Submit` oneof | 所有客户端共用一条创建路径，也不会出现代码生成器从未处理过的 oneof 请求体结构。 |
 | 句柄 | 只用 `job_id` | 所有读取和操作共用一个句柄。 |
 | 规划绑定 | `expected_digest`，在重放之后检查 | 客户端无法重新计算 master 的摘要，而响应丢失后的重试仍必须能够重放。 |
+| 规划冻结什么 | 请求、代码和模板；不包括 master 默认值 | 默认值是管理员策略。绑定合并后的配置需要一份易变字段列表（petname、端口、会话 token），而 master 一旦改变，这份列表就会悄无声息地失效。 |
 | 作业结束 | `tasks.end_time`，由退出决策写入 | 从 allocation 推断结束会误判重试间隙和暂停。 |
 | 何时决定 IMMEDIATE | 下一个 tick，在一轮试算中 | 在 `rp.Allocate` 内运行调度轮次会持有 allocation service 写锁。 |
 | experiment 的 IMMEDIATE | 拒绝，包括只有单个 trial 的 experiment | experiment 在提交调用之后才请求其 allocation，而且没有 gang 调度。 |
@@ -597,12 +609,12 @@ owner 是已认证的用户，记录在 `jobs.owner_id` 中。MCP 的 `--owner` 
 
 | PR | 内容 | 依赖 |
 |---|---|---|
-| F1 退出类别与修复 | 贯穿所有层的 `ExitClass`；新的失败类型；覆盖所有情况的分类器；按状态设定的 `closeOpenAllocations` 类别；`UnknownError` 映射；`crash(*msg)`；`allocations.exit_class` 和 `exit_detail`；`IdentifyTask` 修复。在 F4 加入初始化边界之前，`ResourcesFailed` 和 `TaskError` 分类为 `WORKLOAD_FAILED`；F4 之后，对于在它之前创建的 allocation 仍然如此 | – |
-| F2 台账 | `jobs` 迁移；`SubmitOptions`（含 `expected_digest`）和 `SubmitResult`；handler 顺序，包括规划检查、无副作用的 `dry_run`（尚不评估）以及 `validate_only` 别名；在 F3b 之前 `ADMISSION_IMMEDIATE` 返回 `UNIMPLEMENTED`；单一的提交事务；每次启动后的取消检查；`ACTIVE` experiment；经由 `command_state`、以状态为依据的恢复，包括 `PENDING` 清除、启动预写、结束未启动的快照、状态不一致失败、限定范围的 `start_time` 写入，以及使用已存储 ID 的 `Command.Start`；`Get`/`List`/`CancelSubmission`；由 `CancelSubmission` 和现有 kill endpoint（`KillCommand`、`KillShell`、`KillGenericTask`，`api.proto:1539,1490,2645`）写入的 `cancel_requested_at`；`get_task.sql` 字段；任务容器中的 `DET_JOB_ID`，以及 agent RM 上的 `DET_CLUSTER_ID`；`submission_protocol`（F3a 之前为 0） | F1 |
+| F1 退出类别与修复 | 贯穿所有层的 `ExitClass`；新的失败类型；覆盖所有情况的分类器；按状态设定的 `closeOpenAllocations` 类别；`UnknownError` 映射；`crash(*msg)`；`allocations.exit_class` 和 `exit_detail`；在清除之前用一条 UPDATE 写入的退出记录；`IdentifyTask` 修复。在 F4 加入初始化边界之前，`ResourcesFailed` 和 `TaskError` 分类为 `WORKLOAD_FAILED`；F4 之后，对于在它之前创建的 allocation 仍然如此 | – |
+| F2 台账 | `jobs` 迁移；`SubmitOptions`（含 `expected_digest`）和 `SubmitResult`；handler 顺序，包括规划检查、无副作用的 `dry_run`（尚不评估）以及 `validate_only` 别名；在 F3b 之前 `ADMISSION_IMMEDIATE` 返回 `UNIMPLEMENTED`；单一的提交事务；`dispatch` 及其三个调用方和提交结果未知分支；每次启动后的取消检查；`ACTIVE` experiment；经由 `command_state`、以状态为依据的恢复，包括 `PENDING` 清除、启动预写、结束未启动的快照、状态不一致失败、限定范围的 `start_time` 写入，以及使用已存储 ID 的 `Command.Start`；`Get`/`List`/`CancelSubmission`，包括 GENERIC 子树和 resume 处理；由 `CancelSubmission` 和现有 kill endpoint（`KillCommand`、`KillShell`、`KillGenericTask`，`api.proto:1539,1490,2645`）写入的 `cancel_requested_at`；`get_task.sql` 字段；任务容器中的 `DET_JOB_ID`，以及 agent RM 上的 `DET_CLUSTER_ID`；`submission_protocol`（F3a 之前为 0） | F1 |
 | F3a 评估 | `TaskList.Clone`；`rp.Evaluate`；让旧检查基于静态适配，同时保留每个调用点的结果；`dry_run` 评估及其限流；其他 RM 上的 `Unimplemented`；`submission_protocol` 为 1 | F2 |
-| F3b 立即准入 | tick 决策与 handler 等待；IMMEDIATE 恢复；provider 资源池拒绝 | F3a |
-| F4 初始化边界与重试 | `workload_started_at` 和 `allocations.reports_workload_start`；内部 RPC；每个 entrypoint 中的 `prep_container --workload-start`；带推导预算的 `max_system_retries`；trial 分支；command 和 shell 的单事务退出决策；屏蔽节点行 | F1, F3b |
-| F5 设备与预检 | 在 `device.Device` 旁边传递的显存检测；`resources.accelerators`；`deviceSatisfied`；`cproto.Preflight`；agent 钩子；`SpecRejected` 映射；`submission_protocol` 为 2 | F3a, F4 |
+| F3b 立即准入 | tick 决策与 handler 等待；`allocations.immediate` 和 `ADMITTING` 状态；IMMEDIATE 恢复；provider 资源池拒绝 | F3a |
+| F4 初始化边界与重试 | `workload_started_at` 和 `allocations.reports_workload_start`；内部 RPC；每个 entrypoint 中的 `prep_container --workload-start`；带推导预算的 `max_system_retries`；trial 分支；command 和 shell 的单事务退出决策，限定于已结束的 allocation；按 allocation 判定的重试资格，并停止接受工作负载启动通知的发送；屏蔽节点行 | F1, F3b |
+| F5 设备与预检 | 在 `device.Device` 旁边传递的显存检测；`resources.accelerators`；`deviceSatisfied`；`cproto.Preflight`；agent 钩子；agent 版本门槛；`SpecRejected` 映射；`submission_protocol` 为 2 | F3a, F4 |
 
 master 和 agent 一起升级。fork 保持重新挂接路径的兼容性。`device.Device` 和重连比较保持不变，因为比较不一致会使 agent 关闭（`rm/agentrm/agent.go:609-634`）。容器标签版本同样不变（`agent/internal/containers/spec.go:171-175`）。只有当 agent 在新 master 启动后的 `agent_reconnect_wait`（默认 150 秒，`aproto/net.go:9-17`）内重新连接，并且容器仍处于停止前记录的状态（`containers/manager.go:287-295`）时，运行中的容器才会被重新挂接。否则它会被终止，其 allocation 以 `RestoreError` 结束，分类为 `INFRASTRUCTURE_FAILED`。重新挂接的容器保留旧的 entrypoint 和 wheel。新 master 继续提供上一版本的任务 API，该容器的 allocation 在没有初始化边界的情况下分类。
 
@@ -647,16 +659,24 @@ master 和 agent 一起升级。fork 保持重新挂接路径的兼容性。`dev
 | 第一次尝试结束 25 小时后仍在运行的重试 | 仍然已注册、可终止，并持有其会话 token。 | F4 |
 | 升级前已在运行的 allocation 在升级后因用户代码失败 | `WORKLOAD_FAILED`，带 `init_boundary: "unknown"`，没有 `<task>.<n+1>`，其副作用只发生一次；旧的 trial 计入 `max_restarts`。 | F4 |
 | 分类器覆盖 `reports_workload_start` × `workload_started_at` | 只有 (true, NULL) 得到 `WORKLOAD_INITIALIZATION_FAILED`。 | F4 |
-| 工作负载启动通知发送失败；发送已提交但响应丢失；镜像中的 harness 早于 F4 | hook 和命令都不运行，类别为 `WORKLOAD_INITIALIZATION_FAILED`，预算内会重试；`WORKLOAD_FAILED`，不重试；在 hook 之前退出，`WORKLOAD_INITIALIZATION_FAILED`。 | F4 |
+| 工作负载启动通知发送失败；发送已提交但响应丢失；镜像中的 harness 早于 F4 | hook 和命令都不运行，类别为 `WORKLOAD_INITIALIZATION_FAILED`，预算内会重试；`WORKLOAD_FAILED`，不进行系统重试（command 和 shell 不重新运行；trial 遵循 `max_restarts`）；在 hook 之前退出，`WORKLOAD_INITIALIZATION_FAILED`。 | F4 |
 | 缺失的 bind 源路径（command，以及 experiment 的 `host_path`） | 只有一个 allocation，`WORKLOAD_INITIALIZATION_FAILED`，带 `spec_rejected` 和宿主机路径，没有屏蔽节点行，trial 处于 `ERROR` 且 `restarts` 不变。GPU 预检失败仍会屏蔽节点并重试。 | F5 |
 | 相对的检查点 `storage_path` | 落在继承的 `host_path` 之下；没有 `shared_fs` 默认值时，提交和 `dry_run` 都无法通过完整性检查，且不创建任何内容。 | F2, M3 |
-| 两个 IMMEDIATE 请求争抢最后的 slot | 恰好一个被放置；另一个以 `PLACEMENT_UNSATISFIED`（`busy`）结束；两者都永远不会显示为排队中。 | F3b |
+| 两个 IMMEDIATE 请求争抢最后的 slot | 恰好一个被放置；另一个以 `PLACEMENT_UNSATISFIED`（`busy`）结束；两者都永远不会读作 `QUEUED`。 | F3b |
+| IMMEDIATE GENERIC 作业的排队 resume 在重启时处于 `PENDING` | 它以排队方式恢复，永远不会以 `PLACEMENT_UNSATISFIED` 结束。 | F3b |
 | `admission=immediate`：F3b 之前；用于任何 experiment | `admission_unsupported`，不创建任何内容；在 dry run 时返回 `INVALID_ARGUMENT`。 | M3, F3b |
 | 前导命令失败后的多语句命令，针对每种来源 | `a; b`、`false \|\| b`、两行命令以及 `a & b; wait` 都以前导命令的状态退出，且不运行任何用户语句，在 `sh -c` 和 `bash -lc` 下均如此。 | M3 |
 | 渲染器形式 | 恰好是 `<prelude> \|\| exit $?`、一个换行符和命令；任何配置中都没有 `work_dir`；`module:Class` 被拒绝。 | M3 |
 | `git` 规划检查 | 固定的 SHA；`commit_not_on_ref`；partial clone 被拒绝；`lfs_object_missing`；使用 `git` 的 shell 被拒绝。 | M3 |
 | context 限制 | 计数为 99,614,718 字节的 context 可以通过；单个 99,614,719 字节的文件计为 99,614,721 字节，返回 `context_too_large`，且不发起创建调用；越出树的符号链接返回 `unsafe_symlink`；未改变的树渲染出相同的摘要。 | M3 |
 | 协议门槛 | 没有 `submission_protocol` 或低于最低要求的 master 会被拒绝，无论其 release 字符串是什么。 | M2 |
+| `COMMIT` 成功但 handler 看到错误，或客户端在事务提交之后断开连接；master 持续运行 | 作业无需重启即可启动，途径是 handler 的重新检查、重放或扫描；并发的重放只注册一个 allocation 和一个作业。 | F2 |
+| 取消一个已暂停的 GENERIC 父任务，其 `no_pause` 子任务正在运行且其 resume 尚未完成，然后重启 | 每个成员都以 `CANCELED` 结束，resume 不会被继续，并且在任何改动之前每个成员都已通过授权。 | F2 |
+| 模板在规划与启动之间发生变化 | `plan_changed`；master 默认值的改动则直接生效，不会导致 `plan_changed`。 | F2, M3 |
+| 在退出记录之后、清除之后以及退出决策之前崩溃 | 记录完整；恢复保留类别和重试预算。 | F1, F4 |
+| `.1` 的重复退出在 `.2` 运行之后到达 | `.2` 继续运行；没有 `.3`；预算不变。 | F4 |
+| 资源 A 已发送工作负载启动通知并运行了一个有副作用的 hook；随后资源 B 预检失败 | 不进行系统重试，A 的 hook 只运行一次；类别为 `NODE_PREFLIGHT_FAILED`，trial 遵循 `max_restarts`。 | F4, F5 |
+| 早于 F5 的 agent 位于接收 `accelerators` 请求的资源池中 | 这类请求永远不会被放置到它上面；`dry_run` 把它列为 `agent_upgrade_pending`。 | F5 |
 | 观察工具 | `compute_resources` 只返回投影字段和 `observed_at`；`storage_check` 总是说明其视角。 | M3 |
 
 **沿用自 PR #1。** PR #1 的四项行为必须在现在负责它们的层中重新验证：
@@ -665,7 +685,7 @@ master 和 agent 一起升级。fork 保持重新挂接路径的兼容性。`dev
 |---|---|
 | GPU 不匹配时永不运行用户代码 | 调度器硬约束，以及 `CreateContainer` 之前的 agent 预检（F5） |
 | 失败的前导命令永不运行后续语句 | MCP 渲染器，`<prelude> \|\| exit $?`（M3） |
-| 规划漂移永远不会伪装成已审阅的规划 | master 的 `expected_digest` 检查（F2），以及规划中的 SHA 固定（M3） |
+| 规划漂移永远不会伪装成已审阅的规划 | master 对请求、代码和模板的 `expected_digest` 检查（F2），以及规划中的 SHA 固定（M3）；master 默认值是观察到的，而不被绑定 |
 | 身份检查永远不会为了方便而被绕过 | master 授权：重放会重新检查读取授权，`CancelSubmission` 根据数据库进行授权（F2） |
 
 <a id="out-of-scope"></a>
