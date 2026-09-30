@@ -668,7 +668,7 @@ class ComputeService:
         command: Any, workdir: str, output_dir: str, admission: bool = False
     ) -> str:
         if isinstance(command, str):
-            if not command:
+            if not command.strip():
                 raise ValidationError("command must not be empty")
             rendered = command
         elif isinstance(command, (list, tuple)):

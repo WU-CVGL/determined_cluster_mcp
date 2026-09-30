@@ -191,10 +191,12 @@ Slurm），请按整个节点设置 `count` 和显存下限，或不要使用 `g
 入口变为
 `mkdir -p OUTPUT && cd WORKDIR && /bin/bash -c '<script v1>' determined-compute-gpu-admission || exit $?`，
 下一行是 `COMMAND`，因此任一步骤失败都会在 `COMMAND` 的任何语句运行之前结束 shell。
-带版本号的脚本只需要 bash、coreutils 和 `nvidia-smi`；有 `timeout` 时会用它运行
-`nvidia-smi`。只有形如 GPU 行（数字序号加六个字段）的输出行才计为 GPU；其他行记录在
-`unparsed_lines` 中。脚本以原子方式写入回执，把同一条 JSON 记录作为一行追加到回执的 `.jsonl`
-历史中，使 experiment 重启后仍保留以前的尝试，打印一行
+由于 `COMMAND` 自成一行，只含注释的 `COMMAND` 在准入通过后什么也不做并以 0 退出；空白的
+`COMMAND` 无论是否启用准入都会被拒绝。带版本号的脚本只需要 bash、coreutils 和
+`nvidia-smi`；有 `timeout` 时会用它运行 `nvidia-smi`。只有形如 GPU 行（数字序号加六个字段）
+的输出行才计为 GPU；其他行只保留可打印 ASCII 字符后记录在 `unparsed_lines` 中。脚本以原子
+方式写入回执，把同一条 JSON 记录作为一行追加到回执的 `.jsonl` 历史中，使 experiment 重启后
+仍保留以前的尝试，打印一行
 `determined-compute gpu_admission: passed|failed ...`，失败时以退出码 86 结束，使工作负载不会
 启动。缺少 `nvidia-smi` 或其运行失败都视为准入失败。回执记录 `schema_version`
 （`determined-compute-gpu-admission-v1`）、`status`、`observed_at`、`policy`、`devices`（序号、
@@ -206,9 +208,12 @@ allocation 和 trial ID；不记录其他环境变量值。
 experiment 中并发运行的 trial 会互相覆盖回执。`determined.allocation_id` 与该次尝试相符的
 `.jsonl` 行才是权威记录；同时运行的任务或 experiment 应使用不同的 `output_dir` 或 `receipt`。
 工作负载自身也可能以 86 退出，因此退出码 86 本身只是一个提示：请通过
-`determined-compute gpu_admission: failed` 日志行或相符的记录确认准入失败。在 experiment 中，
-一次准入失败会消耗一次重启；若希望失败一次即停止，请在 `experiment_config` 中设置
-`max_restarts: 0`。不含此字段的请求渲染结果与以前完全相同。
+`determined-compute gpu_admission: failed` 日志行或相符的记录确认准入失败。反过来，失败的
+准入也可能让 command 任务以其他退出码结束：command 任务在登录 shell 中运行，mkdir、cd 或
+准入步骤失败时会调用 `exit`，这会运行容器用户的 `~/.bash_logout`，而该文件中的 `exit` 会
+替换退出码。因此应通过日志行或相符的 `.jsonl` 记录确认准入结果，而不能只看退出码或任务
+状态。在 experiment 中，一次准入失败会消耗一次重启；若希望失败一次即停止，请在
+`experiment_config` 中设置 `max_restarts: 0`。不含此字段的请求渲染结果与以前完全相同。
 
 <a id="start-the-mcp-server"></a>
 ## 启动 MCP server

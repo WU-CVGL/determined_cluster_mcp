@@ -220,9 +220,12 @@ The plan gains the normalized `gpu_admission` object, the config gains the manag
 `COMPUTE_GPU_ADMISSION*` variables, and the entrypoint becomes
 `mkdir -p OUTPUT && cd WORKDIR && /bin/bash -c '<script v1>' determined-compute-gpu-admission || exit $?`
 with `COMMAND` on the next line, so a failed step ends the shell before any statement of
-`COMMAND` runs. The versioned script needs only bash, coreutils, and `nvidia-smi`, which
-it runs under `timeout` when available. Only output lines shaped like a GPU row (a
-numeric index and six fields) count as GPUs; other lines are recorded in `unparsed_lines`.
+`COMMAND` runs. Because `COMMAND` is its own line, a `COMMAND` of only comments does
+nothing and exits 0 once admission passes; a blank `COMMAND` is rejected with or without
+admission. The versioned script needs only bash, coreutils, and `nvidia-smi`, which it
+runs under `timeout` when available. Only output lines shaped like a GPU row (a numeric
+index and six fields) count as GPUs; other lines are recorded in `unparsed_lines`,
+reduced to printable ASCII.
 It atomically writes the receipt, appends the same JSON record as one line to the
 receipt's `.jsonl` history so experiment restarts keep earlier attempts, prints one
 `determined-compute gpu_admission: passed|failed ...` line, and exits 86 on failure so
@@ -239,9 +242,13 @@ The `.jsonl` line whose `determined.allocation_id` matches the attempt is author
 give tasks or experiments that run at the same time separate `output_dir` or `receipt`
 values. A workload can also exit 86 by itself, so exit code 86 alone is only a hint:
 confirm a failed admission by the `determined-compute gpu_admission: failed` log line or
-by the matching record. In an experiment, a failed admission consumes a restart; set
-`max_restarts: 0` in `experiment_config` to stop after one failure. A request without
-the field renders exactly as before.
+by the matching record. Conversely, a failed admission can end a command task with another
+exit code: the task runs in a login shell, where a failed mkdir, cd, or admission step
+calls `exit`, which runs the container user's `~/.bash_logout`, and an `exit` in that file
+replaces the exit code. Confirm the admission result by the log line or the matching
+`.jsonl` record, not by the exit code or task state alone. In an experiment, a failed
+admission consumes a restart; set `max_restarts: 0` in `experiment_config` to stop after
+one failure. A request without the field renders exactly as before.
 
 ## Start the MCP server
 

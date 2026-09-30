@@ -66,7 +66,7 @@ if [ "$rc" = 0 ]; then
     index=$(trim "$index"); uuid=$(trim "$uuid"); name=$(trim "$name")
     driver=$(trim "$driver"); total=$(trim "$total"); free=$(trim "$free")
     case $index in ''|*[!0-9]*) row= ;; *) row=1 ;; esac
-    if [ -z "$row" ] || [ -n "$extra" ] || [ -z "$free" ]; then unparsed="$unparsed${unparsed:+,}$(js "$line")"; continue; fi
+    if [ -z "$row" ] || [ -n "$extra" ] || [ -z "$free" ]; then unparsed="$unparsed${unparsed:+,}$(js "$(printf '%s' "$line" | LC_ALL=C tr -cd '\040-\176')")"; continue; fi
     n=$((n + 1))
     devices="$devices${devices:+,}{\"index\":$(jn "$index"),\"uuid\":$(jo "$uuid"),\"name\":$(jo "$name"),\"driver_version\":$(jo "$driver"),\"memory_total_mib\":$(jn "$total"),\"memory_free_mib\":$(jn "$free")}"
     if [ -n "$names" ] && ! matches "$name" "$names"; then failures+=("GPU $index name $name is not allowed"); fi

@@ -202,6 +202,36 @@ def test_non_object_admission_and_reserved_variables_are_rejected(service):
         service.plan(request)
 
 
+def _entrypoint_request(command):
+    request = experiment_request()
+    del request["command"]
+    request["experiment_config"]["entrypoint"] = command
+    return request
+
+
+# With admission the command runs as its own line, where a blank one would pass as a no-op,
+# so a blank command is rejected whether or not admission is on.
+@pytest.mark.parametrize("admission", [{}, None])
+@pytest.mark.parametrize(
+    "request_factory",
+    [
+        lambda command: command_request(command=command),
+        lambda command: experiment_request(command=command),
+        _entrypoint_request,
+    ],
+    ids=["command", "experiment", "experiment_entrypoint"],
+)
+@pytest.mark.parametrize("command", ["   ", "\n\t\n"], ids=["spaces", "tab_newline"])
+def test_blank_command_is_rejected(service, request_factory, command, admission):
+    request = request_factory(command)
+    if admission is not None:
+        request["gpu_admission"] = admission
+
+    with pytest.raises(ValidationError, match="command must not be empty") as caught:
+        service.plan(request)
+    assert caught.value.code == "invalid_request"
+
+
 BASH = shutil.which("bash")
 pytestmark_bash = pytest.mark.skipif(BASH is None, reason="bash is required")
 
@@ -346,6 +376,23 @@ def test_script_counts_only_rows_shaped_like_a_gpu(tmp_path):
         "2, GPU-2, too few fields",
         "3, GPU-3, NVIDIA Example 24GB, 555.10, 24564, 24000, extra",
     ]
+
+
+@pytestmark_bash
+def test_script_keeps_receipt_valid_json_for_non_utf8_lines(tmp_path):
+    tools = _toolbox(tmp_path)
+    # The fake emits the invalid UTF-8 bytes at run time, so this file stays ASCII.
+    _fake_smi(tools, "printf 'WARN \\377\\376\\tbad\\n'\n" + GPUS.splitlines(keepends=True)[0])
+
+    completed, output = _run_script(tmp_path, tools, count="1")
+
+    assert completed.returncode == 0, completed.stdout
+    receipt = json.loads((output / "gpu-admission.json").read_bytes())
+    assert receipt["status"] == "passed"
+    assert [device["index"] for device in receipt["devices"]] == [0]
+    assert receipt["unparsed_lines"] == ["WARN bad"]
+    history = (output / "gpu-admission.jsonl").read_bytes().splitlines()
+    assert [json.loads(line)["unparsed_lines"] for line in history] == [["WARN bad"]]
 
 
 @pytestmark_bash
