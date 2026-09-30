@@ -158,8 +158,8 @@ One shared `submission` package implements this order for all four handlers.
 1. **Digest.** Canonicalize and digest the client request. Nothing with side effects runs.
 2. **Replay.** If a key is present, look up `(owner_id, key)`. Compare the stored digest
    with `expected_digest` when it is set, otherwise with the computed digest. If they are
-   equal, check read authz on the stored job and return it with `replayed=true`. If not,
-   return `ALREADY_EXISTS` naming the existing `job_id`.
+   equal, check read authz on the stored job, pass it to `dispatch` (step 7), and return it
+   with `replayed=true`. If not, return `ALREADY_EXISTS` naming the existing `job_id`.
 3. **Plan check.** If `expected_digest` is set and differs from the computed digest,
    return `FAILED_PRECONDITION` with `plan_changed`. Nothing is written, and the key stays
    free.
@@ -183,11 +183,24 @@ One shared `submission` package implements this order for all four handlers.
 
    On a unique-index violation, roll back, delete the minted session and the
    `GroupPriorityChangeRegistry` entry (`command/command.go:117-119`), and return to
-   step 2. The index is the guard; `cs.mu` is not.
-7. **Start.** Call `StartAllocation` or `e.Start`, then re-read `cancel_requested_at` and
-   kill the job if it is set. If the start fails in-process, close the `PENDING`
-   allocation with `INFRASTRUCTURE_FAILED` and set `tasks.end_time`, or mark the
-   experiment `ERROR`. A replay then returns a terminal record.
+   step 2. The index is the guard; `cs.mu` is not. An error that leaves the commit's
+   outcome unknown, such as a connection lost during `COMMIT`, is not a rollback: nothing
+   is cleaned up, and the handler looks the key up again. If the job exists, it goes on to
+   step 7; otherwise it returns a retryable `UNAVAILABLE`.
+7. **Dispatch.** Pass the job to `dispatch(job_id)`, which runs detached from the request's
+   context, so a client that disconnects after the commit cannot stop it. `dispatch` is
+   idempotent and serialized per job. It reads the attempt that `command_state` names, or
+   the experiment, and does nothing if that attempt has ended or is already registered
+   with the allocation service (for an experiment, running in the experiment registry).
+   Otherwise it calls `StartAllocation` or `e.Start`, then re-reads `cancel_requested_at`
+   and kills the job if it is set. The allocation service refuses a second registration of
+   an allocation ID, so each ID has at most one runtime instance. If the start fails
+   in-process, `dispatch` closes the `PENDING` allocation with `INFRASTRUCTURE_FAILED` and
+   sets `tasks.end_time`, or marks the experiment `ERROR`, so a replay returns a terminal
+   record. It has three callers: the handler after commit, every replay, and a
+   master-owned sweep that every 30 s dispatches committed jobs whose current attempt is
+   `PENDING`, unregistered, and older than the interval. A committed submission therefore
+   always progresses without a master restart.
 8. **Wait (IMMEDIATE only).** Once the launch call returns, outside `cs.mu`
    (`command/command_service.go:95`), poll the allocation through the allocation
    service's read lock until it leaves `PENDING`. The wait is capped at 5 s, after which
@@ -203,8 +216,9 @@ persisted `allocations.state`:
 - **`PENDING`: never placed.** Delete the attempt's `allocation_resources` rows, which
   cascade to `resourcemanagers_agent_containers`, because the agent RM writes them in the
   tick before the allocation acknowledges them (`rm/agentrm/resource_pool.go:443-454`).
-  Then QUEUE re-requests it under the same allocation ID, and IMMEDIATE ends it with
-  `PLACEMENT_UNSATISFIED`. With `cancel_requested_at` set, the task ends instead.
+  Then an allocation marked `immediate` ends with `PLACEMENT_UNSATISFIED`, and any other
+  is re-requested under the same allocation ID. With `cancel_requested_at` set, the task
+  ends instead.
 - **Any later state: placed,** even if `start_time` is NULL. It is restored with
   `Restore=true` and reconciled through agent reattach, and the cancel check after
   registration kills it if `cancel_requested_at` is set. It is never re-requested and never
@@ -254,7 +268,7 @@ message Submission {
   optional string request_digest = 10;       // owner and admins only
   Admission admission = 11;
   google.protobuf.Timestamp submitted_at = 12; optional google.protobuf.Timestamp ended_at = 13;
-  State state = 14;        // QUEUED RUNNING PAUSED COMPLETED FAILED CANCELED DELETED
+  State state = 14;        // QUEUED RUNNING PAUSED COMPLETED FAILED CANCELED DELETED; F3b adds ADMITTING
   ExitClass exit_class = 15; string exit_reason = 16;   // from the allocation that ended the job
   repeated SubmissionTask tasks = 17;        // task_id, optional trial_id, repeated taskv1.Allocation
 }
@@ -270,8 +284,9 @@ message Submission {
 - **Task state.** A task's job has ended exactly when `tasks.end_time` is set, except that
   a GENERIC task in `PAUSED` or `STOPPING_PAUSED` is `PAUSED`, because pause writes
   `end_time` (`db/postgres_tasks.go:145-156`). A live task is `RUNNING` when the attempt
-  named by `command_state` is placed and has not ended, and `QUEUED` otherwise, including
-  between attempts and during an unpause. An attempt has ended when its `end_time` is set
+  named by `command_state` is placed and has not ended, `ADMITTING` while an immediate
+  attempt awaits its first decision, and `QUEUED` otherwise, including between attempts and
+  during an unpause. An attempt has ended when its `end_time` is set
   or its state is `TERMINATED`. An ended job with `cancel_requested_at` set is `CANCELED`;
   cancel never sets it on an ended job. Otherwise its state comes from its last attempt's
   class: `NONE` is `COMPLETED`, a failure class is `FAILED`, and a pre-upgrade `UNSPECIFIED` is
@@ -296,6 +311,17 @@ message Submission {
   first two fail with `NotFound` when the registry misses (`api_command.go:259-262`,
   `api_shell.go:126-129`). The exit decision and cancel lock the same job row, so a late
   cancel never turns `COMPLETED` into `CANCELED`.
+- **GENERIC cancel.** Every GENERIC task, parent or child, has its own job, and cancelling
+  one covers its task and every descendant, as `KillGenericTask` does today
+  (`api_generic_tasks.go`, `generic_task_resume.go`). It resolves the subtree, authorizes
+  every member before changing anything, and skips members already `COMPLETED` or
+  `CANCELED`. One transaction sets `cancel_requested_at` on each member's job and cancels
+  the members' unfinished `generic_task_resume` rows. After commit it signals each
+  member's current or intended allocation. A member with neither, such as a paused parent
+  whose `no_pause` child still runs, ends `CANCELED` directly while the child is killed.
+  `KillGenericTask` with `kill_from_root` resolves the root and cancels the root's job the
+  same way. Restore never continues a resume whose task has `cancel_requested_at`; it ends
+  the task `CANCELED`.
 
 ### Scheduling evaluation
 
@@ -357,7 +383,12 @@ message SchedulingEvaluation {
   (`:913-919`).
 - **Scope.** IMMEDIATE applies to every allocation that the submit itself creates,
   including system retries. Later user-driven allocations, such as a generic resume,
-  queue.
+  queue. Each allocation records its own admission in
+  `allocations.immediate boolean NOT NULL DEFAULT false`, set when it is inserted. Restore
+  and state derivation read it, never `jobs.admission`, so a queued resume of an
+  IMMEDIATE job restores as queued.
+- **State.** Until its first decision, an immediate attempt reads `ADMITTING`. It never
+  reads `QUEUED`: it is placed, or it ends `PLACEMENT_UNSATISFIED`.
 - **Rejected at submit.** Every experiment, single-trial ones included, gets
   `INVALID_ARGUMENT` (see [Admission](#admission)). Provider-backed pools get
   `FAILED_PRECONDITION`.
@@ -376,8 +407,19 @@ enum ExitClass {
 }
 ```
 
-`allocations` gains `exit_class text` and `exit_detail jsonb`, written by `SetExitStatus`
-(`task/allocation.go:1074-1095`). Startup restores first and then closes every allocation
+`allocations` gains `exit_class text` and `exit_detail jsonb`.
+
+**Exit record.** `finalize` writes the whole exit record in one UPDATE before it changes
+anything else: `state = TERMINATED`, `end_time`, `exit_reason`, `exit_error`,
+`status_code`, `exit_class`, and `exit_detail`. Only after that commits does it purge and
+release the restorable resources, and only then does the task-level exit decision run.
+Purging, releasing, and the exit notification are repeatable, so a crash at any point
+leaves either an open allocation that restore handles or a complete record. Today
+`finalize` writes `TERMINATED`, purges, and writes the exit status last
+(`task/allocation.go:584-588,1074-1095`); a crash between them leaves a terminated
+allocation without a class, whose evidence is already gone.
+
+Startup restores first and then closes every allocation
 that restore did not keep (`core.go:1432-1444`). Restore classifies the attempts it
 decides. `closeOpenAllocations` (`core.go:957-963`) classifies the rest by state, in the
 same UPDATE that closes them: `NONE` for `PENDING`, typically a queued trial allocation
@@ -436,9 +478,9 @@ value-typed switch and lands in "handler crashed".
   F4 that comes from the image (`DET_SKIP_PIP_INSTALL`, `task-setup.sh:26-33`) rejects the
   flag and fails the same way; such images must carry the F4 harness. A post that commits
   but loses its response ends as `WORKLOAD_FAILED`, which never re-runs user code.
-- **When the class is set.** Today `finalize` calls `SetExitStatus` after
-  `purgeRestorableResources` (`allocation.go:584-588`); the class is computed before the
-  purge. These rows live exactly as long as the allocation, because startup purges only
+- **When the class is set.** The class is computed from `workload_started_at` before the
+  exit record is written, and the rows are purged only after it commits (see
+  [Exit classes](#exit-classes)). These rows live exactly as long as the allocation, because startup purges only
   the rows of closed allocations (`taskmodel/resources.go:53-63`).
 
 ### System retries
@@ -461,7 +503,7 @@ value-typed switch and lands in "handler crashed".
   spec ends the trial in `ERROR` without incrementing `restarts`.
 - **Commands and shells.** These gain re-allocation through one exit decision in
   `OnExit`. One transaction locks the job row, reads the ended attempt's class (already
-  durable, because `finalize` runs `SetExitStatus` before `onExit`) and the budget, and
+  durable, because the exit record commits before `onExit`) and the budget, and
   then either inserts `<task>.<n+1>` as `PENDING` with its workspace record and
   blocked-node rows and points `command_state` at it, or sets `tasks.end_time`. It retries
   only when `cancel_requested_at` is NULL. The new attempt starts only after commit, loads
@@ -469,6 +511,18 @@ value-typed switch and lands in "handler crashed".
   token and the registry entry and schedules no garbage collection; only the end branch
   runs today's `OnExit` tail (`command.go:239-279`). A crash at any point leaves a state
   that restore finishes.
+- **Eligibility is per allocation.** A system retry requires that the allocation reports
+  workload start and that none of its resources has `workload_started_at`. The exit
+  decision first closes the allocation to workload-start posts (the RPC fails once the
+  allocation is exiting), so no resource crosses the boundary after the decision. If any
+  resource has crossed, the allocation keeps its class, taken from the failing resource,
+  but is not system-retried: commands and shells end, and a trial follows `max_restarts`.
+  A multi-node allocation whose first node already ran its startup hooks is therefore
+  never re-run as an initialization retry.
+- **Decision scope.** The exit decision acts only while `command_state`, or the trial's
+  current allocation, names the ended allocation. A late or repeated exit of `.1` after
+  `.2` exists is a no-op: it neither ends `.2` nor inserts `.3`. The budget is counted
+  from rows, so nothing is spent twice.
 - **Unchanged.** `INFRASTRUCTURE_FAILED` keeps today's transient handling
   (`sproto/resources.go:353-371`). Generic tasks end with their class, as they do today
   (`spec_util.go:151-160`).
@@ -496,6 +550,11 @@ value-typed switch and lands in "handler crashed".
     no device filter (`agent_state.go:158-186`).
   - The new fields are plumbed to `trial.go:412,459`, `command.go:162`,
     `api_generic_tasks.go:358`, and `generic_task_resume.go:371`.
+- **Upgrade gate.** An agent fits a request with `accelerators` only if its
+  `AgentStarted.Version` (`master/pkg/aproto/master_message.go:80`) supports device memory
+  and preflight. Older agents never receive such a request, and `dry_run` lists them in
+  `blocked_nodes` with the reason `agent_upgrade_pending`, so enabling accelerators needs
+  no flag day across the pool.
 - **Detection.** The nvidia-smi query adds `memory.total`, so the parser's field count goes
   from 3 to 4 (`agent/internal/detect/nvidia.go:25-27,92-94`). MIG devices report 0.
   Memory travels beside the device, as `AgentStarted.DeviceMemoryMiB map[device.ID]int`
@@ -576,6 +635,11 @@ System retries apply to trials, commands, and shells.
   master rejects a request whose digest differs. The check runs after replay, so a retry
   of a launch whose response was lost still returns its job, even if the working tree has
   changed since.
+- **What the plan binds.** `expected_digest` binds the client request, the code, and the
+  template's content. Master and pool defaults, such as `task_container_defaults`, are not
+  bound: they are administrator policy, and a change between plan and launch applies to
+  the launch. The plan therefore labels its effective config as observed at plan time,
+  not frozen.
 - **Digest.** The digest is SHA-256 over the master's canonical JSON of the client request
   (sorted keys, UTF-8, no HTML escaping), taken before master defaults. Only the master
   computes it, so no client has to reproduce the form and no canonicalization library is
@@ -584,7 +648,7 @@ System retries apply to trials, commands, and shells.
 
   | Included | Excluded |
   |---|---|
-  | kind, workspace, project, template name | `idempotency_key`, `dry_run`, `expected_digest` |
+  | kind, workspace, project, template name and content | `idempotency_key`, `dry_run`, `expected_digest` |
   | config, parsed from YAML or Struct, then canonicalized | file `mtime`, `uid`, `gid` |
   | file manifest `{path, type, mode, sha256}` | master defaults and merged values |
   | parent, fork, inherit, `no_pause`, `activate`, `admission` | |
@@ -686,6 +750,8 @@ RBAC. A replay re-checks read authz on the stored job, so revoked access is hono
 - **Plan checks for `git`.** `compute_plan` runs read-only `git` against the repository
   through the configured storage access (a local mount or SSH). `repo` must lie under a
   bind-mount target. `revision` must resolve to a commit, which is pinned as a full SHA.
+  The pin fixes the code's identity; it does not keep the commit's objects available
+  (risk 11).
   The commit must be contained in a branch or tag (`commit_not_on_ref`), because the clone
   borrows objects through alternates and `git gc` in the source prunes unreachable ones.
   Partial clones are rejected, because a lazy fetch needs the network, and so are linked
@@ -754,6 +820,7 @@ Identity, owner, state, placement, and exit class are authoritative, and
 wherever it appears:
 
 - an evaluation, which is a snapshot at `evaluated_at`;
+- a plan's effective config, whose master defaults can change before launch;
 - a preflight pass, which reserves nothing;
 - pre-upgrade jobs, which have no key or digest and cannot be replayed;
 - allocations created before F4, whose init boundary is `unknown`;
@@ -768,6 +835,7 @@ wherever it appears:
 | Create API | envelope on the four RPCs, no `Submit` oneof | One create path for every client, and no oneof body shape that the generators have never handled. |
 | Handle | `job_id` only | One handle for every read and verb. |
 | Plan binding | `expected_digest`, checked after replay | A client cannot recompute the master's digest, and a lost-response retry must still replay. |
+| What a plan freezes | the request, the code, and the template; not master defaults | Defaults are administrator policy. Binding the merged config would need a list of volatile fields (petnames, ports, session tokens) that breaks silently when the master changes. |
 | Job end | `tasks.end_time`, written by the exit decision | Inferring the end from allocations misreads the retry gap and pause. |
 | When IMMEDIATE is decided | next tick, in a scratch pass | A pass inside `rp.Allocate` would hold the allocation-service write lock. |
 | IMMEDIATE for experiments | rejected, single-trial ones included | An experiment requests its allocations after the submit call, and there is no gang scheduling. |
@@ -941,12 +1009,12 @@ and the agent preflight follow in a second release.
 
 | PR | Content | Depends on |
 |---|---|---|
-| F1 Exit classes and fixes | `ExitClass` across all layers; new failure types; a total classifier; the `closeOpenAllocations` class by state; `UnknownError` mapping; `crash(*msg)`; `allocations.exit_class` and `exit_detail`; the `IdentifyTask` fix. Until F4 adds the init boundary, `ResourcesFailed` and `TaskError` classify as `WORKLOAD_FAILED`; after F4 they still do for allocations created before it | – |
-| F2 Ledger | `jobs` migration; `SubmitOptions` (with `expected_digest`) and `SubmitResult`; handler order with the plan check, side-effect-free `dry_run` (no evaluation yet), and the `validate_only` alias; `ADMISSION_IMMEDIATE` returns `UNIMPLEMENTED` until F3b; the single commit transaction; the cancel check after every start; `ACTIVE` experiments; restore through `command_state`, keyed on state, with the `PENDING` purge, launch write-ahead, the unlaunched-snapshot end, the mismatch failure, the scoped `start_time` stamp, and `Command.Start` with the stored ID; `Get`/`List`/`CancelSubmission`; `cancel_requested_at`, written by `CancelSubmission` and the existing kill endpoints (`KillCommand`, `KillShell`, `KillGenericTask`, `api.proto:1539,1490,2645`); `get_task.sql` fields; `DET_JOB_ID`, and `DET_CLUSTER_ID` on the agent RM, in task containers; `submission_protocol` (0 until F3a) | F1 |
+| F1 Exit classes and fixes | `ExitClass` across all layers; new failure types; a total classifier; the `closeOpenAllocations` class by state; `UnknownError` mapping; `crash(*msg)`; `allocations.exit_class` and `exit_detail`; the exit record in one UPDATE before the purge; the `IdentifyTask` fix. Until F4 adds the init boundary, `ResourcesFailed` and `TaskError` classify as `WORKLOAD_FAILED`; after F4 they still do for allocations created before it | – |
+| F2 Ledger | `jobs` migration; `SubmitOptions` (with `expected_digest`) and `SubmitResult`; handler order with the plan check, side-effect-free `dry_run` (no evaluation yet), and the `validate_only` alias; `ADMISSION_IMMEDIATE` returns `UNIMPLEMENTED` until F3b; the single commit transaction; `dispatch` with its three callers and the unknown-commit branch; the cancel check after every start; `ACTIVE` experiments; restore through `command_state`, keyed on state, with the `PENDING` purge, launch write-ahead, the unlaunched-snapshot end, the mismatch failure, the scoped `start_time` stamp, and `Command.Start` with the stored ID; `Get`/`List`/`CancelSubmission`, with the GENERIC subtree and resume handling; `cancel_requested_at`, written by `CancelSubmission` and the existing kill endpoints (`KillCommand`, `KillShell`, `KillGenericTask`, `api.proto:1539,1490,2645`); `get_task.sql` fields; `DET_JOB_ID`, and `DET_CLUSTER_ID` on the agent RM, in task containers; `submission_protocol` (0 until F3a) | F1 |
 | F3a Evaluation | `TaskList.Clone`; `rp.Evaluate`; the static fit behind the old checks, keeping each call site's outcome; `dry_run` evaluation and its rate limit; `Unimplemented` on other RMs; `submission_protocol` 1 | F2 |
-| F3b Immediate admission | the tick decision and handler wait; IMMEDIATE restore; the provider-pool rejection | F3a |
-| F4 Init boundary and retries | `workload_started_at` and `allocations.reports_workload_start`; the internal RPC; `prep_container --workload-start` in every entrypoint; `max_system_retries` with a derived budget; the trial case; the one-transaction exit decision for commands and shells; blocked-node rows | F1, F3b |
-| F5 Devices and preflight | memory detection beside `device.Device`; `resources.accelerators`; `deviceSatisfied`; `cproto.Preflight`; the agent hook; `SpecRejected` mapping; `submission_protocol` 2 | F3a, F4 |
+| F3b Immediate admission | the tick decision and handler wait; `allocations.immediate` and the `ADMITTING` state; IMMEDIATE restore; the provider-pool rejection | F3a |
+| F4 Init boundary and retries | `workload_started_at` and `allocations.reports_workload_start`; the internal RPC; `prep_container --workload-start` in every entrypoint; `max_system_retries` with a derived budget; the trial case; the one-transaction exit decision for commands and shells, scoped to the ended allocation; per-allocation retry eligibility with closed workload-start posts; blocked-node rows | F1, F3b |
+| F5 Devices and preflight | memory detection beside `device.Device`; `resources.accelerators`; `deviceSatisfied`; `cproto.Preflight`; the agent hook; the agent-version gate; `SpecRejected` mapping; `submission_protocol` 2 | F3a, F4 |
 
 Master and agents are upgraded together. The fork keeps the reattach path compatible.
 `device.Device` and the reconnect compare are unchanged, because a mismatch shuts the agent
@@ -1002,16 +1070,24 @@ Each row is a required result. The owner is the PR that must prove it.
 | Retry still running 25 h after the first attempt ended | Still registered, killable, and holding its session token. | F4 |
 | Pre-upgrade running allocation fails in user code after the upgrade | `WORKLOAD_FAILED` with `init_boundary: "unknown"`, no `<task>.<n+1>`, and its side effect happens once; a legacy trial counts against `max_restarts`. | F4 |
 | Classifier over `reports_workload_start` × `workload_started_at` | Only (true, NULL) yields `WORKLOAD_INITIALIZATION_FAILED`. | F4 |
-| Workload-start post fails; post commits but the response is lost; image harness older than F4 | Hooks and command never run, class `WORKLOAD_INITIALIZATION_FAILED` with a retry in budget; `WORKLOAD_FAILED` with no retry; exit before hooks, `WORKLOAD_INITIALIZATION_FAILED`. | F4 |
+| Workload-start post fails; post commits but the response is lost; image harness older than F4 | Hooks and command never run, class `WORKLOAD_INITIALIZATION_FAILED` with a retry in budget; `WORKLOAD_FAILED` with no system retry (commands and shells do not rerun; a trial follows `max_restarts`); exit before hooks, `WORKLOAD_INITIALIZATION_FAILED`. | F4 |
 | Missing bind source (command, and experiment `host_path`) | One allocation, `WORKLOAD_INITIALIZATION_FAILED` with `spec_rejected` and the host path, no blocked-node row, and a trial in `ERROR` with `restarts` unchanged. A GPU preflight failure still blocks the node and retries. | F5 |
 | Relative checkpoint `storage_path` | Lands under the inherited `host_path`; with no `shared_fs` default, submit and `dry_run` fail completeness and create nothing. | F2, M3 |
-| Two IMMEDIATE requests race for the last slots | Exactly one is placed; the other ends `PLACEMENT_UNSATISFIED` (`busy`); neither is ever visible as queued. | F3b |
+| Two IMMEDIATE requests race for the last slots | Exactly one is placed; the other ends `PLACEMENT_UNSATISFIED` (`busy`); neither ever reads `QUEUED`. | F3b |
+| An IMMEDIATE GENERIC job's queued resume is `PENDING` at a restart | It restores as queued and never ends `PLACEMENT_UNSATISFIED`. | F3b |
 | `admission=immediate` before F3b; for any experiment | `admission_unsupported` and nothing created; `INVALID_ARGUMENT` at the dry run. | M3, F3b |
 | Multi-statement command after a failed prelude, for each source | `a; b`, `false \|\| b`, two lines, and `a & b; wait` exit with the prelude's status and run no user statement, under `sh -c` and `bash -lc`. | M3 |
 | Renderer shape | Exactly `<prelude> \|\| exit $?`, a newline, and the command; no `work_dir` in any config; `module:Class` rejected. | M3 |
 | `git` plan checks | Pinned SHA; `commit_not_on_ref`; partial clone rejected; `lfs_object_missing`; shell with `git` rejected. | M3 |
 | Context limits | A context counted at 99,614,718 bytes passes; one file of 99,614,719 bytes counts as 99,614,721 and returns `context_too_large` with no create call; an escaping symlink returns `unsafe_symlink`; an unchanged tree renders the same digest. | M3 |
 | Protocol gate | A master without `submission_protocol`, or below the minimum, is refused, whatever its release string. | M2 |
+| `COMMIT` succeeds but the handler sees an error, or the client disconnects after the commit; the master keeps running | The job starts without a restart, through the handler's re-check, a replay, or the sweep; concurrent replays register one allocation and one job. | F2 |
+| Cancel a paused GENERIC parent whose `no_pause` child runs and whose resume is unfinished, then restart | Every member ends `CANCELED`, the resume is not continued, and every member was authorized before any change. | F2 |
+| The template changes between plan and launch | `plan_changed`; a change to master defaults applies without it. | F2, M3 |
+| Crash after the exit record, after the purge, and before the exit decision | The record is complete; restore keeps the class and the retry budget. | F1, F4 |
+| A repeated exit of `.1` arrives after `.2` runs | `.2` keeps running; no `.3`; the budget is unchanged. | F4 |
+| Resource A posted workload start and ran a hook with a side effect; resource B then fails preflight | No system retry, and A's hook runs once; the class is `NODE_PREFLIGHT_FAILED`, and a trial follows `max_restarts`. | F4, F5 |
+| An agent older than F5 in a pool that receives `accelerators` requests | It is never placed for them; `dry_run` lists it as `agent_upgrade_pending`. | F5 |
 | Observation tools | `compute_resources` returns only projected fields and `observed_at`; `storage_check` always states its viewpoint. | M3 |
 
 **Carried from PR #1.** Four PR #1 behaviours must be re-verified in the layer that now
@@ -1021,7 +1097,7 @@ owns them:
 |---|---|
 | A GPU mismatch never runs user code | scheduler hard constraints, and the agent preflight before `CreateContainer` (F5) |
 | A failed prelude never runs later statements | the MCP renderer, `<prelude> \|\| exit $?` (M3) |
-| Plan drift never masquerades as the reviewed plan | the master's `expected_digest` check (F2), with SHA pinning in the plan (M3) |
+| Plan drift never masquerades as the reviewed plan | the master's `expected_digest` check over the request, code, and template (F2), with SHA pinning in the plan (M3); master defaults are observed, not bound |
 | Identity checks are never bypassed for convenience | master authz: replay re-checks read authz, and `CancelSubmission` authorizes from the database (F2) |
 
 ## Out of scope
