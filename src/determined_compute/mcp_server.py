@@ -35,7 +35,13 @@ from determined_compute.spec import (
 from determined_compute.storage import StorageAccessConfig, StorageError, StorageService
 
 PLACEMENT = "not evaluated; the scheduler decides after launch"
-ENDED_STATES = frozenset({"completed", "failed", "canceled", "deleted"})
+_ENDINGS = {
+    "completed": "completed",
+    "failed": "failed",
+    "canceled": "was cancelled",
+    "deleted": "was deleted",
+}
+ENDED_STATES = frozenset(_ENDINGS)
 _REQUEST_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 _OBSERVED = (
     "observed at plan time: master and pool defaults are not bound by the plan and apply as "
@@ -136,7 +142,7 @@ def explain(submission: Mapping[str, Any]) -> str:
             if exit_class is None
             else _EXIT_CLASSES.get(exit_class, f"Its exit class is {exit_class}.")
         )
-        return f"The job {state}. {text}"
+        return f"The job {_ENDINGS[state]}. {text}"
     if state == "paused":
         return "The job is paused."
     latest = [task["allocations"][-1] for task in submission["tasks"] if task["allocations"]]
@@ -390,6 +396,7 @@ class Tools:
             except StorageError:
                 local = None  # nothing to observe; path code is unpinned either way
             return code_plan.plan_path(code.dir, local)
+        self.policy.mounts.to_host(code.repo, "code.repo")
         try:
             repository = self.storage.local_path(code.repo, "code.repo")
         except StorageError as exc:

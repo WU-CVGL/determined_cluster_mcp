@@ -284,9 +284,8 @@ def test_git_code_is_planned_only_through_a_local_mount(master, shared, repo):
     assert master.calls == []
 
 
-@needs_git
 def test_a_git_repo_outside_every_mount_is_refused(tools, master):
-    refused("invalid_storage_path", tools.plan, spec(code={"source": "git", "repo": "/elsewhere"}))
+    refused("path_not_mounted", tools.plan, spec(code={"source": "git", "repo": "/elsewhere"}))
     assert master.calls == []
 
 
@@ -413,7 +412,8 @@ def test_status_explains_the_job_and_names_its_request_id(tools, master):
         ({"state": "completed", "exit_class": "none"}, "The job completed. It ended without"),
         ({"state": "failed", "exit_class": "workload_failed"}, "'compute:'"),
         ({"state": "failed", "exit_class": "infrastructure_failed"}, "did not cause it"),
-        ({"state": "canceled", "exit_class": None}, "trial never started"),
+        ({"state": "canceled", "exit_class": None}, "The job was cancelled. No exit class"),
+        ({"state": "deleted", "exit_class": "none"}, "The job was deleted."),
         ({"state": "paused"}, "paused"),
         ({"state": "running", "kind": "experiment"}, "waits for the scheduler"),
     ],

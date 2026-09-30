@@ -6,8 +6,10 @@ from determined_compute.storage import StorageAccessConfig, StorageError, Storag
 
 @pytest.fixture
 def setup(tmp_path):
-    shared = tmp_path / 'shared'; shared.mkdir()
-    data = shared / 'data'; data.mkdir()
+    shared = tmp_path / 'shared'
+    shared.mkdir()
+    data = shared / 'data'
+    data.mkdir()
     (data / 'reference.txt').write_text('reference')
     policy = Policy.from_dict({
         'mounts': [
@@ -23,7 +25,8 @@ def setup(tmp_path):
 @pytest.mark.parametrize('dry_run', [True, False])
 def test_readonly_upload_rejected_before_transport(setup, tmp_path, monkeypatch, mode, dry_run):
     policy, _, data = setup
-    source = tmp_path / 'source'; source.mkdir()
+    source = tmp_path / 'source'
+    source.mkdir()
     config = StorageAccessConfig.from_dict({'mode': mode, 'ssh': {'host': 'example-login'}})
     storage = StorageService(policy, config)
     monkeypatch.setattr(storage, '_run', lambda *a, **kw: pytest.fail('transport called'))
@@ -48,7 +51,8 @@ def test_readonly_check_is_policy_aware_and_fetch_allowed(setup, tmp_path):
 def test_shared_aliases_do_not_bypass_readonly_policy(setup, tmp_path):
     policy, shared, data = setup
     storage = StorageService(policy, StorageAccessConfig())
-    source = tmp_path / 'source'; source.mkdir()
+    source = tmp_path / 'source'
+    source.mkdir()
     assert storage.check('/work/data')['read_only'] is True
     with pytest.raises(StorageError, match='read-only'):
         storage.sync(str(source), '/work/data/output', False)
@@ -60,7 +64,8 @@ def test_shared_aliases_do_not_bypass_readonly_policy(setup, tmp_path):
 
 @pytest.mark.parametrize('existing', [True, False])
 def test_fetch_cannot_write_through_readonly_subdirectory_mapping(tmp_path, existing):
-    mapped = tmp_path / 'mounted-subdir'; mapped.mkdir()
+    mapped = tmp_path / 'mounted-subdir'
+    mapped.mkdir()
     (mapped / 'reference.txt').write_text('reference')
     target = mapped / 'download'
     if existing:
