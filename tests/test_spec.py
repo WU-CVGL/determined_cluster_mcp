@@ -378,13 +378,14 @@ def delivery(repo: str, checkout: str = CHECKOUT) -> str:
     root = "/run/determined/code"
     return (
         "( fail() { printf '%s\\n' \"compute: git code delivery failed: $1\" >&2; exit 1; }; "
-        'export GIT_COMPUTE_UNSET=1 && eval "$(env | sed -n '
+        'export GIT_COMPUTE_UNSET=1 && eval "$(env | LC_ALL=C sed -n '
         "'s/^\\(GIT_[A-Za-z0-9_]*\\)=.*/unset \\1 \\&\\&/p') :\" "
         '&& test -z "${GIT_COMPUTE_UNSET+x}" '
         "|| fail 'cannot unset the GIT_ variables; the image needs env and sed'; "
-        "export HOME=/dev/null/home XDG_CONFIG_HOME=/dev/null/home GIT_CONFIG_NOSYSTEM=1; "
-        f"git -c safe.directory={repo} clone -q --shared --no-checkout -- {repo} {root} "
-        "|| fail 'cannot clone the repository'; "
+        "export HOME=/dev/null/home XDG_CONFIG_HOME=/dev/null/home GIT_CONFIG_NOSYSTEM=1 "
+        "GIT_ATTR_NOSYSTEM=1 || fail 'cannot isolate git from user and system config'; "
+        f"git -c safe.directory={repo} clone -q --template= --shared --no-checkout -- {repo} "
+        f"{root} || fail 'cannot clone the repository'; "
         f"{checkout}checkout -q --detach {SHA} || fail 'cannot check out {SHA}'; "
         f'test "$(git -C {root} rev-parse --show-toplevel)" = "$(cd -- {root} && pwd -P)" '
         f"|| fail 'the work tree is not {root}'; "
@@ -396,9 +397,10 @@ def contained(root: str) -> str:
     """The physical workdir check that follows entering a workdir below ``root``, quoted."""
 
     return (
-        f' && {{ test "$(r=$(cd -- {root} && pwd -P) && r=${{r%/}} && case "$(pwd -P)/" in '
-        '("$r"/*) echo in;; esac)" = in || { printf \'compute: the workdir resolves to %s, '
-        'outside the code root\\n\' "$(pwd -P)" >&2; false; }; }'
+        f' && {{ test "$(r=$(cd -- {root} && pwd -P && echo .) && r=${{r%?.}} && r=${{r%/}} '
+        '&& p=$(pwd -P && echo .) && p=${p%?.} && case "$p/" in ("$r"/*) echo in;; esac)" = in '
+        "|| { printf 'compute: the workdir resolves to %s, outside the code root\\n' "
+        '"$(pwd -P)" >&2; false; }; }'
     )
 
 
@@ -806,7 +808,8 @@ def test_context_prelude_enters_the_extracted_root(
 def _linked_code(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
 ) -> Tuple[str, Optional[str], Path]:
-    """Code with pkg/sub, a link alias -> pkg, and two links to a directory beside the root.
+    """Code with pkg/sub, a link alias -> pkg, two links to a directory beside the root, and a
+    link to a sibling whose name extends the root's.
 
     Returns the location and commit to render with, and the code root in the container.
     """
@@ -824,6 +827,9 @@ def _linked_code(
     (tree / "pkg" / "sub" / "keep").write_text("")  # git records no empty directory
     os.symlink(outside, tree / "external")
     os.symlink("../outside", tree / "up")
+    # A sibling whose name extends the root's: a string-prefix check would take it as inside.
+    (root.parent / (root.name + "-private")).mkdir()
+    os.symlink("../" + root.name + "-private", tree / "sibling")
     os.symlink("pkg", tree / "alias")
     if source != "git":
         return str(root), SHA if source == "context" else None, root
@@ -838,7 +844,7 @@ SOURCES = ["path", "context", pytest.param("git", marks=needs_git)]
 
 
 @pytest.mark.parametrize("shell", SHELLS)
-@pytest.mark.parametrize("workdir", ["external", "up", "external/sub"])
+@pytest.mark.parametrize("workdir", ["external", "up", "external/sub", "sibling"])
 @pytest.mark.parametrize("source", SOURCES)
 def test_a_workdir_outside_the_code_root_runs_no_user_statement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell: Shell, workdir: str, source: str
@@ -884,17 +890,17 @@ def test_a_workdir_through_an_in_tree_symlink_runs(
         commit=commit,
         workdir=workdir,
     )
-    # The check's variable must not reach the command.
+    # The check's variables must not reach the command.
     command = (
         f"pwd -P > {shlex.quote(str(marks / 'pwd'))}; "
-        f"printf %s \"${{r-unset}}\" > {shlex.quote(str(marks / 'r'))}"
+        f"printf %s \"${{r-unset}} ${{p-unset}}\" > {shlex.quote(str(marks / 'r'))}"
     )
 
     result = run_shell(shell, render_entrypoint(prelude, command), env, tmp_path)
 
     assert result.returncode == 0, result.stderr
     assert (marks / "pwd").read_text().strip() == os.path.realpath(root / workdir)
-    assert (marks / "r").read_text() == "unset"
+    assert (marks / "r").read_text() == "unset unset"
 
 
 @pytest.mark.parametrize("shell", SHELLS)
@@ -914,6 +920,69 @@ def test_a_path_dir_may_itself_be_a_symlink(tmp_path: Path, shell: Shell, workdi
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == os.path.realpath(real / workdir)
+
+
+# $(...) drops trailing newlines, so a root and a directory that differ only by one would
+# compare equal without the check's sentinel.
+NEWLINE_CASES = {
+    # The workdir leads to a sibling named as the root plus a newline.
+    "sibling-with-newline": ("app", "app\n", False),
+    # The root's name ends in a newline, and the workdir leads to the same name without it.
+    "root-with-newline": ("app\n", "app", False),
+    # A real directory inside a root whose name ends in a newline.
+    "inside-root-with-newline": ("app\n", None, True),
+}
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("case", sorted(NEWLINE_CASES))
+def test_the_workdir_check_keeps_trailing_newlines(tmp_path: Path, shell: Shell, case: str) -> None:
+    root_name, target_name, inside = NEWLINE_CASES[case]
+    env = isolated_env(tmp_path)
+    shared = tmp_path / "shared"
+    root = shared / root_name
+    (root / "pkg").mkdir(parents=True)
+    workdir = "pkg"
+    if target_name is not None:
+        (shared / target_name).mkdir()
+        os.symlink(shared / target_name, root / "ext")
+        workdir = "ext"
+    marks = tmp_path / "marks"
+    marks.mkdir()
+    prelude = render_prelude(
+        "path", output_dir=str(tmp_path / "out"), location=str(root), workdir=workdir
+    )
+    command = f"pwd -P > {shlex.quote(str(marks / 'pwd'))}"
+
+    result = run_shell(shell, render_entrypoint(prelude, command), env, tmp_path)
+
+    if inside:
+        assert result.returncode == 0, result.stderr
+        assert (marks / "pwd").read_text() == os.path.realpath(root / "pkg") + "\n"
+    else:
+        assert result.returncode == 1, result.stderr
+        assert sorted(marks.iterdir()) == []
+        # The message's own $(pwd -P) drops the trailing newline.
+        target = os.path.realpath(shared / target_name).rstrip("\n")
+        assert compute_lines(result) == [
+            f"compute: the workdir resolves to {target}, outside the code root"
+        ]
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_a_path_dir_may_be_the_filesystem_root(tmp_path: Path, shell: Shell) -> None:
+    # The resolved root is then /, whose slash the check strips so the pattern needs only one.
+    env = isolated_env(tmp_path)
+    (tmp_path / "pkg").mkdir()
+    workdir = os.path.join(os.path.realpath(tmp_path), "pkg").lstrip("/")
+    prelude = render_prelude(
+        "path", output_dir=str(tmp_path / "out"), location="/", workdir=workdir
+    )
+
+    result = run_shell(shell, render_entrypoint(prelude, "pwd -P"), env, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == os.path.realpath(tmp_path / "pkg")
 
 
 def _source_repository(tmp_path: Path, env: Dict[str, str]) -> Tuple[Path, str]:
@@ -1113,6 +1182,255 @@ def test_git_delivery_fails_closed_without_sed(
         "the image needs env and sed"
     ]
     assert sorted(marks.iterdir()) == [] and not root.exists()
+
+
+def _wrapped_git(tmp_path: Path, env: Dict[str, str], body: str) -> Dict[str, str]:
+    """Return ``env`` with a git first on PATH that runs ``body``, with $real the real git.
+
+    The delivery calls it after cleaning the environment and config, so it stands in for what
+    the image's own git or its compiled-in defaults would do.
+    """
+
+    real = shutil.which("git", path=env["PATH"])
+    assert real is not None
+    tools = tmp_path / "wrapped-git"
+    tools.mkdir()
+    wrapper = tools / "git"
+    wrapper.write_text(f"#!/bin/sh\nreal={shlex.quote(real)}\n{body}")
+    wrapper.chmod(0o755)
+    return {**env, "PATH": os.pathsep.join([str(tools), env["PATH"]])}
+
+
+# What an image's default template directory can seed in a clone. None of it needs a variable
+# or a config file that the delivery cleans, and each leaves HEAD and the work tree in place.
+CLONE_TEMPLATES = {
+    "post-checkout-hook": {
+        "hooks/post-checkout": "#!/bin/sh\nprintf \"print('hooked')\\n\" > main.py\n",
+    },
+    "smudge-filter": {
+        "config": '[filter "evil"]\n\tsmudge = sed s/pinned/smudged/\n',
+        "info/attributes": "* filter=evil\n",
+    },
+    "attributes": {"info/attributes": "*.py text eol=crlf\n"},
+    "sparse-checkout": {
+        "config": "[core]\n\tsparseCheckout = true\n",
+        "info/sparse-checkout": "/pkg/\n",
+    },
+    "replace-ref": {"refs/replace/{pinned}": "{later}\n"},
+}
+
+
+@needs_git
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("template", sorted(CLONE_TEMPLATES))
+def test_git_delivery_takes_nothing_from_a_clone_template(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell: Shell, template: str
+) -> None:
+    root = _git_root(tmp_path, monkeypatch)
+    env = git_env(tmp_path)
+    repo, pinned = _source_repository(tmp_path, env)
+    later = git(env, repo, "rev-parse", "HEAD")
+    templates = tmp_path / "templates"
+    for name, content in CLONE_TEMPLATES[template].items():
+        path = templates / name.format(pinned=pinned)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content.format(later=later))
+        path.chmod(0o755)
+    # Unsetting GIT_TEMPLATE_DIR and hiding init.templateDir leave the compiled-in default.
+    task_env = _wrapped_git(
+        tmp_path, env, f'GIT_TEMPLATE_DIR={shlex.quote(str(templates))} exec "$real" "$@"\n'
+    )
+    prelude = render_prelude(
+        "git", output_dir=str(tmp_path / "out"), location=str(repo), commit=pinned
+    )
+
+    result = run_shell(shell, render_entrypoint(prelude, "true"), task_env, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert (root / "main.py").read_bytes() == b"print('pinned')\n"
+    assert (root / "pkg" / "data.txt").read_bytes() == b"first\n"
+    assert git(env, root, "rev-parse", "HEAD") == pinned
+    assert git(env, root, "status", "--porcelain") == ""
+
+
+@needs_git
+@pytest.mark.parametrize("shell", SHELLS)
+def test_git_delivery_ignores_system_attributes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell: Shell
+) -> None:
+    # An image's /etc/gitattributes can convert the checkout with no config at all, and no test
+    # may write there; every git the delivery runs must see GIT_ATTR_NOSYSTEM instead.
+    root = _git_root(tmp_path, monkeypatch)
+    env = git_env(tmp_path)
+    repo, pinned = _source_repository(tmp_path, env)
+    seen = tmp_path / "seen"
+    seen.mkdir()
+    task_env = _wrapped_git(
+        tmp_path, env, f'env > {shlex.quote(str(seen))}/$$\nexec "$real" "$@"\n'
+    )
+    task_env["GIT_ATTR_NOSYSTEM"] = "0"  # the task's own value must not reach the delivery
+    prelude = render_prelude(
+        "git", output_dir=str(tmp_path / "out"), location=str(repo), commit=pinned
+    )
+
+    result = run_shell(shell, render_entrypoint(prelude, "true"), task_env, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert (root / "main.py").exists()
+    calls = [path.read_text().splitlines() for path in seen.iterdir()]
+    assert len(calls) >= 2  # the clone and the checkout at least
+    for lines in calls:
+        assert {"GIT_ATTR_NOSYSTEM=1", "GIT_CONFIG_NOSYSTEM=1", "HOME=/dev/null/home"} <= set(lines)
+
+
+def _sed_splits_invalid_utf8() -> bool:
+    """Whether sed in a UTF-8 locale ends ``.*`` at an invalid byte, as GNU sed does."""
+
+    probe = subprocess.run(
+        ["sed", "-n", "s/^x.*/y/p"],
+        input=b"x\xe9z\n",
+        env={"PATH": os.environ.get("PATH", os.defpath), "LC_ALL": "C.UTF-8"},
+        capture_output=True,
+    )
+    return probe.returncode == 0 and probe.stdout != b"y\n"
+
+
+@needs_git
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize(
+    "value", [b"Jos\xe9; touch MARK", b"Ren\xe9 (ops)"], ids=["eval", "syntax"]
+)
+def test_git_delivery_unsets_values_that_are_invalid_in_the_locale(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell: Shell, value: bytes
+) -> None:
+    if shutil.which("sed") is None or not _sed_splits_invalid_utf8():
+        pytest.skip("sed does not stop at an invalid byte in C.UTF-8 here")
+    root = _git_root(tmp_path, monkeypatch)
+    env = git_env(tmp_path)
+    repo, pinned = _source_repository(tmp_path, env)
+    marks = tmp_path / "marks"
+    marks.mkdir()
+    # A Latin-1 name from the image or a startup hook, in a UTF-8 locale.
+    task_env = {**env, "LC_ALL": "C.UTF-8", "GIT_COMMITTER_NAME": os.fsdecode(value)}
+    prelude = render_prelude(
+        "git", output_dir=str(tmp_path / "out"), location=str(repo), commit=pinned
+    )
+    command = f"env > {shlex.quote(str(marks / 'env'))}"
+
+    result = run_shell(shell, render_entrypoint(prelude, command), task_env, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert not (tmp_path / "MARK").exists()
+    assert (root / "main.py").read_text() == "print('pinned')\n"
+    assert b"GIT_COMMITTER_NAME=" + value in (marks / "env").read_bytes().splitlines()
+
+
+@needs_git
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash is not installed")
+def test_git_delivery_fails_when_it_cannot_hide_the_user_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _git_root(tmp_path, monkeypatch)
+    env = git_env(tmp_path)
+    repo, pinned = _source_repository(tmp_path, env)
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    hook = hooks / "post-checkout"
+    hook.write_text("#!/bin/sh\nprintf \"print('hooked')\\n\" > main.py\n")
+    hook.chmod(0o755)
+    home = tmp_path / "user-home"
+    home.mkdir()
+    (home / ".gitconfig").write_text(f"[core]\n\thooksPath = {hooks}\n")
+    # A login profile can mark HOME readonly, so moving it away fails under bash -lc.
+    (home / ".bash_profile").write_text("readonly HOME\n")
+    task_env = {**isolated_env(tmp_path, "git"), "HOME": str(home)}
+    marks = tmp_path / "marks"
+    marks.mkdir()
+    prelude = render_prelude(
+        "git", output_dir=str(tmp_path / "out"), location=str(repo), commit=pinned
+    )
+
+    result = run_shell(
+        ("bash", "-lc"),
+        render_entrypoint(prelude, marker_command("sequence", marks)),
+        task_env,
+        tmp_path,
+    )
+
+    assert result.returncode != 0
+    assert compute_lines(result) == [
+        "compute: git code delivery failed: cannot isolate git from user and system config"
+    ]
+    assert sorted(marks.iterdir()) == [] and not root.exists()
+
+
+@needs_git
+@pytest.mark.parametrize("shell", SHELLS)
+def test_git_delivery_fails_when_the_work_tree_is_elsewhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell: Shell
+) -> None:
+    root = _git_root(tmp_path, monkeypatch)
+    env = git_env(tmp_path)
+    repo, pinned = _source_repository(tmp_path, env)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    # Nothing the delivery cleans can move the work tree any more; a git that points the new
+    # clone's core.worktree elsewhere stands in for whatever still could.
+    task_env = _wrapped_git(
+        tmp_path,
+        env,
+        '"$real" "$@" || exit\n'
+        f'case " $* " in *" clone "*) exec "$real" -C {shlex.quote(str(root))} '
+        f"config core.worktree {shlex.quote(str(elsewhere))};; esac\n",
+    )
+    marks = tmp_path / "marks"
+    marks.mkdir()
+    prelude = render_prelude(
+        "git", output_dir=str(tmp_path / "out"), location=str(repo), commit=pinned
+    )
+
+    result = run_shell(
+        shell, render_entrypoint(prelude, marker_command("sequence", marks)), task_env, tmp_path
+    )
+
+    assert result.returncode != 0
+    assert compute_lines(result) == [
+        f"compute: git code delivery failed: the work tree is not {root}"
+    ]
+    assert sorted(marks.iterdir()) == []
+
+
+@needs_git
+@pytest.mark.parametrize("shell", SHELLS)
+def test_git_delivery_fails_when_head_is_not_the_pinned_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell: Shell
+) -> None:
+    root = _git_root(tmp_path, monkeypatch)
+    env = git_env(tmp_path)
+    repo, pinned = _source_repository(tmp_path, env)
+    later = git(env, repo, "rev-parse", "HEAD")
+    # A git that checks out another commit after the delivery's own checkout stands in for
+    # anything that moves HEAD once the environment and templates are clean.
+    task_env = _wrapped_git(
+        tmp_path,
+        env,
+        '"$real" "$@" || exit\n'
+        f'case " $* " in *" checkout "*) exec "$real" -C {shlex.quote(str(root))} '
+        f"checkout -q --detach {later};; esac\n",
+    )
+    marks = tmp_path / "marks"
+    marks.mkdir()
+    prelude = render_prelude(
+        "git", output_dir=str(tmp_path / "out"), location=str(repo), commit=pinned
+    )
+
+    result = run_shell(
+        shell, render_entrypoint(prelude, marker_command("sequence", marks)), task_env, tmp_path
+    )
+
+    assert result.returncode != 0
+    assert compute_lines(result) == [f"compute: git code delivery failed: HEAD is not {pinned}"]
+    assert sorted(marks.iterdir()) == []
 
 
 def _lfs_repository(tmp_path: Path, env: Dict[str, str]) -> Tuple[Path, str]:

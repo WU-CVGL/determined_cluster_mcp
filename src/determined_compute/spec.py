@@ -54,18 +54,26 @@ _LFS_OPTIONS = (
 # GIT_* variables, which TaskSpec.env, the image or a startup hook may set for the workload;
 # with them, a clone and checkout can succeed while the code lands elsewhere. Delivery runs in
 # a subshell that unsets every exported GIT_* name and leaves the workload's environment alone.
-# POSIX sh cannot list exported names, so they come from `env`. sed emits only names made of
-# [A-Za-z0-9_], so the text is safe to eval, and a value spanning lines can at worst unset a
-# name that is not set. The probe proves that env and sed ran, since without them nothing
-# would be unset.
+# POSIX sh cannot list exported names, so they come from `env`. sed runs under LC_ALL=C, where
+# `.*` consumes the whole value whatever its bytes; in the task's locale a byte that is invalid
+# there would end the match early and leave the rest of the value in the text. So sed emits
+# only names made of [A-Za-z0-9_], the text is safe to eval, and a value spanning lines can at
+# worst unset a name that is not set. The probe proves that env and sed ran, since without
+# them nothing would be unset.
 _UNSET_GIT = (
     "export GIT_COMPUTE_UNSET=1"
-    " && eval \"$(env | sed -n 's/^\\(GIT_[A-Za-z0-9_]*\\)=.*/unset \\1 \\&\\&/p') :\""
+    " && eval \"$(env | LC_ALL=C sed -n 's/^\\(GIT_[A-Za-z0-9_]*\\)=.*/unset \\1 \\&\\&/p') :\""
     ' && test -z "${GIT_COMPUTE_UNSET+x}"'
 )
 # GIT_CONFIG_GLOBAL needs git 2.32, which an image may lack. Nothing can create a path below
 # /dev/null, and git reads a config file there as missing, so no user config applies either.
-_NO_GIT_CONFIG = "export HOME=/dev/null/home XDG_CONFIG_HOME=/dev/null/home GIT_CONFIG_NOSYSTEM=1"
+# The image's system attributes file (e.g. /etc/gitattributes) needs no config to re-encode a
+# file, convert its line endings or expand ident in the checkout, and neither the work-tree
+# nor the HEAD check can see that, so it is disabled too.
+_NO_GIT_CONFIG = (
+    "export HOME=/dev/null/home XDG_CONFIG_HOME=/dev/null/home GIT_CONFIG_NOSYSTEM=1"
+    " GIT_ATTR_NOSYSTEM=1"
+)
 # One line on stderr names the failed step; the subshell's status fails the prelude.
 _GIT_FAIL = "fail() { printf '%s\\n' \"compute: git code delivery failed: $1\" >&2; exit 1; }"
 _FULL_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
@@ -366,7 +374,7 @@ def _enter(root: str, workdir: str) -> str:
     ``workdir`` is checked only lexically, and a symlink along it, committed or on shared
     storage, can lead out of the delivered tree. So the physical directory is compared with
     the resolved root, which a path ``dir`` may itself reach through a symlink. The verdict
-    comes from one command substitution, so its variable never reaches the command, and a root
+    comes from one command substitution, so its variables never reach the command, and a root
     that does not resolve fails it. For '.', ``pwd -P`` is the resolved root by construction.
     """
 
@@ -374,11 +382,14 @@ def _enter(root: str, workdir: str) -> str:
     if workdir == ".":
         return f"cd -- {shlex.quote(root)}"
     quoted = shlex.quote(root)
-    # Stripping the slash of a root that resolves to / keeps the pattern from requiring two;
-    # it is a separate step because bash mismatches "${r%/}" inside a case pattern.
+    # $(...) drops trailing newlines, which a directory name may end in, so each path is read
+    # with a sentinel line that ${x%?.} removes along with pwd's own newline; the echo runs only
+    # after pwd succeeds. Stripping the slash of a root that resolves to / keeps the pattern
+    # from requiring two; it is a separate step because bash mismatches "${r%/}" inside a case
+    # pattern.
     verdict = (
-        f"r=$(cd -- {quoted} && pwd -P) && r=${{r%/}}"
-        ' && case "$(pwd -P)/" in ("$r"/*) echo in;; esac'
+        f"r=$(cd -- {quoted} && pwd -P && echo .) && r=${{r%?.}} && r=${{r%/}}"
+        ' && p=$(pwd -P && echo .) && p=${p%?.} && case "$p/" in ("$r"/*) echo in;; esac'
     )
     message = "compute: the workdir resolves to %s, outside the code root\\n"
     return (
@@ -438,13 +449,19 @@ def _git_delivery(repo: str, commit: str, uses_lfs: bool) -> str:
     steps = [
         _GIT_FAIL,
         f"{_UNSET_GIT} || {fail('cannot unset the GIT_ variables; the image needs env and sed')}",
-        _NO_GIT_CONFIG,
-        f"git -c safe.directory={source} clone -q --shared --no-checkout -- {source} {root}"
-        f" || {fail('cannot clone the repository')}",
+        # A login profile may mark HOME readonly; bash's export then fails and goes on.
+        f"{_NO_GIT_CONFIG} || {fail('cannot isolate git from user and system config')}",
+        # The template directory is the one source the cleanup above cannot reach: the image's
+        # compiled-in default can seed the clone's config, hooks, attributes and refs, such as
+        # a replace ref, a sparse checkout, a smudge filter or a post-checkout hook, that change
+        # the checked-out files while HEAD and the work tree stay put. An empty --template
+        # copies nothing, so it is disabled rather than checked afterwards.
+        f"git -c safe.directory={source} clone -q --template= --shared --no-checkout"
+        f" -- {source} {root} || {fail('cannot clone the repository')}",
         f"{lfs_env}git -C {root}{lfs} checkout -q --detach {commit}"
         f" || {fail(f'cannot check out {commit}')}",
-        # The environment is clean by now; these also catch what it cannot reach, such as a
-        # core.worktree that an image's clone template writes, and prove what the command runs.
+        # These catch a work tree or HEAD moved by anything left, such as the image's own git,
+        # and prove what the command runs.
         f'test "$(git -C {root} rev-parse --show-toplevel)" = "$(cd -- {root} && pwd -P)"'
         f" || {fail(f'the work tree is not {GIT_CODE_ROOT}')}",
         f'test "$(git -C {root} rev-parse HEAD)" = {commit} || {fail(f"HEAD is not {commit}")}',

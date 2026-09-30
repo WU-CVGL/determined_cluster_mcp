@@ -290,6 +290,27 @@ def test_a_commit_missing_from_a_partial_clone_contacts_no_remote(repo, tmp_path
     assert not contacted.exists()
 
 
+@pytest.mark.parametrize("scheme", ["file", "ext"])
+def test_the_repository_cannot_allow_a_transport_for_a_lazy_fetch(
+    repo, tmp_path, monkeypatch, scheme
+):
+    clone, contacted = _unreachable_partial_clone(repo, tmp_path)
+    if scheme == "ext":
+        # ext:: runs a command of the repository's choosing; this one only leaves the mark.
+        upload = git(clone, "config", "remote.origin.uploadpack")
+        git(clone, "config", "remote.origin.url", "ext::" + upload.replace(" ", "% "))
+    # git reads protocol.<scheme>.allow before protocol.allow, so this key in the repository's
+    # own config outranks the planner's -c protocol.allow=never.
+    git(clone, "config", f"protocol.{scheme}.allow", "always")
+    write(repo / "train.py", "print('later')\n")
+    later = commit_all(repo, "later")  # never fetched into the clone
+    _as_older_git(monkeypatch)
+
+    raises("revision_not_found", plan_context, clone, revision=later)
+
+    assert not contacted.exists()
+
+
 @pytest.fixture
 def git_reporting(tmp_path, monkeypatch):
     """Put first on PATH a git that reports a chosen version and otherwise runs the real one."""
@@ -306,10 +327,11 @@ def git_reporting(tmp_path, monkeypatch):
             f'exec {shlex.quote(real)} "$@"\n'
         )
         script.chmod(0o755)
-        code._git_version.cache_clear()
 
-    yield install
-    code._git_version.cache_clear()
+    # Forget a check that an earlier test passed with the real git; install() resets nothing,
+    # so a test may change the reported version between plans.
+    monkeypatch.setattr(code, "_git_version_ok", False)
+    return install
 
 
 @pytest.mark.parametrize(
@@ -346,6 +368,16 @@ def test_git_2_32_and_later_with_vendor_suffixes_are_accepted(repo, git_reportin
     git_reporting(reported)
 
     assert plan_git(repo, "/shared/repo", ROOTS).commit == git(repo, "rev-parse", "HEAD")
+
+
+def test_a_failed_version_check_is_not_remembered(repo, git_reporting):
+    git_reporting("git version 2.31.1")
+    raises("git_too_old", plan_context, repo)
+
+    # The operator upgrades git while the server keeps running.
+    git_reporting("git version 2.32.0")
+
+    assert plan_context(repo).commit == git(repo, "rev-parse", "HEAD")
 
 
 def test_the_git_version_is_read_once_per_process(repo, git_reporting, monkeypatch):
@@ -464,6 +496,7 @@ def test_git_runs_from_argv_with_a_clean_environment(repo, tmp_path, monkeypatch
         assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
         assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
         assert environment["GIT_TERMINAL_PROMPT"] == "0" and environment["LC_ALL"] == "C"
+        assert environment["GIT_ALLOW_PROTOCOL"] == ""
     resolve = next(argv for argv, _ in calls if "--verify" in argv)
     assert resolve[-2:] == ["--end-of-options", "main^{commit}"]
 
@@ -784,6 +817,31 @@ def test_working_tree_symlinks_count_toward_the_early_limit(repo):
     # The walk stops at the second link: 12 + 12 counted bytes are over 20.
     error = raises("context_too_large", plan_context, repo, include=["scripts"], limit=20)
     assert error.details == {**error.details, "reason": "content_size", "total": 24}
+
+
+def test_tracked_symlinks_count_before_any_content_is_read(repo, monkeypatch):
+    # The fixture's scripts/train-link.py is a tracked symlink; only its target pushes this over.
+    result = plan_context(repo)
+    regular = sum(len(f["content"]) // 4 * 3 for f in result.files if f["type"] == ord("0"))
+    assert regular < result.size
+
+    def unread(*_args, **_kwargs):
+        raise AssertionError("content was read before the size check")
+
+    # Not _read_blobs: _dirty calls it before the size check.
+    monkeypatch.setattr(code, "_read_contents", unread)
+    error = raises("context_too_large", plan_context, repo, limit=result.size - 1)
+    assert error.details["total"] == result.size
+
+
+def test_the_final_file_list_is_checked_on_its_own(repo, monkeypatch):
+    result = plan_context(repo)
+
+    # The early check agrees with the final one by construction; without it, the final one
+    # still counts the file list as the harness does.
+    monkeypatch.setattr(code, "check_context_size", lambda sizes, limit: 0)
+    error = raises("context_too_large", plan_context, repo, limit=result.size - 1)
+    assert error.details == {**error.details, "reason": "content_size", "total": result.size}
 
 
 def test_context_size_limit_applies_to_real_files(repo):

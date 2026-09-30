@@ -14,7 +14,6 @@ presented as one.
 from __future__ import annotations
 
 import base64
-import functools
 import hashlib
 import json
 import ntpath
@@ -201,8 +200,12 @@ def _git_environment() -> Dict[str, str]:
         "GIT_OPTIONAL_LOCKS": "0",
         # A partial clone would otherwise fetch missing objects over the network. Only git
         # 2.44 and later honour this, so it is defense in depth: _tree lists missing objects
-        # without fetching before anything reads them, and run_git allows no transport.
+        # without fetching before anything reads them, and no transport is allowed.
         "GIT_NO_LAZY_FETCH": "1",
+        # git checks this allow-list before any protocol.* config, so the repository's own
+        # protocol.<scheme>.allow cannot re-enable a transport, such as file:// to a promisor
+        # remote or ext:: running a command; an empty list allows none.
+        "GIT_ALLOW_PROTOCOL": "",
         # The container clone never fetches refs/replace, so the plan must not honour it either.
         "GIT_NO_REPLACE_OBJECTS": "1",
     }
@@ -226,9 +229,8 @@ def _execute(
         raise CodeError(f"git {name} timed out after {timeout:g}s", code="git_timeout") from exc
 
 
-@functools.lru_cache(maxsize=1)
 def _git_version() -> Tuple[Optional[Tuple[int, int]], str]:
-    """Return (major, minor) of the git on PATH, or None, and its version text; run once."""
+    """Return (major, minor) of the git on PATH, or None, and its version text."""
     completed = _execute(
         ["git", "--version"], _git_environment(), None, GIT_TIMEOUT_SECONDS, "--version"
     )
@@ -240,7 +242,15 @@ def _git_version() -> Tuple[Optional[Tuple[int, int]], str]:
     return (int(match.group(2)), int(match.group(3))), match.group(1).strip()[:100]
 
 
+# Set once a git on PATH meets MIN_GIT_VERSION. A failure is never remembered, so an operator
+# who upgrades git or fixes PATH does not have to restart a long-running server.
+_git_version_ok = False
+
+
 def _require_git() -> None:
+    global _git_version_ok
+    if _git_version_ok:
+        return
     version, found = _git_version()
     if version is None or version < MIN_GIT_VERSION:
         required = ".".join(map(str, MIN_GIT_VERSION))
@@ -249,6 +259,7 @@ def _require_git() -> None:
             code="git_too_old",
             details={"found": found, "required": required},
         )
+    _git_version_ok = True
 
 
 def run_git(
@@ -269,8 +280,9 @@ def run_git(
     """
     _require_git()
     # core.fsmonitor names a command in the repository's config; scanning is enough here.
-    # protocol.allow=never refuses every transport, so a lazy fetch that some command starts
-    # in a partial clone fails before it contacts anything, on any git version.
+    # protocol.allow=never refuses every transport that no protocol.<scheme>.allow names; with
+    # GIT_ALLOW_PROTOCOL, a lazy fetch that some command starts in a partial clone fails before
+    # it contacts anything, on any git version.
     argv = ["git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never"]
     if trust:
         # safe.directory is read only from protected config, which the fresh environment
