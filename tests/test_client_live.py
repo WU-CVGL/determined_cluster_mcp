@@ -12,6 +12,7 @@ import uuid
 
 import pytest
 
+from determined_compute import usage
 from determined_compute.client import APIError, Client
 
 MASTER = os.environ.get("DETERMINED_COMPUTE_LIVE_MASTER")
@@ -79,6 +80,9 @@ def test_plan_launch_replay_and_cancel(live):
     listed = api.list_submissions(kind="command", limit=20)["submissions"]
     assert job["job_id"] in {item["job_id"] for item in listed}
     assert isinstance(api.task_logs(record["entity_id"], tail=5), list)
+    measured = usage.summarize(api, record)
+    assert measured["allocations"][0]["allocation_id"].startswith(record["entity_id"])
+    assert measured["context_unavailable"] == []
 
     api.cancel_submission(job["job_id"])
     deadline = time.monotonic() + 30
