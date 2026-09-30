@@ -572,7 +572,10 @@ RBAC. A replay re-checks read authz on the stored job, so revoked access is hono
   `module:Class` experiment entrypoint is rejected, because any prefix breaks it
   (`launch.py:32-40`).
 - **Plan checks for `git`.** `compute_plan` runs read-only `git` against the repository
-  through the configured storage access (a local mount or SSH). `repo` must lie under a
+  through a local view of it: a local mount, mapped from the container path by the policy.
+  With SSH-only storage access the plan fails with `storage_not_local` and names the
+  remedies, a local mount or the `context` source; planning `git` over SSH is deferred.
+  `repo` must lie under a
   bind-mount target. `revision` must resolve to a commit, which is pinned as a full SHA.
   The pin fixes the code's identity; it does not keep the commit's objects available
   (risk 5).
@@ -879,7 +882,8 @@ and the container's allocation is classified without the init boundary.
 
 These designs are complete but not scheduled. Each is built only when real demand appears
 and it passes the complexity gate in [Principles](#principles), and each raises
-`submission_protocol` when it lands.
+`submission_protocol` when it lands. Planning `git` code over SSH-only storage access is
+also deferred; it needs no master change.
 
 ### Scheduling evaluation
 

@@ -340,7 +340,7 @@ owner 是已认证的用户，记录在 `jobs.owner_id` 中。MCP 的 `--owner` 
   - `path`：`mkdir -p -- OUT && cd -- DIR/WD && CHECK`。
 
   `CHECK` 是上文描述的 workdir 检查；当 `WD` 为 `.` 时省略它，因为此时的物理路径就是解析后的根目录。无论命令采用何种形式（`a; b`、`a & b`、多行），失败的前导命令都会在任何用户语句之前终止作业。在 `main` 上，`mkdir -p OUT && cd WD && CMD` 在失败后仍会运行后续语句，并可能以 0 退出（`compute/service.py:585-599`）。前导命令在初始化边界之后运行，因此它的失败分类为 `WORKLOAD_FAILED`，永远不会被系统重试；MCP 根据退出码和日志把它们报告为代码交付失败。shell 运行 `sshd`，没有命令，因此只接受 `context` 和 `path`，也没有前导命令。旧式的 `module:Class` experiment entrypoint 会被拒绝，因为任何前缀都会破坏它（`launch.py:32-40`）。
-- **`git` 的规划检查。** `compute_plan` 通过配置的存储访问方式（本地挂载或 SSH）对仓库运行只读的 `git`。`repo` 必须位于某个 bind mount 目标之下。`revision` 必须解析为一个提交，该提交被固定为完整 SHA。固定确定的是代码的身份，并不保证该提交的对象一直可用（风险 5）。该提交必须包含在某个分支或 tag 中（`commit_not_on_ref`），因为克隆通过 alternates 借用对象，而源仓库中的 `git gc` 会清除不可达的对象。partial clone 会被拒绝，因为延迟获取需要网络；linked worktree 和带 alternates 的仓库也会被拒绝，因为它们的对象可能位于容器无法解析的路径。缺失的 LFS 对象是错误（`lfs_object_missing`），submodule 会得到 `submodule_not_checked_out` 警告。镜像必须提供 `git`，容器用户必须能读取该仓库；规划无法检查这两点。
+- **`git` 的规划检查。** `compute_plan` 通过仓库的本地视图对其运行只读的 `git`：即由策略从容器路径映射得到的本地挂载。只有 SSH 存储访问时，规划以 `storage_not_local` 失败，并给出补救办法：使用本地挂载或 `context` 来源；通过 SSH 规划 `git` 已推迟。`repo` 必须位于某个 bind mount 目标之下。`revision` 必须解析为一个提交，该提交被固定为完整 SHA。固定确定的是代码的身份，并不保证该提交的对象一直可用（风险 5）。该提交必须包含在某个分支或 tag 中（`commit_not_on_ref`），因为克隆通过 alternates 借用对象，而源仓库中的 `git gc` 会清除不可达的对象。partial clone 会被拒绝，因为延迟获取需要网络；linked worktree 和带 alternates 的仓库也会被拒绝，因为它们的对象可能位于容器无法解析的路径。缺失的 LFS 对象是错误（`lfs_object_missing`），submodule 会得到 `submodule_not_checked_out` 警告。镜像必须提供 `git`，容器用户必须能读取该仓库；规划无法检查这两点。
 - **只读规划。** 规划以参数列表运行 `git`，不读取用户或系统配置，清空所有 filter 驱动并禁用延迟获取，因此不会运行仓库配置的任何命令。它像容器克隆一样通过 `safe.directory` 信任该仓库。规划需要 git 2.32 或更高版本，并在对任何仓库运行命令之前检查版本（`git_too_old`，指明找到的版本和要求的版本）。缺失的对象通过一个从不获取对象的列举找出，且在读取任何对象之前进行；所有传输协议都被拒绝，因此在规划期间，任何 git 版本都不会延迟获取或联系远程仓库。
 - **`context` 的规划检查。** 大小在最终载荷上计算，方式与 harness 的 `v1File_size` 完全相同（`harness/determined/common/v1file_utils.py:9-13`）：每条带内容的记录（包括符号链接的目标和 `.code-provenance.json`）计为其 base64 内容长度乘以 3/4，即其大小向上取整到 3 的倍数。总数超过 99,614,720 字节（`context.py:19-28`、`constants.py:5-18`）时返回 `context_too_large`，附带总大小、限制、最大的几个路径，以及改用 `git` 或共享存储的提示，且不发起创建调用。MCP 不模拟 master 对整个请求的限制，即 96 MiB 的 gRPC 消息限制（`master/internal/grpcutil/api.go:81-85`）：超限的请求会在 master 处失败，且不创建任何内容。解析后仍位于树内的相对符号链接会被保留；绝对的或越出树的符号链接是规划错误（`unsafe_symlink`），因为 harness 会在初始化时拒绝整个归档（`harness/determined/common/tarfile_utils.py:38-76`）。harness 会丢弃归档中的所有权信息，并把权限模式屏蔽为 0755（`tarfile_utils.py:78-89`）。命中硬性 secret 规则的文件从不上传，命中软性规则的文件只有在 `include` 中点名时才上传，两者都列为 `excluded`。LFS 指针会得到 `lfs_pointer` 警告，被跟踪的根目录 `startup-hook.sh`（Determined 会在命令之前 source 它）会得到 `startup_hook`。任何能读取该作业的人都能读取 context；在 basic authz 下，这意味着 experiment 的任何查看者（`experiment/authz_basic_impl.go:26-30`）。这就是 secret 规则只适用于 `context` 的原因。
 - **来源信息。** 配置携带 `COMPUTE_CODE_SOURCE`、`COMPUTE_CODE_ROOT`，对于 `git` 和 `context` 还有 `COMPUTE_CODE_COMMIT`。它们取代 `COMPUTE_WORKDIR` 和 `COMPUTE_CODE_REVISION`（`compute/service.py:426-431`）。`context` 还会附带 `.code-provenance.json`，内容为 `{commit, dirty, included, excluded, skipped}`，不含时间戳，因此未改变的树会渲染出相同的摘要。对于 `path`，规划报告它观察到的 HEAD 和 dirty 状态，并标注为未经验证。
@@ -540,7 +540,7 @@ master 和 agent 一起升级。fork 保持重新挂接路径的兼容性。`dev
 <a id="deferred-designs"></a>
 ## 推迟的设计
 
-以下设计已经完成，但尚未排期。每项只在出现真实需求、并通过[原则](#principles)中的复杂度门槛时才构建；每项落地时都会提高 `submission_protocol`。
+以下设计已经完成，但尚未排期。每项只在出现真实需求、并通过[原则](#principles)中的复杂度门槛时才构建；每项落地时都会提高 `submission_protocol`。通过仅有的 SSH 存储访问规划 `git` 代码也已推迟；它不需要 master 改动。
 
 <a id="scheduling-evaluation"></a>
 ### 调度评估
