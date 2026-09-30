@@ -362,6 +362,104 @@ def test_git_failures_map_to_stable_codes(repo, monkeypatch):
     raises("git_timeout", plan_git, repo, "/shared/repo", ROOTS)
 
 
+# workdir
+
+
+def _link_workdirs(repo, tmp_path):
+    """Links for workdir checks: two that lead outside, and three that stay inside."""
+    (tmp_path / "outside").mkdir(exist_ok=True)
+    os.symlink(tmp_path / "outside", repo / "external")
+    os.symlink("../outside", repo / "up")
+    os.symlink("docs", repo / "alias")
+    os.symlink("missing", repo / "dangling")
+    os.symlink("train.py", repo / "to-file")
+    write(repo / "a" / "b" / "keep", "")
+    os.symlink("../..", repo / "a" / "b" / "top")
+    os.symlink("a/b/top/..", repo / "chain-out")
+    return commit_all(repo, "links")
+
+
+@pytest.mark.parametrize(
+    "workdir, reason, path",
+    [
+        ("external", "outside", "external"),
+        ("up", "outside", "up"),
+        ("external/sub", "outside", "external"),
+        ("chain-out", "outside", "a/b/top"),
+        ("dangling", "missing", "missing"),
+        ("nope/deeper", "missing", "nope"),
+        ("train.py", "not_a_directory", "train.py"),
+        ("to-file", "not_a_directory", "train.py"),
+        ("docs/notes.md", "not_a_directory", "docs/notes.md"),
+    ],
+)
+def test_git_rejects_a_workdir_that_is_not_a_directory_inside_the_checkout(
+    repo, tmp_path, workdir, reason, path
+):
+    commit = _link_workdirs(repo, tmp_path)
+
+    error = raises("unsafe_workdir", plan_git, repo, "/shared/repo", ROOTS, workdir=workdir)
+
+    assert error.details == {"workdir": workdir, "reason": reason, "path": path}
+    assert commit in str(error)
+
+
+def test_git_accepts_a_workdir_through_an_in_tree_symlink(repo, tmp_path):
+    head = _link_workdirs(repo, tmp_path)
+    git(repo, "update-index", "--add", "--cacheinfo", f"160000,{head},vendor/lib")
+    git(repo, "commit", "-q", "-m", "submodule")
+
+    for workdir in (None, ".", "./", "docs", "alias", "a/b/top/docs", "vendor/lib"):
+        result = plan_git(repo, "/shared/repo", ROOTS, workdir=workdir)
+        assert result.commit == git(repo, "rev-parse", "HEAD"), workdir
+
+
+def test_context_rejects_a_workdir_that_is_not_a_directory_of_the_context(repo, tmp_path):
+    write(repo / "cache" / "sub" / "x.bin", "cached\n")
+    os.symlink("cache/sub", repo / "cached")
+    os.symlink("docs", repo / "alias")
+    os.symlink("missing", repo / "dangling")
+    os.symlink("train.py", repo / "to-file")
+    commit_all(repo, "links")
+
+    for workdir, reason, path in (
+        ("dangling", "missing", "missing"),
+        ("cached", "missing", "cache"),  # the cache rule drops the directory
+        ("to-file", "not_a_directory", "train.py"),
+        ("scripts/run.sh", "not_a_directory", "scripts/run.sh"),
+    ):
+        error = raises("unsafe_workdir", plan_context, repo, workdir=workdir)
+        assert error.details == {"workdir": workdir, "reason": reason, "path": path}
+    for workdir in (None, ".", "docs", "alias", "scripts"):
+        assert plan_context(repo, workdir=workdir).commit == git(repo, "rev-parse", "HEAD")
+
+
+def test_context_rejects_a_workdir_through_an_escaping_symlink(repo, tmp_path):
+    (tmp_path / "outside").mkdir()
+    os.symlink(tmp_path / "outside", repo / "external")
+    os.symlink("../outside", repo / "up")
+    commit_all(repo, "links")
+
+    # The harness would reject the whole context for either link, whatever the workdir.
+    for workdir in ("external", "up"):
+        error = raises("unsafe_symlink", plan_context, repo, workdir=workdir)
+        assert error.details["path"] == "external"
+
+
+@pytest.mark.parametrize("workdir", ["/abs", "a/../b", "..", "a\0b", 3])
+def test_a_malformed_workdir_is_rejected_before_git_runs(repo, monkeypatch, workdir):
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("git must not run")
+
+    monkeypatch.setattr(code.subprocess, "run", refuse)
+    for plan in (
+        lambda: plan_git(repo, "/shared/repo", ROOTS, workdir=workdir),
+        lambda: plan_context(repo, workdir=workdir),
+    ):
+        error = raises("unsafe_workdir", plan)
+        assert error.details == {"workdir": workdir, "reason": "invalid"}
+
+
 def test_path_source_is_unpinned():
     result = plan_path("/shared/work/run")
 

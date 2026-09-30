@@ -353,6 +353,16 @@ def delivery(repo: str, checkout: str = CHECKOUT) -> str:
     )
 
 
+def contained(root: str) -> str:
+    """The physical workdir check that follows entering a workdir below ``root``, quoted."""
+
+    return (
+        f' && {{ test "$(r=$(cd -- {root} && pwd -P) && r=${{r%/}} && case "$(pwd -P)/" in '
+        '("$r"/*) echo in;; esac)" = in || { printf \'compute: the workdir resolves to %s, '
+        'outside the code root\\n\' "$(pwd -P)" >&2; false; }; }'
+    )
+
+
 GIT_DELIVERY = delivery("/shared/repo")
 LFS_DELIVERY = delivery("/shared/repo", LFS_CHECKOUT)
 
@@ -373,12 +383,16 @@ LFS_DELIVERY = delivery("/shared/repo", LFS_CHECKOUT)
         (
             "src/pkg",
             False,
-            GIT_DELIVERY + " && mkdir -p -- /shared/out && cd -- /run/determined/code/src/pkg",
+            GIT_DELIVERY
+            + " && mkdir -p -- /shared/out && cd -- /run/determined/code/src/pkg"
+            + contained("/run/determined/code"),
         ),
         (
             "./src//pkg/",
             True,
-            LFS_DELIVERY + " && mkdir -p -- /shared/out && cd -- /run/determined/code/src/pkg",
+            LFS_DELIVERY
+            + " && mkdir -p -- /shared/out && cd -- /run/determined/code/src/pkg"
+            + contained("/run/determined/code"),
         ),
     ],
 )
@@ -399,9 +413,18 @@ def test_git_prelude_bytes(workdir: str, uses_lfs: bool, expected: str) -> None:
     "source, workdir, expected",
     [
         ("context", ".", "mkdir -p -- /shared/out && cd -- /run/determined/workdir"),
-        ("context", "src/pkg", "mkdir -p -- /shared/out && cd -- /run/determined/workdir/src/pkg"),
+        (
+            "context",
+            "src/pkg",
+            "mkdir -p -- /shared/out && cd -- /run/determined/workdir/src/pkg"
+            + contained("/run/determined/workdir"),
+        ),
         ("path", ".", "mkdir -p -- /shared/out && cd -- /shared/app"),
-        ("path", "src/pkg", "mkdir -p -- /shared/out && cd -- /shared/app/src/pkg"),
+        (
+            "path",
+            "src/pkg",
+            "mkdir -p -- /shared/out && cd -- /shared/app/src/pkg" + contained("/shared/app"),
+        ),
         (None, ".", "mkdir -p -- /shared/out"),
     ],
 )
@@ -443,12 +466,16 @@ def test_awkward_values_are_quoted() -> None:
     assert git == (
         f"{delivery(quoted_repo, LFS_CHECKOUT)} "
         f"&& mkdir -p -- {quoted_output} && cd -- '/run/determined/code/sub dir/\"q\"'"
+        + contained("/run/determined/code")
     )
     assert context == (
         f"mkdir -p -- {quoted_output} && cd -- '/run/determined/workdir/sub dir/\"q\"'"
+        + contained("/run/determined/workdir")
     )
     quoted_target = "'/srv/it'\"'\"'s a $repo; x\ny/sub dir/\"q\"'"
-    assert path == f"mkdir -p -- {quoted_output} && cd -- {quoted_target}"
+    assert path == (
+        f"mkdir -p -- {quoted_output} && cd -- {quoted_target}" + contained(quoted_repo)
+    )
 
 
 def test_context_repository_never_reaches_the_container() -> None:
@@ -735,6 +762,119 @@ def test_context_prelude_enters_the_extracted_root(
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == os.path.realpath(root / "src")
+
+
+def _linked_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> Tuple[str, Optional[str], Path]:
+    """Code with pkg/sub, a link alias -> pkg, and two links to a directory beside the root.
+
+    Returns the location and commit to render with, and the code root in the container.
+    """
+
+    if source == "git":
+        root = _git_root(tmp_path, monkeypatch)
+        tree = tmp_path / "repo"
+    elif source == "context":
+        root = tree = _context_root(tmp_path, monkeypatch)
+    else:
+        root = tree = tmp_path / "shared" / "app"
+    outside = root.parent / "outside"
+    (outside / "sub").mkdir(parents=True)
+    (tree / "pkg" / "sub").mkdir(parents=True)
+    (tree / "pkg" / "sub" / "keep").write_text("")  # git records no empty directory
+    os.symlink(outside, tree / "external")
+    os.symlink("../outside", tree / "up")
+    os.symlink("pkg", tree / "alias")
+    if source != "git":
+        return str(root), SHA if source == "context" else None, root
+    env = git_env(tmp_path)
+    git(env, tree, "init", "-q", "-b", "main")
+    git(env, tree, "add", "-A")
+    git(env, tree, "commit", "-q", "-m", "links")
+    return str(tree), git(env, tree, "rev-parse", "HEAD"), root
+
+
+SOURCES = ["path", "context", pytest.param("git", marks=needs_git)]
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("workdir", ["external", "up", "external/sub"])
+@pytest.mark.parametrize("source", SOURCES)
+def test_a_workdir_outside_the_code_root_runs_no_user_statement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell: Shell, workdir: str, source: str
+) -> None:
+    location, commit, root = _linked_code(tmp_path, monkeypatch, source)
+    env = git_env(tmp_path) if source == "git" else isolated_env(tmp_path)
+    marks = tmp_path / "marks"
+    marks.mkdir()
+    prelude = render_prelude(
+        source,  # type: ignore[arg-type]
+        output_dir=str(tmp_path / "out"),
+        location=location,
+        commit=commit,
+        workdir=workdir,
+    )
+
+    result = run_shell(
+        shell, render_entrypoint(prelude, marker_command("sequence", marks)), env, tmp_path
+    )
+
+    assert result.returncode == 1, result.stderr
+    assert sorted(marks.iterdir()) == []
+    assert compute_lines(result) == [
+        f"compute: the workdir resolves to {os.path.realpath(root / workdir)}, "
+        "outside the code root"
+    ]
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("workdir", ["alias", "alias/sub", "pkg/sub"])
+@pytest.mark.parametrize("source", SOURCES)
+def test_a_workdir_through_an_in_tree_symlink_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shell: Shell, workdir: str, source: str
+) -> None:
+    location, commit, root = _linked_code(tmp_path, monkeypatch, source)
+    env = git_env(tmp_path) if source == "git" else isolated_env(tmp_path)
+    marks = tmp_path / "marks"
+    marks.mkdir()
+    prelude = render_prelude(
+        source,  # type: ignore[arg-type]
+        output_dir=str(tmp_path / "out"),
+        location=location,
+        commit=commit,
+        workdir=workdir,
+    )
+    # The check's variable must not reach the command.
+    command = (
+        f"pwd -P > {shlex.quote(str(marks / 'pwd'))}; "
+        f"printf %s \"${{r-unset}}\" > {shlex.quote(str(marks / 'r'))}"
+    )
+
+    result = run_shell(shell, render_entrypoint(prelude, command), env, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert (marks / "pwd").read_text().strip() == os.path.realpath(root / workdir)
+    assert (marks / "r").read_text() == "unset"
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+@pytest.mark.parametrize("workdir", [".", "pkg", "alias"])
+def test_a_path_dir_may_itself_be_a_symlink(tmp_path: Path, shell: Shell, workdir: str) -> None:
+    env = isolated_env(tmp_path)
+    real = tmp_path / "volume" / "app"
+    (real / "pkg").mkdir(parents=True)
+    os.symlink("pkg", real / "alias")
+    shared = tmp_path / "shared-app"
+    os.symlink(real, shared)
+    prelude = render_prelude(
+        "path", output_dir=str(tmp_path / "out"), location=str(shared), workdir=workdir
+    )
+
+    result = run_shell(shell, render_entrypoint(prelude, "pwd -P"), env, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == os.path.realpath(real / workdir)
 
 
 def _source_repository(tmp_path: Path, env: Dict[str, str]) -> Tuple[Path, str]:

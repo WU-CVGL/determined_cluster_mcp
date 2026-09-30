@@ -335,9 +335,32 @@ def _full_sha(commit: Optional[str], source: str) -> str:
     return commit
 
 
-def _under(root: str, workdir: str) -> str:
+def _enter(root: str, workdir: str) -> str:
+    """Enter ``workdir`` below ``root`` and require it to resolve inside ``root``.
+
+    ``workdir`` is checked only lexically, and a symlink along it, committed or on shared
+    storage, can lead out of the delivered tree. So the physical directory is compared with
+    the resolved root, which a path ``dir`` may itself reach through a symlink. The verdict
+    comes from one command substitution, so its variable never reaches the command, and a root
+    that does not resolve fails it. For '.', ``pwd -P`` is the resolved root by construction.
+    """
+
     workdir = normalize_workdir(workdir)
-    return root if workdir == "." else posixpath.join(root, workdir)
+    if workdir == ".":
+        return f"cd -- {shlex.quote(root)}"
+    quoted = shlex.quote(root)
+    # Stripping the slash of a root that resolves to / keeps the pattern from requiring two;
+    # it is a separate step because bash mismatches "${r%/}" inside a case pattern.
+    verdict = (
+        f"r=$(cd -- {quoted} && pwd -P) && r=${{r%/}}"
+        ' && case "$(pwd -P)/" in ("$r"/*) echo in;; esac'
+    )
+    message = "compute: the workdir resolves to %s, outside the code root\\n"
+    return (
+        f"cd -- {shlex.quote(posixpath.join(root, workdir))}"
+        f' && {{ test "$({verdict})" = in'
+        f" || {{ printf '{message}' \"$(pwd -P)\" >&2; false; }}; }}"
+    )
 
 
 def render_prelude(
@@ -353,8 +376,8 @@ def render_prelude(
 
     ``location`` is the container repository for git and the directory for path. A context
     ignores it: its repository is a local path that must not reach the task config.
-    Submodules are never recursed. A failed git delivery prints one ``compute:`` line to
-    stderr.
+    Submodules are never recursed. A failed git delivery, or a workdir whose physical path
+    lies outside the code root, prints one ``compute:`` line to stderr.
     """
 
     if uses_lfs and source != "git":
@@ -367,16 +390,14 @@ def render_prelude(
     if source == "path":
         if commit is not None:
             raise ValueError("path code is never pinned")
-        target = _under(container_path(location or ""), workdir)
-        return f"{make_output} && cd -- {shlex.quote(target)}"
+        return f"{make_output} && {_enter(container_path(location or ''), workdir)}"
     if source not in ("git", "context"):
         raise ValueError(f"unknown code source: {source!r}")
     commit = _full_sha(commit, source)
     if source == "context":
-        return f"{make_output} && cd -- {shlex.quote(_under(CODE_ROOT, workdir))}"
-    enter = f"cd -- {shlex.quote(_under(GIT_CODE_ROOT, workdir))}"
+        return f"{make_output} && {_enter(CODE_ROOT, workdir)}"
     delivery = _git_delivery(container_path(location or ""), commit, uses_lfs)
-    return f"{delivery} && {make_output} && {enter}"
+    return f"{delivery} && {make_output} && {_enter(GIT_CODE_ROOT, workdir)}"
 
 
 def _git_delivery(repo: str, commit: str, uses_lfs: bool) -> str:

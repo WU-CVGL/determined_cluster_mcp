@@ -488,15 +488,21 @@ def under_root(path: str, roots: Iterable[str]) -> bool:
 
 
 def plan_git(
-    repo: PathLike, container_repo: str, mount_roots: Sequence[str], revision: str = "HEAD"
+    repo: PathLike,
+    container_repo: str,
+    mount_roots: Sequence[str],
+    revision: str = "HEAD",
+    *,
+    workdir: Optional[str] = None,
 ) -> GitCode:
     """Check a ``git`` source and pin its revision.
 
     ``repo`` is where the planner reads the repository; ``container_repo`` is the same
     repository as the container sees it, which must lie under one of the bind-mount
-    ``mount_roots``.
+    ``mount_roots``. A ``workdir`` must be a directory of the checkout at the pinned commit.
     """
     revision = _revision(revision)
+    workdir = _workdir(workdir)
     where = _container_path(container_repo, "repo")
     if not under_root(where, mount_roots):
         raise CodeError(
@@ -513,17 +519,23 @@ def plan_git(
     warnings: List[CodeWarning] = []
     candidates: Dict[str, List[str]] = {}
     gitlinks = []
-    for path, mode, oid, size in _tree(root, commit, trust=True):
+    tree = _tree(root, commit, trust=True)
+    for path, mode, oid, size in tree:
         if mode == "160000":
             gitlinks.append(path)
         elif mode in {"100644", "100755"} and size is not None and size < _LFS_POINTER_LIMIT:
             candidates.setdefault(oid, []).append(path)
     if gitlinks:
         warnings.append(_submodule_warning(gitlinks))
+    links = {path: oid for path, mode, oid, _ in tree if mode == "120000"} if workdir else {}
+    blobs = _read_blobs(root, [*candidates, *links.values()], trust=True)
+    if workdir is not None:
+        targets = {
+            path: blobs[oid].decode("utf-8", "surrogateescape") for path, oid in links.items()
+        }
+        _check_workdir(workdir, _checkout_kinds(tree), targets, f"commit {commit} of {where}")
     pointers = {
-        oid: pointer
-        for oid, content in _read_blobs(root, candidates, trust=True).items()
-        if (pointer := _lfs_pointer(content)) is not None
+        oid: pointer for oid in candidates if (pointer := _lfs_pointer(blobs[oid])) is not None
     }
     missing = sorted(
         path
@@ -577,6 +589,23 @@ def _observe(directory: Path) -> Tuple[Optional[str], Optional[bool]]:
         directory, "ls-files", "--others", "--exclude-standard", "--directory", "-z", "--", "."
     )
     return commit, bool(untracked) or _dirty(top, _tree(top, commit), _changed(directory, commit))
+
+
+def _checkout_kinds(tree: Sequence[Tuple[str, str, str, Optional[int]]]) -> Dict[str, int]:
+    """The tar type of every non-link path in a checkout of ``tree``.
+
+    A submodule is an empty directory there, since the container never checks it out.
+    """
+    kinds: Dict[str, int] = {}
+    for path, mode, _oid, _size in tree:
+        parts = path.split("/")
+        for index in range(1, len(parts)):
+            kinds["/".join(parts[:index])] = DIRTYPE
+        if mode == "160000":
+            kinds[path] = DIRTYPE
+        elif mode != "120000":
+            kinds[path] = REGTYPE
+    return kinds
 
 
 def _lfs_object_present(common: Path, oid: str, size: int) -> bool:
@@ -820,37 +849,122 @@ def _check_symlink(path: str, target: str) -> None:
         raise _unsafe_symlink(path, target, "points outside the tree")
 
 
+class _Unresolved(Exception):
+    """A path did not resolve inside the tree: ``reason`` at the component ``path``."""
+
+    def __init__(self, reason: str, path: str) -> None:
+        super().__init__(reason, path)
+        self.reason = reason
+        self.path = path
+
+
+def _resolve(
+    directory: Sequence[str],
+    relative: str,
+    symlinks: Mapping[str, str],
+    kinds: Optional[Mapping[str, int]] = None,
+    hops: int = 0,
+) -> List[str]:
+    """Resolve ``relative`` from ``directory`` through the tree's own links; return its parts.
+
+    A component naming a link is replaced by that link's target, relative to the directory
+    being walked, as path lookup does. Without ``kinds``, any other component is applied
+    lexically, which is at least as strict as a lookup; with it, every component must be a
+    directory there. Raises ``_Unresolved`` with reason ``outside``, ``loop``, ``missing`` or
+    ``not_a_directory``.
+    """
+    resolved = list(directory)
+    pending = list(reversed(relative.split("/")))
+    via = "/".join(directory)  # the last link followed, which any escape goes through
+    while pending:
+        part = pending.pop()
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if not resolved:
+                raise _Unresolved("outside", via)
+            resolved.pop()
+            continue
+        name = "/".join([*resolved, part])
+        target = symlinks.get(name)
+        if target is not None:
+            hops += 1
+            if hops > _MAX_SYMLINK_HOPS:
+                raise _Unresolved("loop", name)
+            if target.startswith("/"):
+                raise _Unresolved("outside", name)
+            via = name
+            pending.extend(reversed(target.split("/")))
+            continue
+        if kinds is not None and kinds.get(name) != DIRTYPE:
+            raise _Unresolved("missing" if name not in kinds else "not_a_directory", name)
+        resolved.append(part)
+    return resolved
+
+
 def _check_symlink_chains(symlinks: Mapping[str, str]) -> None:
     """Resolve every link through the tree's own links and require it to stay inside.
 
-    A component naming another link is replaced by that link's target, relative to the
-    directory being walked, as path lookup does. Any other component is applied lexically,
-    which is at least as strict as a lookup. The caller guarantees that no link is also a
-    parent directory of another entry, so each link's own directory is a real directory.
+    The caller guarantees that no link is also a parent directory of another entry, so each
+    link's own directory is a real directory.
     """
     for path in sorted(symlinks):
-        directory = path.split("/")[:-1]
-        pending = list(reversed(symlinks[path].split("/")))
-        hops = 1
-        while pending:
-            part = pending.pop()
-            if part in {"", "."}:
-                continue
-            if part == "..":
-                if not directory:
-                    raise _unsafe_symlink(path, symlinks[path], "resolves outside the tree")
-                directory.pop()
-                continue
-            target = symlinks.get("/".join([*directory, part]))
-            if target is None:
-                directory.append(part)
-                continue
-            hops += 1
-            if hops > _MAX_SYMLINK_HOPS:
-                raise _unsafe_symlink(
-                    path, symlinks[path], f"does not resolve within {_MAX_SYMLINK_HOPS} links"
-                )
-            pending.extend(reversed(target.split("/")))
+        try:
+            _resolve(path.split("/")[:-1], symlinks[path], symlinks, hops=1)
+        except _Unresolved as exc:
+            why = (
+                f"does not resolve within {_MAX_SYMLINK_HOPS} links"
+                if exc.reason == "loop"
+                else "resolves outside the tree"
+            )
+            raise _unsafe_symlink(path, symlinks[path], why) from None
+
+
+def _workdir(value: Optional[str]) -> Optional[str]:
+    """Normalize a workdir relative to the code root; None or '.' needs no check."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or "\0" in value or value.startswith("/"):
+        raise CodeError(
+            f"workdir {value!r} must be a path relative to the code root",
+            code="unsafe_workdir",
+            details={"workdir": value, "reason": "invalid"},
+        )
+    parts = [part for part in value.split("/") if part not in ("", ".")]
+    if ".." in parts:
+        raise CodeError(
+            f"workdir {value!r} must not contain '..'",
+            code="unsafe_workdir",
+            details={"workdir": value, "reason": "invalid"},
+        )
+    return "/".join(parts) or None
+
+
+_WORKDIR_PROBLEMS = {
+    "outside": "resolves outside the code through the symlink {path}",
+    "loop": f"does not resolve within {_MAX_SYMLINK_HOPS} links at {{path}}",
+    "missing": "needs {path}, which the code does not have",
+    "not_a_directory": "needs {path} to be a directory, and it is not",
+}
+
+
+def _check_workdir(
+    workdir: str, kinds: Mapping[str, int], symlinks: Mapping[str, str], where: str
+) -> None:
+    """Require ``workdir`` to be a directory of the code that resolves inside it.
+
+    The prelude checks the physical directory before the command runs; this finds the same
+    failure at plan time. A symlinked directory that stays inside the tree is fine.
+    """
+    try:
+        _resolve([], workdir, symlinks, kinds)
+    except _Unresolved as exc:
+        problem = _WORKDIR_PROBLEMS[exc.reason].format(path=exc.path)
+        raise CodeError(
+            f"workdir {workdir!r} {problem} at {where}",
+            code="unsafe_workdir",
+            details={"workdir": workdir, "reason": exc.reason, "path": exc.path},
+        ) from None
 
 
 # Context
@@ -1049,13 +1163,16 @@ def plan_context(
     *,
     secrets_file: Optional[PathLike] = None,
     limit: int = MAX_CONTEXT_SIZE,
+    workdir: Optional[str] = None,
 ) -> ContextCode:
     """Build a ``context`` source: tracked files at ``revision`` plus working-tree includes.
 
     Every path a rule drops is listed in ``excluded``. The payload is deterministic: an
-    unchanged tree yields identical file entries and the same ``content_digest``.
+    unchanged tree yields identical file entries and the same ``content_digest``. A
+    ``workdir`` must be a directory of the context.
     """
     revision = _revision(revision)
+    workdir = _workdir(workdir)
     # Normalized duplicates would walk the same tree again. Nested includes stay: naming a
     # directory restores what cache rules dropped below its parent.
     includes: Dict[str, str] = {}
@@ -1112,6 +1229,17 @@ def plan_context(
     sizes[PROVENANCE_PATH] = len(provenance_bytes)
     check_context_size(sizes, limit)
     contents = _read_contents(root, entries)
+    if workdir is not None:
+        # A submodule is skipped, so the context has no directory for it.
+        kinds = {path: entry.type for path, entry in entries.items() if entry.type != SYMTYPE}
+        kinds.update(dict.fromkeys(dirs, DIRTYPE))
+        kinds[PROVENANCE_PATH] = REGTYPE
+        targets = {
+            path: contents[path].decode("utf-8")
+            for path, entry in entries.items()
+            if entry.type == SYMTYPE
+        }
+        _check_workdir(workdir, kinds, targets, "the context")
     contents[PROVENANCE_PATH] = provenance_bytes
     size = check_context_size({path: len(contents[path]) for path in sizes}, limit)
 
