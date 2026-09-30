@@ -165,8 +165,12 @@ and `determined-compute snapshot REPO_DIR [--revision REV] [--include PATH]... [
 publish the exact tracked content of one git commit as a read-only working directory on
 shared storage, so repeated jobs reuse one copy instead of each copying the workspace.
 Configure `snapshots.root`, a container path below a writable mount but not the mount
-root, and optionally `snapshots.link_mode`. This release needs a local, writable view of
-the root; SSH-only access returns `configuration_required`. Preview is the default, as for
+root, and optionally `snapshots.link_mode`. This release needs a trusted, writable local
+view of the root, the same trust rule as launch-path checks: a `local_mounts` entry, or a
+profile root detected as a mount point on this machine. A same-named directory that is not a
+mount point, an unusable `local_mounts` entry, or SSH-only access returns
+`configuration_required`; map the root in `local_mounts`, to itself when the path is the
+same. Preview is the default, as for
 transfers.
 
 `repo_dir` is the top level of a git work tree on the machine running the service. The

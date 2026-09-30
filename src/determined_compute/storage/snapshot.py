@@ -748,15 +748,17 @@ def create_snapshot(
     includes = _string_list(include, "include", _MAX_INCLUDES, 4096)
     exclude_patterns = sorted(set(_string_list(exclude, "exclude", _MAX_PATTERNS, 256)))
     container_root, mount, host_root = storage._snapshot_mount()
-    local = (
-        storage._local_mapping(host_root, mount, write=True)
+    # Publish only through a view the launch checks also trust, so a snapshot can never land
+    # on a same-named directory of this machine instead of the cluster's storage.
+    local, reason = (
+        storage._launch_view(host_root, mount, write=True)
         if storage.config.mode != "ssh"
-        else None
+        else (None, "ssh_only_access")
     )
     if local is None:
         raise StorageError(
-            "snapshots need a local, writable view of snapshots.root; SSH-only access "
-            "is not supported",
+            f"snapshots need a trusted, writable local view of snapshots.root ({reason}); "
+            "map it in local_mounts, to itself when the path is the same",
             code="configuration_required",
         )
     root, mount_root = storage._safe_mapped_path(local, host_root)

@@ -159,8 +159,9 @@ launch 在查找 `request_id` 之后、检查容量之前执行同样的检查�
 launch 在容量检查之后、认领任务记录之前，以默认 umask 连同父目录创建每个目录：有可信本地视图时
 通过该视图创建，否则在 `auto` 或 `ssh` 模式下于已配置的 SSH 登录节点上执行 `mkdir -p`，两者都
 没有时返回 `configuration_required`。服务从不通过不可信的同名目录或不可用的 `local_mounts`
-条目创建目录。每次本地创建同样有 10 秒期限，超时返回可重试的 `storage_timeout`；期限过后才出现
-的目录会在重试时报告为 `created: false`。通过 SSH 创建受存储配置的 `timeout_seconds` 限制，超时
+条目创建目录。每次本地创建同样有 10 秒期限，超时返回可重试的 `storage_timeout`。期限只结束等待，
+不取消文件系统调用：迟到完成的创建仍会留下该目录，但不会记录或提交任何内容，重试时报告为
+`created: false`。通过 SSH 创建受存储配置的 `timeout_seconds` 限制，超时
 同样返回可重试的 `storage_timeout`。本身就是配置挂载根路径的目录从不创建：已存在的根路径报告为
 `created: false`，不存在时 launch 失败，通过 SSH 检查时返回 `invalid_storage_path`。新提交的结果增加
 `prepared_directories`，即 `{field, host_path, created}` 列表。服务从不删除任何内容。

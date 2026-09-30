@@ -94,6 +94,8 @@ def profile_for(tmp_path):
 
 def storage_for(tmp_path, link_mode="hardlink", **access):
     (tmp_path / "shared").mkdir(exist_ok=True)
+    shared = str(tmp_path / "shared")
+    access.setdefault("local_mounts", [{"host_path": shared, "local_path": shared}])
     config = StorageAccessConfig.from_dict(
         {"snapshots": {"root": "/shared/snapshots", "link_mode": link_mode}, **access}
     )
@@ -359,6 +361,29 @@ def test_hard_secret_rules_refuse_every_include(tmp_path, repo, path, skip):
         skipped["excluded"]
     )
     assert skipped["files"] == 5
+
+
+def test_every_hard_secret_rule_refuses_an_explicit_include(tmp_path, repo):
+    storage = storage_for(tmp_path)
+    for path in (".ssh/config", ".aws/credentials", ".config/gcloud/credentials.db", ".netrc",
+                 ".npmrc", ".pypirc", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"):
+        write(repo / path, "not-real\n")
+        with pytest.raises(StorageError) as refused:
+            storage.snapshot(str(repo), include=[path])
+        assert refused.value.code == "secret_like_include", path
+
+
+def test_snapshot_needs_a_trusted_local_view(tmp_path, repo):
+    shared = str(tmp_path / "shared")
+    missing = str(tmp_path / "unmounted")
+    for local_mounts in ([], [{"host_path": shared, "local_path": missing}]):
+        (tmp_path / "unmounted").mkdir(exist_ok=True)
+        (tmp_path / "unmounted").rmdir()
+        storage = storage_for(tmp_path, local_mounts=local_mounts)
+        with pytest.raises(StorageError) as refused:
+            storage.snapshot(str(repo), dry_run=False)
+        assert refused.value.code == "configuration_required"
+        assert not snapshot_root(tmp_path).exists()
 
 
 def test_an_explicit_include_overrides_soft_secret_rules(tmp_path, plain_repo):

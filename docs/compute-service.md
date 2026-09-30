@@ -185,8 +185,10 @@ with its parents and the default umask: through the trusted local view when one 
 otherwise with `mkdir -p` on the configured SSH login node in `auto` or `ssh` mode, and
 otherwise it fails with `configuration_required`. It never creates through an untrusted
 same-named directory or an unusable `local_mounts` entry. Each local creation has the same
-10-second deadline and otherwise fails with the retryable `storage_timeout`; a directory
-that appears after the deadline is reported with `created: false` on retry. Creation over
+10-second deadline and otherwise fails with the retryable `storage_timeout`. The deadline
+stops the wait, not the filesystem call: a creation that completes late still leaves the
+directory in place, although nothing is recorded or submitted, and a retry reports it with
+`created: false`. Creation over
 SSH is bounded by the storage `timeout_seconds` and likewise fails with the retryable
 `storage_timeout`. A directory that is itself a profile mount root is never created: an
 existing root is reported with `created: false`, and a missing one fails the launch, with

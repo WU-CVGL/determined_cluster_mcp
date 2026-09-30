@@ -169,8 +169,10 @@ Rsync 退出码 23 表示部分文件或属性未能传输，目标中可能已�
 和 `determined-compute snapshot REPO_DIR [--revision REV] [--include PATH]... [--exclude GLOB]... [--execute] [--verify]`
 把某个 git 提交中被跟踪的内容原样发布为共享存储上的只读工作目录，使重复运行的任务复用同一份
 副本，而不必每次复制工作区。需要配置 `snapshots.root`（可写挂载下、但不是挂载根目录的容器
-路径），`snapshots.link_mode` 可选。本版本要求快照根目录有本地可写视图；只有 SSH 访问时返回
-`configuration_required`。与传输一样，默认只预览。
+路径），`snapshots.link_mode` 可选。本版本要求快照根目录有可信的本地可写视图，信任规则与 launch 路径检查相同：
+`local_mounts` 条目，或在本机被检测为挂载点的配置根路径。不是挂载点的同名目录、不可用的
+`local_mounts` 条目或只有 SSH 访问时返回 `configuration_required`；请在 `local_mounts` 中映射该根
+路径，路径相同时映射到自身。与传输一样，默认只预览。
 
 `repo_dir` 是运行服务的机器上某个 git 工作树的顶层目录。revision 会解析为完整提交，文件从 git
 对象库而不是工作树读取，因此没有 include 时，快照就是该提交中被跟踪的内容减去下文的
