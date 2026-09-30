@@ -204,10 +204,45 @@ def test_overwrite_needs_the_policy_and_drops_ignore_existing(tmp_path, monkeypa
     monkeypatch.setattr(
         allowed, "_run", lambda argv, **k: calls.append(argv) or {"output": "", "truncated": False}
     )
-    assert transfer(allowed, overwrite=True)["overwrite"] is True
+    kept = ("--no-owner", "--no-group", "--no-perms", "--omit-dir-times")
+    replaced = transfer(allowed, overwrite=True)
+    assert (replaced["overwrite"], replaced["preserve_permissions"]) == (True, True)
     assert "--ignore-existing" not in calls[-1]
-    assert transfer(allowed)["overwrite"] is False
+    assert not set(kept) & set(calls[-1])
+    # Without overwrite, existing directories keep their mode, owner and times too.
+    added = transfer(allowed)
+    assert (added["overwrite"], added["preserve_permissions"]) == (False, False)
     assert "--ignore-existing" in calls[-1]
+    assert set(kept) <= set(calls[-1])
+
+
+@pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync is not installed")
+def test_real_transfers_without_overwrite_keep_existing_directory_modes(tmp_path):
+    source = tmp_path / "source"
+    (source / "sub").mkdir(parents=True)
+    (source / "sub" / "result.txt").write_text("new", encoding="utf-8")
+    source.chmod(0o777)
+    (source / "sub").chmod(0o777)
+    local_root = tmp_path / "client-mount"
+    shared = local_root / "task"
+    (shared / "sub").mkdir(parents=True)
+    shared.chmod(0o700)
+    (shared / "sub").chmod(0o700)
+    service = StorageService(profile(), local_config(local_root))
+
+    service.sync(str(source), "/work/task", dry_run=False)
+    assert (shared.stat().st_mode & 0o777, (shared / "sub").stat().st_mode & 0o777) == (
+        0o700,
+        0o700,
+    )
+    assert (shared / "sub" / "result.txt").read_text(encoding="utf-8") == "new"
+
+    download = tmp_path / "download"
+    download.mkdir(mode=0o700)
+    download.chmod(0o700)
+    service.fetch("/work/task", str(download), dry_run=False)
+    assert download.stat().st_mode & 0o777 == 0o700
+    assert (download / "sub" / "result.txt").read_text(encoding="utf-8") == "new"
 
 
 @pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync is not installed")
@@ -515,6 +550,14 @@ def test_remote_rsync_uses_secluded_args_and_safe_links(tmp_path, monkeypatch):
     for option in ("--no-owner", "--no-group", "--no-perms", "--omit-dir-times"):
         assert option in argv
     assert result["ssh_host"] == "storage.example"
+    # Permission preservation is on by default, and still off without overwrite.
+    ssh_only = {"mode": "ssh", "ssh": {"host": "storage.example"}}
+    preserving = StorageService(profile(), StorageAccessConfig.from_dict(ssh_only))
+    monkeypatch.setattr(
+        preserving, "_run", lambda argv, **kwargs: calls.append((argv, kwargs)) or {"output": ""}
+    )
+    assert preserving.sync(str(source), "/work/task", dry_run=True)["preserve_permissions"] is False
+    assert "--no-perms" in calls[-1][0] and "--omit-dir-times" in calls[-1][0]
     assert result["host_path"] == "/cluster/shared/task one"
     assert result["truncated"] is False
     assert result["preserve_permissions"] is False

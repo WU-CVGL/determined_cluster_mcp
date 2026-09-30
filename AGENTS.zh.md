@@ -6,7 +6,7 @@
 遵循调用方要求的范围，只阅读当前任务需要的路线：
 
 - 集群任务或存储操作：[Agent 工作流](docs/agent-workflow.zh.md)
-- 请求字段、工具、身份或恢复：[计算服务参考](docs/compute-service.zh.md)
+- TaskSpec 字段、工具、任务句柄或错误：[计算服务参考](docs/compute-service.zh.md)
 - 本地挂载、SSH 或文件传输：[共享存储访问](docs/shared-storage-access.zh.md)
 - 启动或运行故障：[故障排查](docs/troubleshooting.zh.md)
 

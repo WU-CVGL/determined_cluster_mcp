@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from pydantic import ValidationError
+
 from determined_compute import __version__, usage
 from determined_compute import code as code_plan
 from determined_compute.client import APIError, Client
@@ -57,9 +59,27 @@ _SUMMARY_KEYS = (
     "work_dir",
     "checkpoint_storage",
     "searcher",
+    "hyperparameters",
     "max_restarts",
     "workspace",
     "project",
+)
+_STORAGE_KEYS = frozenset(
+    {
+        "type",
+        "bucket",
+        "prefix",
+        "container",
+        "host_path",
+        "container_path",
+        "storage_path",
+        "checkpoint_path",
+        "tensorboard_path",
+        "propagation",
+        "save_experiment_best",
+        "save_trial_best",
+        "save_trial_latest",
+    }
 )
 _MASTER_WARNINGS = {
     "current_slots_exceeded": (
@@ -192,6 +212,13 @@ def _effective_summary(effective: Optional[Mapping[str, Any]]) -> Dict[str, Any]
     for key in _SUMMARY_KEYS:
         if key in effective:
             summary[key] = effective[key]
+    storage = summary.get("checkpoint_storage")
+    if isinstance(storage, Mapping):
+        # The master masks only S3 keys, and a workspace default may hold an account key in a
+        # connection string or an endpoint URL, so only named, credential-free fields pass.
+        summary["checkpoint_storage"] = {
+            key: value for key, value in storage.items() if key in _STORAGE_KEYS
+        }
     environment = effective.get("environment")
     if isinstance(environment, Mapping):
         summary["environment"] = {
@@ -313,30 +340,21 @@ class Tools:
         key = _request_id(request_id)
         if not isinstance(request_digest, str) or not request_digest:
             raise ValueError("request_digest must be the digest that compute_plan returned")
-        # A revision pinned to a full SHA resolves to itself, so this renders the planned commit.
-        planned, _resources, request = self._render(spec)
+        notes: List[str] = []
         try:
-            result = self.client.submit(
-                request.kind,
-                request.config,
-                files=request.files,
-                workspace_id=request.workspace_id,
-                idempotency_key=key,
-                expected_digest=request_digest,
+            # A revision pinned to a full SHA resolves to itself, so this renders the planned
+            # commit.
+            planned, _resources, request = self._render(spec)
+        except (ValueError, APIError) as exc:
+            if getattr(exc, "retryable", False):
+                raise  # the master is unreachable, so it cannot be asked either
+            result = self._replay_unrendered(spec.kind, key, request_digest, exc)
+            notes.append(
+                f"the spec no longer renders ({getattr(exc, 'code', 'invalid_request')}), so this "
+                "is the job an earlier launch created; a new job needs a new plan"
             )
-        except APIError as exc:
-            if exc.code != "plan_changed":
-                raise
-            raise APIError(
-                "the request differs from the plan, so nothing was created; review the new "
-                "commit and content, then plan again",
-                code="plan_changed",
-                details={
-                    **exc.details,
-                    "commit": getattr(planned, "commit", None),
-                    "content_digest": getattr(planned, "content_digest", None),
-                },
-            ) from None
+        else:
+            result = self._create(request, key, request_digest, planned)
         launched: Dict[str, Any] = {
             "job_id": result["job_id"],
             "request_id": key,
@@ -344,6 +362,7 @@ class Tools:
             "outcome": result["outcome"],
             "submitted_at": None,
             "state": None,
+            "explanation": None,
         }
         # The create answer carries no time, and a replay's outcome is the one stored at submit,
         # even for a job that has since ended; a failed read must not hide the job it created.
@@ -351,12 +370,70 @@ class Tools:
             submission = self.client.get_submission(result["job_id"])
             launched["submitted_at"] = submission["submitted_at"]
             launched["state"] = submission["state"]
+            # An active experiment reads running while its trials wait for resources.
+            launched["explanation"] = explain(submission)
         except APIError as exc:
-            launched["note"] = (
+            notes.append(
                 f"the job exists, but its submission could not be read ({exc.code}); "
                 "compute_status reports it"
             )
+        if notes:
+            launched["note"] = "; ".join(notes)
         return launched
+
+    def _create(
+        self, request: CreateRequest, key: str, digest: str, planned: PlannedCode
+    ) -> Dict[str, Any]:
+        try:
+            return self.client.submit(
+                request.kind,
+                request.config,
+                files=request.files,
+                workspace_id=request.workspace_id,
+                idempotency_key=key,
+                expected_digest=digest,
+            )
+        except APIError as exc:
+            if exc.code != "plan_changed":
+                raise
+            # The master's new digest is withheld, so content that differs from the plan goes
+            # through compute_plan, and its review, before any launch.
+            raise APIError(
+                "the request differs from the plan, so nothing was created; review the new "
+                "commit and content, then plan again",
+                code="plan_changed",
+                details={
+                    "commit": getattr(planned, "commit", None),
+                    "content_digest": getattr(planned, "content_digest", None),
+                },
+            ) from None
+
+    def _replay_unrendered(
+        self, kind: str, key: str, digest: str, error: Exception
+    ) -> Dict[str, Any]:
+        """The job an earlier launch created under ``key``, when the spec no longer renders.
+
+        A retry after a lost response must return that job even if the tree, the policy or a
+        workspace changed since, so the master is asked before ``error`` is reported. The error
+        then names the request_id, and says so when the master could not tell.
+        """
+
+        details = {**(getattr(error, "details", None) or {}), "request_id": key}
+        try:
+            found = self.client.replay(kind, key, digest)
+        except APIError as probe:
+            if probe.code == "key_conflict":
+                raise
+            error.details = {**details, "replay": probe.code}  # type: ignore[attr-defined]
+            error.args = (
+                f"{error}; whether an earlier launch created a job under this request_id is "
+                f"unknown ({probe.code}), so check compute_list before planning again",
+            )
+            raise error from None
+        if found is None:
+            error.details = details  # type: ignore[attr-defined]
+            raise error
+        return found
 
     def _render(self, spec: TaskSpec) -> Tuple[PlannedCode, Resources, CreateRequest]:
         resources = self.policy.resources(
@@ -406,7 +483,9 @@ class Tools:
             if exc.code != "storage_not_local":
                 raise
             raise StorageError(
-                f"{exc}; this release plans git code only through a local mount, not over SSH",
+                f"{exc}; this release plans git code only through a local mount, not over SSH, "
+                "so map the repository's root in local_mounts with storage mode auto or local, "
+                "or send the code as context",
                 code="storage_not_local",
             ) from None
         return code_plan.plan_git(
@@ -551,19 +630,43 @@ def create_server(tools: Tools) -> Any:
 
     try:
         from mcp.server import MCPServer
-        from mcp.server.mcpserver.exceptions import ToolError
+        from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
         from mcp.types import ToolAnnotations
     except ImportError as exc:  # pragma: no cover - exercised without the optional extra
         raise RuntimeError("MCP support is not installed; install determined-compute[mcp]") from exc
 
-    server = MCPServer("determined-compute", version=__version__, instructions=INSTRUCTIONS)
+    def envelope(exc: BaseException) -> str:
+        return json.dumps(tool_error(exc), sort_keys=True, separators=(",", ":"))
+
+    class Server(MCPServer):
+        async def call_tool(self, name: str, arguments: Dict[str, Any], context: Any = None) -> Any:
+            # The framework validates the arguments, a TaskSpec included, before a tool runs;
+            # its refusal gets the envelope of every other error, without the rejected values.
+            try:
+                return await super().call_tool(name, arguments, context)
+            except ToolError as exc:
+                cause = exc.__cause__
+                if isinstance(exc, UnexpectedToolError) or not isinstance(cause, ValidationError):
+                    raise
+                errors = [
+                    {"loc": ".".join(map(str, item["loc"])), "message": item["msg"]}
+                    for item in cause.errors(
+                        include_url=False, include_context=False, include_input=False
+                    )
+                ]
+                refused = ValueError(
+                    "; ".join(f"{e['loc'] or 'arguments'}: {e['message']}" for e in errors)
+                )
+                refused.details = {"errors": errors}  # type: ignore[attr-defined]
+                raise ToolError(f"Error executing tool {name}: {envelope(refused)}") from None
+
+    server = Server("determined-compute", version=__version__, instructions=INSTRUCTIONS)
 
     async def call(operation: Callable[..., Any], *args: Any) -> Any:
         try:
             return await asyncio.to_thread(operation, *args)
         except (APIError, ValueError, OSError) as exc:
-            error = json.dumps(tool_error(exc), sort_keys=True, separators=(",", ":"))
-            raise ToolError(error) from None
+            raise ToolError(envelope(exc)) from None
 
     def hints(read_only: bool, destructive: bool = False, idempotent: bool = True) -> Any:
         return ToolAnnotations(
@@ -589,8 +692,13 @@ def create_server(tools: Tools) -> Any:
     ) -> dict[str, Any]:
         """Launch a planned spec with the plan's request_id and request_digest.
 
-        A retry with the same arguments returns the same job. If the code or request changed
-        since the plan, nothing is created and plan_changed names the new commit.
+        Returns the job_id, replayed, the outcome, and the job's current state with an
+        explanation; an active experiment whose trials wait for resources reads running. A
+        retry with the same arguments returns the same job, even when the spec no longer
+        renders. If the code or request changed since the plan, nothing is created and
+        plan_changed names the new commit and content digest: plan again. An internal error
+        may follow a created job: repeat the launch once, which returns it, and if the same
+        error comes back, nothing was created.
         """
         return await call(tools.launch, spec, request_id, request_digest)
 
@@ -609,7 +717,9 @@ def create_server(tools: Tools) -> Any:
         """List this user's jobs from every client, newest first, with their request_id.
 
         kind is command, shell or experiment; state is queued, running, paused, completed,
-        failed, canceled or deleted. Pass next_cursor as cursor for the next page.
+        failed, canceled or deleted. An active experiment whose trials wait for resources
+        reads running, not queued; compute_status explains it. Pass next_cursor as cursor for
+        the next page.
         """
         return await call(tools.list, kind, state, limit, cursor)
 
@@ -695,7 +805,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def build_tools(args: argparse.Namespace) -> Tools:
-    """Read the configuration, then pass the master's protocol gate before serving anything."""
+    """Read the configuration, then pass the master's protocol gate before serving anything.
+
+    A master below the protocol stops startup. An unreachable one does not, so the storage
+    tools still serve; the client runs the same gate before its first call to the master.
+    """
 
     profile = args.profile or os.environ.get("DETERMINED_COMPUTE_PROFILE")
     if not profile:
@@ -711,7 +825,16 @@ def build_tools(args: argparse.Namespace) -> Tools:
         secrets_path=secrets_path,
         verify_ssl=args.verify_ssl,
     )
-    client.check_protocol()
+    try:
+        client.check_protocol()
+    except APIError as exc:
+        if exc.code != "unavailable":
+            raise
+        # stdout carries MCP frames.
+        print(
+            f"determined-compute-mcp: {exc}; the protocol gate runs on the first master call",
+            file=sys.stderr,
+        )
     return Tools(client, policy, storage, secrets_path)
 
 

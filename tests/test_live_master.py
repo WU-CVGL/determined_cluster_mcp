@@ -18,7 +18,7 @@ import pytest
 import live
 from determined_compute.client import APIError
 from determined_compute.mcp_server import Tools, build_parser, build_tools
-from determined_compute.policy import Policy
+from determined_compute.policy import Policy, PolicyError
 from determined_compute.spec import TaskSpec
 from determined_compute.storage import StorageAccessConfig, StorageService
 
@@ -32,16 +32,20 @@ def shared(tmp_path) -> Path:
     return root
 
 
+def live_policy(shared: Path, pool: str = "") -> Policy:
+    return Policy.from_dict(
+        {
+            "mounts": [{"host_path": str(shared), "container_path": "/shared"}],
+            "defaults": {"image": "busybox", "pool": pool or live.pool(), "slots": 0},
+        }
+    )
+
+
 @pytest.fixture
 def tools(monkeypatch, shared, tmp_path):
     monkeypatch.setenv("DETERMINED_COMPUTE_SECRETS", str(tmp_path / "absent.env"))
     client = live.client(monkeypatch)
-    policy = Policy.from_dict(
-        {
-            "mounts": [{"host_path": str(shared), "container_path": "/shared"}],
-            "defaults": {"image": "busybox", "pool": live.pool(), "slots": 0},
-        }
-    )
+    policy = live_policy(shared)
     tools = Tools(client, policy, StorageService(policy, StorageAccessConfig()))
     launched = []
     original = tools.launch
@@ -177,12 +181,31 @@ def test_a_changed_request_is_refused_and_creates_nothing(tools):
     assert conflict.details == {"job_id": job["job_id"]}
     fresh = str(uuid.uuid4())
     drift = refused("plan_changed", tools.launch, changed, fresh, plan["request_digest"])
-    assert drift.details["expected_digest"] == plan["request_digest"]
-    assert drift.details["request_digest"] == other["request_digest"]
+    assert "request_digest" not in drift.details and "expected_digest" not in drift.details
     assert fresh not in request_ids(tools)
     # The key stays free: the same key with the new plan creates the job.
     created = tools.launch(changed, fresh, other["request_digest"])
     assert created["replayed"] is False and created["job_id"] != job["job_id"]
+
+
+def test_a_lost_launch_response_replays_after_the_spec_stops_rendering(tools, shared):
+    tag = uuid.uuid4().hex[:12]
+    plan = tools.plan(spec(tag))
+    job = launch_plan(tools, plan)
+    # The pool leaves the policy, so the spec no longer renders; the master still has the key.
+    narrowed = live_policy(shared, pool=f"not-{live.pool()}")
+    later = Tools(tools.client, narrowed, StorageService(narrowed, StorageAccessConfig()))
+    resolved = TaskSpec.model_validate(plan["spec"])
+
+    again = later.launch(resolved, plan["request_id"], plan["request_digest"])
+    assert (again["job_id"], again["replayed"], again["state"]) == (job["job_id"], True, "queued")
+
+    fresh = str(uuid.uuid4())
+    with pytest.raises(PolicyError) as caught:
+        later.launch(resolved, fresh, plan["request_digest"])
+    assert caught.value.code == "pool_not_allowed"
+    assert caught.value.details["request_id"] == fresh
+    assert fresh not in request_ids(tools)
 
 
 def test_immediate_admission_is_refused_and_creates_nothing(tools):
@@ -213,19 +236,36 @@ def test_an_experiment_plans_launches_and_cancels(tools):
         "searcher": {"name": "single", "metric": "loss"},
         "max_restarts": 0,
         "checkpoint_storage": {"type": "shared_fs", "storage_path": f"live-{tag}/checkpoints"},
+        "hyperparameters": {"n": 4, "y": 2, "flag": "y", "lr": "1e-3"},
     }
     bogus = {"searcher": {"name": "bogus", "max_concurrent_trials": 1}}
     broken = spec(tag, kind="experiment", experiment=bogus)
     refused("invalid_request", tools.plan, broken)
+    # The same error on a keyed create comes from parsing, before anything is written.
+    fresh = str(uuid.uuid4())
+    config = {"name": f"live-{tag}", "entrypoint": "true", **bogus}
+    created = refused("invalid_request", tools.client.submit, "experiment", config,
+                      idempotency_key=fresh)
+    assert created.retryable is False and "nothing was created" in str(created)
+    assert fresh not in request_ids(tools)
 
     # The master resolves the workspace and project names of an experiment.
     names = {"workspace": "Uncategorized", "project": "Uncategorized"}
     plan = tools.plan(spec(tag, kind="experiment", experiment=experiment, **names))
-    assert plan["effective_config"]["checkpoint_storage"]["storage_path"] == (
-        f"live-{tag}/checkpoints"
-    )
+    storage = plan["effective_config"]["checkpoint_storage"]
+    assert storage["storage_path"] == f"live-{tag}/checkpoints"
+    assert storage["host_path"]  # inherited from the workspace or master default
+    # The master reads YAML 1.1, where a plain y, n or 1e-3 is a bool or a float.
+    assert plan["effective_config"]["hyperparameters"] == {
+        "n": {"type": "const", "val": 4},
+        "y": {"type": "const", "val": 2},
+        "flag": {"type": "const", "val": "y"},
+        "lr": {"type": "const", "val": "1e-3"},
+    }
     job = launch_plan(tools, plan)
     assert job["outcome"] == "queued"
+    # The ledger reads the active experiment as running while its trial waits.
+    assert "waits for the scheduler" in job["explanation"]
     status = tools.status(job["job_id"])
     assert status["kind"] == "experiment" and status["request_id"] == plan["request_id"]
     assert (status["workspace_id"], status["project_id"]) == (1, 1)

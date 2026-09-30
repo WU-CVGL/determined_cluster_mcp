@@ -1,4 +1,4 @@
-# Client-side file access. This does not change the compute profile's bind_mounts.
+# Client-side file access. This does not change the policy's mounts or any job.
 mode: auto
 connect_timeout_seconds: 10
 timeout_seconds: 120

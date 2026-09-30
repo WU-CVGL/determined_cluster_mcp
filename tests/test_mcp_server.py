@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -180,11 +181,49 @@ def test_errors_are_json_with_their_code_and_details():
                 "message": "request_id must be the UUID that compute_plan returned",
                 "retryable": False,
             }
-            invalid = await client.call_tool("compute_plan", {"spec": {**SPEC, "kind": "trial"}})
-            assert invalid.is_error is True
             assert [call for call in master.calls if call[0] == "submit"] == []
 
     run(exercise)
+
+
+@pytest.mark.parametrize(
+    "tool, arguments, location",
+    [
+        ("compute_plan", {"spec": {**SPEC, "kind": "trial"}}, "spec"),
+        (
+            "compute_plan",
+            {"spec": {**SPEC, "kind": "experiment", "experiment": {"bind_mounts": []}}},
+            "spec",
+        ),
+        ("compute_plan", {"spec": {**SPEC, "kind": "experiment", "command": "model_def:Trial"}},
+         "spec"),
+        (
+            "compute_plan",
+            {"spec": {**SPEC, "kind": "shell", "command": None,
+                      "code": {"source": "git", "repo": "/shared/repo"}}},
+            "spec",
+        ),
+        ("compute_plan", {"spec": {**SPEC, "unknown": 1}}, "spec"),
+        ("compute_launch", {"spec": SPEC, "request_id": 7, "request_digest": "d"}, "request_id"),
+        ("compute_status", {}, "job_id"),
+        ("compute_logs", {"job_id": "j", "tail": "many"}, "tail"),
+    ],
+)
+def test_invalid_arguments_get_the_json_envelope(tool, arguments, location):
+    master = FakeMaster()
+
+    async def exercise():
+        async with Client(create_server(make_tools(master))) as client:
+            error = error_of(await client.call_tool(tool, arguments))
+            assert (error["code"], error["retryable"]) == ("invalid_request", False)
+            assert error["details"]["errors"]
+            assert all(item["loc"].startswith(location) for item in error["details"]["errors"])
+            assert error["message"].startswith(location)
+            # The rejected values are the caller's data and are not echoed back.
+            assert "model_def:Trial" not in json.dumps(error["details"])
+
+    run(exercise)
+    assert master.calls == []
 
 
 def test_a_key_conflict_keeps_the_job_id():
@@ -322,6 +361,33 @@ def test_startup_passes_the_gate_and_builds_the_tools(local_master, profile):
 
     assert tools.policy.pool == "pool"
     assert tools.client.api_url == url
+
+
+def closed_port_url():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return f"http://127.0.0.1:{probe.getsockname()[1]}"
+
+
+def test_an_unreachable_master_leaves_the_storage_tools_up(local_master, tmp_path, capsys):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    profile = tmp_path / "local.yaml"
+    profile.write_text(POLICY.replace("/cluster/shared", str(shared)), encoding="utf-8")
+    tools = build_tools(
+        build_parser().parse_args(["--profile", str(profile), "--api-url", closed_port_url()])
+    )
+
+    assert "protocol gate runs on the first master call" in capsys.readouterr().err
+    assert tools.storage_check("/shared")["exists"] is True
+    with pytest.raises(APIError) as caught:
+        tools.status("j")
+    assert (caught.value.code, caught.value.retryable) == ("unavailable", True)
+    # The gate still refuses a master below the protocol once one answers.
+    tools.client.api_url = local_master(0)
+    with pytest.raises(APIError) as caught:
+        tools.status("j")
+    assert caught.value.code == "protocol_unsupported"
 
 
 def test_stdio_subprocess_serves_the_tools(local_master, profile, tmp_path):

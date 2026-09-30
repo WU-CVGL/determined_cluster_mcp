@@ -5,133 +5,111 @@
 
 [首页](../README.zh.md) · [计算服务参考](compute-service.zh.md) · [共享存储访问](shared-storage-access.zh.md) · [故障排查](troubleshooting.zh.md)
 
-任何能够调用本地 stdio MCP 工具的 agent 或客户端都可以遵循本工作流。模型由客户端自行选择。常规存储和计算操作不依赖仓库 skill。
+本工作流适用于任何能调用本地 stdio MCP 工具的 agent 或客户端。客户端自行选择模型。常规存储和计算工作不需要仓库中的 skill。
 
 <a id="describe-the-goal-and-success-criteria"></a>
 ## 描述目标与成功判据
 
-说明要运行的内容，以及哪项可观察结果代表成功。提供项目版本、输入与输出位置、预期产物或指标，以及已知的资源需求。只引用凭据文件或 SSH 别名，不要提供凭据值。
+说明要运行什么，以及哪种可观察结果算作成功。包括项目版本、输入和输出位置、预期产物或指标，以及已知资源需求。只引用凭据文件或 SSH 别名，不写凭据值。
 
-以下部署输入必须来自集群管理员或项目已有配置，不要自行猜测：
+以下部署参数必须来自集群管理员或项目现有配置，不要自行编造：
 
-- Determined API 地址与账户凭据
-- 已批准的镜像和资源池
-- 集群计算节点宿主机路径及其容器挂载路径
-- 可选的共享存储本地挂载或登录节点 SSH 访问方式
+- Determined API 地址和账户凭据
+- 经批准的镜像和资源池
+- 计算节点宿主机路径及其容器挂载路径
+- 可选的共享存储本地挂载或登录节点 SSH 访问
 
-例如：“使用一个槽位评估这个版本，不排队，将 `metrics.json` 写入共享结果目录，并报告任务 ID、退出结果和该文件是否存在。”
+有用的请求示例：“用一个 slot 评估这个提交，把 `metrics.json` 写到共享结果目录，并报告任务 ID、退出类别以及该文件是否存在。”
 
 <a id="read-local-configuration-first"></a>
 ## 先读取本地配置
 
-阅读 `AGENTS.zh.md`、项目自身说明、已配置的计算 profile、相关请求示例，以及存在时的存储访问配置。复用项目中明确且仍然有效的选择。如果缺少必需部署参数，应询问用户，不要猜测。
+阅读 `AGENTS.md`、项目自身说明、已配置的策略、`cfg/examples/` 中相关的请求示例，以及存在时的存储访问配置。沿用项目中当前且明确的选择。缺少必需的部署参数时应询问，不要猜测。
 
-不要为了确认配置而读取或输出凭据值。MCP 服务通过 secrets 文件或环境接收凭据。除非项目或管理员已经明确选择，否则示例中的镜像和资源池都只是占位符。
+不要为了确认配置而读取或打印凭据值。MCP server 通过 secrets 文件或环境变量获得凭据。除非项目或管理员明确选定，示例中的镜像和资源池只是占位符。
 
-根据工作内容选择任务类型：
+按工作内容选择任务类型：
 
-| 类型 | 适用场景 |
+| 类型 | 用途 |
 | --- | --- |
-| `command` | 有限的非交互任务，例如评估、转换或构建 |
-| `shell` | 需要可重新连接环境的交互调试 |
-| `experiment` | 训练、搜索、trial，或使用 Determined 实验功能的长时间任务 |
-
-MCP 不接受 `kind: notebook`。
+| `command` | 有限的非交互运行，例如评估、转换或构建 |
+| `shell` | 需要可重连环境的交互式调试 |
+| `experiment` | 训练、搜索、trial，或使用 Determined 实验功能的长时间工作 |
 
 <a id="understand-the-three-path-namespaces"></a>
 ## 理解三种路径空间
 
-| 路径空间 | 使用位置 | 含义示例 |
+| 路径空间 | 使用者 | 作用示例 |
 | --- | --- | --- |
-| 容器路径 | `workdir`、`output_dir`、`storage_check.path`，以及 `storage_sync`/`storage_fetch.shared_dir` | Determined 任务容器内可见的路径 |
-| 集群计算节点宿主机路径 | `mounts[].host_path` 和共享文件系统检查点配置 | Determined agent 挂载的路径，由部署配置提供 |
-| MCP 服务端本地路径 | `storage_sync.local_dir` 和 `storage_fetch.local_dir` | 运行 MCP 服务的机器上的绝对路径 |
+| 容器路径 | `output_dir`、`git` 的 `code.repo`、`path` 的 `code.dir`、`storage_check.path`，以及传输的 `shared_dir` | Determined 任务内可见的路径 |
+| 计算节点宿主机路径 | 策略中的 `mounts[].host_path` | 管理员在每个 agent 上挂载的路径 |
+| MCP server 本地路径 | `context` 的 `code.repo`，以及传输的 `local_dir` | 运行 MCP server 的机器上的绝对路径 |
 
-计算 profile 将容器路径映射到集群计算节点宿主机路径。可选存储配置再把宿主机路径映射到本地挂载，或通过 SSH 访问。显示聊天界面的机器可能不是运行 MCP 服务的机器，因此不要根据 UI 中可见的文件推测 `local_dir`。
+策略把容器路径映射到计算节点宿主机路径。可选的存储配置再把这些宿主机路径映射到本地挂载，或通过 SSH 访问。显示对话的机器可能不同于运行 MCP server 的机器，因此不要根据界面中看到的内容推断本地路径。`workdir` 相对于代码根目录。
 
-源码、数据、依赖包、检查点和输出都应放在映射的共享存储上。`workdir` 和 `output_dir` 必须使用可写的容器路径。不要通过 Determined 发送源码归档或项目上传。
+<a id="choose-how-code-reaches-the-task"></a>
+## 选择代码进入任务的方式
+
+| 来源 | 适用情况 | 规划固定的内容 |
+| --- | --- | --- |
+| `git` | 仓库位于共享存储上，且其根目录在本机已挂载 | 提交；任务克隆该提交，不上传任何内容 |
+| `context` | 代码在本地工作树中，且不超过 99,614,720 字节 | 提交和上传文件的清单 |
+| `path` | 代码必须在共享目录中原地运行，例如在 shell 中 | 不固定：内容为 `unpinned` |
+
+本版本只通过本地挂载读取仓库来规划 `git` 代码；通过 SSH 时返回 `storage_not_local`。运行所需的内容都要提交：`git` 的提交必须位于某个分支或标签上。数据、依赖包、检查点和输出应放在映射的共享存储上，不要放进 `context` 上传。
 
 <a id="prepare-shared-files-safely"></a>
 ## 安全准备共享文件
 
-如果项目已经完整地位于共享存储，且调用方提供了其路径，只使用计算 API 的工作流可以直接继续规划和提交；它不需要本地挂载、SSH 登录或存储配置。已经配置存储访问时，可用 `storage_check` 验证相关容器路径。需要准备文件或由客户端直接验证时，先配置存储访问，然后：
+如果项目已完整存在于共享存储中，只进行计算的工作流仅凭 Determined 认证即可继续规划和提交。需要暂存文件或在客户端验证时，先配置存储访问，然后：
 
-1. 对目标或其已有父目录调用 `storage_check(path)`。
+1. 对目标或其已存在的父目录调用 `storage_check(path)`，并阅读其中的 `viewpoint`：权限属于本地或 SSH 用户，而不是容器用户。
 2. 调用 `storage_sync(local_dir, shared_dir, dry_run=true)`。
-3. 检查解析后的源、目标、后端、排除规则和逐项变更。
-4. 仅当预览正确时，以 `dry_run=false` 调用完全相同的操作。
-5. 对准备好的工作目录和所需输入再次调用 `storage_check`。
+3. 检查解析后的源路径、目标路径、后端、排除项和逐项变更。
+4. 仅当预览正确时，才以 `dry_run=false` 执行完全相同的操作。
+5. 再次对准备好的输入调用 `storage_check`。
 
-传输会复制目录内容，不会删除目标中多余的文件；但可能覆盖同名文件，因此预览是安全检查的一部分。没有存储后端时，规划仍不会验证远端文件是否存在或权限是否有效；应让任务自身验证所需输入并写出可观察的结果。SSH 认证、排除规则和传输行为见[共享存储访问](shared-storage-access.zh.md)。
-
-<a id="check-capacity-and-avoid-accidental-queues"></a>
-## 检查容量并避免意外排队
-
-使用所需资源池和槽位数调用 `compute_resources(slots, pool)`。零槽位 command 仍需检查辅助容器容量。容量结果只是当前快照，不是资源预留。
-
-除非用户明确要求等待，否则保持 `allow_queue: false`。容量不足或无法确定时，报告该结果。不要擅自切换资源池、改变槽位数或开启排队。
+传输复制的是目录内容，不会删除目标中多余的文件。未设置 `overwrite` 时，所有已有文件以及已有目录的属性都保持不变。SSH 认证、排除规则和传输行为见[共享存储访问](shared-storage-access.zh.md)。
 
 <a id="plan-review-and-launch-once"></a>
 ## 规划、审核并只提交一次
 
-创建请求时填写有意义的 `name` 和 `description`，并提供选定的 `kind`、命令、容器 `workdir`、容器 `output_dir`、槽位数、`allow_queue`，以及存在时的版本或内容标识。镜像和资源池可来自计算 profile，也可使用明确批准的覆盖值。
+编写一个 `TaskSpec`：有意义的 `name`、`kind`、`command`、`code` 来源、位于可写共享存储上的 `output_dir`，以及 slots 数。除非有经批准的覆盖值，镜像和资源池来自策略。
 
 ```json
 {
-  "name": "evaluate-checkpoint",
-  "description": "Evaluate the selected checkpoint and write metrics to shared storage.",
   "kind": "command",
-  "command": ["bash", "-lc", "python scripts/evaluate.py --output \"$COMPUTE_OUTPUT_DIR/metrics.json\""],
-  "workdir": "/shared-container/project/repo",
-  "output_dir": "/shared-container/project/results",
-  "slots": 1,
-  "code_revision": "REVISION_OR_CONTENT_ID",
-  "allow_queue": false
+  "name": "evaluate-checkpoint",
+  "command": "python scripts/evaluate.py --output \"$COMPUTE_OUTPUT_DIR/metrics.json\"",
+  "code": {"source": "git", "repo": "/shared-container/project/repo", "revision": "main"},
+  "output_dir": "/shared-container/project/results/evaluate-checkpoint",
+  "slots": 1
 }
 ```
 
-调用 `compute_plan(request)`，检查解析后的任务类型、镜像、资源池、挂载、工作目录、输出目录、资源字段和提示信息。规划只在本地验证并渲染配置，不能证明远端文件、权限、凭据或实时容量有效。
+调用 `compute_plan(spec)`。它固定版本、应用策略，并在 master 上对完全相同的请求做 dry run；不创建任何内容。审核解析后的 `spec`、`commit`、`code` 摘要（`context` 的 `included` 和 `excluded` 路径）、`effective_config` 以及每条警告。`path_not_bind_mounted` 表示任务无法访问某个路径；`secret_like_included` 表示某个 include 会上传看起来像 secret 的文件。master 和资源池默认值按提交时的值生效。
 
-生成一个稳定且由调用方控制的 `request_id`，再调用 `compute_launch(request, request_id)`。在工作记录中保留返回的本地 `task_id` 和远端 ID。相同请求使用同一 request ID 重试是幂等的；将该 ID 用于不同内容会被拒绝。
+提交前不评估放置。`compute_resources` 以快照形式显示资源池及其设备型号；slots 超过资源池当前容量的任务会在队列中等待。不要悄悄更换资源池或 slots 数，这是工作负载层面的决定。
 
-如果提交结果不确定，不要生成新的 request ID，也不要再次提交。检查本地任务和远端系统。`compute_reconcile(task_id, remote_id)` 只用于修复这条状态不确定的本地提交，而且必须先找到相符的远端任务。参见[故障排查](troubleshooting.zh.md#submission-outcome-is-uncertain)。
+用规划返回的值调用 `compute_launch(spec, request_id, request_digest)`；传入返回的 `spec`，而不是原始 spec。在工作记录中保存 `job_id` 和 `request_id`。
+
+- 如果提交的响应丢失或返回 `unavailable`，重复同一次提交。即使工作树已变化，它也会返回同一任务，且 `replayed: true`。
+- 如果返回 `internal`，再重复一次；第二次仍是同样错误说明没有创建任何内容。
+- 如果返回 `plan_changed`，说明没有创建任何内容；重新规划并审核新的提交。
+- 提交结果不确定时，不要为新的 `request_id` 重新规划。`compute_list` 会列出该账户的每个任务及其 `request_id`，包括从其他客户端提交的任务。
 
 <a id="monitor-and-accept-the-result"></a>
 ## 跟踪并验收结果
 
-调用 `compute_status(task_id)`，直到任务进入终态；使用 `compute_logs(task_id, tail)` 检查进度和最后的消息。用户不再需要运行中的任务时，调用 `compute_cancel(task_id)`。
+调用 `compute_status(job_id)` 直到任务结束，并用 `compute_logs(job_id, tail=...)` 查看进度和最终信息；对实验，`trial_id` 选择 trial。`explanation` 解读状态：trial 仍在等待资源的活动实验显示为 `running`，说明中会写明它在等待调度器。不再需要的任务用 `compute_cancel(job_id)` 取消。
 
-需要了解运行中的任务实际使用了多少 CPU、内存和 GPU 时，例如在提议调整资源、取消或重新提交之前确认 GPU 利用率是否接近零或 allocation 是否空闲，调用 `compute_usage(task_id)`；对于已结束的任务，它报告任务结束前的窗口。该工具只读，并要求 master 启用任务资源集成；`task_resources_disabled` 或 `task_resources_unsupported` 表示无法取得测量值，而不是任务空闲。先检查 `warnings`。null 或缺失值表示没有测量，绝不表示零；空的 `series` 列表表示该窗口没有数据。数值是每 `step` 秒一次的点采样，GPU 指标覆盖整块分配到的设备，可能包含其他进程。除非指定 `trial_id`，experiment 报告其最新 trial。即使 `metrics` 隐藏了 GPU 序列，`gpus` 仍会比较每个 allocation 的各块 GPU：`utilization_spread_percent` 较大、`least_utilized_gpu_uuid` 的均值很低或 `idle_fraction` 较高，都提示存在空闲或掉队的 GPU；`gpu_count` 小于 `requested_slots` 表示返回了序列的 GPU 少于该 allocation 持有的槽位，并不一定表示其余 GPU 未被使用。对于 experiment，`trial.batches_per_second_lower_bound` 是整个生命周期的下界，因为作为分母的挂钟时间还可能计入镜像拉取、启动、初始化以及因重启损失的 allocation 时间（不含调度排队时间和 allocation 之间的暂停间隔）；工作负载不通过 Determined 的 Core API 报告时，`total_batches_processed` 为 0 属于预期。只报告观察结果；更改槽位数或资源池仍需明确的任务决策。参见[任务用量测量](compute-service.zh.md#task-usage-measurements)。
+调用 `compute_usage(job_id)` 查看任务使用了多少 CPU、内存和 GPU，例如在建议调整规模或取消前发现空闲 GPU。它是只读的；`measurement: "unmeasured"` 表示 master 没有 task-resources 集成，而不是任务空闲。先检查 `warnings`。空值或缺失值表示没有测量，绝不表示零；`series` 为空表示该窗口没有数据。GPU 指标覆盖整张分配的设备。实验默认报告最新的 trial，`trial_id` 或 `allocation_id` 可以选择其他 trial。`gpus` 比较每个 allocation 的 GPU：`utilization_spread_percent` 大、`least_utilized_gpu_uuid` 的均值低或 `idle_fraction` 高，都提示存在空闲或拖后的 GPU。`trial.batches_per_second_lower_bound` 是整个生命周期的下限；工作负载不通过 Determined Core API 报告进度时，`total_batches_processed` 为 0 属于正常。见[任务用量测量](compute-service.zh.md#task-usage-measurements)。
 
-提交成功或进入终态本身不等于验收通过。检查进程退出信息和任务开始时定义的成功判据。已经配置存储访问时，使用 `storage_check` 验证预期共享产物；否则使用任务输出或另一项明确的任务内检查。需要本地副本时，先配置存储访问，再调用 `storage_fetch(shared_dir, local_dir, dry_run=true)` 预览，审核后以 `dry_run=false` 执行，并检查取回的结果。
+任务已提交或已结束，本身都不等于验收通过。检查任务的 `exit_class`、日志以及开始时定义的成功判据。prelude（代码交付、`output_dir` 或 `workdir`）失败时会打印一行以 `compute:` 开头的信息，并归类为 `workload_failed`。配置了存储访问时，用 `storage_check` 验证预期的共享产物；需要本地副本时，先预览 `storage_fetch(shared_dir, local_dir, dry_run=true)`，审核后再以 `dry_run=false` 执行。
 
-报告本地 task ID、远端 ID、最终状态、存在时的退出结果、输出路径，以及实际观察到的产物或指标。绝不包含 token、密码、私钥、cookie 或 secrets 文件内容。
-
-<a id="discover-and-adopt-existing-remote-tasks"></a>
-## 发现并登记已有远端任务
-
-对于通过 Determined WebUI、原生 CLI 或另一台设备独立创建，且属于同一 Determined 账户的任务，使用发现和登记流程：
-
-1. 调用 `compute_discover(kind, limit=50, offset=0)`，其中 kind 为 `command`、`shell` 或 `experiment`。这是只读远端查询，不会创建本地记录，也不会提交任务。
-2. 选择目标结果，再调用 `compute_adopt(kind, remote_id)`。
-3. 保存返回的本地 `task_id`，然后用它调用 `compute_status`、`compute_logs`、`compute_usage` 和 `compute_cancel`。
-
-登记时会核对实际集群、当前认证账户和远端 owner。它会创建幂等的本地记录，绝不会重新启动远端任务。未知的工作路径、输出路径或版本仍保持未知。登记不会授予存储访问权或新的集群权限。
-
-Reconcile 的用途更窄：`compute_reconcile` 通过核对提交标记，修复远端接受状态不确定的已有本地提交。它不能导入独立创建的任务。如果已经存在状态不确定的本地记录，应对该记录执行 reconcile，不要登记对应的远端任务。
+报告任务 ID、request ID、最终状态、退出类别、输出路径以及观察到的产物或指标。绝不包含 token、密码、私钥、cookie 或 secrets 文件内容。
 
 <a id="keep-identity-boundaries-separate"></a>
 ## 区分各身份边界
 
-任务身份和访问涉及四个彼此独立的值：
-
-| 值 | 含义 |
-| --- | --- |
-| SQLite 数据库 | 本地持久任务记录、幂等和 reconcile 状态 |
-| `owner` | 该数据库中的命名空间；它不是身份认证 |
-| Determined 账户 | 由凭据选择的 API 身份和远端权限 |
-| 集群身份 | 用于避免跨集群任务混淆的实际远端集群 |
-
-只有使用相同数据库和 owner 的会话才共享本地记录。不同数据库可以分别登记同一个远端任务。数据库应放在本地持久磁盘，不要放在共享 NFS 中。共享 owner 不等于共享凭据，更换凭据也不会重命名 owner 命名空间。
-
-在使用 basic authorization 的 Determined fork 0.40.1 或更高版本上，只有任务的 Determined 所有者或管理员可以取消任务。submitted 记录绑定配置和端点而不是账户，因此把凭据切换到另一个账户后，`compute_cancel` 可能对 command 或 shell 返回 HTTP 403，对 experiment 返回 HTTP 404；已登记的记录则返回 `ownership_mismatch`。请使用拥有该任务的账户。
+已认证的 Determined 账户拥有它提交的每个任务，记录保存在 master 上。没有本地数据库或 owner 命名空间：同一账户的任何客户端都看到相同的任务，`request_id` 属于该账户的任务。在 basic 授权下，只有任务所有者或管理员可以取消任务，因此请使用提交该任务的账户。写在命令或 `env` 中的 secret 会保存在任务配置里，能读取任务的人都能看到；应改为保存在共享存储上的文件中。

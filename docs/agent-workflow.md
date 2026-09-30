@@ -17,11 +17,11 @@ The following deployment inputs must come from the cluster administrator or the 
 - cluster-agent host paths and their container mount paths
 - optional local mount or login-node SSH access to shared storage
 
-A useful request is: “Evaluate this revision with one slot, avoid queuing, write `metrics.json` under the shared results directory, and report the task IDs, exit result, and whether that file exists.”
+A useful request is: "Evaluate this commit with one slot, write `metrics.json` under the shared results directory, and report the job ID, exit class, and whether that file exists."
 
 ## Read local configuration first
 
-Read `AGENTS.md`, the project's own instructions, the configured compute profile, the relevant request example, and the storage-access configuration when present. Reuse project choices that are current and explicit. Ask for a missing required deployment value instead of guessing.
+Read `AGENTS.md`, the project's own instructions, the configured policy, the relevant request example under `cfg/examples/`, and the storage-access configuration when present. Reuse project choices that are current and explicit. Ask for a missing required deployment value instead of guessing.
 
 Do not read or print credential values merely to confirm configuration. The MCP server receives credentials through its secrets file or environment. Treat image and pool values in examples as placeholders unless the project or administrator explicitly selected them.
 
@@ -33,95 +33,74 @@ Choose the task kind according to the work:
 | `shell` | Interactive debugging that needs a reconnectable environment |
 | `experiment` | Training, searches, trials, or long-running work that uses Determined experiment features |
 
-The MCP does not accept `kind: notebook`.
-
 ## Understand the three path namespaces
 
 | Namespace | Used by | Example role |
 | --- | --- | --- |
-| Container path | `workdir`, `output_dir`, `storage_check.path`, and `storage_sync`/`storage_fetch.shared_dir` | Path visible inside a Determined task |
-| Cluster-agent host path | `mounts[].host_path` and shared-fs checkpoint configuration | Path mounted by the Determined agent; supplied by deployment configuration |
-| MCP-server local path | `storage_sync.local_dir` and `storage_fetch.local_dir` | Absolute path on the machine running the MCP server |
+| Container path | `output_dir`, `code.repo` for `git`, `code.dir` for `path`, `storage_check.path`, and the `shared_dir` of transfers | Path visible inside a Determined task |
+| Cluster-agent host path | `mounts[].host_path` in the policy | Path the administrator mounts on every agent |
+| MCP-server local path | `code.repo` for `context`, and the `local_dir` of transfers | Absolute path on the machine running the MCP server |
 
-The compute profile maps container paths to cluster-agent host paths. The optional storage configuration maps those host paths to a local mount or reaches them through SSH. The machine showing the chat can differ from the machine running the MCP server, so never infer a `local_dir` from what is visible in the UI.
+The policy maps container paths to cluster-agent host paths. The optional storage configuration maps those host paths to a local mount or reaches them through SSH. The machine showing the chat can differ from the machine running the MCP server, so never infer a local path from what is visible in the UI. `workdir` is relative to the code root.
 
-Keep source, data, packages, checkpoints, and outputs on mapped shared storage. `workdir` and `output_dir` must use writable container paths. Do not send a source archive or project upload through Determined.
+## Choose how code reaches the task
+
+| Source | Use it when | What the plan pins |
+| --- | --- | --- |
+| `git` | The repository is on shared storage and its root is mounted on this machine | The commit; the task clones it and nothing is uploaded |
+| `context` | The code is in a local working tree and fits in 99,614,720 bytes | The commit and the manifest of the uploaded files |
+| `path` | The code must run in place from a shared directory, for example in a shell | Nothing: the content is `unpinned` |
+
+`git` planning reads the repository through a local mount only in this release; over SSH it returns `storage_not_local`. Commit what the run needs: a `git` commit must be on a branch or tag. Keep data, packages, checkpoints, and outputs on mapped shared storage; do not upload them in a `context`.
 
 ## Prepare shared files safely
 
-If the project is already complete on shared storage and the caller supplied its paths, a compute-only workflow can continue to plan and launch using Determined authentication; it does not need a local mount, SSH login, or storage configuration. When storage access is configured, use `storage_check` to verify the relevant container paths. If files need staging or direct client-side verification, configure storage access and then:
+If the project is already complete on shared storage, a compute-only workflow can continue to plan and launch with Determined authentication alone. When files need staging or client-side verification, configure storage access and then:
 
-1. Call `storage_check(path)` for the destination or its existing parent.
+1. Call `storage_check(path)` for the destination or its existing parent, and read its `viewpoint`: the permissions are those of the local or SSH user, not of the container user.
 2. Call `storage_sync(local_dir, shared_dir, dry_run=true)`.
 3. Review the resolved source, destination, backend, exclusions, and itemized changes.
 4. Call the identical operation with `dry_run=false` only when that preview is correct.
-5. Call `storage_check` again for the prepared working directory and required inputs.
+5. Call `storage_check` again for the prepared inputs.
 
-A transfer copies directory contents and does not delete extra destination files. It can replace same-named files, so the preview is part of the safety check. Without a storage backend, planning still does not verify remote file existence or permissions; make the workload validate required inputs and write an observable result. See [shared storage access](shared-storage-access.md) for SSH authentication, exclusions, and transfer behavior.
-
-## Check capacity and avoid accidental queues
-
-Call `compute_resources(slots, pool)` with the requested pool and slot count. A zero-slot command still needs the auxiliary-capacity check. Capacity is a current snapshot, not a reservation.
-
-Keep `allow_queue: false` unless the user explicitly wants the task to wait in a queue. If capacity is unavailable or unknown, report that result. Do not silently switch pools, change the slot count, or enable queuing.
+A transfer copies directory contents and does not delete extra destination files. Without `overwrite`, it keeps every existing file and the attributes of existing directories. See [shared storage access](shared-storage-access.md) for SSH authentication, exclusions, and transfer behavior.
 
 ## Plan, review, and launch once
 
-Create a request with a meaningful `name` and `description`, the selected `kind`, command, container `workdir`, container `output_dir`, slot count, `allow_queue`, and a revision or content identifier when available. The image and pool may come from the compute profile or explicit approved overrides.
+Write a `TaskSpec` with a meaningful `name`, the `kind`, the `command`, the `code` source, an `output_dir` on writable shared storage, and the slot count. The image and pool come from the policy unless an approved override is given.
 
 ```json
 {
-  "name": "evaluate-checkpoint",
-  "description": "Evaluate the selected checkpoint and write metrics to shared storage.",
   "kind": "command",
-  "command": ["bash", "-lc", "python scripts/evaluate.py --output \"$COMPUTE_OUTPUT_DIR/metrics.json\""],
-  "workdir": "/shared-container/project/repo",
-  "output_dir": "/shared-container/project/results",
-  "slots": 1,
-  "code_revision": "REVISION_OR_CONTENT_ID",
-  "allow_queue": false
+  "name": "evaluate-checkpoint",
+  "command": "python scripts/evaluate.py --output \"$COMPUTE_OUTPUT_DIR/metrics.json\"",
+  "code": {"source": "git", "repo": "/shared-container/project/repo", "revision": "main"},
+  "output_dir": "/shared-container/project/results/evaluate-checkpoint",
+  "slots": 1
 }
 ```
 
-Call `compute_plan(request)` and inspect the resolved kind, image, pool, mounts, working directory, output directory, resource fields, and advisories. Planning validates and renders locally; it does not prove that remote files, permissions, credentials, or live capacity are valid.
+Call `compute_plan(spec)`. It pins the revision, applies the policy, and dry-runs the exact request on the master; nothing is created. Review the resolved `spec`, the `commit`, the `code` summary (for `context`, the `included` and `excluded` paths), the `effective_config`, and every warning. `path_not_bind_mounted` means the task cannot reach a path; `secret_like_included` means an include uploads a file that looks like a secret. Master and pool defaults apply as they stand at launch.
 
-Generate one stable, caller-controlled `request_id`, then call `compute_launch(request, request_id)`. Preserve the returned local `task_id` and remote ID in the work record. Repeating an identical request with the same request ID is idempotent; reusing it for different content is rejected.
+Placement is not evaluated before launch. `compute_resources` shows the pools and their device models as a snapshot; a job whose slots exceed what the pool has now waits in the queue. Do not switch pools or slot counts silently; that is a workload decision.
 
-If the launch result is uncertain, do not create a new request ID or submit again. Inspect the local task and remote system. Use `compute_reconcile(task_id, remote_id)` only when repairing that same uncertain local submission and after identifying the matching remote task. See [troubleshooting](troubleshooting.md#submission-outcome-is-uncertain).
+Call `compute_launch(spec, request_id, request_digest)` with the values the plan returned; pass the returned `spec`, not the original. Keep the `job_id` and `request_id` in the work record.
+
+- If the launch answer is lost or `unavailable`, repeat the same launch. It returns the same job with `replayed: true`, even if the tree changed since.
+- If it returns `internal`, repeat it once; a second identical error means nothing was created.
+- If it returns `plan_changed`, nothing was created; plan again and review the new commit.
+- Never plan again for a new `request_id` while a launch outcome is uncertain. `compute_list` shows every job of the account with its `request_id`, including jobs launched from other clients.
 
 ## Monitor and accept the result
 
-Call `compute_status(task_id)` until the task reaches a terminal state, and use `compute_logs(task_id, tail)` to inspect progress and the final messages. Cancel a running task with `compute_cancel(task_id)` when the user no longer needs it.
+Call `compute_status(job_id)` until the job ends, and use `compute_logs(job_id, tail=...)` to inspect progress and final messages; for an experiment, `trial_id` selects a trial. The `explanation` interprets the state: an active experiment whose trials wait for resources reads `running`, and the explanation says it waits for the scheduler. Cancel a job with `compute_cancel(job_id)` when it is no longer needed.
 
-Call `compute_usage(task_id)` when you need to know how much CPU, memory, and GPU a running job uses, for example to spot near-zero GPU utilization or an idle allocation before proposing a resize, cancellation, or relaunch; for an ended task it reports the window before the task ended. It is read-only and requires the master's task-resources integration; `task_resources_disabled` or `task_resources_unsupported` means measurements are unavailable, not that the task is idle. Inspect `warnings` first. A null or missing value means no measurement, never zero, and an empty `series` list means no data for the window. Values are point samples taken every `step` seconds, and GPU metrics cover the whole assigned device, which can include other processes. An experiment reports its latest trial unless `trial_id` is given. `gpus` compares each allocation's GPUs even when `metrics` hides their series: a large `utilization_spread_percent`, a low mean on `least_utilized_gpu_uuid`, or a high `idle_fraction` points to idle or straggling GPUs, and a `gpu_count` below `requested_slots` means fewer GPUs returned a series than the allocation holds, not necessarily that the rest are unused. For an experiment, `trial.batches_per_second_lower_bound` is a lifetime floor, because its wall-clock denominator can also count image pull, startup, initialization, and allocations lost to restarts (not scheduler queue time or gaps between allocations); a `total_batches_processed` of 0 is expected when the workload does not report through Determined's Core API. Report what you observe; changing slots or pools remains an explicit workload decision. See [task usage measurements](compute-service.md#task-usage-measurements).
+Call `compute_usage(job_id)` to see how much CPU, memory, and GPU a job uses, for example to spot idle GPUs before proposing a resize or cancellation. It is read-only; `measurement: "unmeasured"` means the master has no task-resources integration, not that the job is idle. Inspect `warnings` first. A null or missing value means no measurement, never zero, and an empty `series` means no data for the window. GPU metrics cover the whole assigned device. An experiment reports its latest trial unless `trial_id` or `allocation_id` selects another. `gpus` compares each allocation's GPUs: a large `utilization_spread_percent`, a low mean on `least_utilized_gpu_uuid`, or a high `idle_fraction` points to idle or straggling GPUs. `trial.batches_per_second_lower_bound` is a lifetime floor, and a `total_batches_processed` of 0 is expected when the workload does not report through Determined's Core API. See [task usage measurements](compute-service.md#task-usage-measurements).
 
-A successful submission or a terminal state alone is not acceptance. Check the process exit information and the success criteria defined at the start. When storage access is configured, verify expected shared artifacts with `storage_check`; otherwise use workload output or another explicit task-level check. When a local copy is needed, configure storage access, preview `storage_fetch(shared_dir, local_dir, dry_run=true)`, review it, then execute with `dry_run=false` and inspect the fetched result.
+A launched job or an ended state alone is not acceptance. Check the job's `exit_class`, the logs, and the success criteria defined at the start. A failed prelude (code delivery, `output_dir`, or `workdir`) prints a line starting with `compute:` and classifies as `workload_failed`. When storage access is configured, verify expected shared artifacts with `storage_check`; when a local copy is needed, preview `storage_fetch(shared_dir, local_dir, dry_run=true)`, review it, then execute with `dry_run=false`.
 
-Report the local task ID, remote ID, final state, exit result when available, output path, and observed artifact or metric. Never include tokens, passwords, private keys, cookies, or secrets-file contents.
-
-## Discover and adopt existing remote tasks
-
-Use discovery and adoption for a task created independently through the Determined WebUI, native CLI, or another device under the same Determined account:
-
-1. Call `compute_discover(kind, limit=50, offset=0)` with `command`, `shell`, or `experiment`. This is a read-only remote query; it does not create a local record or submit work.
-2. Select the intended remote result, then call `compute_adopt(kind, remote_id)`.
-3. Keep the returned local `task_id` and use it with `compute_status`, `compute_logs`, `compute_usage`, and `compute_cancel`.
-
-Adoption verifies the actual cluster, current authenticated account, and remote owner. It creates an idempotent local record and never relaunches the remote task. Unknown work paths, output paths, or revisions remain unknown. Adoption does not grant storage access or new cluster permissions.
-
-Reconciliation has a narrower purpose: `compute_reconcile` repairs an existing local submission whose remote acceptance is uncertain by verifying its submission marker. It does not import independently created tasks. If an uncertain local record exists, reconcile it rather than adopting the corresponding remote task.
+Report the job ID, request ID, final state, exit class, output path, and observed artifact or metric. Never include tokens, passwords, private keys, cookies, or secrets-file contents.
 
 ## Keep identity boundaries separate
 
-Four values participate in task identity and access:
-
-| Value | Meaning |
-| --- | --- |
-| SQLite database | Local durable task records, idempotency, and reconciliation state |
-| `owner` | Namespace within that database; it is not authentication |
-| Determined account | API identity and remote authorization selected by credentials |
-| Cluster identity | Actual remote cluster used to prevent cross-cluster task confusion |
-
-Sessions share local records only when they use the same database and owner. Separate databases can adopt the same remote task independently. Keep the database on local durable disk rather than shared NFS. Sharing an owner does not share credentials, and changing credentials does not rename the owner namespace.
-
-On the Determined fork 0.40.1 or later with basic authorization, only a task's Determined owner or an administrator can cancel it. A submitted record binds to the profile and endpoint rather than the account, so after credentials switch to another account, `compute_cancel` can return HTTP 403 for a command or shell and HTTP 404 for an experiment; an adopted record reports `ownership_mismatch` instead. Use the account that owns the task.
+The authenticated Determined account owns every job it launches, and the master keeps the record. There is no local database or owner namespace: any client of the same account sees the same jobs, and a `request_id` belongs to that account's jobs. Under basic authorization, only a job's owner or an administrator can cancel it, so use the account that launched the job. Secrets written into a command or `env` are stored in the job's config and visible to its readers; keep them in files on shared storage instead.

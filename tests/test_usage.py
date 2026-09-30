@@ -213,7 +213,7 @@ def test_without_monitoring_the_allocations_are_described_as_unmeasured(client):
     assert result["explanation"].startswith("Unmeasured")
 
 
-def test_allocation_must_belong_to_the_selected_task(client):
+def test_allocation_must_belong_to_the_job(client):
     with pytest.raises(UsageError) as caught:
         summarize(client, job(), allocation_id="other.1")
     assert caught.value.code == "not_found"
@@ -221,6 +221,31 @@ def test_allocation_must_belong_to_the_selected_task(client):
 
     summarize(client, job(), allocation_id=f"{TASK}.1")
     assert resources_call(client)[-1] == f"{TASK}.1"
+
+
+def test_an_allocation_selects_its_own_trial_and_task(client):
+    experiment = job("experiment", tasks=[
+        trial_task(1, "trial-1"),
+        trial_task(2, "trial-2a", allocation(task="trial-2a", start=SUBMITTED)),
+        trial_task(2, "trial-2b", allocation(task="trial-2b", start=SUBMITTED)),
+    ])
+
+    earlier_trial = summarize(client, experiment, allocation_id="trial-1.1")
+    assert resources_call(client)[1:2] == ("trial-1",)
+    assert earlier_trial["task_id"] == "trial-1"
+    assert (earlier_trial["trial"]["id"], earlier_trial["trial"]["selection"]) == (1, "allocation")
+
+    client.calls.clear()
+    # An earlier task of a continued trial, which the latest-task default would pass over.
+    earlier_task = summarize(client, experiment, trial_id=2, allocation_id="trial-2a.1")
+    assert resources_call(client)[1] == "trial-2a"
+    assert (earlier_task["task_id"], earlier_task["trial"]["task_count"]) == ("trial-2a", 2)
+
+    client.calls.clear()
+    with pytest.raises(UsageError, match="belongs to trial 1, not trial 2") as caught:
+        summarize(client, experiment, trial_id=2, allocation_id="trial-1.1")
+    assert caught.value.code == "invalid_request"
+    assert client.calls == []
 
 
 def test_metric_filter_and_bounded_samples(client, monkeypatch):
@@ -553,7 +578,7 @@ def test_trial_throughput_context(client):
     context = summarize(client, experiment)["trial"]
     assert (context["total_batches_processed"], context["wall_clock_seconds"]) == (1000, 500.0)
     assert (context["restarts"], context["batches_per_second_lower_bound"]) == (1, 2.0)
-    assert context["state"] == "STATE_ACTIVE"
+    assert context["state"] == "active"  # short and lowercase, like a job's states
 
     trial.update(totalBatchesProcessed=0, wallClockTime=0)
     result = summarize(client, experiment)
@@ -564,6 +589,10 @@ def test_trial_throughput_context(client):
     context = summarize(client, experiment)["trial"]
     assert (context["total_batches_processed"], context["wall_clock_seconds"]) == (None, None)
     assert context["restarts"] is None
+
+    for state in ("STATE_UNSPECIFIED", "ACTIVE", 3):
+        trial["state"] = state
+        assert summarize(client, experiment)["trial"]["state"] is None
 
 
 def test_summary_metrics_keep_numeric_statistics_and_report_truncation(client, monkeypatch):

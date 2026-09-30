@@ -10,34 +10,37 @@ and checking work, see [Agent workflow](agent-workflow.md).
 
 ```mermaid
 flowchart LR
-    U[Any local stdio MCP client] --> M[14 MCP tools]
-    M --> C[ComputeService]
-    C --> D[(local SQLite database)]
-    C --> A[Determined API]
+    U[Any local stdio MCP client] --> M[11 MCP tools]
+    M --> P[policy]
+    M --> G[code planning]
+    M --> A[Determined API]
+    A --> L[(job ledger on the master)]
     A --> K[Determined cluster]
-    P[compute profile] --> C
-    M --> S[shared-storage adapter]
+    M --> S[shared-storage access]
     S --> H[mapped shared storage]
 ```
 
-The MCP server is a local stdio service for one trusted user. It binds `owner` at
-startup; no tool accepts an owner argument. Separate processes can use separate owner
-names with one database, while collaborators can deliberately share a name. This is a
-namespace boundary, not multi-user authentication. A remotely exposed service needs
-its own authenticated transport.
+The MCP server is a local stdio service for one trusted user. It keeps no local state:
+the Determined master records every job, keyed by the `request_id` that a plan mints,
+and `job_id` is the only handle for a job. The owner of a job is the authenticated
+Determined user, so every client of that user, including the WebUI and the CLI, sees
+the same jobs through `compute_list`. A remotely exposed service needs its own
+authenticated transport.
 
-`ComputeService` owns planning, idempotent submission, status, logs, usage measurements,
-cancellation, discovery, adoption, and conservative reconciliation. Its local `task_id`
-remains stable across restarts and is distinct from the Determined `remote_id`. Keep the
-SQLite database on durable local storage. Keep source, data, packages, checkpoints,
-logs, and outputs on mapped shared storage.
+The master owns identity, idempotency, plan binding, admission, placement, and the
+exit class of every allocation. The MCP owns the policy, which is narrower than the
+master's access control, the user's working tree, code delivery, and the
+interpretation of results. Keep source, data, packages, checkpoints, logs, and outputs
+on mapped shared storage.
 
-## Compute profile
+The service needs a Determined master that speaks submission protocol 1 or later.
 
-Pass the profile with `--profile PATH` or `DETERMINED_COMPUTE_PROFILE`. Its schema is:
+## Policy
+
+Pass the policy file with `--profile PATH` or `DETERMINED_COMPUTE_PROFILE`. It is
+YAML, or JSON when its name ends in `.json`, and has these keys:
 
 ```yaml
-cluster_identity: optional-deployment-label
 mounts:
   - host_path: /shared/projects
     container_path: /workspace
@@ -48,71 +51,22 @@ defaults:
   image: your-image
   pool: your-pool
   slots: 1
-shell_inactivity_seconds: 7200
+pools: [your-pool, your-other-pool]
+max_slots: 8
+allow_overwrite: false
 ```
 
-At least one mount is required. `host_path` is the path on cluster agents and need not
-exist on the MCP client machine. Requests use `container_path`; container roots cannot
-overlap, so each container path maps through one corresponding mount. When validating
-a host-path alias against overlapping host roots, the most specific root controls and
-read-only wins a tie. `workdir`, `output_dir`, and explicit checkpoint targets must be
-under writable mounts; reading reference data under a read-only mount remains valid.
-These checks are service policy and do not replace filesystem permissions.
+| Key | Meaning |
+| --- | --- |
+| `mounts` | Required. Maps each container path to the host path that the administrator binds on every agent (`task_container_defaults.bind_mounts`). The MCP never sends a bind mount; it uses the map to check paths and to reach shared storage. `read_only: true` refuses an `output_dir` or a sync target beneath it |
+| `defaults` | Required `image` and `pool`, and `slots` (default 1). A request that omits them gets these values, and pool and slots are always sent explicitly |
+| `pools` | The pools a request may name. When omitted, only the default pool is allowed |
+| `max_slots` | The most slots one request may hold: slots per trial times the concurrent trials of a search |
+| `allow_overwrite` | Whether `storage_sync` and `storage_fetch` may replace existing files (default `false`) |
 
-The image, resource pool, and slot count are defaults that a request can override.
-`slots` must be a non-negative integer; zero asks for CPU-only auxiliary capacity when
-the pool supports it. `shell_inactivity_seconds` is optional and advisory. The service
-does not enforce an idle timeout.
-
-`cluster_identity` is an optional operator-facing label. Submitted local records bind
-to the profile fingerprint and the resolved Determined endpoint, including this label.
-Changing that binding prevents later status, log, usage, cancellation, and
-reconciliation operations on those records.
-
-## Request object and planning
-
-`compute_plan` and `compute_launch` accept the same request object:
-
-| Field | Type | Meaning |
-| --- | --- | --- |
-| `name` | string | Optional display name, at most 128 characters |
-| `description` | string or null | Optional display description, at most 2,048 characters |
-| `allow_queue` | boolean | Allow submission when current capacity is insufficient; default `false` |
-| `kind` | `auto`, `command`, `shell`, or `experiment` | Execution mode; default `auto` |
-| `interactive` | boolean | Requires shell mode; in auto mode selects `shell` |
-| `overnight` | boolean | In auto mode selects `experiment` |
-| `command` | string or string array | Command or experiment entrypoint; shell mode rejects it |
-| `workdir` | absolute container path | Working directory under a writable configured mount |
-| `output_dir` | absolute container path | Output directory under a writable configured mount |
-| `slots` | non-negative integer | Requested slots; defaults to the profile value |
-| `pool`, `image` | string | Optional overrides of profile defaults |
-| `code_revision` | string or null | Caller-provided revision or content identifier |
-| `experiment_config` | object | Extra experiment configuration; requires experiment mode |
-
-Unknown request fields and upload/context fields are rejected. In auto mode,
-`interactive` selects `shell`, then `overnight` or `experiment_config` selects
-`experiment`, and all other requests select `command`. An explicit `kind` is retained;
-an overnight command therefore stays a command and receives an advisory.
-
-Planning is offline and does not authenticate, inspect capacity, create projects, or
-submit work. It returns `kind`, `name`, `description`, `allow_queue`, rendered `config`,
-`code_revision`, and `advisories`. If `name` is omitted, the service creates one and
-adds an advisory. Commands and shells place the name on the first description line;
-experiments use their native name field. Top-level display metadata overrides matching
-experiment fields.
-
-Command and experiment entrypoints create `output_dir`, change to `workdir`, and then
-run the command through `/bin/bash -lc`. Command and shell configs use
-`resources.slots`; experiments use `resources.slots_per_trial`. The service supplies
-profile bind mounts and manages `COMPUTE_WORKDIR`, `COMPUTE_OUTPUT_DIR`,
-`COMPUTE_CODE_REVISION`, and the private submission marker. A request cannot override
-those variables or bind mounts.
-
-Experiments require `command` or `experiment_config.entrypoint`, but not both. An
-explicit `checkpoint_storage` must have `type: shared_fs`, a writable mapped
-`host_path`, and an optional `storage_path` that remains inside that host path. Legacy
-`checkpoint_path` and `tensorboard_path` aliases are rejected. If checkpoint storage is
-omitted, Determined applies its cluster default, which offline planning cannot inspect.
+Unknown keys are rejected. `host_path` need not exist on the MCP client machine. These
+checks narrow what the MCP sends; they do not replace the master's access control or
+filesystem permissions.
 
 ## Start the MCP server
 
@@ -120,320 +74,288 @@ Start one persistent stdio process per configured client:
 
 ```bash
 determined-compute-mcp \
-  --profile /absolute/path/to/compute-profile.yaml \
-  --db /absolute/local/path/to/tasks.sqlite3 \
-  --owner your-owner \
+  --profile /absolute/path/to/profile.yaml \
+  --storage-config /absolute/path/to/storage.yaml \
   --secrets-file /absolute/path/to/credentials.env \
   --verify-ssl
 ```
 
-`--profile`, `--db`, and `--owner` correspond to
-`DETERMINED_COMPUTE_PROFILE`, `DETERMINED_COMPUTE_DB`, and
-`DETERMINED_COMPUTE_OWNER`. `--storage-config` corresponds to
-`DETERMINED_COMPUTE_STORAGE`; `--secrets-file` can instead be supplied through
-`DETERMINED_COMPUTE_SECRETS`. The API URL, token, and TLS verification default to
-`DET_MASTER`, `DET_API_TOKEN`, and `DET_VERIFY_SSL`; keep credentials in the existing
-provider or secrets file rather than the profile, database, tool arguments, or reports.
+| Flag | Environment | Meaning |
+| --- | --- | --- |
+| `--profile` | `DETERMINED_COMPUTE_PROFILE` | Policy file; required |
+| `--storage-config` | `DETERMINED_COMPUTE_STORAGE` | Optional [storage access](shared-storage-access.md) file |
+| `--secrets-file` | `DETERMINED_COMPUTE_SECRETS` | `KEY=VALUE` credentials file |
+| `--api-url` | `DET_MASTER` | Master URL, when the secrets file does not name it |
+| `--api-token` | `DET_API_TOKEN` | API token, when the secrets file does not supply credentials |
+| `--verify-ssl`, `--no-verify-ssl` | `DET_VERIFY_SSL` | TLS verification |
 
-The default database path is `~/.local/state/determined-compute/tasks.sqlite3`, but
-MCP deployments should specify an absolute local path. MCP rejects `:memory:`. After an upgrade, restart every MCP
-process that shares the database so all processes load the same tool set and additive
-schema.
+The master URL is `--api-url`, else the secrets file's `DET_MASTER`, else the
+environment's `DET_MASTER` (`DET_MASTER_ADDR` and `DET_MASTER_HOST` are also read). A
+secrets file that names its master supplies the credentials for that master alone: the
+environment's `DET_API_TOKEN`, `DET_USERNAME` and `DET_PASSWORD` are then ignored, and
+when the environment names a different master, startup refuses. `--api-token` always
+wins. The credentials are either `DET_API_TOKEN` or both `DET_USERNAME` and
+`DET_PASSWORD`. Keep them in the secrets file, never in the policy, tool arguments, or
+reports.
 
-Optional client-side access to mapped storage uses the same profile and a separate
-storage configuration. See [Shared-storage access](shared-storage-access.md).
+At startup the server reads `GET /api/v1/master`, which needs no login, and exits with
+status 2 when the master's submission protocol is below 1 or missing, whatever its
+release string. It also exits with status 2 for an invalid policy, storage file, or
+credential source. An unreachable master does not stop startup: the storage tools
+keep working, and the same protocol check runs before the first call to the master.
+Startup errors go to stderr, because stdout carries MCP frames.
+
+## TaskSpec
+
+`compute_plan` and `compute_launch` take a `TaskSpec`:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `kind` | `command`, `shell`, or `experiment` | Required |
+| `name` | string | Required display name, at most 128 characters |
+| `command` | string | Required for a command and an experiment; a shell has none |
+| `code` | object or omitted | How code reaches the container; see below |
+| `workdir` | relative path | Directory below the code root to run in; default `.` |
+| `output_dir` | absolute container path | Required for a command and an experiment; created before the command runs, and exported as `COMPUTE_OUTPUT_DIR` |
+| `admission` | `queue` | The only supported value; `immediate` is refused with `admission_unsupported` and nothing is created |
+| `image`, `pool`, `slots` | string, string, integer ≥ 0 | Overrides of the policy defaults |
+| `env` | object | Environment variables; the `COMPUTE_` prefix is reserved |
+| `workspace`, `project` | string | Names. A command or shell takes a workspace; an experiment takes both or neither |
+| `experiment` | object | Experiment config; only for an experiment |
+
+Unknown fields are rejected, and so is a shell with a command, an `output_dir`, a
+`workdir`, or git code. The master validates everything else through the dry run.
+
+**Code sources.**
+
+| `code.source` | Fields | Code root (`COMPUTE_CODE_ROOT`) | Delivery |
+| --- | --- | --- | --- |
+| `git` | `repo` (container path on shared storage), `revision` (default `HEAD`) | `/run/determined/code` | The task clones `repo` at the pinned commit; nothing is uploaded |
+| `context` | `repo` (absolute local path of a working tree), `revision`, `include`, `exclude` | `/run/determined/workdir` | Tracked files at `revision` plus the `include` paths from the working tree, uploaded as the task context, at most 99,614,720 bytes |
+| `path` | `dir` (container path on shared storage) | `dir` | Runs in place; never pinned |
+
+The plan pins `revision` to a full commit SHA, and the resolved spec carries it, so a
+launch never re-resolves a branch. A `git` repository must lie under a policy mount
+and be readable on this machine through a local mount: this release plans `git` code
+only through a local mount, not over SSH, so map the repository's root in the storage
+access file's `local_mounts` (with `mode: auto` or `local`) or send the code as
+`context`. The commit must be on a branch or tag (`commit_not_on_ref`), because the
+task's clone borrows objects from the repository and `git gc` prunes unreachable ones.
+Partial clones, linked worktrees, and repositories with alternates are refused, a
+missing LFS object is `lfs_object_missing`, and planning needs git 2.32 or later. The
+image must provide `git`, and `git-lfs` when the commit has LFS files.
+
+A `context` upload never includes hard secret matches (keys, credentials, the
+configured secrets file); secret-like names are uploaded only when `include` names them,
+and both are listed as `excluded`. Anyone who can read the job can read its context.
+
+**Rendering.** Commands run under `bash -lc` and experiment entrypoints under `sh -c`,
+as `<prelude> || exit $?`, a newline, and the command. The prelude delivers the code,
+creates `output_dir`, and enters `workdir`; if any step fails, including a workdir that
+resolves outside the code root, it prints one line starting with `compute:` and the
+job exits before any user statement. The config carries `COMPUTE_CODE_SOURCE`,
+`COMPUTE_CODE_ROOT`, `COMPUTE_CODE_COMMIT` (for `git` and `context`), and
+`COMPUTE_OUTPUT_DIR`. The MCP never sends `work_dir` or a bind mount.
+
+**Experiments.** The MCP types only its own fields and does not vendor Determined's
+experiment schema. `experiment` may not set `entrypoint` (use `command`), `name`,
+`workspace` or `project` (use the top-level fields), `resources.resource_pool`,
+`resources.slots_per_trial`, `environment.image`, or `environment.environment_variables`
+(use `pool`, `slots`, `image`, and `env`), or `bind_mounts`. A search must set
+`searcher.max_concurrent_trials`, so that slots times concurrency stays under
+`max_slots`. A legacy `module:Class` command is refused. `checkpoint_storage` may not
+set `host_path`, `container_path`, `checkpoint_path`, or `tensorboard_path`; it sets
+`type: shared_fs` with a relative `storage_path` without `..`, and inherits
+`host_path` from the workspace or master default.
+
+Secrets typed into a command line or `env` are stored in the job's config, which its
+readers can see. Keep secrets in files on shared storage that the workload reads.
 
 ## MCP API
 
-The server exposes 14 tools. The `owner` below is always the startup-bound
-namespace and never a tool argument.
-
 | Tool | Arguments | Return value and effect |
 | --- | --- | --- |
-| `compute_plan` | `request` | Offline normalized plan; no cluster or database mutation |
-| `compute_launch` | `request`, `request_id` | Persisted task record; may submit once |
-| `compute_status` | `task_id` | Local task record, refreshed remote state, and remote entity when bound |
-| `compute_logs` | `task_id`, optional `tail=200` | Chronological list of the newest remote log records |
-| `compute_usage` | `task_id`, optional `window_seconds=3600`, `allocation_id`, `trial_id`, `metrics`, `include_samples=false` | Read-only summary of one task's measured CPU, memory, and GPU use |
-| `compute_cancel` | `task_id` | Updated record, remote cancellation response, and acknowledgement |
-| `compute_reconcile` | `task_id`, `remote_id` | Record bound only after marker verification |
-| `compute_list_tasks` | none | Local records in the bound owner namespace |
-| `compute_discover` | `kind`, optional `limit=50`, `offset=0` | One current-account remote page; no local mutation |
-| `compute_adopt` | `kind`, `remote_id` | Idempotently registered local record; no remote submission |
-| `compute_resources` | optional `slots=1`, `pool` | Current scheduler capacity and candidate pools |
-| `storage_check` | `path` | Access information for a mapped container path |
-| `storage_sync` | `local_dir`, `shared_dir`, optional `dry_run=true` | Preview or copy local directory contents to shared storage |
-| `storage_fetch` | `shared_dir`, `local_dir`, optional `dry_run=true` | Preview or copy shared directory contents locally |
+| `compute_plan` | `spec` | Resolved spec, a new `request_id`, the master's `request_digest`, and the effective config; nothing is created |
+| `compute_launch` | `spec`, `request_id`, `request_digest` | Creates the planned job, or returns the job this `request_id` already created |
+| `compute_status` | `job_id` | The job, its tasks and allocations, and an explanation of its state |
+| `compute_list` | optional `kind`, `state`, `limit=50`, `cursor` | The user's jobs from every client, newest first, with their `request_id` |
+| `compute_logs` | `job_id`, optional `trial_id`, `tail=200` | The last log lines of the job's task, oldest first |
+| `compute_usage` | `job_id`, optional `trial_id`, `allocation_id`, `window_seconds=3600`, `metrics`, `include_samples=false` | Measured CPU, memory, and GPU use; read-only |
+| `compute_resources` | optional `pool` | The pools and their device models, stamped with `observed_at` |
+| `storage_check` | `path` | Whether a container path exists and is readable and writable, from a stated viewpoint |
+| `compute_cancel` | `job_id` | Records a cancel and waits briefly for the job to end |
+| `storage_sync` | `local_dir`, `shared_dir`, optional `dry_run=true`, `overwrite=false` | Previews or copies a local directory into shared storage |
+| `storage_fetch` | `shared_dir`, `local_dir`, optional `dry_run=true`, `overwrite=false` | Previews or copies a shared directory to this machine |
 
-### Plan, capacity, and launch
+### Plan and launch
 
-Call `compute_plan` first and review resolved paths, mode, image, pool, slots, and
-advisories. `compute_resources` is a live snapshot, not a reservation. Positive slot
-requests inspect schedulable agent slots; zero checks auxiliary-container capacity.
-Candidate pools are suggestions and are never substituted automatically.
-
-`compute_launch` checks capacity unless `allow_queue` is explicitly true. Its
-`request_id` is an idempotency key within the bound owner. Repeating the same ID and
-equivalent request returns the established record. Reusing it with different content
-returns `idempotency_conflict`. Once a local row has claimed an ID, a retry cannot
-submit a second remote task, even after restart.
-
-The adapter sends command and shell configs as mappings. It serializes experiment
-configs as YAML and requests activation. It rejects source upload aliases, never
-creates a project, removes API envelopes, sanitizes retained identity material, and
-returns an entity with an `id`.
-
-### Task records, status, logs, and cancellation
-
-A public task record includes `task_id`, `request_id`, `owner`, `origin`, `kind`, local
-`state`, `remote_id`, `remote_state`, display metadata, paths, revision, cluster/account
-binding fields, an optional fixed `error_code`, and timestamps. Internal request hashes,
-profile hashes, and submission markers are never public. The service stores no full
-request body, generated config, API response, logs, or raw exception text in a task
-record.
-
-`compute_status` returns local state without contacting Determined when no remote ID is
-bound. Otherwise it fetches the entity, updates `remote_state`, and includes the
-sanitized entity as `remote`. A stale `pending` or `submitting` row becomes
-`submission_uncertain`; this never causes automatic resubmission.
-
-`compute_logs` requires a positive `tail`. Command and shell logs come from their task
-log API. Experiment logs come from the highest numeric trial ID, which a server-side
-sort selects even when an experiment has more than 100 trials; an experiment with no
-trials returns an empty list. Results are ordered oldest to newest. A task with no
-remote ID also returns an empty list.
-
-`compute_cancel` uses the task kill endpoint for commands and shells and the experiment
-cancel endpoint for experiments. It requires a bound remote ID and returns
-`cancellation_acknowledged: true` when the API call completes. Remote termination alone
-does not prove success; inspect exit information and expected shared-storage artifacts.
-
-For a running shell, use the sanitized `reconnectCommand`, currently
-`det shell show_ssh_command <remote-id>`. The adapter removes `privateKey`; never put
-private key material in task records or reports.
-
-### Task usage measurements
-
-`compute_usage` is read-only and summarizes the measured CPU, memory, and GPU use of one
-owned task; `compute_resources` describes scheduler capacity instead. It requires a
-Determined master from the research-cluster fork 0.40.1 or later on which an
-administrator has configured `integrations.task_resources` (`prometheus_url` and
-`det_cluster`).
-
-The service validates arguments first and then applies the same owner and binding
-checks as `compute_status`. A record without a remote ID returns `remote_id_unknown`;
-reconcile it first. An adopted task's remote owner is verified again. The service then
-asks the master whether task resources are available: a disabled integration returns
-`task_resources_disabled`, and a master without the API returns
-`task_resources_unsupported`. Neither is retryable.
-
-For a command or shell, `determined_task_id` is the remote ID. An experiment reports one
-trial: the highest-ID trial by default, or `trial_id` when given. A requested trial that
-belongs to another experiment returns `trial_not_found`; a nonexistent or inaccessible
-trial ID returns Determined's HTTP 404. Other kinds reject `trial_id`. The service
-measures the selected trial's newest Determined task. An experiment with no trial, or a
-trial with no task, returns `task_not_started`. `allocation_id` restricts results to one
-allocation listed for that task; any other value returns `allocation_not_found`.
-
-`window_seconds` must be 60 through 604,800 (seven days); the default is 3,600. The
-window ends at the task end time for an ended task, capped at the current time, and
-otherwise at the current time. If every selected allocation ended before that, as for a
-paused trial or an earlier allocation named by `allocation_id`, the window ends when the
-last of them ended instead. It starts `window_seconds` earlier, but never before the
-task start or the requested allocation's start, and always at least one second before
-its end. `window.anchor` reports which end applied: `task_end`, `allocation_end`, or
-`now`. The step is the larger of 15 seconds and the window length divided by 1,439,
-rounded up to a whole second, so no series exceeds 1,440 points. `metrics` is a
-non-empty list drawn from `allocation_active` (count), `cpu_cores` (cores),
-`memory_working_set_bytes` and `memory_rss_bytes` (bytes), `gpu_utilization_percent`
-(percent), `gpu_memory_used_bytes` (bytes), `gpu_power_watts` (watts), and
-`gpu_temperature_celsius` (celsius); omit it to keep every returned series.
-
-The result contains:
+`compute_plan(spec)` pins the code revision, applies the policy, renders the request,
+and makes one create call with `dry_run` on the master. It returns:
 
 | Field | Meaning |
 | --- | --- |
-| `task_id`, `kind`, `remote_id` | Local task identity |
-| `determined_task_id` | Determined task whose measurements were read |
-| `trial` | `null` for commands and shells; otherwise `id`, `state`, `selection` (`latest` or `requested`), `experiment_trial_count` (`null` when `trial_id` was given), `task_count`, and the trial progress and summary-metric fields described below |
-| `resource_pool` | The task's pool as `name` and the operator-written `description` from Determined, trimmed and truncated to 4,096 characters. `description` is `null` when the pool has none or is not in the pool list returned to this account. The whole field is `null` when the pool name is unknown |
-| `task_start_time`, `task_end_time` | Lifetime of the Determined task |
-| `allocations` | Each allocation's `allocation_id`, `state`, `is_ready`, UTC `start_time` and `end_time`, `slots`, `exit_reason` (at most 1,024 characters), and `status_code` |
-| `allocation_details_limit` | Present, as 8, only when the task has more than 8 allocations; see below |
-| `allocation_id` | Requested allocation filter, or `null` |
-| `window` | `start` and `end` in Unix seconds, `step` in seconds, plus `start_at`, `end_at`, `anchor`, and `expected_points` |
-| `series` | One summary per metric and label set |
-| `gpus` | One GPU comparison per allocation; see below |
-| `warnings` | Determined's `{code, message}` warnings, passed through unchanged |
-| `context_unavailable` | Context lookups that failed: `resource_pool`, `allocation_details`, or `gpu_models` |
-| `explanation`, `advisory` | How to read this result |
-| `observed_at` | Time the service built the result |
+| `spec` | The resolved spec: revision pinned, and `pool`, `slots`, and `image` explicit |
+| `request_id` | A new UUID; every plan mints one |
+| `request_digest` | The master's digest of the exact request; opaque |
+| `commit`, `content_digest` | The pinned commit; the content digest is the SHA for `git`, the manifest digest for `context`, and `unpinned` for `path` |
+| `code` | What was planned: for `context` the file count, size, `included`, `excluded`, and `skipped` paths; for `path` the observed commit and dirty state, labelled unverified |
+| `effective_config` | The master's merged config, reduced to reviewable fields and redacted; `observed` says that master and pool defaults are not bound by the plan and apply as they stand at launch |
+| `warnings` | `{code, message, paths}`: for example `path_not_bind_mounted`, `lfs_required`, `lfs_pointer`, `startup_hook`, `submodule_not_checked_out`, `secret_like_included`, or `current_slots_exceeded` |
+| `placement` | Always "not evaluated": the scheduler decides after launch |
 
-Each series has `metric`, `unit`, the labels `allocation_id`, `node`, and `gpu_uuid`,
-`gpu_model`, `points`, `available_points`, `first_at`, `last_at`, and `last`, `min`,
-`max`, `mean`, `p50`, and `p95` over the available samples. `p50` and `p95` are
-nearest-rank percentiles. `gpu_model` is the model name the Determined agent reports for
-`gpu_uuid`, or `null` for a non-GPU series or an unknown device. A
-`gpu_utilization_percent` series also has `idle_fraction`, the share of its available
-samples below 10%.
+Review the resolved spec, commit, effective config, and warnings, then call
+`compute_launch` with the returned `spec`, `request_id`, and `request_digest`. The
+launch renders the spec again and creates the job with `request_id` as its idempotency
+key, bound to the digest. It returns `job_id`, `request_id`, `replayed`, `outcome`
+(`queued`), `submitted_at`, and the job's current `state` with an `explanation`; an
+active experiment whose trials wait for resources reads `running`, and the explanation
+says it waits for the scheduler.
 
-Values are point samples taken every `step` seconds, so `min`, `max`, `mean`, and the
-percentiles describe those samples rather than every instant. A null or missing value
-means no measurement, never zero use. `allocation_active` above zero means the
-allocation was running. CPU and memory series are per allocation and node; GPU series
-are per GPU UUID and cover the whole assigned device, which can include other processes.
-Inspect `warnings`, such as `rss_unverified` or `gpu_full_device`, before drawing
-conclusions. An empty `series` list means no data for the window, not an idle task; if a
-`metrics` filter removed every returned series, `explanation` names the metrics that
-were returned. When `trial_id` is omitted and the experiment has several trials,
-`explanation` states how many exist and which one is reported.
+- **Retry.** A launch repeated with the same arguments returns the same job with
+  `replayed: true`. This holds even when the spec no longer renders, for example after
+  an included file was deleted, a branch was amended, or the policy changed: the
+  service then asks the master for the job of this `request_id` before it reports the
+  error, and the result carries a `note`.
+- **Plan drift.** If the code or request differs from the plan, for example because
+  the spec still names a moving branch, the launch returns `plan_changed` with the new
+  `commit` and `content_digest` and creates nothing. Plan again and review the new plan.
+- **Key reuse.** A `request_id` already used for a different request returns
+  `key_conflict` naming that `job_id`.
+- **Uncertain outcome.** `unavailable` on a launch is retryable: repeat it with the
+  same arguments. `internal` is not: the job may have been created, so repeat the
+  launch once with the same arguments, which returns the job if it exists; if the same
+  error comes back, nothing was created, so fix the request and plan again. Never plan
+  again with a new `request_id` while an outcome is uncertain; `compute_list` shows
+  every job with its `request_id`.
 
-`gpus` compares the GPUs within each allocation. It has one entry per `allocation_id`
-with GPU utilization or memory series and uses every such series returned for the
-window, even those a `metrics` filter hides from `series`; with `allocation_id`, it
-covers that allocation only. Each entry has `gpu_count` (distinct GPU UUIDs with a
-returned utilization or memory series, even if every sample is null), `requested_slots`
-(the allocation's slot count, or `null` when unknown), `gpu_models` (distinct known
-model names, possibly empty), and statistics of per-GPU mean utilization:
-`mean_utilization_percent` averages the per-GPU means so each GPU counts equally,
-`min_gpu_mean_utilization_percent` and `max_gpu_mean_utilization_percent` are the lowest
-and highest, `utilization_spread_percent` is their difference, and
-`least_utilized_gpu_uuid` names the lowest, with ties going to the lexicographically
-first UUID. These utilization statistics include only GPUs with at least one available
-utilization sample, so they can cover fewer GPUs than `gpu_count`. `idle_fraction` is
-instead the share of all the allocation's utilization samples below
-`idle_threshold_percent` (10). `max_memory_used_bytes` is the largest single-GPU memory
-sample in the allocation, not a true peak; GPU memory capacity is not reported. A large
-spread points to an idle or straggling GPU, starting with `least_utilized_gpu_uuid`, and
-a high `idle_fraction` means the GPUs spent much of the window below the threshold. A
-`gpu_count` below `requested_slots` means fewer GPUs returned a series than the
-allocation holds; check `warnings` and monitoring coverage before calling the rest
-unused.
+### Status, list, logs, and cancellation
 
-For an experiment, `trial` also carries Determined's values for the whole trial, not for
-the measurement window: `total_batches_processed`, `wall_clock_seconds`, and `restarts`,
-each `null` when missing or malformed. `total_batches_processed` is the highest reported
-`steps_completed`, and `restarts` is capped at the experiment's `max_restarts`.
-`batches_per_second_lower_bound` divides batches by wall-clock seconds and is `null`
-when either is unknown or wall-clock time is zero; its unit is whatever the workload
-reports as `steps_completed`. It is a floor, because `wall_clock_seconds` adds up each
-allocation from when Determined first reports its resources pulling or running until it
-ends, or until now while it runs. That can include image pull, startup, initialization,
-and allocations lost to restarts; scheduler queue time and gaps between allocations,
-such as pauses, are not counted. `summary_metrics` keeps Determined's per-group,
-per-metric statistics, reduced to `type` and the finite numeric `count`, `sum`, `min`,
-`max`, `last`, and `mean`; group names such as `avg_metrics` (training) and
-`validation_metrics` are Determined's and are passed through unchanged. At most 100
-metric entries are kept: `validation_metrics` first, then `avg_metrics`, then other groups
-by name, with metrics in name order within each group; `summary_metrics_truncated` is
-true when more existed. These fields depend on the
-workload reporting through Determined's Core API. A `total_batches_processed` of 0,
-which `explanation` then notes, is expected for a workload that does not, such as a
-plain bash entrypoint, or that has not reported yet, and does not mean it made no
-progress. `summary_metrics` is `{}`
-when the workload reports no metrics.
+`compute_status(job_id)` returns the job: `job_id`, `kind`, `entity_id` (the command,
+shell, or experiment ID), `name`, `owner_id`, `owner`, `workspace_id`, `project_id`,
+`request_id`, `request_digest`, `admission`, `submitted_at`, `ended_at`, `state`,
+`exit_class`, `exit_reason`, and `tasks` with their allocations, plus an
+`explanation`. The states are `queued`, `running`, `paused`, `completed`, `failed`,
+`canceled`, and `deleted`. Each allocation has an `exit_class` once it ends:
 
-Pool, allocation-detail, and GPU-model context is best-effort and read after the
-measurements. A Determined API error in one of these lookups, including a transport
-failure or malformed response, adds `resource_pool`, `allocation_details`, or
-`gpu_models` to `context_unavailable` and leaves the affected fields empty or `null`;
-the measurements are still returned. After a transport failure, the remaining lookups are
-skipped and reported the same way, so an unresponsive master delays the result by one
-timeout rather than one per lookup. A submitted task needs one extra entity read, which
-`compute_logs` does not make, to learn its pool name, and a failure there reports
-`resource_pool`; an adopted task reuses the entity read for its ownership check.
-Determined serves an ended command or shell for only 24 hours after it ends and not
-after a master restart; for such a task, `resource_pool` is then `null` without a
-`context_unavailable` entry. The
-pool list is read only when the pool name is known. Allocation details are read for the
-first eight allocations in Determined's order (allocations without an end time, such as
-queued or running ones, first, then most recently ended) plus a requested
-`allocation_id`; other allocations keep `null` details, and `allocation_details_limit`
-reports the limit. The agent list, which supplies GPU model names, is read only when a
-GPU series exists. When RBAC hides device UUIDs from the current account, `gpu_model` is
-`null` and `gpu_models` is empty without any `context_unavailable` entry.
+| Exit class | Meaning |
+| --- | --- |
+| `none` | It ended without a failure: completed or cancelled |
+| `workload_failed` | The workload exited with an error; a failed prelude counts too and prints a `compute:` line |
+| `workload_initialization_failed` | The container failed before the workload started, for example pulling the image |
+| `node_preflight_failed` | The node refused the allocation |
+| `placement_unsatisfied` | The scheduler could not place the job as its admission required |
+| `infrastructure_failed` | An agent or its connection was lost, or the master could not restore the task |
 
-`include_samples=true` adds `samples_omitted`. When `samples_omitted` is false, each
-series also has `samples` as `[unix_seconds, value_or_null]` pairs. When the selected
-series together exceed 2,880 points, the service omits samples and reports
-`samples_limit`; narrow the window, select fewer metrics, or choose one allocation.
+Jobs submitted before the ledger have no exit class, and neither has a cancelled
+experiment whose trial never started.
 
-The master limits a query to a seven-day range, a 15-second minimum step, 1,440 points
-per series, and a 10-second timeout, and runs at most four resource queries at once.
-HTTP 503 means the measurement backend is busy or unavailable and is retryable. The
-master rejects an end more than 60 seconds ahead of its own clock with HTTP 400, so a
-client clock far ahead of the master can cause that error. HTTP 404 means the Determined
-task, or a requested trial ID, is missing or inaccessible. See
-[troubleshooting](troubleshooting.md#usage-measurements-are-unavailable-or-empty).
+`compute_list` filters by `kind` and `state` and pages with `next_cursor`; `limit` is 1
+through 1,000. It covers every client of the user, so a lost `job_id` is recovered by
+its `request_id`. An active experiment whose trials wait for resources is listed as
+`running`, not `queued`.
 
-### Discover and adopt
+`compute_logs` returns `job_id`, `task_id`, `trial_id`, and `lines`, each with
+`timestamp`, `level`, `source`, `stdtype`, `allocation_id`, `rank_id`, and `log`. For an
+experiment, `trial_id` selects the trial, by default the latest; a job without a task
+returns no lines and a `note`. `tail` is 0 through 10,000.
 
-`compute_discover` accepts `kind` equal to `command`, `shell`, or `experiment`. `limit`
-must be 1 through 100 and `offset` must be non-negative. It queries only tasks owned by
-the currently authenticated Determined account and returns the actual cluster ID,
-account identity, sanitized metadata, any matching `local_task_id`, and consistent
-pagination including `next_offset`. It neither writes a local record nor submits work.
-Command and shell remote IDs are UUIDs; experiment remote IDs are positive integers.
+`compute_cancel` records the cancel on the master, which ends the job even if it has
+not started, then polls briefly. It returns the job with `cancel: "ended"` when the job
+ended in that time, or `"recorded"` otherwise; `compute_status` shows when it ends. An
+ended job is returned unchanged. Under basic authorization, only the job's owner or an
+administrator can cancel it.
 
-`compute_adopt` fetches one remote task and verifies both its normalized ID and
-`userId` against `/me` before writing. Administrative visibility cannot be used to
-adopt another user's task. Registration identity is the local owner, actual cluster ID,
-kind, and remote ID; the record also binds and verifies the authenticated user ID. A
-previously submitted record in the same database is returned unchanged rather than
-replaced.
+### Resources and storage
 
-New adopted records have `origin: "adopted"`, local `state: "adopted"`, and an internal
-adoption request ID. They retain only whitelisted identity, state, name, and description
-metadata. Unknown `workdir`, `output_dir`, and `code_revision` are exposed as `null`;
-the store does not infer them or retain raw remote configuration. Later status, logs,
-usage, and cancellation re-check the actual cluster and account binding. Adopted tasks
-do not use the submitting profile as their authority and gain no storage permissions.
+`compute_resources` projects each pool as Determined reports it: `name`, `description`,
+`type`, `num_agents`, `slots_available`, `slots_used`, `slot_type`, `slots_per_agent`,
+`aux_container_capacity`, and `aux_containers_running`, with `device_models` counted
+from the agents. It is a snapshot with no verdict: placement is not evaluated before
+launch, and a job whose slots exceed what the pool has now waits in the queue.
 
-Use discovery and adoption for work created by the WebUI, native CLI, or another device
-under the same account. Use reconciliation for a local submission whose acceptance was
-uncertain. An adopted task cannot be reconciled or used as a launch retry.
+`storage_check(path)` translates a container path through the policy and reports
+`host_path`, `exists`, `type`, `readable`, `writable`, `read_only`, and the
+`viewpoint`: the `backend` (`local` with its `local_root`, or `ssh` with its
+`ssh_host`), the `user` it runs as, and a note that the permissions are that user's,
+not the container user's. See [Shared storage access](shared-storage-access.md) for
+transfers.
 
-### Reconciliation and recovery
+### Task usage measurements
 
-A transport timeout can leave remote acceptance unknown. The service preserves the
-local task and returns its `task_id` in error details. It does not resubmit that request
-automatically. `compute_reconcile(task_id, remote_id)` fetches the proposed entity and
-binds it only if its reserved `COMPUTE_SUBMISSION_MARKER` equals the local unguessable
-marker. A mismatch returns `identity_mismatch`. First-line description markers are
-considered only for migrated legacy records without stored display metadata.
+`compute_usage` is read-only and summarizes the measured CPU, memory, and GPU use of
+one job's task. It needs a master on which an administrator has configured
+`integrations.task_resources`; without it the result is labelled `measurement:
+"unmeasured"` and still describes the allocations.
 
-This marker separates reconciliation from adoption: an uncertain local submission with
-a matching marker must be reconciled, while an independently created remote task can be
-adopted. If evidence is unavailable, investigate rather than launching the same work
-again.
+For a command or shell it measures the job's task. For an experiment it reports one
+trial: the latest by default, `trial_id` when given, or the trial that holds
+`allocation_id`. It measures that trial's newest task, or the task that holds
+`allocation_id`. A job without a task returns `task_not_started`, a trial or allocation
+of another job returns `not_found`, and an allocation of another trial than `trial_id`
+returns `invalid_request`.
 
-Submitted local tasks remain bound to the original profile fingerprint and endpoint.
-Adopted tasks remain bound to the actual cluster ID and authenticated user ID. These
-checks prevent a changed profile or account from operating on an unrelated task.
+`window_seconds` must be 60 through 604,800; the default is 3,600. The window ends when
+the job ended, capped at the current time, or at the current time; if every selected
+allocation ended before that, it ends when the last of them ended. It starts
+`window_seconds` earlier, but never before submission or the requested allocation's
+start. The step is at least 15 seconds and keeps each series at or below 1,440 points.
+`metrics` is a non-empty list drawn from `allocation_active`, `cpu_cores`,
+`memory_working_set_bytes`, `memory_rss_bytes`, `gpu_utilization_percent`,
+`gpu_memory_used_bytes`, `gpu_power_watts`, and `gpu_temperature_celsius`.
+
+| Field | Meaning |
+| --- | --- |
+| `job_id`, `kind`, `task_id` | The job and the measured task |
+| `trial` | `null` for a command or shell; otherwise `id`, `selection` (`latest`, `requested`, or `allocation`), `experiment_trial_count`, `task_count`, `state`, `total_batches_processed`, `wall_clock_seconds`, `restarts`, `batches_per_second_lower_bound`, `summary_metrics`, and `summary_metrics_truncated` |
+| `allocation_id`, `allocations` | The requested filter, and the task's allocations as the job reports them |
+| `resource_pool` | `name` and the administrator's `description` |
+| `submitted_at`, `ended_at` | The job's lifetime |
+| `measurement`, `window` | `measured` or `unmeasured`; `start`, `end`, `step`, `start_at`, `end_at`, `anchor` (`job_end`, `allocation_end`, or `now`), and `expected_points` |
+| `series` | One summary per metric and label set: `metric`, `unit`, `allocation_id`, `node`, `gpu_uuid`, `gpu_model`, `points`, `available_points`, `first_at`, `last_at`, `last`, `min`, `max`, `mean`, `p50`, `p95`, and for GPU utilization `idle_fraction` |
+| `gpus` | Per allocation: `gpu_count`, `requested_slots`, `gpu_models`, the mean, lowest, and highest per-GPU mean utilization, their spread, `least_utilized_gpu_uuid`, `idle_fraction`, and `max_memory_used_bytes` |
+| `warnings` | Determined's `{code, message}` warnings |
+| `context_unavailable` | Best-effort lookups that failed: `trial`, `resource_pool`, or `gpu_models` |
+| `explanation`, `advisory`, `observed_at` | How to read the result, and when it was built |
+
+Values are point samples taken every `step` seconds, so `min`, `max`, and `mean`
+describe those samples. A null or missing value means no measurement, never zero use,
+and an empty `series` means no data for the window, not an idle task. GPU metrics cover
+the whole assigned device, which can include other processes. `idle_fraction` is the
+share of GPU utilization samples below 10%. `batches_per_second_lower_bound` is a floor
+over the trial's lifetime, because wall-clock time includes image pulls, startup, and
+restarts; `total_batches_processed` is 0 for a workload that does not report through
+Determined's Core API. `include_samples=true` adds each series' samples as
+`[unix_seconds, value]` pairs, unless together they exceed 2,880 points, in which case
+`samples_omitted` is true.
 
 ### Errors
 
-MCP failures use `isError: true`; their text content is compact JSON of this form:
+A failed tool call has `isError: true`, and its text is `Error executing tool <name>:`
+followed by compact JSON:
 
 ```json
 {"error":{"code":"invalid_request","message":"...","retryable":false,"details":{}}}
 ```
 
-`retryable` and `details` appear only when available, and structured content is null.
-Safe details can include the local task ID and capacity information. Authentication,
-permission, transport, and response-shape failures are errors rather than empty
-results. Error messages and reports may contain sanitized commands, paths, IDs, states,
-and error classes, but must not include credentials or secret-file contents.
+`details` appears when there is something to add. A spec or argument that fails
+validation is `invalid_request`, with `details.errors` listing each location and
+reason, without the rejected values.
 
-A Determined HTTP failure, including a gRPC-gateway error body, appears as
-`<status> <message>`. HTTP 429 and 5xx responses other than 501 are retryable; 501 means
-the master lacks the route. Usage-specific codes are described in
-[Task usage measurements](#task-usage-measurements).
+| Code | Meaning | What to do |
+| --- | --- | --- |
+| `invalid_request` | The spec, an argument, or the master's validation refused the request | Fix the request and plan again |
+| `admission_unsupported` | `admission: immediate` | Use `queue` |
+| `plan_changed` | The code or request differs from the plan; nothing was created | Review `details.commit` and `content_digest`, then plan again |
+| `key_conflict` | The `request_id` names another request's job, in `details.job_id` | Plan again for a new `request_id` |
+| `unavailable` | The master did not answer or is busy; retryable | Repeat the call; repeat a launch with the same arguments |
+| `internal` | The master failed | On a launch, repeat once with the same arguments; if the same error returns, nothing was created, so plan again |
+| `invalid_response` | The master's answer was malformed | As `unavailable` on a launch; otherwise report it |
+| `not_found`, `permission_denied` | The job, trial, pool, or workspace is missing, or the account may not use it | Check the handle and the account |
+| `protocol_unsupported` | The master is below submission protocol 1 | Upgrade the master |
+| `pool_not_allowed`, `slots_exceed_limit`, `path_not_mounted`, `read_only_storage`, `invalid_policy` | The policy refused the request, or the policy file is invalid | Choose an allowed pool, fewer slots, or a writable mounted path |
+| `commit_not_on_ref`, `revision_not_found`, `partial_clone`, `lfs_object_missing`, `git_too_old`, `context_too_large`, `unsafe_symlink`, `invalid_include`, and other code checks | Code planning refused the source | Fix the repository or the code fields |
+| `storage_not_local`, `configuration_required`, `invalid_storage_path`, `storage_not_found`, `overwrite_not_allowed`, and other storage codes | Storage access refused or failed | See [Shared storage access](shared-storage-access.md) |
+| `task_not_started` | The job has no task yet | Wait, then ask again |
 
-On the Determined fork 0.40.1 or later with basic authorization, only the task's
-Determined owner or an administrator can kill or cancel commands, shells, and
-experiments. For a task owned by another account, `compute_cancel` therefore returns
-HTTP 403 for a command or shell and HTTP 404 `experiment '<id>' not found` for an
-experiment. Submitted records bind to the profile and endpoint rather than the account,
-so switching credentials to another account can produce these errors. Cancel with the
-owning account or ask an administrator.
+Error messages and reports may contain commands, paths, IDs, states, and error
+classes, but never credentials or secrets-file contents.

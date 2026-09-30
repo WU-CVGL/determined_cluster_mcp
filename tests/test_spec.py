@@ -166,8 +166,9 @@ def test_legacy_looking_command_is_fine_outside_experiments() -> None:
     [
         {"searcher": {"name": "single", "metric": "loss", "max_length": 10}},
         {"searcher": SEARCH, "hyperparameters": {"lr": {"type": "log", "base": 10}}},
-        {"checkpoint_storage": {"storage_path": "runs/a"}},
+        {"checkpoint_storage": {"type": "shared_fs", "storage_path": "runs/a"}},
         {"checkpoint_storage": {"type": "shared_fs", "storage_path": ".", "save_trial_best": 1}},
+        {"checkpoint_storage": {"save_trial_best": 1}},
         {"checkpoint_storage": None, "searcher": None, "max_restarts": 0},
         {
             "resources": {"max_slots": 4, "priority": 10},
@@ -180,6 +181,7 @@ def test_legacy_looking_command_is_fine_outside_experiments() -> None:
         "search",
         "storage-path",
         "shared-fs",
+        "storage-without-path",
         "nulls",
         "other-settings",
         "null-sections",
@@ -313,6 +315,17 @@ INVALID = [
     (
         experiment_fields(experiment={"checkpoint_storage": {"storage_path": 5}}),
         "storage_path must be relative without '..'",
+    ),
+    (
+        # The master knows storage_path only on shared_fs, and refuses it with an unclear error.
+        experiment_fields(experiment={"checkpoint_storage": {"storage_path": "runs/a"}}),
+        "checkpoint_storage.storage_path needs type: shared_fs",
+    ),
+    (
+        experiment_fields(
+            experiment={"checkpoint_storage": {"type": "s3", "storage_path": "runs/a"}}
+        ),
+        "checkpoint_storage.storage_path needs type: shared_fs",
     ),
     (
         experiment_fields(experiment={"checkpoint_storage": "shared_fs"}),

@@ -292,6 +292,12 @@ def _check_experiment(config: Mapping[str, Any]) -> None:
                 or ".." in storage_path.split("/")
             ):
                 raise ValueError("checkpoint_storage.storage_path must be relative without '..'")
+            # Only the shared_fs member of the storage union has storage_path.
+            if storage.get("type") != "shared_fs":
+                raise ValueError(
+                    "checkpoint_storage.storage_path needs type: shared_fs; host_path is "
+                    "inherited from the workspace or master default"
+                )
     searcher = config.get("searcher")
     if searcher is not None:
         if not isinstance(searcher, Mapping):

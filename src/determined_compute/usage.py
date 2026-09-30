@@ -140,22 +140,46 @@ def _check_arguments(
 
 
 def select_task(
-    submission: Mapping[str, Any], trial_id: Optional[int]
+    submission: Mapping[str, Any],
+    trial_id: Optional[int],
+    allocation_id: Optional[str] = None,
 ) -> Tuple[Mapping[str, Any], Optional[Dict[str, Any]]]:
     """Return the task to measure and, for an experiment, what the submission says of its trial.
 
     Tasks come oldest first, so the last task of a trial is the one a continued trial runs now.
+    An ``allocation_id`` selects the task that holds it, whichever trial that is.
     """
 
     tasks = submission["tasks"]
+    holder = None
+    if allocation_id is not None:
+        holder = next(
+            (
+                task
+                for task in tasks
+                if any(item["allocation_id"] == allocation_id for item in task["allocations"])
+            ),
+            None,
+        )
+        if holder is None:
+            raise UsageError("the allocation does not belong to this job", code="not_found")
     if submission["kind"] != "experiment":
         if trial_id is not None:
             raise UsageError("trial_id applies only to experiments", code="invalid_request")
         if not tasks:
             raise UsageError("the job has no task yet", code="task_not_started")
-        return tasks[-1], None
+        return holder or tasks[-1], None
     trials = sorted({task["trial_id"] for task in tasks if task["trial_id"] is not None})
-    if trial_id is None:
+    if holder is not None:
+        if trial_id is not None and holder["trial_id"] != trial_id:
+            raise UsageError(
+                f"the allocation belongs to trial {holder['trial_id']}, not trial {trial_id}",
+                code="invalid_request",
+            )
+        if holder["trial_id"] is None:
+            return holder, None
+        chosen, selection = holder["trial_id"], "allocation"
+    elif trial_id is None:
         if not trials:
             raise UsageError("the experiment has no trials yet", code="task_not_started")
         chosen, selection = trials[-1], "latest"
@@ -170,7 +194,7 @@ def select_task(
         "experiment_trial_count": len(trials),
         "task_count": len(own),
     }
-    return own[-1], trial
+    return holder or own[-1], trial
 
 
 def _window(
@@ -228,14 +252,14 @@ def summarize(
     """
 
     metrics = _check_arguments(window_seconds, allocation_id, trial_id, metrics, include_samples)
-    task, trial = select_task(submission, trial_id)
+    task, trial = select_task(submission, trial_id, allocation_id)
     allocations = [dict(item) for item in task["allocations"]]
     selected = [
         item
         for item in allocations
         if allocation_id is None or item["allocation_id"] == allocation_id
     ]
-    if allocation_id is not None and not selected:
+    if allocation_id is not None and not selected:  # select_task chose the allocation's task
         raise UsageError("the allocation does not belong to the selected task", code="not_found")
 
     now = int(time.time())
@@ -387,7 +411,7 @@ def _trial_progress(trial: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
     wall_clock = float(wall_clock) if _finite(wall_clock) and wall_clock >= 0 else None
     summary_metrics, truncated = _summary_metrics(trial.get("summaryMetrics"))
     return {
-        "state": state if isinstance(state, str) else None,
+        "state": _trial_state(state),
         "total_batches_processed": batches,
         "wall_clock_seconds": wall_clock,
         "restarts": restarts,
@@ -399,6 +423,18 @@ def _trial_progress(trial: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
         "summary_metrics": summary_metrics,
         "summary_metrics_truncated": truncated,
     }
+
+
+def _trial_state(value: Any) -> Optional[str]:
+    """``STATE_NAME`` as ``name``, like a job's states; unspecified or unknown is None.
+
+    The trial is best-effort context, so a malformed state is dropped rather than refused.
+    """
+
+    if not isinstance(value, str) or not value.startswith("STATE_"):
+        return None
+    name = value[len("STATE_"):].lower()
+    return None if name == "unspecified" else name
 
 
 def _summary_metrics(value: Any) -> Tuple[Dict[str, Dict[str, Any]], bool]:

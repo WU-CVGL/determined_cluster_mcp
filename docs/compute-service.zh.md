@@ -3,39 +3,35 @@
 
 [English](compute-service.md) | [简体中文](compute-service.zh.md)
 
-本文说明本地 Determined 计算服务的配置和公开 MCP 接口。准备、提交和检查任务的通用 agent
-流程见 [Agent 工作流](agent-workflow.zh.md)。
+本文说明本地 Determined 计算服务的配置和公开 MCP 接口。与具体 agent 无关的准备、提交和检查流程见 [Agent 工作流](agent-workflow.zh.md)。
 
 <a id="architecture-and-trust-boundary"></a>
 ## 架构与信任边界
 
 ```mermaid
 flowchart LR
-    U[Any local stdio MCP client] --> M[14 MCP tools]
-    M --> C[ComputeService]
-    C --> D[(local SQLite database)]
-    C --> A[Determined API]
-    A --> K[Determined cluster]
-    P[compute profile] --> C
-    M --> S[shared-storage adapter]
-    S --> H[mapped shared storage]
+    U[任意本地 stdio MCP 客户端] --> M[11 个 MCP 工具]
+    M --> P[策略]
+    M --> G[代码规划]
+    M --> A[Determined API]
+    A --> L[(master 上的任务台账)]
+    A --> K[Determined 集群]
+    M --> S[共享存储访问]
+    S --> H[映射的共享存储]
 ```
 
-MCP server 是供一个可信用户使用的本地 stdio 服务。进程启动时绑定 `owner`，所有工具都不接受
-owner 参数。多个进程可以在同一个数据库中使用不同 owner；需要协作时也可以有意共用 owner。
-这只是命名空间边界，不是多用户认证。若要远程暴露服务，需要另行设计带认证的传输层。
+MCP server 是面向单个可信用户的本地 stdio 服务，不保存任何本地状态：Determined master 记录每个任务，以规划生成的 `request_id` 为键，`job_id` 是任务的唯一句柄。任务的所有者是已认证的 Determined 用户，因此该用户的所有客户端（包括 WebUI 和 CLI）都能通过 `compute_list` 看到相同的任务。远程暴露的服务需要自己的认证传输层。
 
-`ComputeService` 负责规划、幂等提交、状态、日志、用量测量、取消、发现、接管以及保守的
-调和。其本地 `task_id` 在服务重启后保持稳定，与 Determined 的 `remote_id` 不同。SQLite
-数据库应放在持久的本地存储上；源码、数据、包、检查点、日志和输出应放在映射的共享存储上。
+master 负责身份、幂等、规划绑定、准入、调度放置以及每个 allocation 的退出类别。MCP 负责比 master 访问控制更窄的策略、用户的工作树、代码交付和结果解读。源码、数据、依赖包、检查点、日志和输出都应放在映射的共享存储上。
 
-<a id="compute-profile"></a>
-## 计算配置
+本服务需要支持 submission protocol 1 或更高版本的 Determined master。
 
-通过 `--profile PATH` 或 `DETERMINED_COMPUTE_PROFILE` 传入配置。其结构如下：
+<a id="policy"></a>
+## 策略
+
+通过 `--profile PATH` 或 `DETERMINED_COMPUTE_PROFILE` 传入策略文件。文件为 YAML；文件名以 `.json` 结尾时为 JSON。字段如下：
 
 ```yaml
-cluster_identity: optional-deployment-label
 mounts:
   - host_path: /shared/projects
     container_path: /workspace
@@ -46,337 +42,205 @@ defaults:
   image: your-image
   pool: your-pool
   slots: 1
-shell_inactivity_seconds: 7200
+pools: [your-pool, your-other-pool]
+max_slots: 8
+allow_overwrite: false
 ```
 
-至少需要一个挂载。`host_path` 是集群 agent 上的路径，不必存在于运行 MCP client 的机器上；
-请求使用 `container_path`。容器根路径不能重叠，因此每个容器路径只通过一个对应挂载进行
-映射。使用可能重叠的主机根路径验证 host-path 别名时，由最具体的根路径决定策略；匹配程度
-相同时只读优先。`workdir`、`output_dir` 和显式检查点目标必须位于可写挂载下，仍可从只读
-挂载读取参考数据。这些检查是服务策略，不能替代文件系统权限。
+| 字段 | 含义 |
+| --- | --- |
+| `mounts` | 必填。把每个容器路径映射到管理员在每个 agent 上绑定的宿主机路径（`task_container_defaults.bind_mounts`）。MCP 从不发送 bind mount，只用这张映射表检查路径并访问共享存储。`read_only: true` 会拒绝位于其下的 `output_dir` 和同步目标 |
+| `defaults` | 必填 `image` 和 `pool`，以及 `slots`（默认 1）。请求省略时使用这些值；pool 和 slots 总是显式发送 |
+| `pools` | 请求可以指定的资源池。省略时只允许默认资源池 |
+| `max_slots` | 单个请求最多占用的 slots：每个 trial 的 slots 乘以搜索的并发 trial 数 |
+| `allow_overwrite` | `storage_sync` 和 `storage_fetch` 能否覆盖已有文件（默认 `false`） |
 
-镜像、资源池和 slot 数量是请求可以覆盖的默认值。`slots` 必须是非负整数；若资源池支持，
-零表示请求 CPU-only 的辅助容器容量。`shell_inactivity_seconds` 可省略，并且只作为提示；
-服务本身不强制 shell 空闲超时。
-
-`cluster_identity` 是可选的运维标签。服务把本地提交记录绑定到配置指纹、解析后的 Determined
-端点和这个标签。改变该绑定后，不能再对这些记录执行状态、日志、用量、取消或调和操作。
-
-<a id="request-object-and-planning"></a>
-## 请求对象与规划
-
-`compute_plan` 和 `compute_launch` 接受相同的请求对象：
-
-| 字段 | 类型 | 含义 |
-| --- | --- | --- |
-| `name` | 字符串 | 可选显示名称，最多 128 个字符 |
-| `description` | 字符串或 null | 可选显示说明，最多 2,048 个字符 |
-| `allow_queue` | 布尔值 | 当前容量不足时允许排队；默认 `false` |
-| `kind` | `auto`、`command`、`shell` 或 `experiment` | 执行模式；默认 `auto` |
-| `interactive` | 布尔值 | 要求 shell 模式；在 auto 模式下选择 `shell` |
-| `overnight` | 布尔值 | 在 auto 模式下选择 `experiment` |
-| `command` | 字符串或字符串数组 | command 或 experiment 的入口；shell 模式拒绝此字段 |
-| `workdir` | 容器绝对路径 | 可写已配置挂载下的工作目录 |
-| `output_dir` | 容器绝对路径 | 可写已配置挂载下的输出目录 |
-| `slots` | 非负整数 | 请求的 slot 数；默认使用配置值 |
-| `pool`、`image` | 字符串 | 可选的配置默认值覆盖 |
-| `code_revision` | 字符串或 null | 调用方提供的版本或内容标识 |
-| `experiment_config` | 对象 | 额外的实验配置；要求 experiment 模式 |
-
-服务拒绝未知字段以及上传/context 字段。在 auto 模式中，`interactive` 优先选择 `shell`，
-其次由 `overnight` 或 `experiment_config` 选择 `experiment`，其余请求选择 `command`。
-显式 `kind` 会保留，所以 overnight command 仍是 command，并收到一条提示。
-
-规划完全离线，不做认证、容量检查、项目创建或任务提交。它返回 `kind`、`name`、
-`description`、`allow_queue`、渲染后的 `config`、`code_revision` 和 `advisories`。省略
-`name` 时，服务会生成名称并添加提示。command 和 shell 把名称放在 description 第一行；
-experiment 使用原生 name 字段。顶层显示元数据会覆盖同名的 experiment 字段。
-
-command 和 experiment 的入口先创建 `output_dir`，再切换到 `workdir`，最后通过
-`/bin/bash -lc` 运行命令。command 和 shell 配置使用 `resources.slots`，experiment 使用
-`resources.slots_per_trial`。服务提供配置中的 bind mount，并管理 `COMPUTE_WORKDIR`、
-`COMPUTE_OUTPUT_DIR`、`COMPUTE_CODE_REVISION` 和私有提交标记；请求不能覆盖这些环境变量或
-bind mount。
-
-experiment 必须提供 `command` 或 `experiment_config.entrypoint`，但不能同时提供。显式
-`checkpoint_storage` 必须使用 `type: shared_fs`、可写的映射 `host_path`，且可选的
-`storage_path` 必须留在该 host path 内。服务拒绝旧的 `checkpoint_path` 和
-`tensorboard_path` 别名。若省略 checkpoint storage，Determined 使用集群默认配置，离线规划
-无法检查该默认值。
+未知字段会被拒绝。`host_path` 不必存在于 MCP 客户端机器上。这些检查只收窄 MCP 发送的内容，不取代 master 的访问控制或文件系统权限。
 
 <a id="start-the-mcp-server"></a>
 ## 启动 MCP server
 
-为每个已配置的 client 启动一个持久 stdio 进程：
+每个客户端配置启动一个常驻 stdio 进程：
 
 ```bash
 determined-compute-mcp \
-  --profile /absolute/path/to/compute-profile.yaml \
-  --db /absolute/local/path/to/tasks.sqlite3 \
-  --owner your-owner \
+  --profile /absolute/path/to/profile.yaml \
+  --storage-config /absolute/path/to/storage.yaml \
   --secrets-file /absolute/path/to/credentials.env \
   --verify-ssl
 ```
 
-`--profile`、`--db` 和 `--owner` 分别对应 `DETERMINED_COMPUTE_PROFILE`、
-`DETERMINED_COMPUTE_DB` 和 `DETERMINED_COMPUTE_OWNER`；`--storage-config` 对应
-`DETERMINED_COMPUTE_STORAGE`；`--secrets-file` 也可通过 `DETERMINED_COMPUTE_SECRETS`
-提供。API URL、token 和 TLS 验证默认来自 `DET_MASTER`、`DET_API_TOKEN` 和
-`DET_VERIFY_SSL`。凭据应放在现有凭据提供方或 secrets 文件中，不要写入配置、数据库、工具
-参数或报告。
+| 参数 | 环境变量 | 含义 |
+| --- | --- | --- |
+| `--profile` | `DETERMINED_COMPUTE_PROFILE` | 策略文件；必填 |
+| `--storage-config` | `DETERMINED_COMPUTE_STORAGE` | 可选的[存储访问](shared-storage-access.zh.md)文件 |
+| `--secrets-file` | `DETERMINED_COMPUTE_SECRETS` | `KEY=VALUE` 凭据文件 |
+| `--api-url` | `DET_MASTER` | master 地址，用于 secrets 文件未指定时 |
+| `--api-token` | `DET_API_TOKEN` | API token，用于 secrets 文件未提供凭据时 |
+| `--verify-ssl`、`--no-verify-ssl` | `DET_VERIFY_SSL` | TLS 验证 |
 
-默认数据库路径是 `~/.local/state/determined-compute/tasks.sqlite3`，但 MCP 部署应显式
-指定本地绝对路径。MCP 拒绝 `:memory:`。服务升级后，应重启共用该数据库的所有 MCP 进程，
-使它们加载同一套工具和新增式 schema。
+master 地址依次取 `--api-url`、secrets 文件中的 `DET_MASTER`、环境变量 `DET_MASTER`（也读取 `DET_MASTER_ADDR` 和 `DET_MASTER_HOST`）。secrets 文件若指定了 master，其凭据只发往该 master：此时忽略环境中的 `DET_API_TOKEN`、`DET_USERNAME` 和 `DET_PASSWORD`；如果环境指定了另一个 master，服务拒绝启动。`--api-token` 始终优先。凭据为 `DET_API_TOKEN`，或同时提供 `DET_USERNAME` 和 `DET_PASSWORD`。凭据只放在 secrets 文件中，不要写进策略、工具参数或报告。
 
-客户端访问映射共享存储的可选功能使用同一计算配置和独立的存储配置。参见
-[共享存储访问](shared-storage-access.zh.md)。
+启动时服务读取无需登录的 `GET /api/v1/master`；如果 master 的 submission protocol 低于 1 或缺失，无论其版本字符串如何，都以状态码 2 退出。策略文件、存储文件或凭据来源无效时也以状态码 2 退出。master 无法连接不会阻止启动：存储工具照常可用，同样的协议检查会在第一次调用 master 前执行。启动错误写入 stderr，因为 stdout 用于传输 MCP 帧。
+
+<a id="taskspec"></a>
+## TaskSpec
+
+`compute_plan` 和 `compute_launch` 接受一个 `TaskSpec`：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `kind` | `command`、`shell` 或 `experiment` | 必填 |
+| `name` | 字符串 | 必填的显示名称，最多 128 个字符 |
+| `command` | 字符串 | command 和 experiment 必填；shell 没有命令 |
+| `code` | 对象或省略 | 代码如何进入容器，见下文 |
+| `workdir` | 相对路径 | 在代码根目录下运行的目录；默认 `.` |
+| `output_dir` | 容器绝对路径 | command 和 experiment 必填；命令运行前创建，并导出为 `COMPUTE_OUTPUT_DIR` |
+| `admission` | `queue` | 唯一支持的值；`immediate` 以 `admission_unsupported` 拒绝，且不创建任何内容 |
+| `image`、`pool`、`slots` | 字符串、字符串、≥ 0 的整数 | 覆盖策略默认值 |
+| `env` | 对象 | 环境变量；`COMPUTE_` 前缀为保留前缀 |
+| `workspace`、`project` | 字符串 | 名称。command 和 shell 只有 workspace；experiment 两者同时设置或都不设置 |
+| `experiment` | 对象 | 实验配置；仅用于 experiment |
+
+未知字段会被拒绝；带命令、`output_dir`、`workdir` 或 git 代码的 shell 也会被拒绝。其余内容由 master 在 dry run 中校验。
+
+**代码来源。**
+
+| `code.source` | 字段 | 代码根目录（`COMPUTE_CODE_ROOT`） | 交付方式 |
+| --- | --- | --- | --- |
+| `git` | `repo`（共享存储上的容器路径）、`revision`（默认 `HEAD`） | `/run/determined/code` | 任务在固定的提交上克隆 `repo`；不上传任何内容 |
+| `context` | `repo`（工作树的本地绝对路径）、`revision`、`include`、`exclude` | `/run/determined/workdir` | `revision` 中的已跟踪文件加上工作树中的 `include` 路径，作为任务 context 上传，最多 99,614,720 字节 |
+| `path` | `dir`（共享存储上的容器路径） | `dir` | 原地运行；从不固定版本 |
+
+规划把 `revision` 固定为完整的提交 SHA，解析后的 spec 携带该 SHA，因此提交时不会重新解析分支。`git` 仓库必须位于策略挂载之下，并能在本机通过本地挂载读取：本版本只通过本地挂载规划 `git` 代码，不支持 SSH，因此请在存储访问文件的 `local_mounts` 中映射仓库根目录（`mode: auto` 或 `local`），或改用 `context` 发送代码。提交必须位于某个分支或标签上（`commit_not_on_ref`），因为任务中的克隆借用仓库的对象，而 `git gc` 会清理不可达对象。部分克隆、linked worktree 和使用 alternates 的仓库会被拒绝，缺失 LFS 对象返回 `lfs_object_missing`，规划需要 git 2.32 或更高版本。镜像必须提供 `git`；提交包含 LFS 文件时还需要 `git-lfs`。
+
+`context` 上传从不包含硬性 secret 规则匹配的文件（密钥、凭据、已配置的 secrets 文件）；疑似 secret 的文件名只有在 `include` 中点名时才上传，两者都列在 `excluded` 中。能读取该任务的人都能读取它的 context。
+
+**渲染。** command 在 `bash -lc` 下运行，experiment 入口在 `sh -c` 下运行，形式为 `<prelude> || exit $?`、换行、再接命令。prelude 负责交付代码、创建 `output_dir` 并进入 `workdir`；任何一步失败（包括 workdir 实际解析到代码根目录之外）时，会打印一行以 `compute:` 开头的信息，任务在执行任何用户语句前退出。配置中包含 `COMPUTE_CODE_SOURCE`、`COMPUTE_CODE_ROOT`、`COMPUTE_CODE_COMMIT`（`git` 和 `context`）以及 `COMPUTE_OUTPUT_DIR`。MCP 从不发送 `work_dir` 或 bind mount。
+
+**实验。** MCP 只为自己的字段定义类型，不内置 Determined 的实验 schema。`experiment` 不能设置 `entrypoint`（改用 `command`）、`name`、`workspace` 或 `project`（改用顶层字段）、`resources.resource_pool`、`resources.slots_per_trial`、`environment.image` 或 `environment.environment_variables`（改用 `pool`、`slots`、`image` 和 `env`），也不能设置 `bind_mounts`。搜索必须设置 `searcher.max_concurrent_trials`，使 slots 乘以并发数不超过 `max_slots`。旧式 `module:Class` 命令会被拒绝。`checkpoint_storage` 不能设置 `host_path`、`container_path`、`checkpoint_path` 或 `tensorboard_path`；应设置 `type: shared_fs` 和不含 `..` 的相对 `storage_path`，`host_path` 从 workspace 或 master 默认值继承。
+
+写在命令行或 `env` 中的 secret 会保存在任务配置里，能读取该任务的人都能看到。secret 应保存在共享存储上的文件中，由工作负载读取。
 
 <a id="mcp-api"></a>
 ## MCP API
 
-server 提供 14 个工具。下文的 `owner` 始终指启动时绑定的命名空间，不是工具参数。
-
-| 工具 | 参数 | 返回值与作用 |
+| 工具 | 参数 | 返回值与效果 |
 | --- | --- | --- |
-| `compute_plan` | `request` | 离线规范化的规划；不访问集群或修改数据库 |
-| `compute_launch` | `request`、`request_id` | 持久化任务记录；最多提交一次 |
-| `compute_status` | `task_id` | 本地任务记录、刷新后的远端状态，以及绑定后取得的远端实体 |
-| `compute_logs` | `task_id`，可选 `tail=200` | 最新远端日志按时间正序排列的列表 |
-| `compute_usage` | `task_id`，可选 `window_seconds=3600`、`allocation_id`、`trial_id`、`metrics`、`include_samples=false` | 一个任务实测 CPU、内存和 GPU 用量的只读摘要 |
-| `compute_cancel` | `task_id` | 更新后的记录、远端取消响应与确认标志 |
-| `compute_reconcile` | `task_id`、`remote_id` | 仅在验证标记后绑定的记录 |
-| `compute_list_tasks` | 无 | 已绑定 owner 命名空间内的本地记录 |
-| `compute_discover` | `kind`，可选 `limit=50`、`offset=0` | 当前账户的一页远端任务；不修改本地状态 |
-| `compute_adopt` | `kind`、`remote_id` | 幂等注册的本地记录；不提交远端任务 |
-| `compute_resources` | 可选 `slots=1`、`pool` | 当前调度容量和候选资源池 |
-| `storage_check` | `path` | 映射容器路径的访问情况 |
-| `storage_sync` | `local_dir`、`shared_dir`，可选 `dry_run=true` | 预览或把本地目录内容复制到共享存储 |
-| `storage_fetch` | `shared_dir`、`local_dir`，可选 `dry_run=true` | 预览或把共享目录内容复制到本地 |
+| `compute_plan` | `spec` | 解析后的 spec、新的 `request_id`、master 的 `request_digest` 和生效配置；不创建任何内容 |
+| `compute_launch` | `spec`、`request_id`、`request_digest` | 创建已规划的任务，或返回该 `request_id` 已创建的任务 |
+| `compute_status` | `job_id` | 任务、其 task 和 allocation，以及状态说明 |
+| `compute_list` | 可选 `kind`、`state`、`limit=50`、`cursor` | 该用户在所有客户端提交的任务，按时间倒序，附带 `request_id` |
+| `compute_logs` | `job_id`，可选 `trial_id`、`tail=200` | 任务 task 的最后若干行日志，按时间正序 |
+| `compute_usage` | `job_id`，可选 `trial_id`、`allocation_id`、`window_seconds=3600`、`metrics`、`include_samples=false` | 实测 CPU、内存和 GPU 用量；只读 |
+| `compute_resources` | 可选 `pool` | 资源池及其设备型号，附 `observed_at` |
+| `storage_check` | `path` | 从明确说明的视角检查容器路径是否存在、可读和可写 |
+| `compute_cancel` | `job_id` | 记录取消，并短暂等待任务结束 |
+| `storage_sync` | `local_dir`、`shared_dir`，可选 `dry_run=true`、`overwrite=false` | 预览或把本地目录复制到共享存储 |
+| `storage_fetch` | `shared_dir`、`local_dir`，可选 `dry_run=true`、`overwrite=false` | 预览或把共享目录复制到本机 |
 
-<a id="plan-capacity-and-launch"></a>
-### 规划、容量与提交
+<a id="plan-and-launch"></a>
+### 规划与提交
 
-先调用 `compute_plan`，检查解析后的路径、模式、镜像、资源池、slot 和提示。
-`compute_resources` 返回实时快照，不保留资源。正 slot 数检查可调度的 agent slot；零检查辅助
-容器容量。候选资源池只是建议，服务不会自动替换。
+`compute_plan(spec)` 固定代码版本、应用策略、渲染请求，并在 master 上以 `dry_run` 发起一次创建调用。返回：
 
-除非显式设置 `allow_queue: true`，`compute_launch` 会先检查容量。`request_id` 是已绑定 owner
-内的幂等键。用相同 ID 和等价请求重试会返回已有记录；用不同内容复用会返回
-`idempotency_conflict`。本地记录一旦认领该 ID，即使服务重启，重试也不会提交第二个远端
-任务。
+| 字段 | 含义 |
+| --- | --- |
+| `spec` | 解析后的 spec：版本已固定，`pool`、`slots` 和 `image` 均为显式值 |
+| `request_id` | 新的 UUID；每次规划都生成一个 |
+| `request_digest` | master 对该请求计算的摘要；不透明 |
+| `commit`、`content_digest` | 固定的提交；内容摘要对 `git` 为 SHA，对 `context` 为清单摘要，对 `path` 为 `unpinned` |
+| `code` | 规划内容：`context` 的文件数、大小以及 `included`、`excluded`、`skipped` 路径；`path` 观察到的提交和 dirty 状态，标注为未验证 |
+| `effective_config` | master 合并后的配置，精简为可审核字段并已脱敏；`observed` 说明 master 和资源池默认值不受规划绑定，按提交时的值生效 |
+| `warnings` | `{code, message, paths}`，例如 `path_not_bind_mounted`、`lfs_required`、`lfs_pointer`、`startup_hook`、`submodule_not_checked_out`、`secret_like_included` 或 `current_slots_exceeded` |
+| `placement` | 始终为“未评估”：调度器在提交后决定放置 |
 
-适配器把 command 和 shell 配置作为 mapping 发送；experiment 配置会序列化为 YAML 并请求
-激活。适配器拒绝源码上传别名，从不自动创建项目，会移除 API envelope、清理用于身份调和的
-材料，并返回含 `id` 的实体。
+审核解析后的 spec、提交、生效配置和警告，然后用返回的 `spec`、`request_id` 和 `request_digest` 调用 `compute_launch`。提交会重新渲染 spec，以 `request_id` 作为幂等键并绑定摘要来创建任务。返回 `job_id`、`request_id`、`replayed`、`outcome`（`queued`）、`submitted_at`，以及任务当前的 `state` 和 `explanation`；trial 仍在等待资源的活动实验显示为 `running`，说明中会写明它在等待调度器。
 
-<a id="task-records-status-logs-and-cancellation"></a>
-### 任务记录、状态、日志与取消
+- **重试。** 用相同参数重复提交会返回同一任务，且 `replayed: true`。即使 spec 已无法渲染（例如 include 的文件被删除、分支被 amend 或策略已变化）也是如此：服务会在报告错误前向 master 查询该 `request_id` 对应的任务，结果中附带 `note`。
+- **规划漂移。** 如果代码或请求与规划不同（例如 spec 仍指向会移动的分支），提交返回 `plan_changed`，附新的 `commit` 和 `content_digest`，且不创建任何内容。请重新规划并审核新规划。
+- **键重用。** 已用于其他请求的 `request_id` 返回 `key_conflict`，并给出那个 `job_id`。
+- **结果不确定。** 提交返回 `unavailable` 时可以重试：用相同参数再次提交。`internal` 不可直接重试：任务可能已创建，因此用相同参数再提交一次，若任务存在则会返回它；如果仍返回同样的错误，说明没有创建任何内容，应修正请求后重新规划。结果不确定时不要用新的 `request_id` 重新规划；`compute_list` 会列出每个任务及其 `request_id`。
 
-公开任务记录包含 `task_id`、`request_id`、`owner`、`origin`、`kind`、本地 `state`、
-`remote_id`、`remote_state`、显示元数据、路径、版本、集群/账户绑定字段、可选的固定
-`error_code` 和时间戳。内部请求 hash、配置 hash 和提交标记不会公开。服务不会在任务记录中
-保存完整请求、生成的配置、API 响应、日志或原始异常文本。
+<a id="status-list-logs-and-cancellation"></a>
+### 状态、列表、日志与取消
 
-未绑定 remote ID 时，`compute_status` 只返回本地状态，不访问 Determined；绑定后会取得远端
-实体、更新 `remote_state`，并在 `remote` 中包含清理后的实体。过期的 `pending` 或
-`submitting` 记录会变为 `submission_uncertain`，但不会触发自动重提。
+`compute_status(job_id)` 返回任务：`job_id`、`kind`、`entity_id`（command、shell 或 experiment 的 ID）、`name`、`owner_id`、`owner`、`workspace_id`、`project_id`、`request_id`、`request_digest`、`admission`、`submitted_at`、`ended_at`、`state`、`exit_class`、`exit_reason` 以及带 allocation 的 `tasks`，另附 `explanation`。状态有 `queued`、`running`、`paused`、`completed`、`failed`、`canceled` 和 `deleted`。每个 allocation 结束后都有 `exit_class`：
 
-`compute_logs` 要求 `tail` 为正数。command 和 shell 日志来自相应 task log API；experiment
-日志来自数值最大的 trial ID，该 trial 由服务端排序选出，即使 experiment 超过 100 个 trial
-也能正确选择；没有 trial 时返回空列表。结果按从旧到新排列。没有 remote ID
-的任务也返回空列表。
+| 退出类别 | 含义 |
+| --- | --- |
+| `none` | 正常结束：完成或被取消 |
+| `workload_failed` | 工作负载以错误退出；prelude 失败也算在内，并打印一行 `compute:` |
+| `workload_initialization_failed` | 容器在工作负载启动前失败，例如拉取镜像时 |
+| `node_preflight_failed` | 节点拒绝了该 allocation |
+| `placement_unsatisfied` | 调度器无法按准入要求放置任务 |
+| `infrastructure_failed` | agent 或其连接丢失，或 master 无法恢复该 task |
 
-`compute_cancel` 对 command 和 shell 使用 task kill endpoint，对 experiment 使用 experiment
-cancel endpoint。它要求任务已绑定 remote ID；API 调用完成后返回
-`cancellation_acknowledged: true`。远端终止并不能单独证明成功，还应检查退出信息和预期的
-共享存储产物。
+台账之前提交的任务没有退出类别；trial 从未启动就被取消的实验也没有。
 
-对于正在运行的 shell，应使用已清理的 `reconnectCommand`，当前为
-`det shell show_ssh_command <remote-id>`。适配器会移除 `privateKey`；不要把私钥材料写入任务
-记录或报告。
+`compute_list` 按 `kind` 和 `state` 过滤，用 `next_cursor` 翻页；`limit` 为 1 到 1,000。它覆盖该用户的所有客户端，因此丢失的 `job_id` 可以通过 `request_id` 找回。trial 仍在等待资源的活动实验列为 `running`，而不是 `queued`。
+
+`compute_logs` 返回 `job_id`、`task_id`、`trial_id` 和 `lines`，每行包含 `timestamp`、`level`、`source`、`stdtype`、`allocation_id`、`rank_id` 和 `log`。对实验，`trial_id` 选择 trial，默认最新的 trial；没有 task 的任务不返回日志行，并附 `note`。`tail` 为 0 到 10,000。
+
+`compute_cancel` 在 master 上记录取消（即使任务尚未启动也会结束它），然后短暂轮询。任务在此期间结束时返回 `cancel: "ended"`，否则返回 `"recorded"`；`compute_status` 会显示何时结束。已结束的任务原样返回。在 basic 授权下，只有任务所有者或管理员可以取消任务。
+
+<a id="resources-and-storage"></a>
+### 资源与存储
+
+`compute_resources` 按 Determined 的报告投影每个资源池：`name`、`description`、`type`、`num_agents`、`slots_available`、`slots_used`、`slot_type`、`slots_per_agent`、`aux_container_capacity` 和 `aux_containers_running`，并附按 agent 统计的 `device_models`。它只是快照，不给出判断：提交前不评估放置，slots 超过资源池当前容量的任务会在队列中等待。
+
+`storage_check(path)` 通过策略转换容器路径，并返回 `host_path`、`exists`、`type`、`readable`、`writable`、`read_only` 以及 `viewpoint`：`backend`（`local` 附 `local_root`，或 `ssh` 附 `ssh_host`）、运行所用的 `user`，以及“权限属于该用户而非容器用户”的说明。传输见[共享存储访问](shared-storage-access.zh.md)。
 
 <a id="task-usage-measurements"></a>
 ### 任务用量测量
 
-`compute_usage` 是只读工具，汇总当前 owner 命名空间中某个任务实测的 CPU、内存和 GPU 用量；
-`compute_resources` 描述的则是调度容量。它要求 Determined master 来自 research-cluster fork
-0.40.1 或更高版本，并由管理员配置 `integrations.task_resources`（`prometheus_url` 和
-`det_cluster`）。
+`compute_usage` 为只读，汇总一个任务 task 的实测 CPU、内存和 GPU 用量。它需要管理员在 master 上配置 `integrations.task_resources`；未配置时结果标注为 `measurement: "unmeasured"`，仍会描述各 allocation。
 
-服务先验证参数，再执行与 `compute_status` 相同的 owner 和绑定检查。没有 remote ID 的记录返回
-`remote_id_unknown`，应先调和。adopted 任务会再次验证远端 owner。随后服务向 master 查询任务
-资源功能是否可用：集成未启用时返回 `task_resources_disabled`，master 不提供该 API 时返回
-`task_resources_unsupported`。两者都不可重试。
+对 command 或 shell，测量任务的 task。对实验只报告一个 trial：默认最新的 trial；给出 `trial_id` 时为该 trial；给出 `allocation_id` 时为持有该 allocation 的 trial。测量该 trial 最新的 task，或持有 `allocation_id` 的 task。没有 task 的任务返回 `task_not_started`；属于其他任务的 trial 或 allocation 返回 `not_found`；allocation 属于 `trial_id` 以外的 trial 时返回 `invalid_request`。
 
-command 和 shell 的 `determined_task_id` 就是 remote ID。experiment 只报告一个 trial：默认是
-ID 最大的 trial，指定 `trial_id` 时则为该 trial。指定的 trial 属于其他 experiment 时返回
-`trial_not_found`；trial ID 不存在或无权访问时返回 Determined 的 HTTP 404。其他任务类型会拒绝
-`trial_id`。服务测量所选 trial 最新的 Determined task。experiment 尚无 trial，或 trial 尚无
-task 时，返回 `task_not_started`。`allocation_id` 把结果限定为该 task 列出的一个 allocation；
-其他值返回 `allocation_not_found`。
-
-`window_seconds` 必须在 60 到 604,800（七天）之间，默认 3,600。已结束任务的窗口终点是任务结束
-时间（不晚于当前时间），其他任务的终点是当前时间。如果所选的每个 allocation 都在此之前结束，
-例如已暂停的 trial，或通过 `allocation_id` 指定的较早 allocation，窗口终点改为其中最晚的
-allocation 结束时间。起点比终点早 `window_seconds`，但不早于任务开始时间或所请求 allocation 的
-开始时间，且至少比终点早一秒。`window.anchor` 说明采用的终点：`task_end`、`allocation_end` 或
-`now`。步长取 15 秒与窗口长度除以 1,439 后向上取整两者中的较大值，因此每个序列不超过
-1,440 个点。`metrics` 是非空列表，取值来自 `allocation_active`（count）、`cpu_cores`
-（cores）、`memory_working_set_bytes` 和 `memory_rss_bytes`（bytes）、
-`gpu_utilization_percent`（percent）、`gpu_memory_used_bytes`（bytes）、`gpu_power_watts`
-（watts）以及 `gpu_temperature_celsius`（celsius）；省略时保留所有返回的序列。
-
-结果包含：
+`window_seconds` 必须为 60 到 604,800，默认 3,600。窗口在任务结束时结束（不晚于当前时间），否则在当前时间结束；如果所有选中的 allocation 都在此之前结束，窗口在最后一个结束时结束。窗口从 `window_seconds` 之前开始，但不早于提交时间或所请求 allocation 的开始时间。步长至少 15 秒，使每个序列不超过 1,440 个点。`metrics` 是非空列表，取值为 `allocation_active`、`cpu_cores`、`memory_working_set_bytes`、`memory_rss_bytes`、`gpu_utilization_percent`、`gpu_memory_used_bytes`、`gpu_power_watts` 和 `gpu_temperature_celsius`。
 
 | 字段 | 含义 |
 | --- | --- |
-| `task_id`、`kind`、`remote_id` | 本地任务身份 |
-| `determined_task_id` | 实际读取测量值的 Determined task |
-| `trial` | command 和 shell 为 `null`；否则包含 `id`、`state`、`selection`（`latest` 或 `requested`）、`experiment_trial_count`（指定 `trial_id` 时为 `null`）、`task_count`，以及下文所述的 trial 进度和汇总指标字段 |
-| `resource_pool` | 任务所在资源池的 `name`，以及 Determined 中由运维人员填写的 `description`（去除首尾空白，最多 4,096 个字符；资源池没有描述或不在当前账户可见的资源池列表中时为 `null`）；资源池名称未知时整个字段为 `null` |
-| `task_start_time`、`task_end_time` | Determined task 的生命周期 |
-| `allocations` | 每个 allocation 的 `allocation_id`、`state`、`is_ready`、UTC 时间 `start_time` 和 `end_time`、`slots`、`exit_reason`（最多 1,024 个字符）以及 `status_code` |
-| `allocation_details_limit` | 仅当任务的 allocation 超过 8 个时出现，值为 8；见下文 |
-| `allocation_id` | 请求的 allocation 过滤条件，或 `null` |
-| `window` | 以 Unix 秒表示的 `start` 和 `end`、以秒为单位的 `step`，以及 `start_at`、`end_at`、`anchor` 和 `expected_points` |
-| `series` | 每个指标和标签组合一条摘要 |
-| `gpus` | 每个 allocation 一条 GPU 对比；见下文 |
-| `warnings` | Determined 返回的 `{code, message}` 警告，原样透传 |
-| `context_unavailable` | 查询失败的上下文：`resource_pool`、`allocation_details` 或 `gpu_models` |
-| `explanation`、`advisory` | 如何解读本结果 |
-| `observed_at` | 服务生成结果的时间 |
+| `job_id`、`kind`、`task_id` | 任务及被测量的 task |
+| `trial` | command 或 shell 为 `null`；否则包含 `id`、`selection`（`latest`、`requested` 或 `allocation`）、`experiment_trial_count`、`task_count`、`state`、`total_batches_processed`、`wall_clock_seconds`、`restarts`、`batches_per_second_lower_bound`、`summary_metrics` 和 `summary_metrics_truncated` |
+| `allocation_id`、`allocations` | 请求的过滤条件，以及任务报告的该 task 的 allocation |
+| `resource_pool` | `name` 和管理员填写的 `description` |
+| `submitted_at`、`ended_at` | 任务的生命周期 |
+| `measurement`、`window` | `measured` 或 `unmeasured`；`start`、`end`、`step`、`start_at`、`end_at`、`anchor`（`job_end`、`allocation_end` 或 `now`）和 `expected_points` |
+| `series` | 每个指标和标签组合一个摘要：`metric`、`unit`、`allocation_id`、`node`、`gpu_uuid`、`gpu_model`、`points`、`available_points`、`first_at`、`last_at`、`last`、`min`、`max`、`mean`、`p50`、`p95`，GPU 利用率另有 `idle_fraction` |
+| `gpus` | 按 allocation 给出：`gpu_count`、`requested_slots`、`gpu_models`、各 GPU 平均利用率的均值、最低值和最高值及其差值、`least_utilized_gpu_uuid`、`idle_fraction` 和 `max_memory_used_bytes` |
+| `warnings` | Determined 的 `{code, message}` 警告 |
+| `context_unavailable` | 失败的尽力查询：`trial`、`resource_pool` 或 `gpu_models` |
+| `explanation`、`advisory`、`observed_at` | 如何解读结果，以及生成时间 |
 
-每个序列包含 `metric`、`unit`，标签 `allocation_id`、`node` 和 `gpu_uuid`，`gpu_model`，
-`points`、`available_points`、`first_at`、`last_at`，以及基于可用样本的 `last`、`min`、`max`、
-`mean`、`p50` 和 `p95`。`p50` 和 `p95` 是最近秩（nearest-rank）百分位数。`gpu_model` 是
-Determined agent 为该 `gpu_uuid` 报告的型号名称；非 GPU 序列或设备未知时为 `null`。
-`gpu_utilization_percent` 序列还包含 `idle_fraction`，即其可用样本中低于 10% 的比例。
-
-数值是每 `step` 秒一次的点采样，因此 `min`、`max`、`mean` 和百分位数描述的是这些样本，
-而不是每个时刻的值。null 或缺失值表示没有测量，绝不表示用量为零。`allocation_active`
-大于零表示该 allocation 在该采样点处于运行状态。CPU 和内存序列按 allocation 和节点区分；GPU
-序列按 GPU UUID 区分，覆盖整块分配到的设备，可能包含其他进程。下结论前先检查 `warnings`，
-例如 `rss_unverified` 或 `gpu_full_device`。空的 `series` 列表表示该窗口没有数据，
-而不是任务空闲；如果 `metrics` 过滤掉了所有返回的序列，`explanation` 会列出实际返回的指标。
-未指定 `trial_id` 且 experiment 有多个 trial 时，`explanation` 会说明 trial 总数以及报告的是
-哪一个。
-
-`gpus` 比较每个 allocation 内的各块 GPU。每个带有 GPU 利用率或显存序列的 `allocation_id`
-对应一个条目，基于该窗口返回的所有此类序列计算，即使 `metrics` 过滤条件使其不出现在 `series`
-中；指定 `allocation_id` 时只覆盖该 allocation。每个条目包含 `gpu_count`（返回了利用率或显存
-序列的不同 GPU UUID 数，即使其样本全为 null）、`requested_slots`（该 allocation 的槽位数，
-未知时为 `null`）、`gpu_models`（已知的不同型号名称，可能为空），以及各 GPU 平均利用率的统
-计：`mean_utilization_percent` 是各 GPU 均值的平均，每块 GPU 权重相同；
-`min_gpu_mean_utilization_percent` 和 `max_gpu_mean_utilization_percent` 是其中的最低值和最
-高值；`utilization_spread_percent` 是两者之差；`least_utilized_gpu_uuid` 是均值最低的 GPU，
-并列时取字典序最小的 UUID。这些利用率统计只包含至少有一个可用利用率样本的 GPU，因此覆盖的
-GPU 数可能少于 `gpu_count`。`idle_fraction` 则是该 allocation 全部 GPU 利用率样本中低于
-`idle_threshold_percent`（10）的比例。`max_memory_used_bytes` 是该 allocation 中单块 GPU
-采样到的最大显存用量，而不是真正的峰值；不报告显存容量。差值较大提示存在空闲或掉队的 GPU，
-可先查看 `least_utilized_gpu_uuid`；`idle_fraction` 较高表示这些 GPU 在窗口内大部分时间低于
-阈值。`gpu_count` 小于 `requested_slots` 表示返回了序列的 GPU 少于该 allocation 持有的槽位；
-在认定其余 GPU 未被使用之前，应先检查 `warnings` 和监控覆盖情况。
-
-对于 experiment，`trial` 还包含 Determined 针对整个 trial（而不是测量窗口）记录的值：
-`total_batches_processed`、`wall_clock_seconds` 和 `restarts`，缺失或格式异常时为 `null`。
-`total_batches_processed` 是报告过的最大 `steps_completed`，`restarts` 不超过该 experiment
-的 `max_restarts`。`batches_per_second_lower_bound` 是批次数除以挂钟秒数，任一值未知或挂钟时
-间为零时为 `null`；其单位取决于工作负载以 `steps_completed` 报告的内容。它只是下界，因为
-`wall_clock_seconds` 累加每个 allocation 从 Determined 首次报告其资源处于拉取镜像或运行状态
-起，到该 allocation 结束（运行中则到当前时间）为止的时间，其中可能包括镜像拉取、启动、
-初始化以及因重启损失的 allocation 时间（不含调度排队时间和 allocation 之间的暂停间隔）。
-`summary_metrics` 收录 Determined 按组、按指标的统计，其中只保留 `type` 以及有限数值
-`count`、`sum`、`min`、`max`、`last` 和 `mean`；`avg_metrics`（训练）和 `validation_metrics`
-等组名来自 Determined，原样透传。最多保留 100 个指标条目：先是 `validation_metrics`，
-然后是 `avg_metrics`，再按组名排列其他组，每组内按指标名排序；存在更多条目时
-`summary_metrics_truncated` 为 true。这些字段依赖工作负载通过 Determined 的
-Core API 报告。对于不这样报告的工作负载（例如普通 bash 入口）或尚未报告的工作负载，
-`total_batches_processed` 为 0 属于预期，`explanation` 也会说明这一点；这并不表示工作负载
-没有进展。工作负载未报告指标时，
-`summary_metrics` 为 `{}`。
-
-资源池、allocation 详情和 GPU 型号等上下文以尽力而为的方式获取，并在读取测量值之后进行。
-其中某项查询出现 Determined API 错误（包括传输失败或响应格式异常）时，会把 `resource_pool`、
-`allocation_details` 或 `gpu_models` 加入 `context_unavailable`，受影响字段为空或 `null`，
-测量值仍照常返回。出现传输失败后，其余查询会被跳过并以相同方式报告，因此无响应的 master
-只会让结果延迟一次超时，而不是每项查询各一次。submitted 任务需要额外读取一次任务实体以获得
-资源池名称，`compute_logs` 不会进行这次读取；该读取失败时报告 `resource_pool`。adopted 任务
-复用所有权检查时读取的实体。Determined 只在已结束的 command 或 shell 结束后 24 小时内提供
-其实体，master 重启后也不再提供；对这类任务，`resource_pool` 为 `null`，且
-`context_unavailable` 中没有相应条目。
-只有已知资源池名称时才读取资源池列表。allocation 详情只读取 Determined 顺序（先是尚无结束时
-间的 allocation，例如排队中或运行中的，再按结束时间由近到远）中的前八个 allocation，
-以及请求的 `allocation_id`；其他 allocation 的详情为 `null`，并由 `allocation_details_limit`
-报告上限。提供 GPU 型号名称的 agent 列表只在存在 GPU 序列时读取。RBAC 对当前账户隐藏设备
-UUID 时，`gpu_model` 为 `null`，`gpu_models` 为空，且 `context_unavailable` 中没有相应条目。
-
-`include_samples=true` 会增加 `samples_omitted`。`samples_omitted` 为 false 时，每个序列还包含
-`samples`，格式为 `[unix_seconds, value_or_null]` 对。所选序列合计超过 2,880 个点时，服务省略
-样本并报告 `samples_limit`；应缩短窗口、减少指标或选择一个 allocation。
-
-master 限制每次查询最多覆盖七天、最小步长 15 秒、每个序列 1,440 个点、超时 10 秒，并且同时
-最多运行四个资源查询。HTTP 503 表示测量后端繁忙或不可用，可以重试。master 会以 HTTP 400 拒绝
-比其自身时钟超前 60 秒以上的终点，因此客户端时钟明显快于 master 时可能出现该错误。Determined
-task 或指定的 trial ID 不存在或无权访问时返回 HTTP 404。参见
-[故障排查](troubleshooting.zh.md#usage-measurements-are-unavailable-or-empty)。
-
-<a id="discover-and-adopt"></a>
-### 发现与接管
-
-`compute_discover` 的 `kind` 可以是 `command`、`shell` 或 `experiment`。`limit` 必须在
-1 到 100 之间，`offset` 必须是非负数。它只查询当前已认证 Determined 账户拥有的任务，返回
-实际集群 ID、账户身份、清理后的元数据、匹配的 `local_task_id`（若有）以及包含
-`next_offset` 的一致分页信息。它既不写入本地记录，也不提交任务。
-command 和 shell 的 remote ID 是 UUID，experiment 的 remote ID 是正整数。
-
-`compute_adopt` 先取得一个远端任务，再把其规范化 ID 和 `userId` 与 `/me` 对照，验证通过后
-才写入。即使管理员可以看到其他任务，也不能接管其他用户的任务。注册身份由本地 owner、实际
-集群 ID、kind 和 remote ID 组成；记录还会绑定并验证已认证的用户 ID。同一数据库中已有的
-submitted 记录会原样返回，不会被替换。
-
-新接管记录使用 `origin: "adopted"`、本地 `state: "adopted"` 和内部接管 request ID。记录只
-保留白名单中的身份、状态、名称和说明元数据。未知的 `workdir`、`output_dir` 和
-`code_revision` 对外为 `null`；存储层不会推断这些值，也不保留原始远端配置。后续状态、日志、
-用量和取消操作会再次检查实际集群和账户绑定。接管任务不把提交时配置作为授权依据，也不会获得
-任何存储权限。
-
-对于通过 WebUI、原生 CLI 或同一账户的另一设备创建的工作，使用发现和接管；对于远端是否
-接受某次本地提交并不确定的情况，使用调和。adopted 任务不能调和，也不能作为 launch 重试。
-
-<a id="reconciliation-and-recovery"></a>
-### 调和与恢复
-
-传输超时可能导致远端是否接受提交未知。服务会保留本地任务，并在错误 details 中返回其
-`task_id`，不会自动重提该请求。`compute_reconcile(task_id, remote_id)` 会取得候选实体，仅当
-其保留的 `COMPUTE_SUBMISSION_MARKER` 等于本地不可猜测标记时才绑定；不匹配会返回
-`identity_mismatch`。只有缺少已存显示元数据的迁移旧记录才会使用 description 第一行标记。
-
-该标记把调和与接管隔离开：有匹配标记的不确定本地提交必须调和，独立创建的远端任务才可以
-接管。缺少证据时应继续调查，不要再次提交同一工作。
-
-本地 submitted 任务始终绑定原始配置指纹和端点；adopted 任务始终绑定实际集群 ID 和已认证
-用户 ID。这些检查避免改变配置或账户后操作无关任务。
+数值是每 `step` 秒采集的点样本，因此 `min`、`max` 和 `mean` 描述的是这些样本。空值或缺失值表示没有测量，绝不表示用量为零；`series` 为空表示该窗口没有数据，而不是任务空闲。GPU 指标覆盖整张分配的设备，可能包含其他进程。`idle_fraction` 是低于 10% 的 GPU 利用率样本占比。`batches_per_second_lower_bound` 是 trial 整个生命周期的下限，因为墙钟时间包含镜像拉取、启动和重启；不通过 Determined Core API 报告进度的工作负载，其 `total_batches_processed` 为 0。`include_samples=true` 会以 `[unix_seconds, value]` 对的形式附上每个序列的样本；若合计超过 2,880 个点，则省略样本并设置 `samples_omitted` 为 true。
 
 <a id="errors"></a>
 ### 错误
 
-MCP 失败使用 `isError: true`；其文本内容是如下形式的紧凑 JSON：
+失败的工具调用带有 `isError: true`，其文本为 `Error executing tool <name>:` 加上紧凑 JSON：
 
 ```json
 {"error":{"code":"invalid_request","message":"...","retryable":false,"details":{}}}
 ```
 
-`retryable` 和 `details` 仅在可用时出现，structured content 为 null。安全 details 可包含本地
-task ID 和容量信息。认证、权限、传输和响应结构错误都会返回错误，而不是空结果。错误消息和
-报告可以包含清理后的命令、路径、ID、状态和错误类别，但不能包含凭据或 secrets 文件内容。
+有补充信息时才出现 `details`。未通过校验的 spec 或参数返回 `invalid_request`，`details.errors` 列出每个位置和原因，但不回显被拒绝的值。
 
-Determined 的 HTTP 失败（包括 gRPC-gateway 错误响应体）显示为 `<status> <message>`。HTTP 429
-以及除 501 之外的 5xx 响应可以重试；501 表示 master 缺少对应路由。用量相关的错误码见
-[任务用量测量](#task-usage-measurements)。
+| 代码 | 含义 | 处理方式 |
+| --- | --- | --- |
+| `invalid_request` | spec、参数或 master 校验拒绝了请求 | 修正请求后重新规划 |
+| `admission_unsupported` | `admission: immediate` | 使用 `queue` |
+| `plan_changed` | 代码或请求与规划不同；没有创建任何内容 | 审核 `details.commit` 和 `content_digest` 后重新规划 |
+| `key_conflict` | 该 `request_id` 已属于另一个请求的任务，见 `details.job_id` | 重新规划以获得新的 `request_id` |
+| `unavailable` | master 未响应或繁忙；可重试 | 重复调用；提交时用相同参数重复 |
+| `internal` | master 出错 | 提交时用相同参数再重复一次；若仍返回同样错误，说明没有创建任何内容，应重新规划 |
+| `invalid_response` | master 的响应格式错误 | 提交时按 `unavailable` 处理；其他情况请报告 |
+| `not_found`、`permission_denied` | 任务、trial、资源池或 workspace 不存在，或当前账户无权使用 | 检查句柄和账户 |
+| `protocol_unsupported` | master 低于 submission protocol 1 | 升级 master |
+| `pool_not_allowed`、`slots_exceed_limit`、`path_not_mounted`、`read_only_storage`、`invalid_policy` | 策略拒绝了请求，或策略文件无效 | 选择允许的资源池、更少的 slots 或可写的挂载路径 |
+| `commit_not_on_ref`、`revision_not_found`、`partial_clone`、`lfs_object_missing`、`git_too_old`、`context_too_large`、`unsafe_symlink`、`invalid_include` 及其他代码检查 | 代码规划拒绝了代码来源 | 修正仓库或代码字段 |
+| `storage_not_local`、`configuration_required`、`invalid_storage_path`、`storage_not_found`、`overwrite_not_allowed` 及其他存储代码 | 存储访问被拒绝或失败 | 见[共享存储访问](shared-storage-access.zh.md) |
+| `task_not_started` | 任务尚无 task | 稍后再查询 |
 
-在使用 basic authorization 的 Determined fork 0.40.1 或更高版本上，只有任务的 Determined 所有者
-或管理员可以终止或取消 command、shell 和 experiment。因此，对于其他账户拥有的任务，
-`compute_cancel` 对 command 或 shell 返回 HTTP 403，对 experiment 返回 HTTP 404
-`experiment '<id>' not found`。submitted 记录绑定配置和端点而不是账户，所以把凭据切换到
-另一个账户后可能遇到这些错误。应使用拥有该任务的账户取消，或联系管理员。
+错误信息和报告可以包含命令、路径、ID、状态和错误类别，但绝不能包含凭据或 secrets 文件内容。

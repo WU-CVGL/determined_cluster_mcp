@@ -6,7 +6,6 @@ from urllib.parse import urlsplit
 
 import pytest
 import requests
-import yaml
 
 from determined_compute.client import APIError, Client, normalize_api_url, redact
 
@@ -174,11 +173,39 @@ def test_construction_touches_no_network_and_reads_the_secrets_file(tmp_path, mo
     secrets = tmp_path / "secrets.env"
     secrets.write_text("DET_MASTER=https://secret.example\nDET_USERNAME=alice\nDET_PASSWORD=pw\n")
 
-    assert Client(secrets_path=secrets).api_url == "https://secret.example"
-    monkeypatch.setenv("DET_MASTER", "https://environment.example")
     resolved = Client(secrets_path=secrets)
-    assert resolved.api_url == "https://environment.example"
+    assert resolved.api_url == "https://secret.example"
     assert "pw" not in repr(resolved) and "alice" not in repr(resolved)
+
+
+def test_the_secrets_file_password_never_goes_to_another_master(tmp_path, monkeypatch):
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("DET_MASTER=https://secret.example\nDET_USERNAME=alice\nDET_PASSWORD=pw\n")
+    monkeypatch.setenv("DET_MASTER", "http://environment.example:8080")
+
+    with pytest.raises(ValueError, match="differs from the secrets file"):
+        Client(secrets_path=secrets)
+    # The same master named both ways, or an explicit URL, is a deliberate choice.
+    monkeypatch.setenv("DET_MASTER", "https://secret.example/")
+    assert Client(secrets_path=secrets).api_url == "https://secret.example"
+    explicit = Client("https://chosen.example", secrets_path=secrets)
+    assert explicit.api_url == "https://chosen.example"
+
+
+def test_a_file_that_names_its_master_ignores_ambient_credentials(tmp_path, monkeypatch):
+    named = tmp_path / "named.env"
+    named.write_text("DET_MASTER=https://secret.example\nDET_USERNAME=alice\nDET_PASSWORD=pw\n")
+    monkeypatch.setenv("DET_API_TOKEN", "ambient-token")
+    monkeypatch.setenv("DET_USERNAME", "mallory")
+
+    resolved = Client(secrets_path=named)
+    assert resolved._token is None and resolved._login == ("alice", "pw")
+    # A file without a master keeps working with the environment's master and token.
+    unnamed = tmp_path / "unnamed.env"
+    unnamed.write_text("DET_USERNAME=alice\nDET_PASSWORD=pw\n")
+    monkeypatch.setenv("DET_MASTER", "https://environment.example")
+    ambient = Client(secrets_path=unnamed)
+    assert (ambient.api_url, ambient._token) == ("https://environment.example", "ambient-token")
 
 
 def test_protocol_gate_reads_the_master_without_credentials(monkeypatch):
@@ -350,14 +377,16 @@ def test_shell_launch_never_returns_the_private_key(monkeypatch):
                            "effective_config", "warnings"}
 
 
-def test_experiment_sends_yaml_config_model_definition_and_activation(monkeypatch):
+def test_experiment_sends_json_config_model_definition_and_activation(monkeypatch):
     master = Master(monkeypatch)
     master.route("POST", "/api/v1/experiments", submit_response("experiment"))
     config = {
-        "name": "exp",
+        "name": "x-\U0001F600",
         "entrypoint": "mkdir -p -- /out || exit $?\npython train.py --lr 'yes'",
         "searcher": {"name": "single", "metric": "loss"},
-        "hyperparameters": {"flag": "on", "empty": "", "version": "1.10"},
+        # YAML 1.1 reads a plain y, n or 1e-3 as a bool or a float; JSON quotes every string.
+        "hyperparameters": {"n": 1, "y": 2, "v": "y", "lr": "1e-3", "flag": "on", "empty": "",
+                            "breaks": "a\u2028b\u0085c", "control": "x\x7fy"},
     }
 
     client().submit("experiment", config, files=FILES[1:], project_id=7,
@@ -365,7 +394,11 @@ def test_experiment_sends_yaml_config_model_definition_and_activation(monkeypatc
 
     body = master.calls[-1]["json"]
     assert isinstance(body["config"], str)
-    assert yaml.safe_load(body["config"]) == config
+    assert json.loads(body["config"]) == config
+    # The master's parser refuses surrogate-pair escapes and folds raw line separators.
+    assert "\U0001F600" in body["config"] and "\\ud83d" not in body["config"]
+    assert "\\u2028" in body["config"] and "\\u0085" in body["config"]
+    assert "\\u007f" in body["config"] and "\u2028" not in body["config"]
     assert body["model_definition"] == FILES[1:]
     assert body["activate"] is True
     assert body["project_id"] == 7
@@ -467,7 +500,6 @@ def test_experiment_immediate_admission_and_config_errors(monkeypatch):
 @pytest.mark.parametrize(
     "answer",
     [
-        gateway_error(500, 13, "Internal", "commit failed"),
         gateway_error(503, 14, "Unavailable", "shutting down"),
         requests.ConnectionError("reset"),
         Response(text="not json", status=200),
@@ -482,8 +514,85 @@ def test_an_unknown_launch_outcome_is_retried_with_the_same_key(monkeypatch, ans
         client().submit("command", {}, idempotency_key="k1", expected_digest=DIGEST)
 
     assert caught.value.retryable is True
-    assert caught.value.code in {"internal", "unavailable", "invalid_response"}
+    assert caught.value.code in {"unavailable", "invalid_response"}
     assert "same idempotency key" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        gateway_error(500, 13, "Internal", "commit failed"),
+        Response({"error": {"code": 2, "error": "commit failed"}}, 500),
+    ],
+)
+def test_an_internal_launch_error_is_replayed_once_not_retried(monkeypatch, answer):
+    master = Master(monkeypatch)
+    master.route("POST", "/api/v1/commands", answer)
+
+    with pytest.raises(APIError) as caught:
+        client().submit("command", {}, idempotency_key="k1", expected_digest=DIGEST)
+
+    assert (caught.value.code, caught.value.retryable) == ("internal", False)
+    message = str(caught.value)
+    assert message.startswith("commit failed")
+    assert "repeat the launch once" in message and "plan again" in message
+
+
+def test_an_invalid_experiment_config_at_launch_created_nothing(monkeypatch):
+    # A workspace or master default that changed after the plan can break the merged config.
+    master = Master(monkeypatch)
+    invalid = "invalid experiment configuration: <config>.searcher: is not an object"
+    master.route("POST", "/api/v1/experiments", gateway_error(500, 13, "Internal", invalid))
+
+    with pytest.raises(APIError) as caught:
+        client().submit("experiment", {}, idempotency_key="k1", expected_digest=DIGEST)
+
+    assert (caught.value.code, caught.value.retryable) == ("invalid_request", False)
+    assert str(caught.value).startswith(invalid)
+    assert "nothing was created" in str(caught.value)
+
+
+def test_replay_asks_the_master_for_the_job_of_a_key_with_a_keyed_dry_run(monkeypatch):
+    master = Master(monkeypatch)
+    master.route("POST", "/api/v1/commands", submit_response(replayed=True))
+    master.route("POST", "/api/v1/experiments", submit_response("experiment", replayed=True))
+
+    found = client().replay("command", "k1", DIGEST)
+
+    assert found == {
+        "job_id": JOB, "replayed": True, "request_digest": DIGEST, "outcome": "queued",
+        "effective_config": None, "warnings": [],
+    }
+    assert master.calls[-1]["json"] == {
+        "config": {},
+        "submit": {"admission": "ADMISSION_QUEUE", "dry_run": True, "idempotency_key": "k1",
+                   "expected_digest": DIGEST},
+    }
+    assert client().replay("experiment", "k1", DIGEST)["job_id"] == JOB
+    assert master.calls[-1]["json"]["config"] == "{}"
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        gateway_error(400, 9, "FailedPrecondition", PLAN_CHANGED),
+        submit_response(jobId="", replayed=False, outcome="ADMISSION_OUTCOME_UNSPECIFIED"),
+    ],
+)
+def test_replay_of_a_free_key_is_none(monkeypatch, answer):
+    master = Master(monkeypatch)
+    master.route("POST", "/api/v1/commands", answer)
+
+    assert client().replay("command", "k1", DIGEST) is None
+
+
+def test_replay_of_a_key_bound_to_other_content_is_a_conflict(monkeypatch):
+    master = Master(monkeypatch)
+    master.route("POST", "/api/v1/commands", gateway_error(409, 6, "AlreadyExists", KEY_USED))
+
+    with pytest.raises(APIError) as caught:
+        client().replay("command", "k1", DIGEST)
+    assert caught.value.code == "key_conflict" and caught.value.details == {"job_id": JOB}
 
 
 def test_a_dry_run_transport_failure_is_retryable_without_a_key_hint(monkeypatch):

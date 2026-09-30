@@ -19,7 +19,6 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import requests
-import yaml
 
 from determined_compute.utils.secrets import load_secrets
 
@@ -33,7 +32,15 @@ _RETRY_SAME_KEY = (
     "; the job may have been created, so retry with the same idempotency key, which returns "
     "that job instead of creating another"
 )
+_REPLAY_ONCE = (
+    "; the job may have been created, so repeat the launch once with the same idempotency key, "
+    "which returns that job if it exists; if the same error comes back, nothing was created, so "
+    "fix the request and plan again"
+)
 _DIGEST = re.compile(r"\b[0-9a-f]{64}\b")
+# Characters that YAML reads as line breaks, or refuses as unprintable, inside a quoted string.
+_YAML_UNSAFE = re.compile("[\x7f-\x9f\u2028\u2029\ufffe\uffff]")
+_MASTER_NAMES = ("DET_MASTER", "DET_MASTER_ADDR", "DET_MASTER_HOST")
 _JOB_ID = re.compile(r"\bjob ([0-9A-Za-z-]+)")
 # The reason a bare status stands for when a proxy, not the gateway, answered.
 _STATUS_REASONS = {
@@ -129,6 +136,16 @@ def _classify(reason: str, message: str, call: _Call) -> APIError:
         call.dry_run and reason in {"Internal", "Unknown"}
     ):
         return APIError(message, code="invalid_request")
+    if (
+        call.keyed
+        and reason in {"Internal", "Unknown"}
+        and message.startswith("invalid experiment configuration")
+    ):
+        # The master raises this only while it parses a create, before anything is written.
+        return APIError(
+            message + "; nothing was created, so fix the request and plan again",
+            code="invalid_request",
+        )
     if reason == "NotFound":
         return APIError(message, code="not_found")
     if reason in {"Unauthenticated", "PermissionDenied"}:
@@ -138,9 +155,12 @@ def _classify(reason: str, message: str, call: _Call) -> APIError:
         return APIError(message, code="protocol_unsupported")
     retryable = reason in _RETRYABLE_REASONS
     code = "unavailable" if retryable else "internal"
-    # A keyed create whose outcome is unknown is safe to repeat: the master replays it.
     if call.keyed:
-        return APIError(message + _RETRY_SAME_KEY, code=code, retryable=True)
+        # The master reports a commit of unknown outcome as Unavailable. It replays a key before
+        # it parses the request, so one repeat after an Internal either returns the job an
+        # earlier call created or fails the same way; only a transient reason is worth more.
+        suffix = _RETRY_SAME_KEY if retryable else _REPLAY_ONCE
+        return APIError(message + suffix, code=code, retryable=retryable)
     return APIError(message, code=code, retryable=retryable)
 
 
@@ -196,11 +216,20 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return default if raw is None else raw.lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _master_from_environment() -> Optional[str]:
-    for name in ("DET_MASTER", "DET_MASTER_ADDR", "DET_MASTER_HOST"):
-        if os.environ.get(name):
-            return os.environ[name]
-    return None
+def _master_from(values: Mapping[str, str]) -> Optional[str]:
+    return next((values[name] for name in _MASTER_NAMES if values.get(name)), None)
+
+
+def _experiment_text(config: Mapping[str, Any]) -> str:
+    """An experiment config as the YAML text the master reads: JSON, with every string quoted.
+
+    The master's YAML 1.1 parser reads a plain ``y``, ``n`` or ``1e-3`` as a bool or a float,
+    and PyYAML writes them plain. It refuses the surrogate pairs that JSON escapes characters
+    outside the BMP with, so only the characters YAML itself would misread are escaped.
+    """
+
+    text = json.dumps(dict(config), ensure_ascii=False, allow_nan=False)
+    return _YAML_UNSAFE.sub(lambda match: f"\\u{ord(match.group()):04x}", text)
 
 
 # Redaction
@@ -553,16 +582,26 @@ class Client:
         verify_ssl: Optional[bool] = None,
     ) -> None:
         secrets = load_secrets(secrets_path)
-        secret_master = next(
-            (secrets[name] for name in ("DET_MASTER", "DET_MASTER_ADDR", "DET_MASTER_HOST")
-             if secrets.get(name)),
-            None,
-        )
-        self.api_url = normalize_api_url(api_url or _master_from_environment() or secret_master)
+        file_master, ambient_master = _master_from(secrets), _master_from(os.environ)
+        if (
+            api_url is None
+            and file_master
+            and ambient_master
+            and normalize_api_url(ambient_master) != normalize_api_url(file_master)
+        ):
+            # Credentials must reach only the master they were written for.
+            raise ValueError(
+                "the environment's DET_MASTER differs from the secrets file's; unset one or "
+                "pass --api-url"
+            )
+        # A secrets file that names its master supplies the URL and the credentials together, so
+        # no ambient token or login reaches that master; otherwise the environment fills in.
+        ambient: Mapping[str, str] = {} if file_master else os.environ
+        self.api_url = normalize_api_url(api_url or file_master or ambient_master)
         self.verify_ssl = _bool_env("DET_VERIFY_SSL", False) if verify_ssl is None else verify_ssl
-        self._token = api_token or os.environ.get("DET_API_TOKEN") or secrets.get("DET_API_TOKEN")
-        username = secrets.get("DET_USERNAME") or os.environ.get("DET_USERNAME")
-        password = secrets.get("DET_PASSWORD") or os.environ.get("DET_PASSWORD")
+        self._token = api_token or ambient.get("DET_API_TOKEN") or secrets.get("DET_API_TOKEN")
+        username = secrets.get("DET_USERNAME") or ambient.get("DET_USERNAME")
+        password = secrets.get("DET_PASSWORD") or ambient.get("DET_PASSWORD")
         self._login = (username, password) if not self._token and username and password else None
         self._protocol: Optional[Dict[str, Any]] = None
         self._lock = threading.Lock()
@@ -731,7 +770,7 @@ class Client:
         body: Dict[str, Any]
         if kind == "experiment":
             # The experiment route takes YAML text; the digest is over the parsed config.
-            body = {"config": yaml.safe_dump(dict(config), sort_keys=False), "activate": True}
+            body = {"config": _experiment_text(config), "activate": True}
             if files:
                 body["model_definition"] = list(files)
             if project_id is not None:
@@ -747,6 +786,40 @@ class Client:
         # The response's entity is never returned: a shell's carries its private key.
         response = self._post(f"api/v1/{kind}s", body, call)
         return _submit_result(response, dry_run, call.keyed)
+
+    def replay(
+        self, kind: str, idempotency_key: str, expected_digest: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the job created under ``idempotency_key`` for ``expected_digest``, or None.
+
+        This is the keyed dry run that ``submit`` never sends, of an empty config. The master
+        replays a key before it checks the plan or reads the request: a key bound to this digest
+        returns its job, a key bound to another is ``key_conflict``, and a free key fails the
+        plan check, because no plan has an empty config. Nothing is created either way. The job
+        comes as ``submit`` returns one.
+        """
+
+        if kind not in KINDS:
+            raise ValueError(f"kind must be one of {', '.join(KINDS)}")
+        if not idempotency_key or not expected_digest:
+            raise ValueError("a replay needs the idempotency key and the expected digest")
+        options = {
+            "admission": _ADMISSIONS["queue"],
+            "dry_run": True,
+            "idempotency_key": idempotency_key,
+            "expected_digest": expected_digest,
+        }
+        body = {"config": "{}" if kind == "experiment" else {}, "submit": options}
+        try:
+            response = self._post(f"api/v1/{kind}s", body, _Call())
+        except APIError as exc:
+            if exc.code == "plan_changed":
+                return None  # no job holds the key, and it stays free
+            raise
+        result = response.get("submission")
+        if isinstance(result, Mapping) and result.get("replayed") is False:
+            return None  # the empty config itself was checked, so no job holds the key
+        return _submit_result(response, dry_run=False, keyed=False)
 
     def get_submission(self, job_id: str) -> Dict[str, Any]:
         response = self._get(f"api/v1/submissions/{_identifier(job_id, 'job_id')}")

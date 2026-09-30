@@ -5,44 +5,38 @@ description: Plan, launch, inspect, and stop resource-intensive GPU or CPU work 
 
 # Intensive Compute Runner
 
-Use this repository's `ComputeService` for heavy-compute planning, idempotent launch, task state, logs, measured usage, and cancellation. Any MCP-capable agent can use the tools with its own model.
+Use this repository's compute MCP to plan and launch heavy work on Determined, then read its state, logs, measured usage, and cancel it. Any MCP-capable agent can use the tools with its own model.
 
-## Choose a mode
-
-Let `kind: auto` select from intent when the request is clear:
+## Choose a kind
 
 - Use `command` for a one-off, non-interactive job expected to finish during an ordinary working session.
-- Use `shell` for interactive debugging, environment inspection, and iterative work. A deployment may advertise an inactivity window such as about two hours; treat it as an advisory, configurable site policy rather than a Determined guarantee.
-- Use `experiment` for overnight or durable work, and whenever experiment features such as search, trial tracking, or checkpoint lifecycle are actually needed. There is no rigid midnight cutoff.
+- Use `shell` for interactive debugging, environment inspection, and iterative work. A shell takes no command, `output_dir`, `workdir`, or `git` code.
+- Use `experiment` for overnight or durable work, and whenever experiment features such as search, trial tracking, or checkpoints are needed.
 
-Set `interactive` or `overnight` explicitly when intent would otherwise be ambiguous. Use the minimum suitable `slots`; heavy CPU work can use zero GPU slots only if the service and target pool support it.
-
-Give each request a short, task-specific `name` and a `description` that states its purpose or config. Do not use task IDs, request IDs, or UUIDs as display names.
+Use the minimum suitable `slots`; CPU work can use zero slots when the pool supports it. Give each spec a short, task-specific `name`; never use a job ID, request ID, or UUID as a name.
 
 ## Prepare durable inputs
 
-Put code, configs, datasets, packages, outputs, checkpoints, and other artifacts on storage covered by the compute profile's `mounts`. Use the mapped container path for `workdir` and `output_dir`. Never send source through an experiment `modelDefinition`, project archive, or other upload field.
+Put datasets, packages, outputs, checkpoints, and other artifacts on storage covered by the policy's `mounts`, and set `output_dir` to a writable container path there. Choose how code reaches the task:
 
-For durable jobs, use a stable revision in its own shared directory and record `code_revision`. Reserve mutable workspaces for shell debugging.
+- `git`: a repository on shared storage whose root this machine mounts; the plan pins a commit that must be on a branch or tag.
+- `context`: a local working tree, uploaded at a pinned commit plus explicit `include` paths, up to 99,614,720 bytes.
+- `path`: a shared directory run in place and never pinned; reserve it for shells and debugging.
 
-If files must be copied into shared storage, read [references/compute-workflow.md](references/compute-workflow.md). Preserve its secret exclusions and safe sync rules.
-
-If the client lacks cluster mounts, read [the shared-storage access guide](../../docs/shared-storage-access.md). Use `storage_check`, preview `storage_sync` or `storage_fetch`, and execute only after review. Storage credentials stay service-side.
+If files must be copied to shared storage, read [references/compute-workflow.md](references/compute-workflow.md) and [the shared-storage access guide](../../docs/shared-storage-access.md). Use `storage_check`, preview `storage_sync` or `storage_fetch`, and execute only after review. Storage credentials stay service-side.
 
 ## Plan, then execute
 
-1. Call `compute_plan`; inspect the resolved kind, config, paths, revision, and advisories.
-2. Call `compute_resources` for the requested slots and pool. Capacity is a snapshot, not a reservation; do not switch pool or location automatically.
-3. Keep `allow_queue: false` unless queueing is approved for this call. Resolve unsafe or unknown capacity before launch.
-4. Call `compute_launch` with a stable `request_id`. Keep its local `task_id`, which differs from the remote ID.
-5. Observe with `compute_status`, `compute_logs`, and `compute_list_tasks`; use `compute_usage` to check measured CPU, memory, and GPU use before proposing a resize. Cancel only the intended task.
+1. Call `compute_plan(spec)`. Review the resolved spec, `commit`, `code` summary, `effective_config`, and `warnings`. Placement is not evaluated; `compute_resources` shows the pools as a snapshot, and a job waits in the queue until its slots are free. Do not switch pool or slots automatically.
+2. Call `compute_launch(spec, request_id, request_digest)` with the values the plan returned. Keep the `job_id` and `request_id`.
+3. Observe with `compute_status(job_id)` and `compute_logs(job_id)`; use `compute_usage(job_id)` to check measured CPU, memory, and GPU use before proposing a resize. Cancel only the intended job with `compute_cancel(job_id)`.
 
-Never include credentials in requests, configs, logs, or reports. A launch with `allow_queue: false` performs admission checking and rejects busy or unknown capacity without submitting; `true` explicitly permits scheduler queueing.
+If a launch answer is lost or `unavailable`, repeat the same launch: it returns the same job with `replayed: true`, even if the tree changed. After `internal`, repeat it once; the same error again means nothing was created. `plan_changed` means nothing was created and the content moved: plan again. Never plan a new `request_id` while an outcome is uncertain; `compute_list` shows every job of the account with its `request_id`.
 
-If launch outcome is unknown after a timeout or connection loss, do not submit again blindly. Use `compute_reconcile` only with a verified remote ID for the known task; the service checks its submission marker before binding. If authentication fails, stop and report the configuration problem; do not fall back to local execution.
+Never include credentials in specs, commands, `env`, logs, or reports; a command's text and `env` are stored in the job's config. If authentication fails, stop and report the configuration problem; do not fall back to local execution.
 
 ## Report
 
-Return the name, mode, IDs, state, pool, slots, mapped paths, revision, and next status/log/cancel action. Omit secrets.
+Return the name, kind, `job_id`, `request_id`, state, exit class, pool, slots, commit, output path, and the next status, log, or cancel action. Omit secrets.
 
-Read [references/compute-workflow.md](references/compute-workflow.md) for request fields, storage preparation, failure handling, and deployment-specific shell policy.
+Read [references/compute-workflow.md](references/compute-workflow.md) for spec fields, storage preparation, failure handling, and shell lifetime.

@@ -2,13 +2,13 @@
 
 [English](shared-storage-access.md) | [简体中文](shared-storage-access.zh.md)
 
-Determined tasks use the shared host/container mappings in the compute profile. The optional storage client lets a machine that does not mount those filesystems check, stage, and fetch files through a login node. It does not upload source through Determined.
+Determined tasks use the shared host/container mappings in the policy. The optional storage client lets a machine that does not mount those filesystems check, stage, and fetch files through a login node. It does not upload source through Determined.
 
 An already prepared workload needs only Determined authentication to launch. SSH is needed only for `storage_check`, `storage_sync`, or `storage_fetch` when the selected path is not locally mounted.
 
 ## Configure access separately
 
-Keep storage access in its own YAML file and pass it with `--storage-config PATH` or `DETERMINED_COMPUTE_STORAGE`. It does not change the compute-profile fingerprint or task identity.
+Keep storage access in its own YAML file and pass it with `--storage-config PATH` or `DETERMINED_COMPUTE_STORAGE`. It does not change any job.
 
 ```yaml
 mode: auto                 # auto, local, or ssh
@@ -28,9 +28,11 @@ timeout_seconds: 120
 preserve_permissions: true # set false only for a verified incompatible filesystem
 ```
 
-`local_mounts` maps a compute-profile host root or subdirectory to an absolute path on the client. `auto` uses an explicit mapping or the same host root when that root exists locally, then falls back to configured SSH. `local` requires local access; `ssh` always accesses the login node. The `shared_dir` argument is always a container-namespace path. The service first resolves the authoritative compute-profile mount, then translates to its cluster host path and the chosen client backend.
+`local_mounts` maps a policy host root or subdirectory to an absolute path on the client. `auto` uses an explicit mapping or the same host root when that root exists locally, then falls back to configured SSH. `local` requires local access; `ssh` always accesses the login node. The `shared_dir` argument is always a container-namespace path. The service first resolves the authoritative policy mount, then translates to its cluster host path and the chosen client backend.
 
-Without a storage file, the service uses empty `auto` configuration. A storage operation with neither local access nor SSH returns `configuration_required`; compute planning and launch remain available. `connect_timeout_seconds` accepts 1–120 seconds and defaults to 10; `timeout_seconds` accepts 1–3600 seconds and defaults to 120. `preserve_permissions` is a boolean and defaults to `true`.
+Without a storage file, the service uses empty `auto` configuration. A storage operation with neither local access nor SSH returns `configuration_required`; compute planning and launch remain available.
+
+Planning `git` code reads the repository through a local mount only: this release does not plan `git` code over SSH. The repository's root needs a `local_mounts` entry, or its host root must exist at the same path on the client, with `mode: auto` or `local`; otherwise `compute_plan` returns `storage_not_local`. Send such code as `context`, or run it as `path` code, instead. `connect_timeout_seconds` accepts 1–120 seconds and defaults to 10; `timeout_seconds` accepts 1–3600 seconds and defaults to 120. `preserve_permissions` is a boolean and defaults to `true`.
 
 Use the login node as `ssh.host`. A gateway is only an optional `ProxyJump`; do not mistake it for the storage endpoint. Prefer an SSH alias so user, identity, port, jump route, and host-key policy stay in `~/.ssh/config`:
 
@@ -113,15 +115,15 @@ The selected keyring backend must already be unlocked and available to the servi
 
 ## Check, preview, and transfer
 
-The Python boundary is `StorageService.check(path)`, `sync(local_dir, shared_dir, dry_run=True)`, and `fetch(shared_dir, local_dir, dry_run=True)`. The MCP storage tools call these methods. `check` reports the selected backend, container path, translated host path, optional local path, existence, type, and read/write access. Sync/fetch copy directory contents and report the operation, backend, resolved endpoints, host path, exclusions, effective `preserve_permissions`, dry-run/completion state, and bounded output with a `truncated` flag. Local results include the mapped path; SSH results expose only the configured host alias, never the user, identity path, or credential.
+The Python boundary is `StorageService.check(path)`, `sync(local_dir, shared_dir, dry_run=True, overwrite=False)`, and `fetch(shared_dir, local_dir, dry_run=True, overwrite=False)`. The MCP storage tools call these methods. `check` reports the container path, translated host path, optional local path, existence, type, read/write access, and its `viewpoint`: the backend, the user it runs as, and a note that the permissions are that user's, not the container user's. Sync/fetch copy directory contents and report the operation, backend, resolved endpoints, host path, exclusions, effective `preserve_permissions`, dry-run/completion state, and bounded output with a `truncated` flag. Local results include the mapped path; SSH results expose only the configured host alias, never the user, identity path, or credential.
 
-MCP exposes `storage_check(path)`, `storage_sync(local_dir, shared_dir, dry_run=True)`, and `storage_fetch(shared_dir, local_dir, dry_run=True)`. Preview is the default; pass `dry_run=false` only after reviewing resolved source, destination, transport, and exclusions.
+MCP exposes `storage_check(path)`, `storage_sync(local_dir, shared_dir, dry_run=True, overwrite=False)`, and `storage_fetch(shared_dir, local_dir, dry_run=True, overwrite=False)`. Preview is the default; pass `dry_run=false` only after reviewing resolved source, destination, transport, and exclusions. `overwrite=true` needs `allow_overwrite: true` in the policy; otherwise it returns `overwrite_not_allowed`.
 
-Client-side `local_dir` values must be absolute paths. Transfer uses `rsync -a --safe-links --mkpath --itemize-changes`; SSH transfers also use secluded arguments (`-s`). With the default `preserve_permissions: true`, archive mode preserves permissions, owner, group, and directory times. Set it to `false` only for a verified mount that rejects those operations; the backend then adds `--no-owner --no-group --no-perms --omit-dir-times` for local and SSH transfers. Do not disable preservation globally, infer it from a storage name, or retry automatically with different flags.
+Client-side `local_dir` values must be absolute paths. Transfer uses `rsync -a --safe-links --mkpath --itemize-changes`; SSH transfers also use secluded arguments (`-s`). Without `overwrite`, it adds `--ignore-existing` together with `--no-owner --no-group --no-perms --omit-dir-times`, because `--ignore-existing` skips existing files but not existing directories, whose mode, owner, and times archive mode would otherwise rewrite, the destination root's included. Existing entries are then left untouched, and new entries get the source mode masked by the umask, without their directory times. With `overwrite`, the default `preserve_permissions: true` keeps exact permissions, owner, group, and directory times. Set it to `false` only for a verified mount that rejects those operations; the backend then adds the same four flags for local and SSH transfers. A result's `preserve_permissions` reports the effective value. Do not disable preservation globally, infer it from a storage name, or retry automatically with different flags.
 
 Dry-run creates no destination directories and returns bounded preview output. Transfer never adds `--delete`, `--copy-links`, or a password to the process arguments. Sync excludes VCS metadata, local caches, SSH/cloud configuration, common environment/credential/key files, and the exact configured secrets file when it lies under the source. These exclusions are defense in depth, not a complete secret scanner; review project-specific names before execution.
 
-The absence of `--delete` means extra destination files remain. An executed transfer can still replace same-named destination files according to normal rsync archive-mode rules; review the itemized dry-run output first.
+The absence of `--delete` means extra destination files remain. Only an executed transfer with `overwrite` replaces same-named destination files; review the itemized dry-run output first.
 
 Rsync exit code 23 means some files or attributes were not transferred and the destination may already contain a partial copy. Inspect the bounded output, correct the filesystem/configuration cause, run a fresh preview, and review it before executing again. The service must not blindly retry a failed transfer.
 
@@ -150,4 +152,4 @@ ssh -O exit cluster-login
 
 OpenSSH recommends a private `ControlPath` containing `%h/%p/%r` or `%C`; `-M` creates a master, `-N` runs no remote command, and `-f` backgrounds after authentication. This persists the login-node transport for later storage operations. It is unrelated to GPU activity and does not keep Determined tasks or shells alive. See [`ssh_config(5)`](https://man.openbsd.org/ssh_config.5) and [`ssh(1)`](https://man.openbsd.org/ssh.1).
 
-Compute-profile `read_only: true` also applies to storage operations: uploads are rejected, while checks and downloads remain allowed. A download destination cannot map back into read-only shared storage. `storage_check` reports `read_only`; its `writable` flag combines filesystem access with profile policy.
+The policy's `read_only: true` also applies to storage operations: uploads are rejected, while checks and downloads remain allowed. A download destination cannot map back into read-only shared storage. `storage_check` reports `read_only`; its `writable` flag combines filesystem access with the policy.

@@ -184,7 +184,7 @@ class StorageService:
                 host_path=host_path,
                 local_path=str(destination),
                 excludes=excludes,
-                preserve_permissions=self.config.preserve_permissions,
+                preserve_permissions=self.config.preserve_permissions and overwrite,
                 overwrite=overwrite,
             )
         destination = self._remote_spec(host_path)
@@ -199,7 +199,7 @@ class StorageService:
             host_path=host_path,
             ssh_host=self._require_ssh().host,
             excludes=excludes,
-            preserve_permissions=self.config.preserve_permissions,
+            preserve_permissions=self.config.preserve_permissions and overwrite,
             overwrite=overwrite,
         )
 
@@ -236,7 +236,7 @@ class StorageService:
                 local_path=str(source),
                 local_output_path=str(output),
                 excludes=(),
-                preserve_permissions=self.config.preserve_permissions,
+                preserve_permissions=self.config.preserve_permissions and overwrite,
                 overwrite=overwrite,
             )
         source = self._remote_spec(host_path)
@@ -252,7 +252,7 @@ class StorageService:
             ssh_host=self._require_ssh().host,
             local_output_path=str(output),
             excludes=(),
-            preserve_permissions=self.config.preserve_permissions,
+            preserve_permissions=self.config.preserve_permissions and overwrite,
             overwrite=overwrite,
         )
 
@@ -427,7 +427,9 @@ class StorageService:
         overwrite: bool,
     ) -> list[str]:
         argv = ["rsync", "-a", "--safe-links", "--mkpath", "--itemize-changes"]
-        if not preserve_permissions:
+        # --ignore-existing skips existing files but not directories, whose mode, owner and
+        # times -a would still rewrite, the destination root's included.
+        if not preserve_permissions or not overwrite:
             argv.extend(("--no-owner", "--no-group", "--no-perms", "--omit-dir-times"))
         if not overwrite:
             argv.append("--ignore-existing")
@@ -461,7 +463,8 @@ class StorageService:
                 "-e",
                 shlex.join(["ssh", *ssh_options]),
             ]
-            if not self.config.preserve_permissions:
+            # As in _rsync_args: without overwrite, existing directories keep their attributes.
+            if not self.config.preserve_permissions or not overwrite:
                 argv.extend(("--no-owner", "--no-group", "--no-perms", "--omit-dir-times"))
             if not overwrite:
                 argv.append("--ignore-existing")

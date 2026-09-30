@@ -34,7 +34,7 @@ DET_MASTER=https://determined.example.org
 DET_API_TOKEN=replace-with-your-token
 ```
 
-也支持 `DET_USERNAME` 和 `DET_PASSWORD`。不要提交凭据文件。使用管理员提供的镜像、资源池、计算节点宿主机路径和容器挂载路径填写 `profile.yaml`。任务请求使用容器路径。SQLite 数据库应保存在本地持久磁盘上，不要放在共享 NFS 中。
+也支持 `DET_USERNAME` 和 `DET_PASSWORD`。不要提交凭据文件。secrets 文件指定了 `DET_MASTER` 时，其凭据只发往该 master；环境变量指向另一个 master 时，服务拒绝启动。使用管理员提供的镜像、资源池、计算节点宿主机路径和容器挂载路径填写策略文件 `profile.yaml`。任务请求使用容器路径。服务不保存本地状态：Determined master 记录每个任务。
 
 计算任务不需要客户端存储配置。共享路径与已配置的 `host_path` 在本机一致时，存储工具会自动使用该本地路径。需要自定义本地映射或登录节点 SSH 时，将 `cfg/storage-access.example.yaml` 复制为 `.local/storage.yaml`，编辑后再把 `--storage-config /absolute/path/to/.local/storage.yaml` 加入 MCP 参数。
 
@@ -48,20 +48,18 @@ DET_API_TOKEN=replace-with-your-token
   "command": "/absolute/path/to/determined_cluster_mcp/.venv/bin/determined-compute-mcp",
   "args": [
     "--profile", "/absolute/path/to/determined_cluster_mcp/.local/profile.yaml",
-    "--db", "/absolute/local/path/to/tasks.sqlite3",
-    "--owner", "your-owner",
     "--secrets-file", "/absolute/path/to/determined_cluster_mcp/.local/credentials.env",
     "--verify-ssl"
   ]
 }
 ```
 
-`owner` 是本地任务命名空间，不用于身份认证；凭据决定所使用的 Determined 账户。需要 SSH 或私有 CA 时，将相应环境传给 stdio 进程，具体见下方故障排查文档。
+存储访问需要单独的文件时，加入 `"--storage-config", "/absolute/path/to/.local/storage.yaml"`；只有不使用 TLS 的部署才使用 `--no-verify-ssl`。凭据决定所使用的 Determined 账户，该账户拥有服务提交的每个任务。启动时服务检查 master 的 submission protocol；master 低于 protocol 1 或配置无效时以状态码 2 退出，master 无法连接则不影响启动。需要 SSH 或私有 CA 时，将相应环境传给 stdio 进程，具体见下方故障排查文档。
 
 <a id="documentation"></a>
 ## 文档
 
 - [Agent 工作流](docs/agent-workflow.zh.md)：准备、规划、提交、跟踪和验收任务
-- [计算服务参考](docs/compute-service.zh.md)：配置、请求、工具、用量测量、任务身份与恢复
+- [计算服务参考](docs/compute-service.zh.md)：策略、TaskSpec、11 个工具、用量测量和错误
 - [共享存储访问](docs/shared-storage-access.zh.md)：本地挂载、SSH、预览和传输
-- [故障排查](docs/troubleshooting.zh.md)：启动、认证、TLS、路径、容量、提交状态不确定、用量测量和取消
+- [故障排查](docs/troubleshooting.zh.md)：启动、认证、TLS、spec、路径、git 规划、任务排队、提交结果不确定、用量测量和取消

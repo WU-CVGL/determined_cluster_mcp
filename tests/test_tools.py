@@ -203,9 +203,9 @@ def test_a_moving_revision_returns_plan_changed_and_creates_nothing(tools, maste
         "plan_changed", tools.launch, moving, plan["request_id"], plan["request_digest"]
     )
 
-    assert error.details["commit"] == error.details["content_digest"] == moved
-    assert error.details["expected_digest"] == plan["request_digest"]
-    assert error.details["request_digest"] != plan["request_digest"]
+    assert error.details == {"commit": moved, "content_digest": moved}
+    # The master's new digest is withheld: unplanned content cannot be launched under the key.
+    assert "request_digest" not in error.details and "expected_digest" not in error.details
     assert master.jobs == {} and master.keys == {}
     # A fresh plan and key succeed.
     fresh = tools.plan(moving)
@@ -231,6 +231,130 @@ def test_a_lost_launch_response_replays_after_the_tree_changes(tools, master, re
     assert len(master.jobs) == 1
     # A new request with the changed tree needs its own plan.
     refused("plan_changed", tools.launch, resolved, str(uuid.uuid4()), plan["request_digest"])
+
+
+def lose_the_include(repo: Path) -> None:
+    (repo / "notes.txt").unlink()
+
+
+def link_the_include_outside(repo: Path) -> None:
+    (repo / "notes.txt").unlink()
+    (repo / "notes.txt").symlink_to("/etc/hostname")
+
+
+def amend_the_commit(repo: Path) -> None:
+    git(repo, "commit", "-q", "--amend", "-m", "amended")
+
+
+@needs_git
+@pytest.mark.parametrize(
+    "change, source",
+    [
+        (lose_the_include, "context"),
+        (link_the_include_outside, "context"),
+        (amend_the_commit, "git"),
+    ],
+    ids=["deleted-include", "absolute-symlink", "amended-commit"],
+)
+def test_a_lost_launch_response_replays_when_the_spec_no_longer_renders(
+    tools, master, repo, change, source
+):
+    (repo / "notes.txt").write_text("first\n")
+    code = (
+        {"source": "context", "repo": str(repo), "include": ["notes.txt"]}
+        if source == "context"
+        else {"source": "git", "repo": "/shared/repos/app"}
+    )
+    plan = tools.plan(spec(code=code))
+    resolved = TaskSpec.model_validate(plan["spec"])
+    first = tools.launch(resolved, plan["request_id"], plan["request_digest"])
+
+    change(repo)
+    with pytest.raises((CodeError, StorageError)):
+        tools.plan(resolved)  # the spec no longer renders
+    again = tools.launch(resolved, plan["request_id"], plan["request_digest"])
+
+    assert (again["job_id"], again["replayed"]) == (first["job_id"], True)
+    assert again["state"] == "queued" and "no longer renders" in again["note"]
+    assert len(master.jobs) == 1
+
+
+def test_a_lost_launch_response_replays_after_the_policy_narrows(master, shared):
+    plan = make_tools(master, shared).plan(spec(slots=2))
+    first = make_tools(master, shared).launch(
+        spec(slots=2), plan["request_id"], plan["request_digest"]
+    )
+
+    again = make_tools(master, shared, max_slots=1).launch(
+        spec(slots=2), plan["request_id"], plan["request_digest"]
+    )
+
+    assert (again["job_id"], again["replayed"]) == (first["job_id"], True)
+    assert len(master.jobs) == 1
+
+
+@needs_git
+def test_a_first_launch_that_no_longer_renders_keeps_its_error(tools, master, repo):
+    (repo / "notes.txt").write_text("first\n")
+    context = spec(code={"source": "context", "repo": str(repo), "include": ["notes.txt"]})
+    plan = tools.plan(context)
+    resolved = TaskSpec.model_validate(plan["spec"])
+    lose_the_include(repo)
+
+    error = refused(
+        "invalid_include", tools.launch, resolved, plan["request_id"], plan["request_digest"]
+    )
+
+    assert error.details["request_id"] == plan["request_id"]
+    assert master.jobs == {} and master.keys == {}
+    assert ("replay", "command", plan["request_id"], plan["request_digest"]) in master.calls
+
+
+def test_a_render_failure_says_when_the_master_cannot_tell_about_the_key(master, shared):
+    plan = make_tools(master, shared).plan(spec(slots=2))
+
+    def unreachable(*args):
+        raise APIError("Determined did not answer", code="unavailable", retryable=True)
+
+    master.replay = unreachable
+    narrowed = make_tools(master, shared, max_slots=1)
+    error = refused(
+        "slots_exceed_limit", narrowed.launch, spec(slots=2), plan["request_id"],
+        plan["request_digest"],
+    )
+
+    assert error.details["request_id"] == plan["request_id"]
+    assert error.details["replay"] == "unavailable"
+    assert "check compute_list before planning again" in str(error)
+
+
+def test_a_render_failure_on_a_key_of_other_content_is_a_conflict(master, shared):
+    tools = make_tools(master, shared)
+    plan = tools.plan(spec())
+    first = tools.launch(spec(), plan["request_id"], plan["request_digest"])
+    other = tools.plan(spec(slots=2))
+
+    error = refused(
+        "key_conflict", make_tools(master, shared, max_slots=1).launch, spec(slots=2),
+        plan["request_id"], other["request_digest"],
+    )
+
+    assert error.details == {"job_id": first["job_id"]}
+
+
+def test_an_unreachable_workspace_lookup_is_not_probed(tools, master):
+    plan = tools.plan(spec(workspace="research"))
+
+    def unreachable(name):
+        raise APIError("Determined did not answer", code="unavailable", retryable=True)
+
+    master.find_workspace_id = unreachable
+    refused(
+        "unavailable", tools.launch, spec(workspace="research"), plan["request_id"],
+        plan["request_digest"],
+    )
+
+    assert not [call for call in master.calls if call[0] == "replay"]
 
 
 @needs_git
@@ -280,7 +404,9 @@ def test_git_code_is_planned_only_through_a_local_mount(master, shared, repo):
         "storage_not_local", tools.plan, spec(code={"source": "git", "repo": "/shared/repos/app"})
     )
 
-    assert "not over SSH" in str(error)
+    # A scope limit of this release, named with its remedies.
+    assert "not over SSH" in str(error) and "local_mounts" in str(error)
+    assert "as context" in str(error)
     assert master.calls == []
 
 
@@ -343,7 +469,7 @@ def test_an_experiment_names_its_workspace_and_project_for_the_master(tools, mas
 
 
 def test_a_dry_run_error_creates_nothing(tools, master):
-    master.dry_run_error = APIError('unknown field "storage_path"', code="invalid_request")
+    master.dry_run_error = APIError('unknown field "save_everything"', code="invalid_request")
 
     refused("invalid_request", tools.plan, spec())
 
@@ -384,6 +510,49 @@ def test_launch_validates_the_plan_handles_before_any_call(tools, master, reques
     refused("invalid_request", tools.launch, spec(), request_id, digest)
 
     assert master.calls == []
+
+
+def test_launch_explains_an_experiment_that_waits_for_resources(tools, master):
+    experiment = spec(kind="experiment")
+    plan = tools.plan(experiment)
+    create = master.submit
+
+    def submit(*args, **kwargs):
+        created = create(*args, **kwargs)
+        if not kwargs.get("dry_run"):
+            # The ledger reads an active experiment as running while its trial is queued.
+            master.jobs[created["job_id"]].update(kind="experiment", state="running")
+        return created
+
+    master.submit = submit
+    launched = tools.launch(experiment, plan["request_id"], plan["request_digest"])
+
+    assert (launched["outcome"], launched["state"]) == ("queued", "running")
+    assert "waits for the scheduler" in launched["explanation"]
+
+
+def test_plan_never_returns_checkpoint_storage_credentials(tools, master):
+    master.defaults = {
+        "checkpoint_storage": {
+            "type": "azure",
+            "container": "checkpoints",
+            "connection_string": "AccountName=a;AccountKey=WORKSPACEADMINKEY==",
+            "account_url": "https://a.blob.example/?sig=ACCOUNTSIGNATURE",
+            "endpoint_url": "https://keyid:ENDPOINTSECRET@s3.example",
+            "save_trial_best": 1,
+        }
+    }
+
+    plan = tools.plan(spec(kind="experiment"))
+
+    text = json.dumps(plan)
+    for secret in ("WORKSPACEADMINKEY", "ACCOUNTSIGNATURE", "ENDPOINTSECRET"):
+        assert secret not in text
+    assert plan["effective_config"]["checkpoint_storage"] == {
+        "type": "azure",
+        "container": "checkpoints",
+        "save_trial_best": 1,
+    }
 
 
 def test_a_failed_read_after_the_create_still_returns_the_job(tools, master):

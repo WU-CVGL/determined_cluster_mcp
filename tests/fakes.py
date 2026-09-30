@@ -34,6 +34,8 @@ class FakeMaster:
         self.cancel_after_polls = 1
         self.polls: Dict[str, int] = {}
         self.dry_run_error: Optional[APIError] = None
+        # Master and workspace defaults the dry run merges under the request's own config.
+        self.defaults: Dict[str, Any] = {}
         self.read_error: Optional[APIError] = None
         self.logs: List[Dict[str, Any]] = [{"log": "hello"}]
         self.pools: List[Dict[str, Any]] = []
@@ -81,7 +83,11 @@ class FakeMaster:
         if dry_run:
             if self.dry_run_error is not None:
                 raise self.dry_run_error
-            effective = {**copy.deepcopy(config), "bind_mounts": self.bind_mounts}
+            effective = {
+                **copy.deepcopy(self.defaults),
+                **copy.deepcopy(config),
+                "bind_mounts": self.bind_mounts,
+            }
             effective["environment"]["registry_auth"] = {"password": "hidden"}
             return {
                 "job_id": None,
@@ -114,6 +120,22 @@ class FakeMaster:
             job_id, kind=kind, key=idempotency_key, digest=digest, name=config.get("name")
         )
         return self._result(job_id, digest, replayed=False)
+
+    def replay(self, kind, idempotency_key, expected_digest):
+        """The master's key lookup: nothing is created, and a free key stays free."""
+
+        self.calls.append(("replay", kind, idempotency_key, expected_digest))
+        if idempotency_key not in self.keys:
+            return None
+        job_id, stored = self.keys[idempotency_key]
+        if stored != expected_digest or self.jobs[job_id]["kind"] != kind:
+            raise APIError(
+                f'idempotency key "{idempotency_key}" is already used by job {job_id} for a '
+                "different request",
+                code="key_conflict",
+                details={"job_id": job_id},
+            )
+        return self._result(job_id, stored, replayed=True)
 
     @staticmethod
     def _result(job_id, digest, replayed):

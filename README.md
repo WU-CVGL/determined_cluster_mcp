@@ -31,7 +31,7 @@ DET_MASTER=https://determined.example.org
 DET_API_TOKEN=replace-with-your-token
 ```
 
-`DET_USERNAME` and `DET_PASSWORD` are also supported. Do not commit the credentials file. Fill `profile.yaml` with the administrator-provided image, resource pool, cluster-agent host paths, and container mount paths. Use container paths in task requests. Keep the SQLite database on local durable disk, not shared NFS.
+`DET_USERNAME` and `DET_PASSWORD` are also supported. Do not commit the credentials file. A secrets file that names `DET_MASTER` sends its credentials to that master only, and the server refuses to start when the environment names another one. Fill `profile.yaml`, the policy, with the administrator-provided image, resource pool, cluster-agent host paths, and container mount paths. Use container paths in task requests. The server keeps no local state: the Determined master records every job.
 
 Compute tasks do not need a client storage configuration. Storage tools automatically use a local shared path when it matches the configured `host_path`. For a custom local mapping or login-node SSH, copy `cfg/storage-access.example.yaml` to `.local/storage.yaml`, edit it, and add `--storage-config /absolute/path/to/.local/storage.yaml` to the MCP arguments.
 
@@ -44,19 +44,17 @@ Add this server in the syntax used by your MCP client. Replace every example val
   "command": "/absolute/path/to/determined_cluster_mcp/.venv/bin/determined-compute-mcp",
   "args": [
     "--profile", "/absolute/path/to/determined_cluster_mcp/.local/profile.yaml",
-    "--db", "/absolute/local/path/to/tasks.sqlite3",
-    "--owner", "your-owner",
     "--secrets-file", "/absolute/path/to/determined_cluster_mcp/.local/credentials.env",
     "--verify-ssl"
   ]
 }
 ```
 
-The `owner` is a local task namespace, not authentication. The credentials select the Determined account. If SSH or a private CA is required, pass the needed environment to the stdio process; see troubleshooting below.
+Add `"--storage-config", "/absolute/path/to/.local/storage.yaml"` when storage access needs its own file, and use `--no-verify-ssl` only for a deployment without TLS. The credentials select the Determined account, which owns every job the server launches. At startup the server checks the master's submission protocol and exits with status 2 when the master is older than protocol 1 or the configuration is invalid; an unreachable master does not stop it. If SSH or a private CA is required, pass the needed environment to the stdio process; see troubleshooting below.
 
 ## Documentation
 
 - [Agent workflow](docs/agent-workflow.md): prepare, plan, launch, monitor, and accept work
-- [Compute service reference](docs/compute-service.md): profiles, requests, tools, usage measurements, task identity, and recovery
+- [Compute service reference](docs/compute-service.md): the policy, TaskSpec, the eleven tools, usage measurements, and errors
 - [Shared storage access](docs/shared-storage-access.md): local mounts, SSH, dry runs, and transfers
-- [Troubleshooting](docs/troubleshooting.md): startup, authentication, TLS, paths, capacity, uncertain submissions, usage measurements, and cancellation
+- [Troubleshooting](docs/troubleshooting.md): startup, authentication, TLS, specs, paths, git planning, queued jobs, uncertain launches, usage measurements, and cancellation
