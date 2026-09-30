@@ -1,8 +1,8 @@
-"""Local stdio MCP adapter for the persistent compute service.
+"""The compute MCP: eleven tools over the Determined job ledger and shared storage.
 
-The configured owner is a local namespace, not an authentication mechanism.
-This server is intended for a trusted same-user MCP client launched as a child
-process.  No tool accepts an owner argument.
+``Tools`` implements each tool without the MCP package, so it can be tested with a fake client;
+``create_server`` publishes them. There is no local state: the master keeps every job, keyed by
+the ``request_id`` a plan mints, and ``job_id`` is the only handle.
 """
 
 from __future__ import annotations
@@ -11,241 +11,656 @@ import argparse
 import asyncio
 import json
 import os
+import re
+import sys
+import time
+import uuid
+from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from determined_compute.compute import ComputeError, ComputeProfile, ComputeService, SQLiteTaskStore
-from determined_compute.core.api_client import APIError as ClientAPIError
-from determined_compute.core.api_client import DeterminedAPIClient
+from determined_compute import __version__, usage
+from determined_compute import code as code_plan
+from determined_compute.client import APIError, Client
+from determined_compute.policy import Policy, PolicyError, Resources
+from determined_compute.spec import (
+    CreateRequest,
+    PlannedCode,
+    TaskSpec,
+    compile_request,
+    concurrent_trials,
+    resolve,
+)
+from determined_compute.storage import StorageAccessConfig, StorageError, StorageService
+
+PLACEMENT = "not evaluated; the scheduler decides after launch"
+ENDED_STATES = frozenset({"completed", "failed", "canceled", "deleted"})
+_REQUEST_ID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+_OBSERVED = (
+    "observed at plan time: master and pool defaults are not bound by the plan and apply as "
+    "they stand at launch"
+)
+# Top-level effective settings worth reviewing; the rest are Determined's defaults.
+_SUMMARY_KEYS = (
+    "name",
+    "description",
+    "entrypoint",
+    "resources",
+    "bind_mounts",
+    "work_dir",
+    "checkpoint_storage",
+    "searcher",
+    "max_restarts",
+    "workspace",
+    "project",
+)
+_MASTER_WARNINGS = {
+    "current_slots_exceeded": (
+        "the request needs more slots than the cluster has now; the job waits in the queue "
+        "until they exist"
+    ),
+}
+_EXIT_CLASSES = {
+    "none": "It ended without a failure: it completed or was cancelled.",
+    "workload_failed": (
+        "The workload exited with an error. A failed prelude (code delivery, output_dir or "
+        "workdir) counts too, and prints a line starting with 'compute:' in compute_logs."
+    ),
+    "workload_initialization_failed": (
+        "The container failed before the workload started, for example while pulling the image "
+        "or creating the container."
+    ),
+    "node_preflight_failed": "The node refused the allocation in its preflight checks.",
+    "placement_unsatisfied": "The scheduler could not place the job as its admission required.",
+    "infrastructure_failed": (
+        "An agent or its connection was lost, or the master could not restore the task; the "
+        "workload did not cause it."
+    ),
+}
+_NO_EXIT_CLASS = (
+    "No exit class was recorded: jobs submitted before the ledger have none, and neither has a "
+    "cancelled experiment whose trial never started."
+)
+INSTRUCTIONS = (
+    "Plan, then launch. compute_plan(spec) validates a TaskSpec, pins its code revision, "
+    "applies the policy and dry-runs the exact request on the master; review the resolved "
+    "spec, commit, effective config and warnings, then call compute_launch with the returned "
+    "spec, request_id and request_digest. Retrying a launch with the same arguments returns "
+    "the same job; plan_changed means the code or request moved since the plan, so plan again. "
+    "job_id is the only handle: compute_status, compute_logs, compute_usage and compute_cancel "
+    "take it, and compute_list finds the jobs of every client with their request_id. Only "
+    "admission=queue is supported, and placement is not evaluated before launch; "
+    "compute_resources is a projection of the pools, not a verdict. Keep data and outputs on "
+    "the mounted shared storage and move files with storage_sync and storage_fetch, previewing "
+    "with dry_run first. Credentials belong in the local configuration, never in tool "
+    "arguments or env."
+)
 
 
-DEFAULT_DB_PATH = Path("~/.local/state/determined-compute/tasks.sqlite3").expanduser()
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def normalize_owner(value: str) -> str:
-    """Validate the owner namespace bound at startup."""
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("owner must be a non-empty string")
-    value = value.strip()
-    if len(value.encode("utf-8")) > 256:
-        raise ValueError("owner is too long")
+def _refuse_immediate(spec: TaskSpec) -> None:
+    # Checked before any code is read or request sent, so nothing is created.
+    if spec.admission != "queue":
+        raise APIError(
+            "admission=immediate is not supported in this release; use queue",
+            code="admission_unsupported",
+        )
+
+
+def _request_id(value: Any) -> str:
+    if not isinstance(value, str) or not _REQUEST_ID.fullmatch(value):
+        raise ValueError("request_id must be the UUID that compute_plan returned")
     return value
 
 
-class _LazyClient:
-    """Construct the API client only when a service operation needs it."""
+def _job(submission: Mapping[str, Any], *, tasks: bool = True) -> Dict[str, Any]:
+    """A submission as the tools report it; its idempotency key is the plan's request_id."""
 
-    def __init__(self, factory: Callable[[], DeterminedAPIClient]) -> None:
-        import threading
-
-        self._factory = factory
-        self._client: Optional[DeterminedAPIClient] = None
-        self._lock = threading.Lock()
-
-    def _resolve_client(self) -> DeterminedAPIClient:
-        if self._client is None:
-            with self._lock:
-                if self._client is None:
-                    client = self._factory()
-                    self._client = client
-        return self._client
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._resolve_client(), name)
+    job = {key: value for key, value in submission.items() if key != "idempotency_key"}
+    job["request_id"] = submission["idempotency_key"]
+    if not tasks:
+        job.pop("tasks")
+    return job
 
 
-def safe_error_details(exc: BaseException) -> dict[str, Any]:
-    details = getattr(exc, "details", None)
-    allowed = {"task_id", "resource_pool", "requested_slots", "available", "candidate_pools"}
-    result = {key: value for key, value in details.items() if key in allowed} if isinstance(details, dict) else {}
-    if "task_id" not in result and getattr(exc, "task_id", None):
-        result["task_id"] = str(exc.task_id)
-    return result
+def explain(submission: Mapping[str, Any]) -> str:
+    state = submission["state"]
+    if state in ENDED_STATES:
+        exit_class = submission["exit_class"]
+        text = (
+            _NO_EXIT_CLASS
+            if exit_class is None
+            else _EXIT_CLASSES.get(exit_class, f"Its exit class is {exit_class}.")
+        )
+        return f"The job {state}. {text}"
+    if state == "paused":
+        return "The job is paused."
+    latest = [task["allocations"][-1] for task in submission["tasks"] if task["allocations"]]
+    # An active experiment reads running while every trial still waits for resources.
+    if state == "queued" or (latest and all(item["state"] == "queued" for item in latest)):
+        return "The job waits for the scheduler to place it; placement is decided after launch."
+    return "The job is running."
 
 
-def _tool_error(exc: BaseException) -> dict[str, Any]:
-    error: dict[str, Any] = {
-        "code": getattr(exc, "code", "internal_error"),
+def _code_summary(planned: PlannedCode) -> Optional[Dict[str, Any]]:
+    if isinstance(planned, code_plan.GitCode):
+        return {
+            "source": "git",
+            "repo": planned.repo,
+            "commit": planned.commit,
+            "uses_lfs": planned.uses_lfs,
+        }
+    if isinstance(planned, code_plan.ContextCode):
+        return {
+            "source": "context",
+            "repo": planned.repo,
+            "commit": planned.commit,
+            "dirty": planned.dirty,
+            "files": len(planned.files),
+            "size": planned.size,
+            "included": list(planned.included),
+            "excluded": list(planned.excluded),
+            "skipped": list(planned.skipped),
+        }
+    if isinstance(planned, code_plan.PathCode):
+        # What the planner saw in the directory; nothing ties it to what the task runs.
+        return {
+            "source": "path",
+            "dir": planned.dir,
+            "observed_commit": planned.observed_commit,
+            "observed_dirty": planned.observed_dirty,
+            "verified": planned.verified,
+        }
+    return None
+
+
+def _effective_summary(effective: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """The reviewable part of the master's effective config, as the client redacted it."""
+
+    effective = effective or {}
+    summary: Dict[str, Any] = {"observed": _OBSERVED}
+    for key in _SUMMARY_KEYS:
+        if key in effective:
+            summary[key] = effective[key]
+    environment = effective.get("environment")
+    if isinstance(environment, Mapping):
+        summary["environment"] = {
+            key: environment[key]
+            for key in ("image", "environment_variables")
+            if key in environment
+        }
+    return summary
+
+
+def _bind_targets(effective: Optional[Mapping[str, Any]]) -> List[str]:
+    mounts = (effective or {}).get("bind_mounts") or []
+    return [
+        mount["container_path"]
+        for mount in mounts
+        if isinstance(mount, Mapping) and isinstance(mount.get("container_path"), str)
+    ]
+
+
+def _warnings(
+    spec: TaskSpec,
+    planned: PlannedCode,
+    effective: Optional[Mapping[str, Any]],
+    master: Sequence[str],
+) -> List[Dict[str, Any]]:
+    warnings: List[Dict[str, Any]] = []
+    for warning in getattr(planned, "warnings", ()):
+        warnings.append(
+            {"code": warning.code, "message": warning.message, "paths": list(warning.paths)}
+        )
+    if isinstance(planned, code_plan.GitCode) and planned.uses_lfs:
+        warnings.append(
+            {
+                "code": "lfs_required",
+                "message": "the commit has Git LFS files, so the image needs git-lfs",
+                "paths": [],
+            }
+        )
+    # The container sees shared storage only through the bind mounts the master applies.
+    paths = [spec.output_dir]
+    if isinstance(planned, code_plan.GitCode):
+        paths.append(planned.repo)
+    elif isinstance(planned, code_plan.PathCode):
+        paths.append(planned.dir)
+    targets = _bind_targets(effective)
+    outside = [path for path in paths if path and not code_plan.under_root(path, targets)]
+    if outside:
+        warnings.append(
+            {
+                "code": "path_not_bind_mounted",
+                "message": (
+                    "no bind mount of the effective config holds these paths, so the task "
+                    "cannot reach them on shared storage"
+                ),
+                "paths": outside,
+            }
+        )
+    for name in master:
+        message = _MASTER_WARNINGS.get(name, "the master reported this warning")
+        warnings.append({"code": name, "message": message, "paths": []})
+    return warnings
+
+
+class Tools:
+    """The tool implementations over one master, one policy and one storage access."""
+
+    def __init__(
+        self,
+        client: Any,
+        policy: Policy,
+        storage: StorageService,
+        secrets_path: Optional[Path] = None,
+        *,
+        cancel_wait_seconds: float = 10.0,
+        poll_seconds: float = 0.5,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.client = client
+        self.policy = policy
+        self.storage = storage
+        self.secrets_path = secrets_path
+        self._cancel_wait = cancel_wait_seconds
+        self._poll = poll_seconds
+        self._sleep = sleep
+        self._clock = clock
+
+    # Plan and launch
+
+    def plan(self, spec: TaskSpec) -> Dict[str, Any]:
+        """Render ``spec`` and dry-run it on the master; nothing is created."""
+
+        _refuse_immediate(spec)
+        planned, resources, request = self._render(spec)
+        result = self.client.submit(
+            request.kind,
+            request.config,
+            files=request.files,
+            workspace_id=request.workspace_id,
+            dry_run=True,
+        )
+        effective = result["effective_config"]
+        return {
+            "spec": resolve(spec, planned, resources).model_dump(mode="json"),
+            "request_id": str(uuid.uuid4()),
+            "request_digest": result["request_digest"],
+            "commit": getattr(planned, "commit", None),
+            "content_digest": getattr(planned, "content_digest", None),
+            "code": _code_summary(planned),
+            "effective_config": _effective_summary(effective),
+            "warnings": _warnings(spec, planned, effective, result["warnings"]),
+            "placement": PLACEMENT,
+        }
+
+    def launch(self, spec: TaskSpec, request_id: str, request_digest: str) -> Dict[str, Any]:
+        """Create the planned job, bound to the plan's digest; a retry replays it."""
+
+        _refuse_immediate(spec)
+        key = _request_id(request_id)
+        if not isinstance(request_digest, str) or not request_digest:
+            raise ValueError("request_digest must be the digest that compute_plan returned")
+        # A revision pinned to a full SHA resolves to itself, so this renders the planned commit.
+        planned, _resources, request = self._render(spec)
+        try:
+            result = self.client.submit(
+                request.kind,
+                request.config,
+                files=request.files,
+                workspace_id=request.workspace_id,
+                idempotency_key=key,
+                expected_digest=request_digest,
+            )
+        except APIError as exc:
+            if exc.code != "plan_changed":
+                raise
+            raise APIError(
+                "the request differs from the plan, so nothing was created; review the new "
+                "commit and content, then plan again",
+                code="plan_changed",
+                details={
+                    **exc.details,
+                    "commit": getattr(planned, "commit", None),
+                    "content_digest": getattr(planned, "content_digest", None),
+                },
+            ) from None
+        launched: Dict[str, Any] = {
+            "job_id": result["job_id"],
+            "request_id": key,
+            "replayed": result["replayed"],
+            "outcome": result["outcome"],
+            "submitted_at": None,
+        }
+        # The create answer carries no time, and a failed read must not hide the job it created.
+        try:
+            submission = self.client.get_submission(result["job_id"])
+            launched["submitted_at"] = submission["submitted_at"]
+        except APIError as exc:
+            launched["note"] = (
+                f"the job exists, but its submission could not be read ({exc.code}); "
+                "compute_status reports it"
+            )
+        return launched
+
+    def _render(self, spec: TaskSpec) -> Tuple[PlannedCode, Resources, CreateRequest]:
+        resources = self.policy.resources(
+            image=spec.image, pool=spec.pool, slots=spec.slots, trials=concurrent_trials(spec)
+        )
+        if spec.output_dir is not None:
+            self._check_output(spec.output_dir)
+        planned = self._plan_code(spec)
+        workspace_id = None
+        if spec.kind != "experiment" and spec.workspace is not None:
+            workspace_id = self.client.find_workspace_id(spec.workspace)
+        request = compile_request(spec, planned, resources, workspace_id=workspace_id)
+        return planned, resources, request
+
+    def _check_output(self, output_dir: str) -> None:
+        # The prelude creates output_dir, so it must lie on writable shared storage.
+        if self.policy.mounts.read_only(output_dir, "output_dir"):
+            raise PolicyError(
+                f"output_dir {output_dir} is on read-only shared storage",
+                code="read_only_storage",
+                details={"path": output_dir},
+            )
+
+    def _plan_code(self, spec: TaskSpec) -> PlannedCode:
+        code = spec.code
+        if code is None:
+            return None
+        if code.source == "context":
+            return code_plan.plan_context(
+                code.repo,
+                code.revision,
+                code.include,
+                code.exclude,
+                secrets_file=self.secrets_path,
+            )
+        if code.source == "path":
+            self.policy.mounts.to_host(code.dir, "code.dir")
+            try:
+                local: Optional[Path] = self.storage.local_path(code.dir, "code.dir")
+            except StorageError:
+                local = None  # nothing to observe; path code is unpinned either way
+            return code_plan.plan_path(code.dir, local)
+        try:
+            repository = self.storage.local_path(code.repo, "code.repo")
+        except StorageError as exc:
+            if exc.code != "storage_not_local":
+                raise
+            raise StorageError(
+                f"{exc}; this release plans git code only through a local mount, not over SSH",
+                code="storage_not_local",
+            ) from None
+        return code_plan.plan_git(
+            repository, code.repo, self.policy.mounts.container_roots, code.revision
+        )
+
+    # Observe
+
+    def status(self, job_id: str) -> Dict[str, Any]:
+        submission = self.client.get_submission(job_id)
+        return {**_job(submission), "explanation": explain(submission)}
+
+    def list(
+        self,
+        kind: Optional[str] = None,
+        state: Optional[str] = None,
+        limit: int = 50,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        page = self.client.list_submissions(kind=kind, state=state, limit=limit, page_token=cursor)
+        return {
+            "jobs": [_job(item, tasks=False) for item in page["submissions"]],
+            "next_cursor": page["next_page_token"],
+        }
+
+    def logs(self, job_id: str, trial_id: Optional[int] = None, tail: int = 200) -> Dict[str, Any]:
+        submission = self.client.get_submission(job_id)
+        result: Dict[str, Any] = {"job_id": job_id, "task_id": None, "trial_id": None}
+        try:
+            task, trial = usage.select_task(submission, trial_id)
+        except usage.UsageError as exc:
+            if exc.code != "task_not_started":
+                raise
+            return {**result, "lines": [], "note": str(exc)}
+        result["task_id"] = task["task_id"]
+        result["trial_id"] = trial["id"] if trial else None
+        result["lines"] = self.client.task_logs(task["task_id"], tail)
+        return result
+
+    def usage(
+        self,
+        job_id: str,
+        trial_id: Optional[int] = None,
+        allocation_id: Optional[str] = None,
+        window_seconds: int = 3600,
+        metrics: Optional[List[str]] = None,
+        include_samples: bool = False,
+    ) -> Dict[str, Any]:
+        return usage.summarize(
+            self.client,
+            self.client.get_submission(job_id),
+            trial_id=trial_id,
+            allocation_id=allocation_id,
+            window_seconds=window_seconds,
+            metrics=metrics,
+            include_samples=include_samples,
+        )
+
+    def resources(self, pool: Optional[str] = None) -> Dict[str, Any]:
+        """Pools and their device models as the master reports them, with no verdict."""
+
+        pools = self.client.list_resource_pools()
+        if pool is not None:
+            pools = [item for item in pools if item["name"] == pool]
+            if not pools:
+                raise APIError(f"pool {pool!r} does not exist", code="not_found")
+        agents = self.client.list_agents()
+        observed_at = _now()
+        projected = []
+        for item in pools:
+            models = Counter(
+                (device["type"], device["brand"])
+                for agent in agents
+                if item["name"] in agent["resource_pools"]
+                for device in agent["devices"]
+            )
+            device_models = [
+                {"type": kind, "brand": brand, "count": count}
+                for (kind, brand), count in sorted(models.items(), key=str)
+            ]
+            projected.append({**item, "device_models": device_models})
+        return {"observed_at": observed_at, "pools": projected}
+
+    def storage_check(self, path: str) -> Dict[str, Any]:
+        return self.storage.check(path)
+
+    # Control and transfer
+
+    def cancel(self, job_id: str) -> Dict[str, Any]:
+        """Cancel a job and wait briefly for it to end; the master records the cancel first."""
+
+        snapshot = self.client.cancel_submission(job_id)
+        deadline = self._clock() + self._cancel_wait
+        while snapshot["state"] not in ENDED_STATES and self._clock() < deadline:
+            self._sleep(self._poll)
+            try:
+                snapshot = self.client.get_submission(job_id)
+            except APIError:
+                break  # the cancel is recorded; compute_status reads the rest
+        if snapshot["state"] in ENDED_STATES:
+            return {**_job(snapshot), "cancel": "ended", "explanation": explain(snapshot)}
+        return {
+            **_job(snapshot),
+            "cancel": "recorded",
+            "explanation": "The cancel is recorded and the job ends shortly; compute_status "
+            "shows when.",
+        }
+
+    def storage_sync(
+        self, local_dir: str, shared_dir: str, dry_run: bool = True, overwrite: bool = False
+    ) -> Dict[str, Any]:
+        return self.storage.sync(local_dir, shared_dir, dry_run, overwrite)
+
+    def storage_fetch(
+        self, shared_dir: str, local_dir: str, dry_run: bool = True, overwrite: bool = False
+    ) -> Dict[str, Any]:
+        return self.storage.fetch(shared_dir, local_dir, dry_run, overwrite)
+
+
+# The MCP server
+
+
+def tool_error(exc: BaseException) -> Dict[str, Any]:
+    """The JSON error a tool returns: a stable code, the message, and JSON-safe details."""
+
+    code = getattr(exc, "code", None)
+    if not isinstance(code, str):
+        code = "invalid_request" if isinstance(exc, ValueError) else "internal_error"
+    error: Dict[str, Any] = {
+        "code": code,
         "message": str(exc),
+        "retryable": bool(getattr(exc, "retryable", False)),
     }
-    retryable = getattr(exc, "retryable", None)
-    if retryable is not None:
-        error["retryable"] = bool(retryable)
-    details = safe_error_details(exc)
-    if details:
-        error["details"] = details
+    details = getattr(exc, "details", None)
+    if isinstance(details, dict) and details:
+        error["details"] = json.loads(json.dumps(details, default=str))
     return {"error": error}
 
 
-def create_server(
-    service: ComputeService,
-    owner: str,
-    storage_service: Any = None,
-    resource_inspector: Any = None,
-) -> Any:
-    """Create an MCP server bound to one local owner namespace."""
+def create_server(tools: Tools) -> Any:
+    """Publish ``tools`` as an MCP server."""
 
-    owner = normalize_owner(owner)
     try:
         from mcp.server import MCPServer
         from mcp.server.mcpserver.exceptions import ToolError
         from mcp.types import ToolAnnotations
     except ImportError as exc:  # pragma: no cover - exercised without the optional extra
-        raise RuntimeError(
-            "MCP support is not installed; install determined-compute[mcp]"
-        ) from exc
+        raise RuntimeError("MCP support is not installed; install determined-compute[mcp]") from exc
 
-    server = MCPServer(
-        "determined-compute",
-        instructions=(
-            "Choose a meaningful request.name and request.description for each launch. "
-            "Check capacity with compute_resources; queuing requires explicit allow_queue=true. "
-            "Keep code and data on shared mounts; use storage_check/sync/fetch for file access. "
-            "Plan before launch, keep request_id stable, and use the returned task_id for control. "
-            "Use compute_usage to check a task's measured CPU, memory, and GPU use. "
-            "Credentials belong in local configuration, never in tool arguments."
-        ),
-    )
+    server = MCPServer("determined-compute", version=__version__, instructions=INSTRUCTIONS)
 
-    def fail(exc: BaseException) -> None:
-        raise ToolError(json.dumps(_tool_error(exc), sort_keys=True, separators=(",", ":")))
-
-    async def call(operation: Any, *args: Any) -> Any:
+    async def call(operation: Callable[..., Any], *args: Any) -> Any:
         try:
             return await asyncio.to_thread(operation, *args)
-        except (ComputeError, ClientAPIError) as exc:
-            fail(exc)
-        except (OSError, ValueError) as exc:
-            fail(exc)
+        except (APIError, ValueError, OSError) as exc:
+            error = json.dumps(tool_error(exc), sort_keys=True, separators=(",", ":"))
+            raise ToolError(error) from None
 
-    @server.tool(annotations=ToolAnnotations(
-        read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False,
-    ))
-    async def compute_plan(request: dict[str, Any]) -> dict[str, Any]:
-        """Render a request offline. Include name, description, command, workdir and output_dir.
+    def hints(read_only: bool, destructive: bool = False, idempotent: bool = True) -> Any:
+        return ToolAnnotations(
+            read_only_hint=read_only,
+            destructive_hint=destructive,
+            idempotent_hint=idempotent,
+            open_world_hint=True,
+        )
 
-        Optional kind, slots, pool, image and allow_queue control execution; paths use container mounts.
+    @server.tool(annotations=hints(read_only=True, idempotent=False))
+    async def compute_plan(spec: TaskSpec) -> dict[str, Any]:
+        """Check a TaskSpec and dry-run its exact request on the master; nothing is created.
+
+        Returns the resolved spec (revision pinned; pool, slots and image explicit), a new
+        request_id, the master's request_digest, the commit and content digest, the effective
+        config as observed now, and warnings. Placement is not evaluated.
         """
+        return await call(tools.plan, spec)
 
-        return await call(service.plan, request)
+    @server.tool(annotations=hints(read_only=False))
+    async def compute_launch(
+        spec: TaskSpec, request_id: str, request_digest: str
+    ) -> dict[str, Any]:
+        """Launch a planned spec with the plan's request_id and request_digest.
 
-    @server.tool(annotations=ToolAnnotations(
-        read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
-    ))
-    async def compute_launch(request: dict[str, Any], request_id: str) -> dict[str, Any]:
-        """Launch a named request idempotently, checking capacity unless allow_queue=true."""
+        A retry with the same arguments returns the same job. If the code or request changed
+        since the plan, nothing is created and plan_changed names the new commit.
+        """
+        return await call(tools.launch, spec, request_id, request_digest)
 
-        return await call(service.launch, request, request_id, owner)
+    @server.tool(annotations=hints(read_only=True))
+    async def compute_status(job_id: str) -> dict[str, Any]:
+        """Read a job, its tasks and allocations, and an explanation of its state."""
+        return await call(tools.status, job_id)
 
-    @server.tool(annotations=ToolAnnotations(
-        read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
-    ))
-    async def compute_status(task_id: str) -> dict[str, Any]:
-        """Refresh and return a task in the server's owner namespace."""
+    @server.tool(annotations=hints(read_only=True))
+    async def compute_list(
+        kind: Optional[str] = None,
+        state: Optional[str] = None,
+        limit: int = 50,
+        cursor: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """List this user's jobs from every client, newest first, with their request_id.
 
-        return await call(service.status, task_id, owner)
+        kind is command, shell or experiment; state is queued, running, paused, completed,
+        failed, canceled or deleted. Pass next_cursor as cursor for the next page.
+        """
+        return await call(tools.list, kind, state, limit, cursor)
 
-    @server.tool(annotations=ToolAnnotations(
-        read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
-    ))
-    async def compute_logs(task_id: str, tail: int = 200) -> list[Any]:
-        """Return the latest task log records; tail must be a positive integer."""
+    @server.tool(annotations=hints(read_only=True))
+    async def compute_logs(
+        job_id: str, trial_id: Optional[int] = None, tail: int = 200
+    ) -> dict[str, Any]:
+        """Return the last tail log lines of a job's task, oldest first.
 
-        if tail < 1:
-            fail(ValueError("tail must be at least 1"))
-        return await call(service.logs, task_id, owner, tail)
+        For an experiment, trial_id selects the trial; the latest trial by default.
+        """
+        return await call(tools.logs, job_id, trial_id, tail)
 
-    @server.tool(annotations=ToolAnnotations(
-        read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
-    ))
+    @server.tool(annotations=hints(read_only=True))
     async def compute_usage(
-        task_id: str,
-        window_seconds: int = 3600,
-        allocation_id: Optional[str] = None,
+        job_id: str,
         trial_id: Optional[int] = None,
+        allocation_id: Optional[str] = None,
+        window_seconds: int = 3600,
         metrics: Optional[list[str]] = None,
         include_samples: bool = False,
     ) -> dict[str, Any]:
-        """Summarize one task's measured CPU, memory, and GPU use; compute_resources is cluster capacity."""
-
+        """Summarize a job's measured CPU, memory and GPU use; compute_resources shows pools."""
         return await call(
-            service.usage, task_id, owner, window_seconds, allocation_id, trial_id,
-            metrics, include_samples,
+            tools.usage, job_id, trial_id, allocation_id, window_seconds, metrics, include_samples
         )
 
-    @server.tool(annotations=ToolAnnotations(
-        read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=True,
-    ))
-    async def compute_cancel(task_id: str) -> dict[str, Any]:
-        """Cancel a task in the server's owner namespace."""
+    @server.tool(annotations=hints(read_only=True))
+    async def compute_resources(pool: Optional[str] = None) -> dict[str, Any]:
+        """Project the resource pools and their device models; not a placement verdict."""
+        return await call(tools.resources, pool)
 
-        return await call(service.cancel, task_id, owner)
+    @server.tool(annotations=hints(read_only=True))
+    async def storage_check(path: str) -> dict[str, Any]:
+        """Check a shared container path from this client's viewpoint (local mount or SSH)."""
+        return await call(tools.storage_check, path)
 
-    @server.tool(annotations=ToolAnnotations(
-        read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
-    ))
-    async def compute_reconcile(task_id: str, remote_id: str) -> dict[str, Any]:
-        """Bind an uncertain task to a remote id after verifying its identity marker."""
+    @server.tool(annotations=hints(read_only=False, destructive=True))
+    async def compute_cancel(job_id: str) -> dict[str, Any]:
+        """Cancel a job; an ended job is returned unchanged."""
+        return await call(tools.cancel, job_id)
 
-        return await call(service.reconcile, task_id, owner, remote_id)
-
-    @server.tool(annotations=ToolAnnotations(
-        read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False,
-    ))
-    async def compute_list_tasks() -> list[dict[str, Any]]:
-        """List tasks in the server's owner namespace."""
-
-        return await call(service.list_tasks, owner)
-
-    @server.tool(annotations=ToolAnnotations(
-        read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
-    ))
-    async def compute_discover(
-        kind: str, limit: int = 50, offset: int = 0
+    @server.tool(annotations=hints(read_only=False, destructive=True, idempotent=False))
+    async def storage_sync(
+        local_dir: str, shared_dir: str, dry_run: bool = True, overwrite: bool = False
     ) -> dict[str, Any]:
-        """Discover one kind of remote task with bounded pagination; this does not adopt it."""
+        """Copy a local directory's contents into a shared directory; previews by default.
 
-        return await call(service.discover, kind, owner, limit, offset)
+        Existing files are kept unless overwrite is set and the policy allows it.
+        """
+        return await call(tools.storage_sync, local_dir, shared_dir, dry_run, overwrite)
 
-    @server.tool(annotations=ToolAnnotations(
-        read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
-    ))
-    async def compute_adopt(kind: str, remote_id: str) -> dict[str, Any]:
-        """Register an existing remote task in the local owner namespace without submitting work."""
+    @server.tool(annotations=hints(read_only=False, destructive=True, idempotent=False))
+    async def storage_fetch(
+        shared_dir: str, local_dir: str, dry_run: bool = True, overwrite: bool = False
+    ) -> dict[str, Any]:
+        """Copy a shared directory's contents into a local directory; previews by default.
 
-        return await call(service.adopt, kind, remote_id, owner)
-
-    if resource_inspector is not None:
-
-        @server.tool(annotations=ToolAnnotations(
-            read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
-        ))
-        async def compute_resources(slots: int = 1, pool: Optional[str] = None) -> dict[str, Any]:
-            """Inspect current scheduler capacity; slots=0 checks auxiliary capacity, not free GPUs."""
-            return await call(resource_inspector.resources, slots, pool)
-
-    if storage_service is not None:
-
-        @server.tool(annotations=ToolAnnotations(
-            read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
-        ))
-        async def storage_check(path: str) -> dict[str, Any]:
-            """Check a shared container path through a local mount or configured SSH login node."""
-            return await call(storage_service.check, path)
-
-        @server.tool(annotations=ToolAnnotations(
-            read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True,
-        ))
-        async def storage_sync(local_dir: str, shared_dir: str, dry_run: bool = True) -> dict[str, Any]:
-            """Copy local directory contents to a mapped shared directory; preview by default, no deletions."""
-            return await call(storage_service.sync, local_dir, shared_dir, dry_run)
-
-        @server.tool(annotations=ToolAnnotations(
-            read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True,
-        ))
-        async def storage_fetch(shared_dir: str, local_dir: str, dry_run: bool = True) -> dict[str, Any]:
-            """Copy shared directory contents to a local directory; preview by default, no deletions."""
-            return await call(storage_service.fetch, shared_dir, local_dir, dry_run)
+        Existing files are kept unless overwrite is set and the policy allows it.
+        """
+        return await call(tools.storage_fetch, shared_dir, local_dir, dry_run, overwrite)
 
     return server
 
@@ -253,18 +668,15 @@ def create_server(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="determined-compute-mcp",
-        description="Run the trusted local Determined compute MCP server over stdio",
+        description="Serve the Determined compute tools over MCP stdio",
     )
-    parser.add_argument("--profile", help="Compute profile YAML (or DETERMINED_COMPUTE_PROFILE)")
-    parser.add_argument("--storage-config", help="Client storage access YAML (or DETERMINED_COMPUTE_STORAGE)")
-    parser.add_argument("--db", help="Shared SQLite database (or DETERMINED_COMPUTE_DB)")
+    parser.add_argument("--profile", help="Policy file (or DETERMINED_COMPUTE_PROFILE)")
     parser.add_argument(
-        "--owner",
-        help="Bound owner namespace (or DETERMINED_COMPUTE_OWNER)",
+        "--storage-config", help="Storage access file (or DETERMINED_COMPUTE_STORAGE)"
     )
     parser.add_argument("--api-url", help="Determined master URL (defaults to DET_MASTER)")
     parser.add_argument("--api-token", help="Determined API token (defaults to DET_API_TOKEN)")
-    parser.add_argument("--secrets-file", help="Path to a KEY=VALUE secrets file")
+    parser.add_argument("--secrets-file", help="KEY=VALUE secrets file")
     verify = parser.add_mutually_exclusive_group()
     verify.add_argument("--verify-ssl", action="store_true", dest="verify_ssl")
     verify.add_argument("--no-verify-ssl", action="store_false", dest="verify_ssl")
@@ -272,60 +684,34 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _runtime(args: argparse.Namespace) -> tuple[Any, str]:
-    profile_path = args.profile or os.environ.get("DETERMINED_COMPUTE_PROFILE")
-    if not profile_path:
+def build_tools(args: argparse.Namespace) -> Tools:
+    """Read the configuration, then pass the master's protocol gate before serving anything."""
+
+    profile = args.profile or os.environ.get("DETERMINED_COMPUTE_PROFILE")
+    if not profile:
         raise ValueError("--profile or DETERMINED_COMPUTE_PROFILE is required")
-
-    db_path = Path(args.db or os.environ.get("DETERMINED_COMPUTE_DB") or DEFAULT_DB_PATH)
-    if db_path == Path(":memory:"):
-        raise ValueError("MCP requires a persistent local database; :memory: is unsupported")
-    owner = args.owner or os.environ.get("DETERMINED_COMPUTE_OWNER")
-    if not owner:
-        raise ValueError("--owner or DETERMINED_COMPUTE_OWNER is required")
-    owner = normalize_owner(owner)
-    if db_path != Path(":memory:"):
-        db_path.expanduser().parent.mkdir(parents=True, exist_ok=True)
-        db_path = db_path.expanduser()
-    profile = ComputeProfile.from_file(profile_path)
-    store = SQLiteTaskStore(db_path)
-
-    def make_client() -> DeterminedAPIClient:
-        return DeterminedAPIClient(
-            api_url=args.api_url,
-            api_token=args.api_token,
-            secrets_path=Path(args.secrets_file) if args.secrets_file else None,
-            verify_ssl=args.verify_ssl,
-        )
-
-    service = ComputeService(_LazyClient(make_client), store, profile)
-
-    from determined_compute.policy import Mount, MountMap, Policy
-    from determined_compute.storage import StorageAccessConfig, StorageService
+    policy = Policy.from_file(profile)
     access_path = args.storage_config or os.environ.get("DETERMINED_COMPUTE_STORAGE")
     access = StorageAccessConfig.from_file(access_path) if access_path else StorageAccessConfig()
-    # Storage reads the policy's mount map; the profile keeps serving the rest until the cutover.
-    mounts = tuple(Mount(m.host_path, m.container_path, m.read_only) for m in profile.mounts)
-    policy = Policy(
-        mounts=MountMap(mounts),
-        image=profile.default_image,
-        pool=profile.default_pool,
-        slots=profile.default_slots,
-    )
     secrets_path = Path(args.secrets_file).expanduser() if args.secrets_file else None
     storage = StorageService(policy, access, secrets_path)
-
-    from determined_compute.compute.admission import ResourceInspector
-    return create_server(service, owner, storage, ResourceInspector(service.client)), owner
+    client = Client(
+        api_url=args.api_url,
+        api_token=args.api_token,
+        secrets_path=secrets_path,
+        verify_ssl=args.verify_ssl,
+    )
+    client.check_protocol()
+    return Tools(client, policy, storage, secrets_path)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        server, _owner = _runtime(args)
+        server = create_server(build_tools(args))
     except Exception as exc:
-        # stdout is reserved for MCP frames.
-        print(f"determined-compute-mcp: {exc}", file=os.sys.stderr)
+        # stdout carries MCP frames.
+        print(f"determined-compute-mcp: {exc}", file=sys.stderr)
         return 2
     server.run()
     return 0

@@ -1,6 +1,3 @@
-"""Persistent shared-storage compute services for Determined clusters."""
+"""MCP tools that plan, launch and observe Determined jobs on shared storage."""
 
-from determined_compute.core.api_client import APIError, DeterminedAPIClient, SubmissionUncertainError
-
-__all__ = ["DeterminedAPIClient", "APIError", "SubmissionUncertainError"]
-__version__ = "0.5.0"
+__version__ = "0.6.0"
