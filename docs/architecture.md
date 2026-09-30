@@ -503,7 +503,14 @@ RBAC. A replay re-checks read authz on the stored job, so revoked access is hono
   (`master/pkg/tasks/task_trial.go:52`), and it becomes the task user's home
   (`master/pkg/tasks/task.go:384-388`). The rendered command changes directory itself, so
   a pool default `work_dir` cannot move the code. `workdir` is relative to the code root
-  and never escapes it. Experiments using `context` also get a copy under
+  and never escapes it. The plan checks `workdir` only lexically (relative, without `..`)
+  and does not resolve symlinks, so the guarantee is a physical check at run time: after
+  entering `workdir`, the prelude compares `pwd -P` with the resolved code root and, if the
+  directory lies outside, fails before the first user statement with
+  `compute: the workdir resolves to X, outside the code root`. A symlink that stays inside
+  the tree works; one that leaves it, committed or on shared storage, fails. For `path`,
+  the resolved `DIR` is the root, so `dir` may itself be a symlink. The check sets no
+  variable the command can see. Experiments using `context` also get a copy under
   `/run/determined/train/model`.
 - **Rendering.** Commands run under `bash -lc` and experiment entrypoints under `sh -c`
   (`harness/determined/exec/launch.py:43-44`), so the rendered text is POSIX sh with one
@@ -514,7 +521,35 @@ RBAC. A replay re-checks read authz on the stored job, so revoked access is hono
   <command>
   ```
 
-  - `git`: `git -c safe.directory=R clone -q --shared --no-checkout -- R /run/determined/code && git -C /run/determined/code checkout -q --detach SHA && mkdir -p -- OUT && cd -- /run/determined/code/WD`.
+  - `git`: one subshell delivers the code, then the prelude creates `OUT` and enters `WD`.
+    The prelude is one line; here each step has its own line, and `…` marks elided text:
+
+    ```sh
+    ( fail() { printf '%s\n' "compute: git code delivery failed: $1" >&2; exit 1; }
+      <unset every exported GIT_* variable> || fail …
+      export HOME=/dev/null/home XDG_CONFIG_HOME=/dev/null/home GIT_CONFIG_NOSYSTEM=1 GIT_ATTR_NOSYSTEM=1 || fail …
+      git -c safe.directory=R clone -q --template= --shared --no-checkout -- R /run/determined/code || fail …
+      git -C /run/determined/code checkout -q --detach SHA || fail …
+      test "$(git -C /run/determined/code rev-parse --show-toplevel)" = "$(cd -- /run/determined/code && pwd -P)" || fail …
+      test "$(git -C /run/determined/code rev-parse HEAD)" = SHA || fail … ) &&
+    mkdir -p -- OUT && cd -- /run/determined/code/WD && CHECK
+    ```
+
+    The subshell unsets every exported `GIT_*` variable, whose names it lists from `env`
+    with `sed`; a probe variable proves that step ran, so an image without `env` or `sed`
+    fails delivery instead of skipping it. It points `HOME` and `XDG_CONFIG_HOME` below
+    `/dev/null`, where nothing can exist, and turns off system config and system
+    attributes, so no user or system setting applies, even with a git too old for
+    `GIT_CONFIG_GLOBAL`. The clone takes an empty template, so the image's default
+    template seeds no hooks, config, attributes or refs. After the checkout, the work
+    tree's toplevel must be `/run/determined/code` and `HEAD` must be `SHA`. So no `GIT_*`
+    variable, user or system config, system attributes, or clone template, whether it comes
+    from the image, a startup hook, or `TaskSpec.env`, can move or alter the delivered
+    tree: the pinned tree is at the root with `HEAD` at `SHA`, or delivery prints one
+    `compute: git code delivery failed: …` line and the prelude fails before any user
+    statement. The isolation applies only to delivery, never to the workload: it ends with
+    the subshell, so the command sees its own `GIT_*` variables, `HOME`, and config
+    unchanged.
     When the revision has LFS pointers, the checkout runs with `GIT_LFS_SKIP_SMUDGE=0` and
     adds `-c filter.lfs.process='git-lfs filter-process' -c filter.lfs.required=true -c
     lfs.fetchinclude= -c lfs.fetchexclude=`, so a missing `git-lfs` fails instead of
@@ -523,17 +558,19 @@ RBAC. A replay re-checks read authz on the stored job, so revoked access is hono
     target and `/run/determined/workdir` can be the task user's `HOME`
     (`master/pkg/tasks/task.go:384-388`, `task-setup.sh:49-54`), where startup hooks may
     write. `/run/determined` belongs to the task user (`task.go:336`).
-  - `context`: `mkdir -p -- OUT && cd -- /run/determined/workdir/WD`.
-  - `path`: `mkdir -p -- OUT && cd -- DIR/WD`.
+  - `context`: `mkdir -p -- OUT && cd -- /run/determined/workdir/WD && CHECK`.
+  - `path`: `mkdir -p -- OUT && cd -- DIR/WD && CHECK`.
 
-  A failed prelude stops the job before any user statement, whatever the command's form
-  (`a; b`, `a & b`, several lines). On `main`, `mkdir -p OUT && cd WD && CMD` runs later
-  statements after a failure and can exit 0 (`compute/service.py:585-599`). The prelude
-  runs after the init boundary, so its failures classify `WORKLOAD_FAILED` and are never
-  system-retried; the MCP reports them as code-delivery failures from the exit code and
-  log. Shells run `sshd` and have no command, so they accept only `context` and `path` and
-  get no prelude. A legacy `module:Class` experiment entrypoint is rejected, because any
-  prefix breaks it (`launch.py:32-40`).
+  `CHECK` is the workdir check described above; it is left out when `WD` is `.`, whose
+  physical path is the resolved root. A failed prelude stops the job before any user
+  statement, whatever the command's form (`a; b`, `a & b`, several lines). On `main`,
+  `mkdir -p OUT && cd WD && CMD` runs later statements after a failure and can exit 0
+  (`compute/service.py:585-599`). The prelude runs after the init boundary, so its
+  failures classify `WORKLOAD_FAILED` and are never system-retried; the MCP reports them
+  as code-delivery failures from the exit code and log. Shells run `sshd` and have no
+  command, so they accept only `context` and `path` and get no prelude. A legacy
+  `module:Class` experiment entrypoint is rejected, because any prefix breaks it
+  (`launch.py:32-40`).
 - **Plan checks for `git`.** `compute_plan` runs read-only `git` against the repository
   through the configured storage access (a local mount or SSH). `repo` must lie under a
   bind-mount target. `revision` must resolve to a commit, which is pinned as a full SHA.
@@ -550,14 +587,21 @@ RBAC. A replay re-checks read authz on the stored job, so revoked access is hono
 - **Read-only planning.** The plan runs `git` from an argument list, without user or system
   config, with every filter driver blanked and lazy fetches disabled, so no command a
   repository configures runs. It trusts the repository through `safe.directory`, as the
-  container clone does, and needs git 2.31 or later.
-- **Plan checks for `context`.** Size is counted as the harness counts it: each file's
-  size rounded up to a multiple of three, the length of its base64 content times 3/4
-  (`harness/determined/common/v1file_utils.py:9-13`), summed and rejected when it exceeds
-  99,614,720 bytes (`context.py:19-28`, `constants.py:5-18`). The master enforces only a
-  96 MiB gRPC message limit (`master/internal/grpcutil/api.go:81-85`), which fails opaquely, so the MCP checks first
-  and returns `context_too_large` with the total, the limit, the largest paths, and a hint
-  to use `git` or shared storage. Relative symlinks that resolve inside the tree are kept;
+  container clone does. Planning needs git 2.32 or later, which it checks before running
+  any command against a repository (`git_too_old`, naming the version found and the one
+  required). Missing objects are found with a listing that never fetches, before any
+  object is read, and every transport is refused, so no git version lazy-fetches or
+  contacts a remote during a plan.
+- **Plan checks for `context`.** Size is counted over the final payload exactly as the
+  harness's `v1File_size` counts it (`harness/determined/common/v1file_utils.py:9-13`):
+  every record with content, a symlink's target and `.code-provenance.json` included,
+  counts the length of its base64 content times 3/4, which is its size rounded up to a
+  multiple of three. A total over 99,614,720 bytes (`context.py:19-28`,
+  `constants.py:5-18`) returns `context_too_large` with the total, the limit, the largest
+  paths, and a hint to use `git` or shared storage, and makes no create call. The MCP does
+  not simulate the master's limit on the whole request, a 96 MiB gRPC message
+  (`master/internal/grpcutil/api.go:81-85`): an oversize request fails at the master and
+  nothing is created. Relative symlinks that resolve inside the tree are kept;
   absolute or escaping ones are a plan error (`unsafe_symlink`), because the harness
   rejects the whole archive at init (`harness/determined/common/tarfile_utils.py:38-76`).
   The harness drops archive ownership and masks modes to 0755 (`tarfile_utils.py:78-89`).
@@ -714,17 +758,22 @@ platform or storage facts through without deriving new ones.
   `revision` defaults to `HEAD`, and the plan returns it pinned to a full SHA.
 - `workdir`: relative to the code root (default `.`). `output_dir`: a container path
   inside a mounted root. The prelude runs `mkdir -p` on `output_dir`, then `cd` into
-  `workdir`.
+  `workdir`, and fails if its physical path lies outside the code root.
 - `admission`: `queue` (the default and the only value); `immediate` is refused with
   `admission_unsupported`.
 - `image`, `pool`, and `slots`. Pool and slots are always sent explicitly, from the policy
   defaults.
 - `env`, `workspace`, and `project`.
-- `experiment`: typed by the fork's expconf JSON schemas, vendored at the pinned version.
-  A search must set `max_concurrent_trials`, so that the MCP's per-request max slots can
-  bound slots times concurrency. The MCP rejects `bind_mounts`, a `checkpoint_storage`
-  `host_path` or `container_path`, and the legacy `checkpoint_path` and
-  `tensorboard_path`; `storage_path` must be relative, without `..`.
+- `experiment`: the experiment config. The MCP types its own outer fields and applies its
+  narrower policy here; Determined validates the config itself (full schema, defaults,
+  config policy) through `dry_run`, and the MCP does not vendor the expconf schemas. Keys
+  that duplicate top-level fields (`resources.resource_pool`, `resources.slots_per_trial`,
+  `environment.image`, `environment.environment_variables`) are rejected, so the compiled
+  request is unambiguous and cannot bypass the MCP's limits. A search must set
+  `max_concurrent_trials`, so that the MCP's per-request max slots can bound slots times
+  concurrency. The MCP rejects `bind_mounts`, a `checkpoint_storage` `host_path` or
+  `container_path`, and the legacy `checkpoint_path` and `tensorboard_path`;
+  `storage_path` must be relative, without `..`.
 
 There is no bind-mount field. `accelerators` stays out until the deferred M4.
 
@@ -1145,8 +1194,10 @@ Each row is a required result. The owner is the PR that must prove it.
 | `admission=immediate` | `admission_unsupported` and nothing created; experiments also get `INVALID_ARGUMENT` at the dry run. | M3, F2 |
 | Multi-statement command after a failed prelude, for each source | `a; b`, `false \|\| b`, two lines, and `a & b; wait` exit with the prelude's status and run no user statement, under `sh -c` and `bash -lc`. | M3 |
 | Renderer shape | Exactly `<prelude> \|\| exit $?`, a newline, and the command; no `work_dir` in any config; `module:Class` rejected. | M3 |
+| Hostile `GIT_*` variables or image git config at delivery | The pinned tree is at the root with `HEAD` at the pinned SHA, or the prelude fails before any user statement; the workload environment is unchanged. | M3 |
+| A workdir through a symlink that leaves the tree | The prelude fails before any user statement; an in-tree symlink works. | M3 |
 | `git` plan checks | Pinned SHA; `commit_not_on_ref`; partial clone rejected; `lfs_object_missing`; shell with `git` rejected. | M3 |
-| Context limits | A context counted at 99,614,718 bytes passes; one file of 99,614,719 bytes counts as 99,614,721 and returns `context_too_large` with no create call; an escaping symlink returns `unsafe_symlink`; an unchanged tree renders the same digest. | M3 |
+| Context limits | A context counted at 99,614,718 bytes passes; one file of 99,614,719 bytes counts as 99,614,721 and returns `context_too_large` with no create call; an escaping symlink returns `unsafe_symlink`; an unchanged tree renders the same digest; the counted size equals the harness count of the final payload, symlinks included. | M3 |
 | Protocol gate | A master without `submission_protocol`, or below the minimum, is refused, whatever its release string. | M2 |
 | `COMMIT` succeeds but the handler sees an error, or the client disconnects after the commit; the master keeps running | The job starts without a restart, through the handler's re-check, a replay, or the sweep; concurrent replays register one allocation and one job. | F2 |
 | Cancel a paused GENERIC parent whose `no_pause` child runs and whose resume is unfinished, then restart | Every member ends `CANCELED`, the resume is not continued, and every member was authorized before any change. | F2 |

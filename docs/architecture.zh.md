@@ -314,7 +314,7 @@ owner 是已认证的用户，记录在 `jobs.owner_id` 中。MCP 的 `--owner` 
   | `context` | `/run/determined/workdir` | `revision` 处被跟踪的文件加上显式的 `include` 路径，作为任务 context（`files` 或 `model_definition`）发送。Determined 在 startup hook 之前解压它（`harness/determined/exec/prep_container.py:28-36`）。 | 否 | 99,614,720 字节 |
   | `path` | 共享存储上的 `dir` | 原地运行。 | 是 | 无 |
 
-- **工作目录。** MCP 从不发送 `work_dir`。Determined 会拒绝它与 context 同时出现（`master/internal/spec_util.go:98-103`），trial 会忽略它（`master/pkg/tasks/task_trial.go:52`），而且它会成为任务用户的 home（`master/pkg/tasks/task.go:384-388`）。渲染后的命令自己切换目录，因此资源池默认的 `work_dir` 无法移动代码。`workdir` 相对于代码根目录，且永远不会越出它。使用 `context` 的 experiment 还会在 `/run/determined/train/model` 下得到一份副本。
+- **工作目录。** MCP 从不发送 `work_dir`。Determined 会拒绝它与 context 同时出现（`master/internal/spec_util.go:98-103`），trial 会忽略它（`master/pkg/tasks/task_trial.go:52`），而且它会成为任务用户的 home（`master/pkg/tasks/task.go:384-388`）。渲染后的命令自己切换目录，因此资源池默认的 `work_dir` 无法移动代码。`workdir` 相对于代码根目录，且永远不会越出它。规划只在字面上检查 `workdir`（相对路径，且不含 `..`），不解析符号链接，因此这一保证来自运行时的物理检查：进入 `workdir` 之后，前导命令把 `pwd -P` 与解析后的代码根目录比较；如果它位于代码根目录之外，就在第一条用户语句之前以 `compute: the workdir resolves to X, outside the code root` 失败。停留在树内的符号链接可以正常使用；离开树的符号链接，无论是提交在仓库中的还是位于共享存储上的，都会导致失败。对于 `path`，解析后的 `DIR` 就是根目录，因此 `dir` 本身可以是符号链接。该检查不会留下命令能看到的任何变量。使用 `context` 的 experiment 还会在 `/run/determined/train/model` 下得到一份副本。
 - **渲染。** command 在 `bash -lc` 下运行，experiment entrypoint 在 `sh -c` 下运行（`harness/determined/exec/launch.py:43-44`），因此渲染出的文本是 POSIX sh，并且每种来源都采用同一种形式：
 
   ```sh
@@ -322,14 +322,27 @@ owner 是已认证的用户，记录在 `jobs.owner_id` 中。MCP 的 `--owner` 
   <command>
   ```
 
-  - `git`：`git -c safe.directory=R clone -q --shared --no-checkout -- R /run/determined/code && git -C /run/determined/code checkout -q --detach SHA && mkdir -p -- OUT && cd -- /run/determined/code/WD`。当该 revision 含有 LFS 指针时，检出以 `GIT_LFS_SKIP_SMUDGE=0` 运行，并加上 `-c filter.lfs.process='git-lfs filter-process' -c filter.lfs.required=true -c lfs.fetchinclude= -c lfs.fetchexclude=`，因此缺少 `git-lfs` 时会失败，而不是留下指针文件，镜像或环境中的设置也无法跳过 smudge。从不递归处理 submodule。克隆目标不是 workdir，因为 `git clone` 需要空的目标目录，而 `/run/determined/workdir` 可能是任务用户的 `HOME`（`master/pkg/tasks/task.go:384-388`、`task-setup.sh:49-54`），startup hook 可能在那里写入。`/run/determined` 属于任务用户（`task.go:336`）。
-  - `context`：`mkdir -p -- OUT && cd -- /run/determined/workdir/WD`。
-  - `path`：`mkdir -p -- OUT && cd -- DIR/WD`。
+  - `git`：一个子 shell 交付代码，随后前导命令创建 `OUT` 并进入 `WD`。前导命令只有一行；这里每个步骤各占一行，`…` 表示省略的文本：
 
-  无论命令采用何种形式（`a; b`、`a & b`、多行），失败的前导命令都会在任何用户语句之前终止作业。在 `main` 上，`mkdir -p OUT && cd WD && CMD` 在失败后仍会运行后续语句，并可能以 0 退出（`compute/service.py:585-599`）。前导命令在初始化边界之后运行，因此它的失败分类为 `WORKLOAD_FAILED`，永远不会被系统重试；MCP 根据退出码和日志把它们报告为代码交付失败。shell 运行 `sshd`，没有命令，因此只接受 `context` 和 `path`，也没有前导命令。旧式的 `module:Class` experiment entrypoint 会被拒绝，因为任何前缀都会破坏它（`launch.py:32-40`）。
+    ```sh
+    ( fail() { printf '%s\n' "compute: git code delivery failed: $1" >&2; exit 1; }
+      <unset every exported GIT_* variable> || fail …
+      export HOME=/dev/null/home XDG_CONFIG_HOME=/dev/null/home GIT_CONFIG_NOSYSTEM=1 GIT_ATTR_NOSYSTEM=1 || fail …
+      git -c safe.directory=R clone -q --template= --shared --no-checkout -- R /run/determined/code || fail …
+      git -C /run/determined/code checkout -q --detach SHA || fail …
+      test "$(git -C /run/determined/code rev-parse --show-toplevel)" = "$(cd -- /run/determined/code && pwd -P)" || fail …
+      test "$(git -C /run/determined/code rev-parse HEAD)" = SHA || fail … ) &&
+    mkdir -p -- OUT && cd -- /run/determined/code/WD && CHECK
+    ```
+
+    该子 shell 对每个已导出的 `GIT_*` 变量执行 `unset`，变量名由 `sed` 从 `env` 的输出中列出；一个探测变量证明这一步确实运行过，因此缺少 `env` 或 `sed` 的镜像会使交付失败，而不是跳过这一步。它把 `HOME` 和 `XDG_CONFIG_HOME` 指向 `/dev/null` 之下（那里不可能存在任何内容），并关闭系统配置和系统 attributes，因此即使 git 版本过旧、不支持 `GIT_CONFIG_GLOBAL`，也不会应用任何用户或系统设置。克隆使用空模板，因此镜像的默认模板不会植入任何 hook、配置、attributes 或 ref。检出之后，工作树的顶层目录必须是 `/run/determined/code`，`HEAD` 必须是 `SHA`。因此，无论来自镜像、startup hook 还是 `TaskSpec.env`，任何 `GIT_*` 变量、用户或系统配置、系统 attributes 或克隆模板都无法移动或改变交付的树：要么固定的树位于根目录且 `HEAD` 位于 `SHA`，要么交付打印一行 `compute: git code delivery failed: …`，前导命令在任何用户语句之前失败。这种隔离只作用于交付，从不作用于工作负载：它随子 shell 一同结束，因此命令看到的是自己未被改变的 `GIT_*` 变量、`HOME` 和配置。当该 revision 含有 LFS 指针时，检出以 `GIT_LFS_SKIP_SMUDGE=0` 运行，并加上 `-c filter.lfs.process='git-lfs filter-process' -c filter.lfs.required=true -c lfs.fetchinclude= -c lfs.fetchexclude=`，因此缺少 `git-lfs` 时会失败，而不是留下指针文件，镜像或环境中的设置也无法跳过 smudge。从不递归处理 submodule。克隆目标不是 workdir，因为 `git clone` 需要空的目标目录，而 `/run/determined/workdir` 可能是任务用户的 `HOME`（`master/pkg/tasks/task.go:384-388`、`task-setup.sh:49-54`），startup hook 可能在那里写入。`/run/determined` 属于任务用户（`task.go:336`）。
+  - `context`：`mkdir -p -- OUT && cd -- /run/determined/workdir/WD && CHECK`。
+  - `path`：`mkdir -p -- OUT && cd -- DIR/WD && CHECK`。
+
+  `CHECK` 是上文描述的 workdir 检查；当 `WD` 为 `.` 时省略它，因为此时的物理路径就是解析后的根目录。无论命令采用何种形式（`a; b`、`a & b`、多行），失败的前导命令都会在任何用户语句之前终止作业。在 `main` 上，`mkdir -p OUT && cd WD && CMD` 在失败后仍会运行后续语句，并可能以 0 退出（`compute/service.py:585-599`）。前导命令在初始化边界之后运行，因此它的失败分类为 `WORKLOAD_FAILED`，永远不会被系统重试；MCP 根据退出码和日志把它们报告为代码交付失败。shell 运行 `sshd`，没有命令，因此只接受 `context` 和 `path`，也没有前导命令。旧式的 `module:Class` experiment entrypoint 会被拒绝，因为任何前缀都会破坏它（`launch.py:32-40`）。
 - **`git` 的规划检查。** `compute_plan` 通过配置的存储访问方式（本地挂载或 SSH）对仓库运行只读的 `git`。`repo` 必须位于某个 bind mount 目标之下。`revision` 必须解析为一个提交，该提交被固定为完整 SHA。固定确定的是代码的身份，并不保证该提交的对象一直可用（风险 5）。该提交必须包含在某个分支或 tag 中（`commit_not_on_ref`），因为克隆通过 alternates 借用对象，而源仓库中的 `git gc` 会清除不可达的对象。partial clone 会被拒绝，因为延迟获取需要网络；linked worktree 和带 alternates 的仓库也会被拒绝，因为它们的对象可能位于容器无法解析的路径。缺失的 LFS 对象是错误（`lfs_object_missing`），submodule 会得到 `submodule_not_checked_out` 警告。镜像必须提供 `git`，容器用户必须能读取该仓库；规划无法检查这两点。
-- **只读规划。** 规划以参数列表运行 `git`，不读取用户或系统配置，清空所有 filter 驱动并禁用延迟获取，因此不会运行仓库配置的任何命令。它像容器克隆一样通过 `safe.directory` 信任该仓库，并需要 git 2.31 或更高版本。
-- **`context` 的规划检查。** 大小按 harness 的方式计算：每个文件的大小向上取整到 3 的倍数，即其 base64 内容长度乘以 3/4（`harness/determined/common/v1file_utils.py:9-13`），求和后超过 99,614,720 字节即拒绝（`context.py:19-28`、`constants.py:5-18`）。master 只强制执行 96 MiB 的 gRPC 消息限制（`master/internal/grpcutil/api.go:81-85`），失败时原因不明确，因此 MCP 先行检查，并返回 `context_too_large`，附带总大小、限制、最大的几个路径，以及改用 `git` 或共享存储的提示。解析后仍位于树内的相对符号链接会被保留；绝对的或越出树的符号链接是规划错误（`unsafe_symlink`），因为 harness 会在初始化时拒绝整个归档（`harness/determined/common/tarfile_utils.py:38-76`）。harness 会丢弃归档中的所有权信息，并把权限模式屏蔽为 0755（`tarfile_utils.py:78-89`）。命中硬性 secret 规则的文件从不上传，命中软性规则的文件只有在 `include` 中点名时才上传，两者都列为 `excluded`。LFS 指针会得到 `lfs_pointer` 警告，被跟踪的根目录 `startup-hook.sh`（Determined 会在命令之前 source 它）会得到 `startup_hook`。任何能读取该作业的人都能读取 context；在 basic authz 下，这意味着 experiment 的任何查看者（`experiment/authz_basic_impl.go:26-30`）。这就是 secret 规则只适用于 `context` 的原因。
+- **只读规划。** 规划以参数列表运行 `git`，不读取用户或系统配置，清空所有 filter 驱动并禁用延迟获取，因此不会运行仓库配置的任何命令。它像容器克隆一样通过 `safe.directory` 信任该仓库。规划需要 git 2.32 或更高版本，并在对任何仓库运行命令之前检查版本（`git_too_old`，指明找到的版本和要求的版本）。缺失的对象通过一个从不获取对象的列举找出，且在读取任何对象之前进行；所有传输协议都被拒绝，因此在规划期间，任何 git 版本都不会延迟获取或联系远程仓库。
+- **`context` 的规划检查。** 大小在最终载荷上计算，方式与 harness 的 `v1File_size` 完全相同（`harness/determined/common/v1file_utils.py:9-13`）：每条带内容的记录（包括符号链接的目标和 `.code-provenance.json`）计为其 base64 内容长度乘以 3/4，即其大小向上取整到 3 的倍数。总数超过 99,614,720 字节（`context.py:19-28`、`constants.py:5-18`）时返回 `context_too_large`，附带总大小、限制、最大的几个路径，以及改用 `git` 或共享存储的提示，且不发起创建调用。MCP 不模拟 master 对整个请求的限制，即 96 MiB 的 gRPC 消息限制（`master/internal/grpcutil/api.go:81-85`）：超限的请求会在 master 处失败，且不创建任何内容。解析后仍位于树内的相对符号链接会被保留；绝对的或越出树的符号链接是规划错误（`unsafe_symlink`），因为 harness 会在初始化时拒绝整个归档（`harness/determined/common/tarfile_utils.py:38-76`）。harness 会丢弃归档中的所有权信息，并把权限模式屏蔽为 0755（`tarfile_utils.py:78-89`）。命中硬性 secret 规则的文件从不上传，命中软性规则的文件只有在 `include` 中点名时才上传，两者都列为 `excluded`。LFS 指针会得到 `lfs_pointer` 警告，被跟踪的根目录 `startup-hook.sh`（Determined 会在命令之前 source 它）会得到 `startup_hook`。任何能读取该作业的人都能读取 context；在 basic authz 下，这意味着 experiment 的任何查看者（`experiment/authz_basic_impl.go:26-30`）。这就是 secret 规则只适用于 `context` 的原因。
 - **来源信息。** 配置携带 `COMPUTE_CODE_SOURCE`、`COMPUTE_CODE_ROOT`，对于 `git` 和 `context` 还有 `COMPUTE_CODE_COMMIT`。它们取代 `COMPUTE_WORKDIR` 和 `COMPUTE_CODE_REVISION`（`compute/service.py:426-431`）。`context` 还会附带 `.code-provenance.json`，内容为 `{commit, dirty, included, excluded, skipped}`，不含时间戳，因此未改变的树会渲染出相同的摘要。对于 `path`，规划报告它观察到的 HEAD 和 dirty 状态，并标注为未经验证。
 - **存储根目录。** 管理员挂载每个 bind 源路径：`task_container_defaults.bind_mounts`，以及 workspace 或 master `checkpoint_storage` 的 `shared_fs.host_path`。在任何作业运行之前，每个源路径都存在于该资源池的每个 agent 上。作业从不指定 bind 源路径。
 - **数据和输出**位于工作负载在这些根目录内创建的运行目录中，由 `storage_sync` 和 `storage_fetch` 移动。`git` 仓库和 `path` 目录也位于某个根目录之下。
@@ -438,11 +451,11 @@ owner 是已认证的用户，记录在 `jobs.owner_id` 中。MCP 的 `--owner` 
   - `{source: path, dir}`：`dir` 是共享存储上的容器路径。
 
   `revision` 默认为 `HEAD`，规划会把它固定为完整 SHA 后返回。
-- `workdir`：相对于代码根目录（默认 `.`）。`output_dir`：位于某个已挂载根目录内的容器路径。前导命令先对 `output_dir` 执行 `mkdir -p`，再 `cd` 到 `workdir`。
+- `workdir`：相对于代码根目录（默认 `.`）。`output_dir`：位于某个已挂载根目录内的容器路径。前导命令先对 `output_dir` 执行 `mkdir -p`，再 `cd` 到 `workdir`，并在其物理路径位于代码根目录之外时失败。
 - `admission`：`queue`（默认值，也是唯一的取值）；`immediate` 以 `admission_unsupported` 被拒绝。
 - `image`、`pool` 和 `slots`。资源池和 slot 数总是根据策略默认值显式发送。
 - `env`、`workspace` 和 `project`。
-- `experiment`：类型由 fork 的 expconf JSON schema 定义，这些 schema 以锁定版本 vendor 到本仓库。搜索必须设置 `max_concurrent_trials`，以便 MCP 按请求设置的最大 slot 数能限制 slot 数与并发数的乘积。MCP 拒绝 `bind_mounts`、`checkpoint_storage` 的 `host_path` 或 `container_path`，以及旧式的 `checkpoint_path` 和 `tensorboard_path`；`storage_path` 必须是相对路径，且不含 `..`。
+- `experiment`：experiment 配置。MCP 为自己的外层字段定义类型，并在此应用其更严格的策略；Determined 通过 `dry_run` 自行校验 experiment 配置（完整 schema、默认值、配置策略），MCP 不 vendor expconf schema。与顶层字段重复的键（`resources.resource_pool`、`resources.slots_per_trial`、`environment.image`、`environment.environment_variables`）会被拒绝，从而使编译出的请求没有歧义，也无法绕过 MCP 的限制。搜索必须设置 `max_concurrent_trials`，以便 MCP 按请求设置的最大 slot 数能限制 slot 数与并发数的乘积。MCP 拒绝 `bind_mounts`、`checkpoint_storage` 的 `host_path` 或 `container_path`，以及旧式的 `checkpoint_path` 和 `tensorboard_path`；`storage_path` 必须是相对路径，且不含 `..`。
 
 没有 bind mount 字段。`accelerators` 在推迟的 M4 之前不加入。
 
@@ -707,8 +720,10 @@ message SchedulingEvaluation {
 | `admission=immediate` | `admission_unsupported`，不创建任何内容；experiment 还会在 dry run 时得到 `INVALID_ARGUMENT`。 | M3, F2 |
 | 前导命令失败后的多语句命令，针对每种来源 | `a; b`、`false \|\| b`、两行命令以及 `a & b; wait` 都以前导命令的状态退出，且不运行任何用户语句，在 `sh -c` 和 `bash -lc` 下均如此。 | M3 |
 | 渲染器形式 | 恰好是 `<prelude> \|\| exit $?`、一个换行符和命令；任何配置中都没有 `work_dir`；`module:Class` 被拒绝。 | M3 |
+| 交付时存在恶意的 `GIT_*` 变量或镜像 git 配置 | 要么固定的树位于根目录且 `HEAD` 位于固定的 SHA，要么前导命令在任何用户语句之前失败；工作负载的环境保持不变。 | M3 |
+| workdir 经由离开树的符号链接 | 前导命令在任何用户语句之前失败；树内的符号链接可以正常使用。 | M3 |
 | `git` 规划检查 | 固定的 SHA；`commit_not_on_ref`；partial clone 被拒绝；`lfs_object_missing`；使用 `git` 的 shell 被拒绝。 | M3 |
-| context 限制 | 计数为 99,614,718 字节的 context 可以通过；单个 99,614,719 字节的文件计为 99,614,721 字节，返回 `context_too_large`，且不发起创建调用；越出树的符号链接返回 `unsafe_symlink`；未改变的树渲染出相同的摘要。 | M3 |
+| context 限制 | 计数为 99,614,718 字节的 context 可以通过；单个 99,614,719 字节的文件计为 99,614,721 字节，返回 `context_too_large`，且不发起创建调用；越出树的符号链接返回 `unsafe_symlink`；未改变的树渲染出相同的摘要；计数的大小等于 harness 对最终载荷的计数，包括符号链接。 | M3 |
 | 协议门槛 | 没有 `submission_protocol` 或低于最低要求的 master 会被拒绝，无论其 release 字符串是什么。 | M2 |
 | `COMMIT` 成功但 handler 看到错误，或客户端在事务提交之后断开连接；master 持续运行 | 作业无需重启即可启动，途径是 handler 的重新检查、重放或扫描；并发的重放只注册一个 allocation 和一个作业。 | F2 |
 | 取消一个已暂停的 GENERIC 父任务，其 `no_pause` 子任务正在运行且其 resume 尚未完成，然后重启 | 每个成员都以 `CANCELED` 结束，resume 不会被继续，并且在任何改动之前每个成员都已通过授权。 | F2 |
