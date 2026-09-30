@@ -252,7 +252,7 @@ enum ExitClass {
 
 `allocations` 增加 `exit_class text` 和 `exit_detail jsonb`。
 
-**退出记录。** `finalize` 在改动其他任何内容之前，用一条 UPDATE 写入完整的退出记录：`state = TERMINATED`、`end_time`、`exit_reason`、`exit_error`、`status_code`、`exit_class` 和 `exit_detail`。只有在这条 UPDATE 提交之后，它才清除并释放可恢复的资源，此后才运行任务级的退出决策。清除、释放和退出通知都可以重复执行，因此在任何时刻崩溃，留下的要么是由恢复处理的未关闭 allocation，要么是一条完整的记录。目前 `finalize` 先写入 `TERMINATED`，再清除，最后写入退出状态（`task/allocation.go:584-588,1074-1095`）；在两者之间崩溃会留下一个没有类别的已终止 allocation，而其证据已经不复存在。
+**退出记录。** `finalize` 在改动其他任何内容之前，用一条 UPDATE 写入完整的退出记录：`state = TERMINATED`、`end_time`、`exit_reason`、`exit_error`、`status_code`、`exit_class` 和 `exit_detail`。只有在这条 UPDATE 提交之后，它才清除并释放可恢复的资源，此后才运行任务级的退出决策。清除、释放和退出通知都可以重复执行，因此在任何时刻崩溃，留下的要么是由恢复处理的未关闭 allocation，要么是一条完整的记录。目前 `finalize` 先写入 `TERMINATED`，再清除，最后写入退出状态（`task/allocation.go:584-588,1074-1095`）；在这些步骤之间崩溃会留下一个没有类别的已终止 allocation，而其证据已经不复存在。
 
 启动时先执行恢复，然后关闭恢复没有保留的所有 allocation（`core.go:1432-1444`）。恢复为它所决定的尝试分类。`closeOpenAllocations`（`core.go:957-963`）在关闭其余 allocation 的同一条 UPDATE 中按状态为它们分类：`PENDING` 为 `NONE`（通常是被恢复替换掉的、排队中的 trial allocation，`trial.go:806-808`），任何更靠后的状态为 `INFRASTRUCTURE_FAILED`。类别描述的是结果而不是原因：是谁要求停止作业只记录一次，即 `jobs.cancel_requested_at`。分类器覆盖所有情况：
 
