@@ -147,8 +147,9 @@ def _gateway_error(error: Any, status: int, code_key: str, call: _Call) -> APIEr
     error = error if isinstance(error, dict) else {}
     reason = error.get("reason")
     if not isinstance(reason, str) or not reason:
-        reason = _GRPC_REASONS.get(error.get(code_key)) or _STATUS_REASONS.get(
-            status, "Internal" if status >= 500 else "InvalidArgument"
+        number = error.get(code_key)
+        reason = (_GRPC_REASONS.get(number) if isinstance(number, int) else None) or (
+            _STATUS_REASONS.get(status, "Internal" if status >= 500 else "InvalidArgument")
         )
     message = error.get("error") or error.get("message")
     if not isinstance(message, str) or not message:
@@ -282,8 +283,9 @@ def _allocation(value: Any) -> Dict[str, Any]:
         raise _malformed(what)
     parsed_placements = []
     for placement in placements:
-        uuids = placement.get("acceleratorUuids") if isinstance(placement, Mapping) else None
-        uuids = [] if uuids is None else uuids
+        if not isinstance(placement, Mapping):
+            raise _malformed(what)
+        uuids = placement.get("acceleratorUuids") or []
         if not isinstance(uuids, list) or not all(isinstance(item, str) for item in uuids):
             raise _malformed(what)
         parsed_placements.append(

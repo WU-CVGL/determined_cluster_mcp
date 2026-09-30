@@ -423,6 +423,10 @@ KEY_USED = f'idempotency key "k1" is already used by job {JOB} for a different r
          {"dry_run": True}, "unavailable", True, {}),
         (Response(text="<html>bad gateway</html>", status=502),
          {"dry_run": True}, "unavailable", True, {}),
+        (Response({"error": {"code": 5, "error": "no reason given"}}, 404),
+         {"dry_run": True}, "not_found", False, {}),
+        (Response({"error": {"code": [5], "reason": None}}, 404),
+         {"dry_run": True}, "not_found", False, {}),
         (gateway_error(501, 12, "Unimplemented", "Not Implemented"),
          {"dry_run": True}, "protocol_unsupported", False, {}),
     ],
@@ -437,7 +441,7 @@ def test_create_errors_map_to_stable_codes(monkeypatch, answer, kwargs, code, re
     assert caught.value.code == code
     assert caught.value.retryable is retryable
     assert caught.value.details == details
-    if answer.payload is not None:
+    if answer.payload is not None and "error" in answer.payload["error"]:
         assert str(caught.value).startswith(answer.payload["error"]["error"])
 
 
@@ -601,6 +605,9 @@ def test_a_job_created_without_submit_options_has_no_key_or_digest(monkeypatch):
         {"tasks": None},
         {"tasks": [{"taskId": TASK, "allocations": [allocation(slots="0")]}]},
         {"tasks": [{"taskId": TASK, "allocations": [allocation(placements=[{"node": 1}])]}]},
+        {"tasks": [{"taskId": TASK, "allocations": [allocation(placements=["node-a"])]}]},
+        {"tasks": [{"taskId": TASK, "allocations": ["not an allocation"]}]},
+        {"tasks": ["not a task"]},
     ],
 )
 def test_a_malformed_submission_is_refused(monkeypatch, broken):
