@@ -303,11 +303,12 @@ def _check_experiment(config: Mapping[str, Any]) -> None:
 class TaskSpec(_Model):
     """A command, shell, or experiment request, published as the plan tool's input schema.
 
-    ``experiment`` is validated only in part: it may not set what the MCP renders or never
-    allows, including the settings of ``pool``, ``slots``, ``image`` and ``env``. Full expconf
-    typing, the merge order with the rendered fields (``name``, ``workspace`` and ``project``
-    among them) and the pool policy apply when the spec is wired to the master, in the M3
-    wiring PR. ``frozen`` only makes an instance immutable; it is not a persisted plan.
+    The MCP types only its own fields. ``experiment`` may not set what the MCP renders or never
+    allows, including the settings of ``pool``, ``slots``, ``image`` and ``env``, so the
+    compiled request is unambiguous; Determined validates the rest of the experiment config
+    through ``dry_run``, and the MCP does not vendor the expconf schemas. How ``name``,
+    ``workspace`` and ``project`` are rendered, and the pool policy, apply when the spec is wired
+    to the master. ``frozen`` only makes an instance immutable; it is not a persisted plan.
     """
 
     kind: Literal["command", "shell", "experiment"]
