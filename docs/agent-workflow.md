@@ -86,10 +86,10 @@ Placement is not evaluated before launch. `compute_resources` shows the pools an
 
 Call `compute_launch(spec, request_id, request_digest)` with the values the plan returned; pass the returned `spec`, not the original. Keep the `job_id` and `request_id` in the work record.
 
-- If the launch answer is lost or `unavailable`, repeat the same launch. It returns the same job with `replayed: true`, even if the tree changed since.
+- After a timeout, a lost answer, or `unavailable`, repeat the identical launch with the same `spec`, `request_id`, and `request_digest`. It returns the same job with `replayed: true`, even if the working tree changed since, and never creates a second one. Or find the job in `compute_list` by its `request_id`; the list covers every client of the account.
 - If it returns `internal`, repeat it once; a second identical error means nothing was created.
-- If it returns `plan_changed`, nothing was created; plan again and review the new commit.
-- Never plan again for a new `request_id` while a launch outcome is uncertain. `compute_list` shows every job of the account with its `request_id`, including jobs launched from other clients.
+- If it returns `plan_changed`, nothing was created: the code or request moved since the plan. Plan again and review the new commit before launching.
+- Never resubmit with a new `request_id` after a timeout or any other uncertain outcome. A new plan mints a new key, so the master would create a second job beside the one that may already exist.
 
 ## Monitor and accept the result
 
@@ -100,6 +100,15 @@ Call `compute_usage(job_id)` to see how much CPU, memory, and GPU a job uses, fo
 A launched job or an ended state alone is not acceptance. Check the job's `exit_class`, the logs, and the success criteria defined at the start. A failed prelude (code delivery, `output_dir`, or `workdir`) prints a line starting with `compute:` and classifies as `workload_failed`. When storage access is configured, verify expected shared artifacts with `storage_check`; when a local copy is needed, preview `storage_fetch(shared_dir, local_dir, dry_run=true)`, review it, then execute with `dry_run=false`.
 
 Report the job ID, request ID, final state, exit class, output path, and observed artifact or metric. Never include tokens, passwords, private keys, cookies, or secrets-file contents.
+
+## Report failures as failures
+
+A job may fail, but a failure is never reported as success, and work whose outcome is uncertain is never run again silently.
+
+- Report a `failed` or `canceled` job as such, with its `exit_class`, `exit_reason`, and the log lines that show the cause, such as a `compute:` line from the prelude. An ended job is not a finished task, and an output that was not checked is not a result.
+- Never relaunch automatically, whether after a failure, a cancel, `plan_changed`, or an uncertain launch. Repeating the identical launch is not a relaunch: it returns the existing job. A new run is a new plan with a new `request_id`, reviewed, and the user decides on it.
+- Nothing retries a failed job for you, except the restarts an experiment's own `max_restarts` allows.
+- When a request is refused, for example `admission_unsupported`, `protocol_unsupported`, or a policy or code check, stop and report the refusal. Do not work around it with another pool, code source, or tool.
 
 ## Keep identity boundaries separate
 

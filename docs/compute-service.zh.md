@@ -24,7 +24,7 @@ MCP server 是面向单个可信用户的本地 stdio 服务，不保存任何�
 
 master 负责身份、幂等、规划绑定、准入、调度放置以及每个 allocation 的退出类别。MCP 负责比 master 访问控制更窄的策略、用户的工作树、代码交付和结果解读。源码、数据、依赖包、检查点、日志和输出都应放在映射的共享存储上。
 
-本服务需要支持 submission protocol 1 或更高版本的 Determined master。
+本服务需要支持 submission protocol 1 或更高版本的 Determined master，见[协议检查](#protocol-gate)。
 
 <a id="policy"></a>
 ## 策略
@@ -81,7 +81,14 @@ determined-compute-mcp \
 
 master 地址依次取 `--api-url`、secrets 文件中的 `DET_MASTER`、环境变量 `DET_MASTER`（也读取 `DET_MASTER_ADDR` 和 `DET_MASTER_HOST`）。secrets 文件若指定了 master，其凭据只发往该 master：此时忽略环境中的 `DET_API_TOKEN`、`DET_USERNAME` 和 `DET_PASSWORD`；如果环境指定了另一个 master，服务拒绝启动。`--api-token` 始终优先。凭据为 `DET_API_TOKEN`，或同时提供 `DET_USERNAME` 和 `DET_PASSWORD`。凭据只放在 secrets 文件中，不要写进策略、工具参数或报告。
 
-启动时服务读取无需登录的 `GET /api/v1/master`；如果 master 的 submission protocol 低于 1 或缺失，无论其版本字符串如何，都以状态码 2 退出。策略文件、存储文件或凭据来源无效时也以状态码 2 退出。master 无法连接不会阻止启动：存储工具照常可用，同样的协议检查会在第一次调用 master 前执行。启动错误写入 stderr，因为 stdout 用于传输 MCP 帧。
+策略文件、存储文件或凭据来源无效，传入服务不接受的参数，或 master 未通过协议检查时，服务以状态码 2 退出。启动错误写入 stderr，因为 stdout 用于传输 MCP 帧。
+
+<a id="protocol-gate"></a>
+### 协议检查
+
+submission protocol 1 即 master 上的任务台账：带幂等键和规划绑定的提交选项，以及持久的 `GetSubmission`、`ListSubmissions` 和 `CancelSubmission` 读取。启动时服务读取无需登录的 `GET /api/v1/master`；如果 `submission_protocol` 缺失或低于 1，无论 master 的版本字符串如何，都以状态码 2 退出。版本字符串只出现在错误信息中：本地构建报告上一个标签，候选版本报告下一个版本，因此它无法说明 master 具备哪些功能。
+
+master 无法连接不会阻止启动：存储工具照常可用，同样的检查会在第一次调用 master 前执行，此时计算工具返回 `protocol_unsupported`。master 对协议承诺的路由返回 `Unimplemented` 时，同样返回 `protocol_unsupported`。不会回退到旧 API；请升级 master。
 
 <a id="taskspec"></a>
 ## TaskSpec
@@ -94,15 +101,15 @@ master 地址依次取 `--api-url`、secrets 文件中的 `DET_MASTER`、环境�
 | `name` | 字符串 | 必填的显示名称，最多 128 个字符 |
 | `command` | 字符串 | command 和 experiment 必填；shell 没有命令 |
 | `code` | 对象或省略 | 代码如何进入容器，见下文 |
-| `workdir` | 相对路径 | 在代码根目录下运行的目录；默认 `.` |
-| `output_dir` | 容器绝对路径 | command 和 experiment 必填；命令运行前创建，并导出为 `COMPUTE_OUTPUT_DIR` |
+| `workdir` | 相对路径 | 在代码根目录下运行的目录，不含 `..`；默认 `.`；需要 `code` |
+| `output_dir` | 容器绝对路径 | command 和 experiment 必填；必须位于非 `read_only` 的策略挂载之下。命令运行前创建，并导出为 `COMPUTE_OUTPUT_DIR` |
 | `admission` | `queue` | 唯一支持的值；`immediate` 以 `admission_unsupported` 拒绝，且不创建任何内容 |
 | `image`、`pool`、`slots` | 字符串、字符串、≥ 0 的整数 | 覆盖策略默认值 |
 | `env` | 对象 | 环境变量；`COMPUTE_` 前缀为保留前缀 |
 | `workspace`、`project` | 字符串 | 名称。command 和 shell 只有 workspace；experiment 两者同时设置或都不设置 |
 | `experiment` | 对象 | 实验配置；仅用于 experiment |
 
-未知字段会被拒绝；带命令、`output_dir`、`workdir` 或 git 代码的 shell 也会被拒绝。其余内容由 master 在 dry run 中校验。
+未知字段会被拒绝；带命令、`output_dir`、`workdir` 或 git 代码的 shell，以及没有 `code` 却设置了 `workdir` 的 spec 也会被拒绝。不在任何策略挂载之下的 `output_dir` 返回 `path_not_mounted`，位于 `read_only` 挂载之下的返回 `read_only_storage`。其余内容由 master 在 dry run 中校验。
 
 **代码来源。**
 
@@ -157,6 +164,8 @@ master 地址依次取 `--api-url`、secrets 文件中的 `DET_MASTER`、环境�
 
 审核解析后的 spec、提交、生效配置和警告，然后用返回的 `spec`、`request_id` 和 `request_digest` 调用 `compute_launch`。提交会重新渲染 spec，以 `request_id` 作为幂等键并绑定摘要来创建任务。返回 `job_id`、`request_id`、`replayed`、`outcome`（`queued`）、`submitted_at`，以及任务当前的 `state` 和 `explanation`；trial 仍在等待资源的活动实验显示为 `running`，说明中会写明它在等待调度器。
 
+**规划绑定。** 传入返回的 `spec`，而不是原始 spec：它带有固定的提交以及显式的 `pool`、`slots` 和 `image`，因此即使分支或策略默认值已变化，提交渲染出的仍是规划时的请求。`request_id` 必须是规划返回的 UUID，其他值返回 `invalid_request`。master 对完全相同的请求计算 `request_digest`：带入口命令和 `COMPUTE_*` 变量的渲染配置、`context` 的文件清单、workspace 和 project。固定的提交属于该请求，因此对 `git` 和 `context`，摘要绑定了代码；对 `path` 只绑定目录字符串，内容仍为 `unpinned`。master 和资源池默认值（例如 `task_container_defaults`）不受绑定：它们属于管理员策略，规划与提交之间的变化会直接作用于提交，不会返回 `plan_changed`。规划不创建任何内容，也不占用任何键，因此从未提交的规划无需清理。
+
 - **重试。** 用相同参数重复提交会返回同一任务，且 `replayed: true`。即使 spec 已无法渲染（例如 include 的文件被删除、分支被 amend 或策略已变化）也是如此：服务会在报告错误前向 master 查询该 `request_id` 对应的任务，结果中附带 `note`。
 - **规划漂移。** 如果代码或请求与规划不同（例如 spec 仍指向会移动的分支），提交返回 `plan_changed`，附新的 `commit` 和 `content_digest`，且不创建任何内容。请重新规划并审核新规划。
 - **键重用。** 已用于其他请求的 `request_id` 返回 `key_conflict`，并给出那个 `job_id`。
@@ -189,7 +198,7 @@ master 地址依次取 `--api-url`、secrets 文件中的 `DET_MASTER`、环境�
 
 `compute_resources` 按 Determined 的报告投影每个资源池：`name`、`description`、`type`、`num_agents`、`slots_available`、`slots_used`、`slot_type`、`slots_per_agent`、`aux_container_capacity` 和 `aux_containers_running`，并附按 agent 统计的 `device_models`。它只是快照，不给出判断：提交前不评估放置，slots 超过资源池当前容量的任务会在队列中等待。
 
-`storage_check(path)` 通过策略转换容器路径，并返回 `host_path`、`exists`、`type`、`readable`、`writable`、`read_only` 以及 `viewpoint`：`backend`（`local` 附 `local_root`，或 `ssh` 附 `ssh_host`）、运行所用的 `user`，以及“权限属于该用户而非容器用户”的说明。传输见[共享存储访问](shared-storage-access.zh.md)。
+`storage_check(path)` 通过策略转换容器路径，并返回 `path`、`host_path`、`local_path`（本地挂载时）、`exists`、`type`、`readable`、`writable`、`read_only` 以及 `viewpoint`：`backend`（`local` 附 `local_root`，或 `ssh` 附 `ssh_host`）、运行所用的 `user`，以及“权限属于该用户而非容器用户”的说明。传输见[共享存储访问](shared-storage-access.zh.md)。
 
 <a id="task-usage-measurements"></a>
 ### 任务用量测量
@@ -230,14 +239,14 @@ master 地址依次取 `--api-url`、secrets 文件中的 `DET_MASTER`、环境�
 | 代码 | 含义 | 处理方式 |
 | --- | --- | --- |
 | `invalid_request` | spec、参数或 master 校验拒绝了请求 | 修正请求后重新规划 |
-| `admission_unsupported` | `admission: immediate` | 使用 `queue` |
+| `admission_unsupported` | `admission: immediate`；在读取任何代码或发送任何请求之前拒绝 | 使用 `queue` |
 | `plan_changed` | 代码或请求与规划不同；没有创建任何内容 | 审核 `details.commit` 和 `content_digest` 后重新规划 |
-| `key_conflict` | 该 `request_id` 已属于另一个请求的任务，见 `details.job_id` | 重新规划以获得新的 `request_id` |
+| `key_conflict` | 该 `request_id` 已属于另一个请求的任务，见 `details.job_id` | 先用 `compute_status` 读取该任务，它可能正是想要的任务；否则重新规划以获得新的 `request_id` |
 | `unavailable` | master 未响应或繁忙；可重试 | 重复调用；提交时用相同参数重复 |
 | `internal` | master 出错 | 提交时用相同参数再重复一次；若仍返回同样错误，说明没有创建任何内容，应重新规划 |
 | `invalid_response` | master 的响应格式错误 | 提交时按 `unavailable` 处理；其他情况请报告 |
 | `not_found`、`permission_denied` | 任务、trial、资源池或 workspace 不存在，或当前账户无权使用 | 检查句柄和账户 |
-| `protocol_unsupported` | master 低于 submission protocol 1 | 升级 master |
+| `protocol_unsupported` | master 低于 submission protocol 1，或缺少协议承诺的路由 | 升级 master，见[协议检查](#protocol-gate) |
 | `pool_not_allowed`、`slots_exceed_limit`、`path_not_mounted`、`read_only_storage`、`invalid_policy` | 策略拒绝了请求，或策略文件无效 | 选择允许的资源池、更少的 slots 或可写的挂载路径 |
 | `commit_not_on_ref`、`revision_not_found`、`partial_clone`、`lfs_object_missing`、`git_too_old`、`context_too_large`、`unsafe_symlink`、`invalid_include` 及其他代码检查 | 代码规划拒绝了代码来源 | 修正仓库或代码字段 |
 | `storage_not_local`、`configuration_required`、`invalid_storage_path`、`storage_not_found`、`overwrite_not_allowed` 及其他存储代码 | 存储访问被拒绝或失败 | 见[共享存储访问](shared-storage-access.zh.md) |

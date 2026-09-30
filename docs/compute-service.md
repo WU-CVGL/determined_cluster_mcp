@@ -33,7 +33,8 @@ master's access control, the user's working tree, code delivery, and the
 interpretation of results. Keep source, data, packages, checkpoints, logs, and outputs
 on mapped shared storage.
 
-The service needs a Determined master that speaks submission protocol 1 or later.
+The service needs a Determined master that speaks submission protocol 1 or later; see
+[Protocol gate](#protocol-gate).
 
 ## Policy
 
@@ -98,12 +99,25 @@ wins. The credentials are either `DET_API_TOKEN` or both `DET_USERNAME` and
 `DET_PASSWORD`. Keep them in the secrets file, never in the policy, tool arguments, or
 reports.
 
-At startup the server reads `GET /api/v1/master`, which needs no login, and exits with
-status 2 when the master's submission protocol is below 1 or missing, whatever its
-release string. It also exits with status 2 for an invalid policy, storage file, or
-credential source. An unreachable master does not stop startup: the storage tools
-keep working, and the same protocol check runs before the first call to the master.
-Startup errors go to stderr, because stdout carries MCP frames.
+The server exits with status 2 for an invalid policy, storage file, or credential
+source, for an argument it does not take, and for a master that fails the protocol
+gate. Startup errors go to stderr, because stdout carries MCP frames.
+
+### Protocol gate
+
+Submission protocol 1 is the job ledger on the master: submit options with an
+idempotency key and plan binding, and the durable `GetSubmission`, `ListSubmissions`,
+and `CancelSubmission` reads. At startup the server reads `GET /api/v1/master`, which
+needs no login, and exits with status 2 when `submission_protocol` is missing or below
+1, whatever the master's release string. The release string appears only in the
+message: a local build reports the previous tag and a release candidate the next one,
+so it cannot say which features a master has.
+
+An unreachable master does not stop startup: the storage tools keep working, and the
+same check runs before the first call to the master, so a compute tool returns
+`protocol_unsupported` then. A master that answers `Unimplemented` for a route the
+protocol promises returns `protocol_unsupported` too. There is no fallback to older
+APIs; upgrade the master.
 
 ## TaskSpec
 
@@ -115,8 +129,8 @@ Startup errors go to stderr, because stdout carries MCP frames.
 | `name` | string | Required display name, at most 128 characters |
 | `command` | string | Required for a command and an experiment; a shell has none |
 | `code` | object or omitted | How code reaches the container; see below |
-| `workdir` | relative path | Directory below the code root to run in; default `.` |
-| `output_dir` | absolute container path | Required for a command and an experiment; created before the command runs, and exported as `COMPUTE_OUTPUT_DIR` |
+| `workdir` | relative path | Directory below the code root to run in, without `..`; default `.`; needs `code` |
+| `output_dir` | absolute container path | Required for a command and an experiment; must lie under a policy mount that is not `read_only`. Created before the command runs, and exported as `COMPUTE_OUTPUT_DIR` |
 | `admission` | `queue` | The only supported value; `immediate` is refused with `admission_unsupported` and nothing is created |
 | `image`, `pool`, `slots` | string, string, integer ≥ 0 | Overrides of the policy defaults |
 | `env` | object | Environment variables; the `COMPUTE_` prefix is reserved |
@@ -124,7 +138,9 @@ Startup errors go to stderr, because stdout carries MCP frames.
 | `experiment` | object | Experiment config; only for an experiment |
 
 Unknown fields are rejected, and so is a shell with a command, an `output_dir`, a
-`workdir`, or git code. The master validates everything else through the dry run.
+`workdir`, or git code, and a `workdir` without `code`. An `output_dir` outside every
+policy mount is `path_not_mounted`, and one under a `read_only` mount is
+`read_only_storage`. The master validates everything else through the dry run.
 
 **Code sources.**
 
@@ -211,6 +227,19 @@ key, bound to the digest. It returns `job_id`, `request_id`, `replayed`, `outcom
 active experiment whose trials wait for resources reads `running`, and the explanation
 says it waits for the scheduler.
 
+**Plan binding.** Pass the returned `spec`, not the original: it carries the pinned
+commit and explicit `pool`, `slots`, and `image`, so the launch renders the planned
+request even after a branch or a policy default moved. `request_id` must be the UUID
+the plan returned; any other value is `invalid_request`. The master computes
+`request_digest` over the exact request: the rendered config with its entrypoint and
+`COMPUTE_*` variables, the `context` file manifest, the workspace, and the project. The
+pinned commit is part of that request, so for `git` and `context` the digest binds the
+code; for `path` it binds only the directory string, and the content stays
+`unpinned`. Master and pool defaults, such as `task_container_defaults`, are not bound:
+they are administrator policy, and a change between plan and launch applies to the
+launch without `plan_changed`. A plan creates nothing and binds no key, so a plan that
+is never launched needs no cleanup.
+
 - **Retry.** A launch repeated with the same arguments returns the same job with
   `replayed: true`. This holds even when the spec no longer renders, for example after
   an included file was deleted, a branch was amended, or the policy changed: the
@@ -274,10 +303,10 @@ from the agents. It is a snapshot with no verdict: placement is not evaluated be
 launch, and a job whose slots exceed what the pool has now waits in the queue.
 
 `storage_check(path)` translates a container path through the policy and reports
-`host_path`, `exists`, `type`, `readable`, `writable`, `read_only`, and the
-`viewpoint`: the `backend` (`local` with its `local_root`, or `ssh` with its
-`ssh_host`), the `user` it runs as, and a note that the permissions are that user's,
-not the container user's. See [Shared storage access](shared-storage-access.md) for
+`path`, `host_path`, `local_path` (for a local mount), `exists`, `type`, `readable`,
+`writable`, `read_only`, and the `viewpoint`: the `backend` (`local` with its
+`local_root`, or `ssh` with its `ssh_host`), the `user` it runs as, and a note that the
+permissions are that user's, not the container user's. See [Shared storage access](shared-storage-access.md) for
 transfers.
 
 ### Task usage measurements
@@ -344,14 +373,14 @@ reason, without the rejected values.
 | Code | Meaning | What to do |
 | --- | --- | --- |
 | `invalid_request` | The spec, an argument, or the master's validation refused the request | Fix the request and plan again |
-| `admission_unsupported` | `admission: immediate` | Use `queue` |
+| `admission_unsupported` | `admission: immediate`; refused before any code is read or any request is sent | Use `queue` |
 | `plan_changed` | The code or request differs from the plan; nothing was created | Review `details.commit` and `content_digest`, then plan again |
-| `key_conflict` | The `request_id` names another request's job, in `details.job_id` | Plan again for a new `request_id` |
+| `key_conflict` | The `request_id` names another request's job, in `details.job_id` | Read that job with `compute_status`, since it may be the one intended; otherwise plan again for a new `request_id` |
 | `unavailable` | The master did not answer or is busy; retryable | Repeat the call; repeat a launch with the same arguments |
 | `internal` | The master failed | On a launch, repeat once with the same arguments; if the same error returns, nothing was created, so plan again |
 | `invalid_response` | The master's answer was malformed | As `unavailable` on a launch; otherwise report it |
 | `not_found`, `permission_denied` | The job, trial, pool, or workspace is missing, or the account may not use it | Check the handle and the account |
-| `protocol_unsupported` | The master is below submission protocol 1 | Upgrade the master |
+| `protocol_unsupported` | The master is below submission protocol 1, or lacks a route the protocol promises | Upgrade the master; see [Protocol gate](#protocol-gate) |
 | `pool_not_allowed`, `slots_exceed_limit`, `path_not_mounted`, `read_only_storage`, `invalid_policy` | The policy refused the request, or the policy file is invalid | Choose an allowed pool, fewer slots, or a writable mounted path |
 | `commit_not_on_ref`, `revision_not_found`, `partial_clone`, `lfs_object_missing`, `git_too_old`, `context_too_large`, `unsafe_symlink`, `invalid_include`, and other code checks | Code planning refused the source | Fix the repository or the code fields |
 | `storage_not_local`, `configuration_required`, `invalid_storage_path`, `storage_not_found`, `overwrite_not_allowed`, and other storage codes | Storage access refused or failed | See [Shared storage access](shared-storage-access.md) |

@@ -1,7 +1,7 @@
 interface:
   display_name: "Intensive Compute Runner"
-  short_description: "Run heavy work through the repository compute service."
-  default_prompt: "Use $intensive-compute-runner to plan and operate this heavy task through the repository's Determined compute service."
+  short_description: "Plan, launch, and track heavy work as Determined jobs."
+  default_prompt: "Use $intensive-compute-runner to plan this heavy task as a TaskSpec, review the plan, launch it with the plan's request_id and request_digest, and track the job by its job_id; report a failure as a failure and never resubmit silently."
 
 policy:
   allow_implicit_invocation: true

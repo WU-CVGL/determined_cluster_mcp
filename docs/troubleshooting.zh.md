@@ -16,13 +16,29 @@
 
 服务把启动错误写入 stderr，因为 stdout 用于传输 MCP 帧；请在 MCP 客户端的服务日志中查看准确信息。以下情况服务以状态码 2 退出：
 
-- 策略文件、存储访问文件或凭据来源无效；
+- 收到服务不接受的参数，例如早期版本的 `--db`、`--owner`、`--repo-root` 或 `--consultation-*` 参数；请删除它（见[从早期版本升级](../README.zh.md#upgrade-from-an-earlier-release)）；
+- 策略文件、存储访问文件或凭据来源无效。早期版本的策略会因 `cluster_identity`、`shell_inactivity_seconds` 或 `shared_mounts` 返回 `invalid_policy`；
 - 环境变量 `DET_MASTER` 与 secrets 文件中的不同（见[身份认证失败](#authentication-fails)）；
-- master 有响应，但没有 submission protocol 或低于 1。错误信息会给出 master 的版本；请升级 master。
+- master 有响应，但未通过协议检查（见[master 缺少 submission protocol](#the-master-lacks-the-submission-protocol)）。
 
 master 无法连接不会阻止启动。服务记录连接错误，存储工具照常可用，并会在第一次调用 master 前再次执行协议检查；在 master 响应之前，计算工具返回 `unavailable`。
 
+升级后请重启每个 MCP 进程：升级前启动的进程保留旧代码、旧工具和旧数据库。
+
 计算任务不需要 `--storage-config`。共享路径与已配置的 `host_path` 在本机一致时，存储工具会自动使用该本地路径。需要自定义本地映射或登录节点 SSH 时，将 `cfg/storage-access.example.yaml` 复制为 `.local/storage.yaml`，编辑后再添加 `--storage-config /absolute/path/to/.local/storage.yaml`。
+
+<a id="the-master-lacks-the-submission-protocol"></a>
+## master 缺少 submission protocol
+
+`protocol_unsupported` 表示 master 不支持 submission protocol 1，即本 MCP 所需的任务台账：它是上游发行版或较旧的构建。此时服务在启动时以状态码 2 退出，错误信息会给出 master 的版本。如果启动时 master 无法连接，服务仍会启动，改为在第一次调用计算工具时返回 `protocol_unsupported`。master 对 submission 路由返回 `Unimplemented` 时也会返回该错误。
+
+版本字符串不能作为依据，因为本地构建报告上一个标签，候选版本报告下一个版本。请从无需登录的 `GET /api/v1/master` 读取 `submissionProtocol`：
+
+```bash
+curl -s https://determined.example.org/api/v1/master | python3 -c 'import json, sys; print(json.load(sys.stdin).get("submissionProtocol"))'
+```
+
+请把 master 升级为带有任务台账的 Determined fork 构建。不会回退到旧 API；在此期间存储工具照常可用。
 
 <a id="authentication-fails"></a>
 ## 身份认证失败
@@ -67,7 +83,7 @@ export DET_VERIFY_SSL=true
 <a id="a-spec-or-argument-is-refused"></a>
 ## spec 或参数被拒绝
 
-未通过校验的 spec 或参数返回 `invalid_request`，`details.errors` 中每项都给出位置（例如 `spec.experiment`）和原因。常见原因：shell 带有命令、`output_dir`、`workdir` 或 `git` 代码；command 或 experiment 缺少 `output_dir`；实验设置了 MCP 负责渲染的字段（`entrypoint`、`resources.slots_per_trial`、`environment.image` 等）、`bind_mounts` 或 `checkpoint_storage` 的 `host_path`；`storage_path` 没有配套 `type: shared_fs`；搜索未设置 `searcher.max_concurrent_trials`；或使用旧式 `module:Class` 命令。`admission: immediate` 返回 `admission_unsupported`。以上情况都不会创建任何内容。
+未通过校验的 spec 或参数返回 `invalid_request`，`details.errors` 中每项都给出位置（例如 `spec.experiment`）和原因。常见原因：shell 带有命令、`output_dir`、`workdir` 或 `git` 代码；command 或 experiment 缺少 `output_dir`；实验设置了 MCP 负责渲染的字段（`entrypoint`、`resources.slots_per_trial`、`environment.image` 等）、`bind_mounts` 或 `checkpoint_storage` 的 `host_path`；`storage_path` 没有配套 `type: shared_fs`；搜索未设置 `searcher.max_concurrent_trials`；或使用旧式 `module:Class` 命令。`admission: immediate` 返回 `admission_unsupported`：本版本让每个任务排队，且提交前不评估放置，因此请使用默认值 `queue`。以上情况都不会创建任何内容。
 
 其余实验配置由 master 在规划的 dry run 中校验，问题以 `invalid_request` 报告，并附 master 自己的信息。
 
@@ -112,7 +128,20 @@ master 以 `request_id` 保存每个任务，因此用相同的 `spec`、`reques
 
 结果不确定时，不要为新的 `request_id` 重新规划。`compute_list` 会列出该账户在所有客户端提交的每个任务及其 `request_id`。
 
-`plan_changed` 表示内容与规划不同（例如 spec 仍指向会移动的分支）；没有创建任何内容，错误中给出新的提交和内容摘要。请重新规划并审核。`key_conflict` 表示该 `request_id` 已属于另一个请求的任务，见 `details.job_id`。
+`plan_changed` 和 `key_conflict` 并非结果不确定：要么没有创建任何内容，要么错误中给出了该任务；见下一节。
+
+<a id="a-launch-returns-plan_changed-or-key_conflict"></a>
+## 提交返回 plan_changed 或 key_conflict
+
+`plan_changed` 表示提交渲染出的请求与规划 dry run 的请求不同，因此 master 没有创建任何内容，该 `request_id` 仍未被占用。常见原因：
+
+- 提交时传入的是原始 spec 而不是解析后的 spec，且其分支在规划后发生了移动。`compute_plan` 返回的 `spec` 固定了提交和策略默认值；提交时始终使用它。
+- 对 `context`，某个 `include` 路径在工作树中发生了变化，或工作树在 dirty 与 clean 之间切换，这一状态记录在 `.code-provenance.json` 中。
+- 对 command 或 shell，spec 中指定的 workspace 现在解析到了另一个 workspace。
+
+错误的 `details` 给出提交渲染出的 `commit` 和 `content_digest`。审核后重新调用 `compute_plan`，并用新规划的 `spec`、`request_id` 和 `request_digest` 提交。master 或资源池默认值的变化不会导致 `plan_changed`：它们按提交时的值生效。
+
+`key_conflict` 表示该 `request_id` 已绑定到请求不同的任务，见 `details.job_id`；当 `request_id` 与另一次规划的 spec 或摘要一起重用时会发生。用 `compute_status` 读取该任务：它可能正是之前已提交的目标任务。否则重新规划以生成新的 `request_id`；绝不要手动修改 `request_id`。
 
 <a id="a-job-ended-but-the-result-is-unclear"></a>
 ## 任务已结束但结果不明确
@@ -139,5 +168,7 @@ master 以 `request_id` 保存每个任务，因此用相同的 `spec`、`reques
 ## 传输不完整或与预览不同
 
 传输从不加入 `--delete`，因此目标中无关的文件会保留。未设置 `overwrite` 时，已有文件以及已有目录的属性保持不变；设置 `overwrite`（需策略允许）时，同名文件会被替换。实际执行失败的传输可能留下部分目标内容；rsync 退出码 23 表示部分文件或属性未能传输。
+
+`overwrite_not_allowed` 表示传入了 `overwrite=true`，但策略中的 `allow_overwrite` 为 `false`；没有传输任何内容。早期版本默认替换同名文件；现在除非设置了 `overwrite` 且策略允许，目标中已有的文件都会保留。请写入新的运行目录，或请管理员允许覆盖。
 
 检查长度受限的传输输出，修正文件系统或配置问题，重新执行 dry run 并审核后再执行。不要自动改用其他权限保留参数重试。详细规则见[共享存储访问](shared-storage-access.zh.md#check-preview-and-transfer)。

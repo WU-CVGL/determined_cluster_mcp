@@ -3,7 +3,7 @@
 
 [English](shared-storage-access.md) | [简体中文](shared-storage-access.zh.md)
 
-Determined 任务使用策略中的共享主机路径与容器路径映射。可选的存储客户端让未挂载这些文件系统的机器通过登录节点检查、同步和取回文件。它不会通过 Determined 上传源码。
+Determined 任务使用策略中的共享主机路径与容器路径映射。可选的存储客户端让未挂载这些文件系统的机器通过登录节点检查、同步和取回文件。它从不通过 Determined 发送文件：代码通过 `code.source` 进入任务，只有 `context` 代码会作为规划和提交的任务 context 上传（见 [TaskSpec](compute-service.zh.md#taskspec)）。
 
 如果工作目录已经准备在共享存储上，提交任务只需要 Determined 认证。只有在所选路径没有本地挂载、并调用 `storage_check`、`storage_sync` 或 `storage_fetch` 时才需要 SSH。
 
@@ -122,9 +122,9 @@ python -m keyring set determined-compute alice
 <a id="check-preview-and-transfer"></a>
 ## 检查、预览和传输
 
-Python 接口为 `StorageService.check(path)`、`sync(local_dir, shared_dir, dry_run=True, overwrite=False)` 和 `fetch(shared_dir, local_dir, dry_run=True, overwrite=False)`。MCP 存储工具调用这些方法。`check` 返回容器路径、转换后的主机路径、可选本地路径、存在性、类型、读写权限以及 `viewpoint`：后端、运行所用的用户，以及“权限属于该用户而非容器用户”的说明。同步/取回复制目录内容，并返回操作、后端、解析后的两端路径、主机路径、排除项、实际 `preserve_permissions`、dry-run/完成状态，以及带 `truncated` 标志的长度受限输出。本地结果包含映射路径；SSH 结果只暴露配置的主机别名，不返回用户名、密钥路径或凭据。
+Python 接口为 `StorageService.check(path)`、`sync(local_dir, shared_dir, dry_run=True, overwrite=False)` 和 `fetch(shared_dir, local_dir, dry_run=True, overwrite=False)`。MCP 存储工具调用这些方法。`check` 返回容器路径、转换后的主机路径、可选本地路径、存在性、类型、读写权限以及 `viewpoint`：后端、运行所用的用户，以及“权限属于该用户而非容器用户”的说明。同步/取回复制目录内容，并返回操作、后端、解析后的两端路径、主机路径、排除项、实际 `preserve_permissions`、dry-run/完成状态，以及带 `truncated` 标志的长度受限输出。本地结果包含映射路径。SSH 同步和取回结果只暴露配置的主机别名，不返回用户名、密钥路径或凭据；检查结果的 `viewpoint` 会给出执行检查的用户，因为其报告的权限属于该用户。
 
-MCP 提供 `storage_check(path)`、`storage_sync(local_dir, shared_dir, dry_run=True, overwrite=False)` 和 `storage_fetch(shared_dir, local_dir, dry_run=True, overwrite=False)`。默认为预览；检查解析后的源路径、目标路径、传输方式和排除规则之后，才传入 `dry_run=false`。`overwrite=true` 需要策略中设置 `allow_overwrite: true`，否则返回 `overwrite_not_allowed`。
+MCP 提供 `storage_check(path)`、`storage_sync(local_dir, shared_dir, dry_run=True, overwrite=False)` 和 `storage_fetch(shared_dir, local_dir, dry_run=True, overwrite=False)`。默认为预览；检查解析后的源路径、目标路径、传输方式和排除规则之后，才传入 `dry_run=false`。`overwrite=true` 需要策略中设置 `allow_overwrite: true`，否则返回 `overwrite_not_allowed`，且不传输任何内容。早期版本默认替换同名文件；现在除非设置 `overwrite`，传输都会保留目标中已有的文件。
 
 客户端的 `local_dir` 必须是绝对路径。传输使用 `rsync -a --safe-links --mkpath --itemize-changes`；SSH 传输还使用隔离参数选项（`-s`）。未设置 `overwrite` 时，会同时加入 `--ignore-existing` 和 `--no-owner --no-group --no-perms --omit-dir-times`，因为 `--ignore-existing` 只跳过已有文件而不跳过已有目录，否则归档模式会改写这些目录（包括目标根目录）的权限、所有者和时间。此时已有条目保持不变，新条目使用源权限经 umask 屏蔽后的值，且不保留目录时间。设置 `overwrite` 时，默认的 `preserve_permissions: true` 会精确保留权限、所有者、用户组和目录时间。只有确认某个挂载拒绝这些操作时才设为 `false`；此时本地和 SSH 传输都会加入同样的四个参数。结果中的 `preserve_permissions` 报告实际生效的值。不要全局关闭保留行为，不要根据存储名称猜测，也不要在失败后自动改参数重试。
 

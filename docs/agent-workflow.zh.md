@@ -93,10 +93,10 @@
 
 用规划返回的值调用 `compute_launch(spec, request_id, request_digest)`；传入返回的 `spec`，而不是原始 spec。在工作记录中保存 `job_id` 和 `request_id`。
 
-- 如果提交的响应丢失或返回 `unavailable`，重复同一次提交。即使工作树已变化，它也会返回同一任务，且 `replayed: true`。
+- 超时、响应丢失或返回 `unavailable` 后，用相同的 `spec`、`request_id` 和 `request_digest` 重复完全相同的提交。即使工作树已变化，它也会返回同一任务，且 `replayed: true`，绝不会创建第二个任务。也可以在 `compute_list` 中按 `request_id` 查找该任务；列表覆盖该账户的所有客户端。
 - 如果返回 `internal`，再重复一次；第二次仍是同样错误说明没有创建任何内容。
-- 如果返回 `plan_changed`，说明没有创建任何内容；重新规划并审核新的提交。
-- 提交结果不确定时，不要为新的 `request_id` 重新规划。`compute_list` 会列出该账户的每个任务及其 `request_id`，包括从其他客户端提交的任务。
+- 如果返回 `plan_changed`，说明没有创建任何内容：规划之后代码或请求发生了变化。请重新规划，并在提交前审核新的提交。
+- 超时或其他结果不确定的情况下，绝不要用新的 `request_id` 重新提交。新规划会生成新的键，master 会在可能已存在的任务之外再创建一个任务。
 
 <a id="monitor-and-accept-the-result"></a>
 ## 跟踪并验收结果
@@ -108,6 +108,16 @@
 任务已提交或已结束，本身都不等于验收通过。检查任务的 `exit_class`、日志以及开始时定义的成功判据。prelude（代码交付、`output_dir` 或 `workdir`）失败时会打印一行以 `compute:` 开头的信息，并归类为 `workload_failed`。配置了存储访问时，用 `storage_check` 验证预期的共享产物；需要本地副本时，先预览 `storage_fetch(shared_dir, local_dir, dry_run=true)`，审核后再以 `dry_run=false` 执行。
 
 报告任务 ID、request ID、最终状态、退出类别、输出路径以及观察到的产物或指标。绝不包含 token、密码、私钥、cookie 或 secrets 文件内容。
+
+<a id="report-failures-as-failures"></a>
+## 如实报告失败
+
+任务可以失败，但失败绝不能报告为成功；结果不确定的工作也绝不会被悄悄重新运行。
+
+- 如实报告 `failed` 或 `canceled` 的任务，并附上 `exit_class`、`exit_reason` 以及说明原因的日志行，例如 prelude 打印的 `compute:` 行。任务结束不等于工作完成，未经检查的输出也不算结果。
+- 绝不自动重新提交，无论是在失败、取消、`plan_changed` 之后，还是提交结果不确定时。重复完全相同的提交不算重新提交：它返回已有的任务。新的运行是一次新的规划，带新的 `request_id`，需经审核并由用户决定。
+- 除实验自身 `max_restarts` 允许的重启外，没有任何机制会替你重试失败的任务。
+- 请求被拒绝时（例如 `admission_unsupported`、`protocol_unsupported`，或策略、代码检查拒绝），停止并报告该拒绝。不要改用其他资源池、代码来源或工具绕过它。
 
 <a id="keep-identity-boundaries-separate"></a>
 ## 区分各身份边界

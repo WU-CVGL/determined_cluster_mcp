@@ -14,13 +14,28 @@ Check that the client uses the virtual environment's absolute executable path an
 
 The server writes startup errors to stderr, because stdout carries MCP frames; inspect the MCP client's server log for the exact message. It exits with status 2 when:
 
-- the policy, the storage access file, or the credential source is invalid;
+- it gets an argument it does not take, such as `--db`, `--owner`, `--repo-root`, or a `--consultation-*` option from an earlier release; remove it (see [Upgrade from an earlier release](../README.md#upgrade-from-an-earlier-release));
+- the policy, the storage access file, or the credential source is invalid. A policy from an earlier release fails with `invalid_policy` on `cluster_identity`, `shell_inactivity_seconds`, or `shared_mounts`;
 - the environment's `DET_MASTER` differs from the one in the secrets file (see [Authentication fails](#authentication-fails));
-- the master answers but speaks no submission protocol, or one below 1. The message names the master's release; upgrade the master.
+- the master answers but fails the protocol gate (see [The master lacks the submission protocol](#the-master-lacks-the-submission-protocol)).
 
 An unreachable master does not stop startup. The server logs the connection error, the storage tools keep working, and the protocol check runs again before the first call to the master; until the master answers, compute tools return `unavailable`.
 
+After an upgrade, restart every MCP process: a process started before it keeps the old code, its old tools, and its old database.
+
 Compute tasks do not need `--storage-config`. Storage tools automatically use a local shared path when it matches the configured `host_path`. For a custom local mapping or login-node SSH, copy `cfg/storage-access.example.yaml` to `.local/storage.yaml`, edit it, and add `--storage-config /absolute/path/to/.local/storage.yaml`.
+
+## The master lacks the submission protocol
+
+`protocol_unsupported` means the master does not speak submission protocol 1, the job ledger this MCP needs: it is an upstream release or an older build. At startup the server then exits with status 2, and the message names the master's release. When the master was unreachable at startup, the server starts anyway, and the first compute tool call returns `protocol_unsupported` instead. A master that answers `Unimplemented` for a submission route returns it too.
+
+The release string does not decide, because a local build reports the previous tag and a release candidate the next one. Read `submissionProtocol` from `GET /api/v1/master`, which needs no login:
+
+```bash
+curl -s https://determined.example.org/api/v1/master | python3 -c 'import json, sys; print(json.load(sys.stdin).get("submissionProtocol"))'
+```
+
+Upgrade the master to a build of the Determined fork with the job ledger. There is no fallback to older APIs; the storage tools keep working meanwhile.
 
 ## Authentication fails
 
@@ -62,7 +77,7 @@ An unknown issuer is addressed by the correct CA chain. An expired certificate o
 
 ## A spec or argument is refused
 
-A spec or argument that fails validation returns `invalid_request` with `details.errors`, each naming a location such as `spec.experiment` and the reason. Common causes: a shell with a command, `output_dir`, `workdir`, or `git` code; a command or experiment without `output_dir`; an experiment that sets a field the MCP renders (`entrypoint`, `resources.slots_per_trial`, `environment.image`, and so on), `bind_mounts`, or a `checkpoint_storage` `host_path`; a `storage_path` without `type: shared_fs`; a search without `searcher.max_concurrent_trials`; or a legacy `module:Class` command. `admission: immediate` returns `admission_unsupported`. None of these create anything.
+A spec or argument that fails validation returns `invalid_request` with `details.errors`, each naming a location such as `spec.experiment` and the reason. Common causes: a shell with a command, `output_dir`, `workdir`, or `git` code; a command or experiment without `output_dir`; an experiment that sets a field the MCP renders (`entrypoint`, `resources.slots_per_trial`, `environment.image`, and so on), `bind_mounts`, or a `checkpoint_storage` `host_path`; a `storage_path` without `type: shared_fs`; a search without `searcher.max_concurrent_trials`; or a legacy `module:Class` command. `admission: immediate` returns `admission_unsupported`: this release queues every job and does not evaluate placement before launch, so use `queue`, the default. None of these create anything.
 
 The master validates the rest of an experiment config in the plan's dry run and reports a problem as `invalid_request` with its own message.
 
@@ -102,7 +117,19 @@ The master keeps every job under its `request_id`, so a launch is always safe to
 
 Never plan again for a new `request_id` while an outcome is uncertain. `compute_list` shows every job of the account, from every client, with its `request_id`.
 
-`plan_changed` means the content differs from the plan, for example because the spec still names a moving branch; nothing was created, and the error names the new commit and content digest. Plan again and review. `key_conflict` means the `request_id` already names another request's job, given in `details.job_id`.
+`plan_changed` and `key_conflict` are not uncertain: nothing was created, or the error names the job; see the next section.
+
+## A launch returns plan_changed or key_conflict
+
+`plan_changed` means the request the launch rendered differs from the one the plan dry-ran, so the master created nothing and the `request_id` stays unused. Common causes:
+
+- The launch passed the original spec instead of the resolved one, and its branch moved since the plan. The `spec` that `compute_plan` returns pins the commit and the policy defaults; always launch with it.
+- For `context`, an `include` path changed in the working tree, or the tree became dirty or clean, which `.code-provenance.json` records.
+- For a command or shell, the workspace named in the spec now resolves to another workspace.
+
+The error's `details` give the `commit` and `content_digest` that the launch rendered. Review them, call `compute_plan` again, and launch with the new plan's `spec`, `request_id`, and `request_digest`. A change to master or pool defaults never causes `plan_changed`: those apply as they stand at launch.
+
+`key_conflict` means the `request_id` is already bound to a job whose request differs, given in `details.job_id`; this happens when a `request_id` is reused with another plan's spec or digest. Read that job with `compute_status`: it may be the job intended, launched earlier. Otherwise plan again, which mints a new `request_id`; never edit one by hand.
 
 ## A job ended but the result is unclear
 
@@ -125,5 +152,7 @@ Under basic authorization, only a job's owner or an administrator can cancel it,
 ## A transfer is partial or different from the preview
 
 Transfers never add `--delete`, so unrelated destination files remain. Without `overwrite`, existing files and the attributes of existing directories are kept; with `overwrite`, which the policy must allow, same-named files are replaced. A failed executed transfer can leave a partial destination; rsync exit code 23 reports that some files or attributes were not transferred.
+
+`overwrite_not_allowed` means `overwrite=true` was passed while the policy's `allow_overwrite` is `false`; nothing was transferred. Earlier releases replaced same-named files by default. Now an existing destination file is kept unless `overwrite` is set and allowed, so write to a new run directory, or ask the administrator to allow overwrite.
 
 Inspect the bounded transfer output, correct the filesystem or configuration problem, run a fresh dry run, and review it before executing again. Do not retry automatically with changed permission-preservation flags. The detailed rules are in [shared storage access](shared-storage-access.md#check-preview-and-transfer).
