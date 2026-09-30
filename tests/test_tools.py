@@ -185,7 +185,7 @@ def test_git_plan_pins_the_commit_and_launch_submits_it_after_head_moves(tools, 
     launched = tools.launch(resolved, plan["request_id"], plan["request_digest"])
 
     assert launched["replayed"] is False and launched["outcome"] == "queued"
-    assert launched["submitted_at"] == SUBMITTED_AT
+    assert (launched["submitted_at"], launched["state"]) == (SUBMITTED_AT, "queued")
     assert launched["request_id"] == plan["request_id"]
     (created,) = master.created()
     assert created["key"] == plan["request_id"]
@@ -359,6 +359,10 @@ def test_launch_replays_a_retry_and_conflicts_on_other_content(tools, master):
     again = tools.launch(spec(), plan["request_id"], plan["request_digest"])
 
     assert (again["job_id"], again["replayed"]) == (first["job_id"], True)
+    # A replay of an ended job keeps the stored outcome; its state tells that it ended.
+    tools.cancel(first["job_id"])
+    ended = tools.launch(spec(), plan["request_id"], plan["request_digest"])
+    assert (ended["outcome"], ended["state"]) == ("queued", "canceled")
 
     other = tools.plan(spec(command="python other.py"))
     error = refused(
@@ -389,7 +393,7 @@ def test_a_failed_read_after_the_create_still_returns_the_job(tools, master):
     launched = tools.launch(spec(), plan["request_id"], plan["request_digest"])
 
     assert launched["job_id"] in master.jobs
-    assert launched["submitted_at"] is None
+    assert launched["submitted_at"] is None and launched["state"] is None
     assert "compute_status" in launched["note"]
 
 

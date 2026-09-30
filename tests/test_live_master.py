@@ -131,8 +131,11 @@ def test_the_protocol_gate_admits_the_master(monkeypatch, tmp_path):
 
 def test_plan_launch_replay_observe_and_cancel_a_command(tools):
     tag = uuid.uuid4().hex[:12]
-    plan = tools.plan(spec(tag))
-    assert tools.plan(spec(tag))["request_digest"] == plan["request_digest"]
+    # Every master has the Uncategorized workspace, and a command names it by its id.
+    plan = tools.plan(spec(tag, workspace="Uncategorized"))
+    assert tools.plan(spec(tag, workspace="Uncategorized"))["request_digest"] == (
+        plan["request_digest"]
+    )
     assert plan["placement"].startswith("not evaluated")
     assert plan["effective_config"]["resources"]["slots"] == 0
 
@@ -144,6 +147,7 @@ def test_plan_launch_replay_observe_and_cancel_a_command(tools):
 
     status = tools.status(job["job_id"])
     assert (status["state"], status["request_id"]) == ("queued", plan["request_id"])
+    assert status["workspace_id"] == 1
     assert status["request_digest"] == plan["request_digest"]
     assert "waits for the scheduler" in status["explanation"]
     assert plan["request_id"] in request_ids(tools, kind="command")
@@ -156,6 +160,8 @@ def test_plan_launch_replay_observe_and_cancel_a_command(tools):
     assert cancelled["cancel"] in {"ended", "recorded"}
     assert ended(tools, job["job_id"])["state"] == "canceled"
     assert tools.cancel(job["job_id"])["cancel"] == "ended"
+    replayed = launch_plan(tools, plan)
+    assert (replayed["replayed"], replayed["state"]) == (True, "canceled")
 
 
 def test_a_changed_request_is_refused_and_creates_nothing(tools):
@@ -212,7 +218,9 @@ def test_an_experiment_plans_launches_and_cancels(tools):
     broken = spec(tag, kind="experiment", experiment=bogus)
     refused("invalid_request", tools.plan, broken)
 
-    plan = tools.plan(spec(tag, kind="experiment", experiment=experiment))
+    # The master resolves the workspace and project names of an experiment.
+    names = {"workspace": "Uncategorized", "project": "Uncategorized"}
+    plan = tools.plan(spec(tag, kind="experiment", experiment=experiment, **names))
     assert plan["effective_config"]["checkpoint_storage"]["storage_path"] == (
         f"live-{tag}/checkpoints"
     )
@@ -220,6 +228,7 @@ def test_an_experiment_plans_launches_and_cancels(tools):
     assert job["outcome"] == "queued"
     status = tools.status(job["job_id"])
     assert status["kind"] == "experiment" and status["request_id"] == plan["request_id"]
+    assert (status["workspace_id"], status["project_id"]) == (1, 1)
     assert isinstance(tools.logs(job["job_id"], tail=5)["lines"], list)
     if status["tasks"]:  # usage needs the trial's task, which the master may not have made yet
         tools.usage(job["job_id"], window_seconds=600)

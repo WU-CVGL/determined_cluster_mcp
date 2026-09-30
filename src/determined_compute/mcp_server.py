@@ -343,11 +343,14 @@ class Tools:
             "replayed": result["replayed"],
             "outcome": result["outcome"],
             "submitted_at": None,
+            "state": None,
         }
-        # The create answer carries no time, and a failed read must not hide the job it created.
+        # The create answer carries no time, and a replay's outcome is the one stored at submit,
+        # even for a job that has since ended; a failed read must not hide the job it created.
         try:
             submission = self.client.get_submission(result["job_id"])
             launched["submitted_at"] = submission["submitted_at"]
+            launched["state"] = submission["state"]
         except APIError as exc:
             launched["note"] = (
                 f"the job exists, but its submission could not be read ({exc.code}); "
