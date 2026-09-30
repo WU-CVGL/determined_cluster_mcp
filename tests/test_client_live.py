@@ -1,29 +1,20 @@
-"""The client against a real master with submission protocol 1.
+"""The client against a real master; see ``live.py`` for how to name one."""
 
-Skipped unless DETERMINED_COMPUTE_LIVE_MASTER names the master. Credentials come from
-DET_USERNAME and DET_PASSWORD, or DET_API_TOKEN; DETERMINED_COMPUTE_LIVE_POOL names the pool
-(default ``default``). Jobs are launched with zero slots and cancelled before the test ends, so
-a pool without agents is enough.
-"""
-
-import os
 import time
 import uuid
 
 import pytest
 
+import live
 from determined_compute import usage
-from determined_compute.client import APIError, Client
+from determined_compute.client import APIError
 
-MASTER = os.environ.get("DETERMINED_COMPUTE_LIVE_MASTER")
-pytestmark = pytest.mark.skipif(not MASTER, reason="DETERMINED_COMPUTE_LIVE_MASTER is not set")
+pytestmark = live.requires_master
 
 
 @pytest.fixture
-def live(tmp_path, monkeypatch):
-    # Only the environment configures a live run, never a secrets file.
-    monkeypatch.setenv("DETERMINED_COMPUTE_SECRETS", str(tmp_path / "absent.env"))
-    api = Client(MASTER)
+def live_client(monkeypatch):
+    api = live.client(monkeypatch)
     launched = []
     yield api, launched
     for job_id in launched:
@@ -31,11 +22,10 @@ def live(tmp_path, monkeypatch):
 
 
 def command(tag, text="echo live"):
-    pool = os.environ.get("DETERMINED_COMPUTE_LIVE_POOL", "default")
     return {
         "description": f"client-live-{tag}",
         "entrypoint": ["sh", "-c", text],
-        "resources": {"resource_pool": pool, "slots": 0},
+        "resources": {"resource_pool": live.pool(), "slots": 0},
     }
 
 
@@ -46,8 +36,8 @@ def refused(code, operation, *args, **kwargs):
     return caught.value
 
 
-def test_plan_launch_replay_and_cancel(live):
-    api, launched = live
+def test_plan_launch_replay_and_cancel(live_client):
+    api, launched = live_client
     tag = uuid.uuid4().hex[:12]
     assert api.check_protocol()["submission_protocol"] >= 1
 
@@ -91,8 +81,8 @@ def test_plan_launch_replay_and_cancel(live):
         time.sleep(1)
 
 
-def test_refusals_create_nothing(live):
-    api, _ = live
+def test_refusals_create_nothing(live_client):
+    api, _ = live_client
     tag = uuid.uuid4().hex[:12]
     refused("admission_unsupported", api.submit, "command", command(tag), dry_run=True,
             admission="immediate")
