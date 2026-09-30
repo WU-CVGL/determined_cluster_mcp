@@ -10,6 +10,7 @@
 - 本地挂载、SSH 或文件传输：[共享存储访问](docs/shared-storage-access.zh.md)
 - 可选的服务端建议：[咨询](docs/consultation.zh.md)
 - 启动或运行故障：[故障排查](docs/troubleshooting.zh.md)
+- 目标架构与平台改动：[架构](docs/architecture.zh.md)
 
 API 地址、账户、镜像、资源池和挂载路径必须来自管理员或项目配置。不要自行编造部署参数，也不要暴露凭据。
 

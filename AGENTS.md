@@ -9,6 +9,7 @@ Follow the caller's requested scope. Read only the route needed for the task:
 - Local mount, SSH, or file transfer: [shared storage access](docs/shared-storage-access.md)
 - Optional server-side advice: [consultation](docs/consultation.md)
 - Startup or runtime failure: [troubleshooting](docs/troubleshooting.md)
+- Target architecture and platform changes: [architecture](docs/architecture.md)
 
 Use the administrator or project configuration for the API URL, account, image, pool, and mount paths. Never invent deployment values or expose credentials.
 

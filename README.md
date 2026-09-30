@@ -61,5 +61,6 @@ The `owner` is a local task namespace, not authentication. The credentials selec
 - [Shared storage access](docs/shared-storage-access.md): local mounts, SSH, dry runs, and transfers
 - [Optional consultation](docs/consultation.md): server-side Codex backend and model configuration
 - [Troubleshooting](docs/troubleshooting.md): startup, authentication, TLS, paths, capacity, uncertain submissions, usage measurements, and cancellation
+- [Architecture](docs/architecture.md): target design and the Determined fork changes it needs
 
 For JSON CLI usage, run `determined-compute --help`.
