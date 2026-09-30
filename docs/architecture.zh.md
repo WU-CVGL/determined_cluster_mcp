@@ -5,7 +5,21 @@
 
 本文描述计算 MCP 的目标架构，以及它要求 Determined fork 做出的改动，面向两个仓库的维护者。当前的 MCP 接口见[计算服务参考](compute-service.zh.md)。
 
-Fork 路径相对于 `8e26a69`（release 0.40.1）处的 fork 根目录，MCP 路径相对于本仓库的 `2404d0d`。“PR #1” 指尚未合并的 `feat/research-workflow-support` 分支。所有引用都来自阅读源码，而不是实际运行。
+Fork 路径相对于 `8e26a69`（release 0.40.1）处的 fork 根目录，MCP 路径相对于本仓库的 `2404d0d`。“PR #1” 指尚未合并的 `feat/research-workflow-support` 分支。所有引用都来自阅读源码，而不是实际运行；它们指向上述基准提交，不会随代码变化而维护。
+
+<a id="what-changes-for-users"></a>
+## 对用户的变化
+
+- **代码作为任务 context 发送。** 作业以 Determined 现有的任务 context 携带某个 git revision
+  中被跟踪的文件及显式 include 的文件，上限约 95 MiB。代码不再从共享存储上可变的 `workdir`
+  运行。数据、输出和检查点仍在共享存储上，因此超过上限的仓库（例如包含数据的仓库）需要把这些
+  数据移到共享存储。
+- **单一句柄。** `job_id` 取代本地 `task_id`，`--owner` 和 `--db` 被移除。同一账户的所有客户端
+  看到并控制相同的作业。
+- **`allow_queue=false`。** 在 MCP 1.0 中，它先进行评估，只提交当前可以放置的请求，这是某一时刻的
+  检查；从 MCP 1.1 起，它是原子的立即准入。
+- **更少的工具。** reconcile、discover、adopt、resources、`storage_check` 和 `determined-compute`
+  CLI 被移除；由 `compute_list` 和 `det` 覆盖其用途。
 
 <a id="principles"></a>
 ## 原则
@@ -365,6 +379,19 @@ owner 是已认证的用户，记录在 `jobs.owner_id` 中。MCP 的 `--owner` 
 - **检查点**与目前一样使用 `checkpoint_storage`。
 - **不在本设计中**：快照服务、对象存储或 `snapshot_id`。
 
+<a id="defaults"></a>
+### 默认值
+
+| 设置 | 默认值 | 设置位置 |
+|---|---|---|
+| `resources.max_system_retries` | 3 | expconf，另有 master 默认值 |
+| `dry_run` 评估频率 | 每用户每秒一次 | master 配置 |
+| IMMEDIATE handler 等待 | 5 秒 | master |
+| agent 预检宽限期（`Preflight.Timeout`） | 30 秒 | master 默认值 |
+| 幂等键 | 最多 128 个 `[A-Za-z0-9._:-]` 字符 | API |
+| 任务 context 大小 | 约 95 MiB（现有的 `MAX_CONTEXT_SIZE`） | harness |
+| 最低 fork 版本 | MCP 1.0 为 0.41.0，MCP 1.1 为 0.42.0 | MCP |
+
 <a id="what-remains-unverified"></a>
 ### 仍未经验证的内容
 
@@ -410,7 +437,7 @@ owner 是已认证的用户，记录在 `jobs.owner_id` 中。MCP 的 `--owner` 
 | 工具 | 行为 |
 |---|---|
 | `compute_plan(spec: TaskSpec, evaluate=True)` | 编译 spec、应用策略，并生成 UUIDv4 `request_id`。启用 `evaluate` 时，以 `dry_run` 调用创建接口，返回生效配置概要、摘要、评估结果和警告，其中包括位于生效 bind mount 目标之外的路径。否则离线渲染。 |
-| `compute_launch(spec, request_id, allow_queue=False)` | 检查策略，然后带 `SubmitOptions` 发起一次创建调用。要求 `request_id` 为 UUID。返回 `job_id`、`replayed`、`submitted_at` 和 `outcome`。experiment 需要 `allow_queue=True`。 |
+| `compute_launch(spec, request_id, allow_queue=False)` | 检查策略，然后带 `SubmitOptions` 发起一次创建调用。要求 `request_id` 为 UUID。返回 `job_id`、`replayed`、`submitted_at` 和 `outcome`。experiment 需要 `allow_queue=True`。`allow_queue=False` 时，1.0 先评估，只提交 `PLACEABLE_NOW` 的请求（某一时刻的检查）；从 1.1 起以 IMMEDIATE 准入提交。 |
 | `compute_status(job_id)` | `GetSubmission`，并附带对退出类别的解释。 |
 | `compute_list(kind=None, state=None, limit=50, cursor=None)` | 针对调用方的 `ListSubmissions`，覆盖所有客户端。 |
 | `compute_logs(job_id, trial_id=None, tail=200)` | 任务日志。 |
@@ -473,30 +500,43 @@ owner 是已认证的用户，记录在 `jobs.owner_id` 中。MCP 的 `--owner` 
 <a id="delivery-plan"></a>
 ## 交付计划
 
-<a id="fork-tag-0410"></a>
-### Fork（tag 0.41.0）
+<a id="phasing"></a>
+### 分阶段
+
+第一个 fork 版本只包含能删除 MCP 代码的部分：台账和评估，以及 `GetSubmission` 报告的退出类别。
+立即准入、系统重试和 agent 预检放在第二个版本。
+
+| Fork 版本 | Fork PR | MCP 版本 |
+|---|---|---|
+| 0.41.0 | F1, F2, F3a | 1.0：M1, M2, M3 |
+| 0.42.0 | F3b, F4, F5 | 1.1：M4 |
+
+<a id="fork-pull-requests"></a>
+### Fork PR
 
 | PR | 内容 | 依赖 |
 |---|---|---|
 | F1 退出类别与修复 | 贯穿所有层的 `ExitClass`；新的失败类型；覆盖所有情况的分类器；`closeOpenAllocations` 的类别；`UnknownError` 映射；`crash(*msg)`；`allocations.exit_class` 和 `exit_detail`；`IdentifyTask` 修复。在 F4 加入初始化边界之前，`ResourcesFailed` 和 `TaskError` 分类为 `WORKLOAD_FAILED` | – |
-| F2 台账 | `jobs` 迁移；`SubmitOptions` 和 `SubmitResult`；handler 顺序，其中 `dry_run` 无副作用（尚不评估），以及 `validate_only` 别名；在 F3 之前 `ADMISSION_IMMEDIATE` 返回 `UNIMPLEMENTED`；单一的提交事务；`ACTIVE` experiment；从未放置的恢复规则；`Get`/`List`/`CancelSubmission`；`get_task.sql` 字段 | F1 |
-| F3 评估与 IMMEDIATE | `TaskList.Clone`；`rp.Evaluate`；让旧检查基于静态适配，同时保留每个调用点的结果；`dry_run` 评估及其限流；tick 决策与 handler 等待；IMMEDIATE 恢复；其他 RM 上的 `Unimplemented`；provider 资源池拒绝 | F2 |
-| F4 初始化边界与重试 | `workload_started_at`、内部 RPC 以及 `prep_container` 的发送；带推导预算的 `max_system_retries`；trial 分支；command 和 shell 重新分配；屏蔽节点行 | F1, F3 |
-| F5 设备与预检 | 在 `device.Device` 旁边传递的显存检测；`resources.accelerators`；`deviceSatisfied`；`cproto.Preflight`；agent 钩子；挂载源映射 | F3, F4 |
+| F2 台账 | `jobs` 迁移；`SubmitOptions` 和 `SubmitResult`；handler 顺序，其中 `dry_run` 无副作用（尚不评估），以及 `validate_only` 别名；在 F3b 之前 `ADMISSION_IMMEDIATE` 返回 `UNIMPLEMENTED`；单一的提交事务；`ACTIVE` experiment；从未放置的恢复规则；`Get`/`List`/`CancelSubmission`；`get_task.sql` 字段 | F1 |
+| F3a 评估 | `TaskList.Clone`；`rp.Evaluate`；让旧检查基于静态适配，同时保留每个调用点的结果；`dry_run` 评估及其限流；其他 RM 上的 `Unimplemented` | F2 |
+| F3b 立即准入 | tick 决策与 handler 等待；IMMEDIATE 恢复；provider 资源池拒绝 | F3a |
+| F4 初始化边界与重试 | `workload_started_at`、内部 RPC 以及 `prep_container` 的发送；带推导预算的 `max_system_retries`；trial 分支；command 和 shell 重新分配；屏蔽节点行 | F1, F3b |
+| F5 设备与预检 | 在 `device.Device` 旁边传递的显存检测；`resources.accelerators`；`deviceSatisfied`；`cproto.Preflight`；agent 钩子；挂载源映射 | F3a, F4 |
 
 master 和 agent 一起升级。运行中的容器不受影响，因为 `device.Device` 和重连比较保持不变。
 
-<a id="mcp-10-requires-fork-0410"></a>
-### MCP（1.0 要求 fork 0.41.0）
+<a id="mcp-pull-requests"></a>
+### MCP PR
 
 | PR | 内容 | 依赖 |
 |---|---|---|
 | M1 收窄 server | 把咨询移到独立入口点；删除 `compute_cli.py`；关闭 PR #1 | – |
-| M2 改用台账 | `client.py`、版本门槛以及 `job_id` 句柄；基于 submission 的 launch、status、list、logs、usage 和 cancel；删除 store、提交标记、reconcile、discover、adopt、绑定和 owner 命名空间 | F2, F3 |
-| M3 类型化 spec | `TaskSpec`、`spec.py`、`policy.py`、`context.py` 和 `accelerators`；通过 `dry_run` 规划；删除 `admission.py`、`compute_resources`、`storage_check` 和路径校验 | F5 |
+| M2 改用台账 | `client.py`、版本门槛以及 `job_id` 句柄；基于 submission 的 launch、status、list、logs、usage 和 cancel；删除 store、提交标记、reconcile、discover、adopt、绑定和 owner 命名空间 | F2, F3a |
+| M3 类型化 spec | `TaskSpec`、`spec.py`、`policy.py` 和 `context.py`；通过 `dry_run` 规划；`allow_queue=false` 实现为先评估后提交；删除 `admission.py`、`compute_resources`、`storage_check` 和路径校验 | F3a |
+| M4 加速器与立即准入 | `TaskSpec` 中的 `accelerators`；`allow_queue=false` 以 IMMEDIATE 准入提交 | F3b, F5 |
 
-- **合并顺序。** MCP PR 只有在其 fork 依赖进入 fork `main` 之后才能合并。集成测试针对 0.41.0 预发布构建运行。
-- **发布。** 在 fork 打出 0.41.0 tag 之前，不发布 MCP `main`。
+- **合并顺序。** MCP PR 只有在其 fork 依赖进入 fork `main` 之后才能合并。集成测试针对目标 fork 版本的预发布构建运行。
+- **发布。** 在 fork 打出 0.41.0 tag 之前不发布 MCP 1.0，MCP 1.1 等待 0.42.0。
 - **文档。** 每个 PR 都更新其涉及的英文和中文文档。M3 重写[计算服务参考](compute-service.zh.md)、[Agent 工作流](agent-workflow.zh.md)、[故障排查](troubleshooting.zh.md)和 `AGENTS` 路由。
 
 <a id="out-of-scope"></a>
@@ -520,7 +560,7 @@ master 和 agent 一起升级。运行中的容器不受影响，因为 `device.
 3. **严格的 IMMEDIATE。** 由于 IMMEDIATE 从不抢占也不插队，它在繁忙的集群上会经常拒绝。替代方案是 `allow_queue=true`。
 4. **以 `ACTIVE` 提交的 experiment。** 创建路径必须跳过 `ActivateExperiment`（`api_experiment.go:1682-1687`），并以恢复时的方式启动 experiment；恢复已经能处理 nil 快照（`restore.go:118-124`）。在 F2 中验证。
 5. **Docker bind 错误。** 挂载源分类依赖 Docker 的 bind 错误。应在实际部署的 Docker 版本上测试。
-6. **重连窗口。** 把处于重连窗口内的 agent 视为已启用，需要用到它们暂存的状态（`agent.go:80-83`）。在 F3 中验证。
+6. **重连窗口。** 把处于重连窗口内的 agent 视为已启用，需要用到它们暂存的状态（`agent.go:80-83`）。在 F3a 中验证。
 7. **Generic 取消。** 对 generic 任务调用 `CancelSubmission` 可能遇到全局变更锁（`api_generic_tasks.go:580-583`），此时返回可重试的 `UNAVAILABLE`。
 8. **命令中的 secret。** 在命令行中输入的 secret 会按提交时的内容存储。文档必须说明这一点。
 9. **重试预算。** `max_system_retries` 的默认值 3 是否合适？

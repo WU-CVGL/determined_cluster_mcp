@@ -9,7 +9,22 @@ current MCP interface, see [Compute service reference](compute-service.md).
 Fork paths are relative to the fork root at `8e26a69` (release 0.40.1). MCP paths are
 relative to this repository at `2404d0d`. "PR #1" is the unmerged
 `feat/research-workflow-support` branch. Citations come from reading the source, not from
-running it.
+running it. They point to those base commits and are not maintained as the code changes.
+
+## What changes for users
+
+- **Code ships as the task context.** A job carries the tracked files of a git revision plus
+  explicit includes as Determined's existing task context, capped at about 95 MiB. Code no
+  longer runs from a mutable `workdir` on shared storage. Data, outputs, and checkpoints stay
+  on shared storage, so a repository over the cap, for example one with vendored data, must
+  move that data there.
+- **One handle.** `job_id` replaces the local `task_id`, and `--owner` and `--db` go away.
+  Every client of the same account sees and controls the same jobs.
+- **`allow_queue=false`.** In MCP 1.0 it evaluates first and submits only a request that can
+  be placed now, which is a point-in-time check. From MCP 1.1 it is atomic immediate
+  admission.
+- **Fewer tools.** Reconcile, discover, adopt, resources, `storage_check`, and the
+  `determined-compute` CLI are removed; `compute_list` and `det` cover their uses.
 
 ## Principles
 
@@ -497,6 +512,18 @@ RBAC. A replay re-checks read authz on the stored job, so revoked access is hono
 - **Checkpoints** use `checkpoint_storage`, as today.
 - **Not in this design:** a snapshot service, an object store, or `snapshot_id`.
 
+### Defaults
+
+| Setting | Default | Set in |
+|---|---|---|
+| `resources.max_system_retries` | 3 | expconf, with a master default |
+| `dry_run` evaluation rate | one per second per user | master config |
+| IMMEDIATE handler wait | 5 s | master |
+| Agent preflight grace (`Preflight.Timeout`) | 30 s | master default |
+| Idempotency key | at most 128 characters of `[A-Za-z0-9._:-]` | API |
+| Task context size | about 95 MiB (`MAX_CONTEXT_SIZE`, existing) | harness |
+| Minimum fork release | 0.41.0 for MCP 1.0, 0.42.0 for MCP 1.1 | MCP |
+
 ### What remains unverified
 
 Identity, owner, state, placement, and exit class are authoritative, and
@@ -540,7 +567,7 @@ There are 9 tools, down from 16 on `main` (14 base tools plus 2 consultation too
 | Tool | Behaviour |
 |---|---|
 | `compute_plan(spec: TaskSpec, evaluate=True)` | Compiles the spec, applies policy, and mints a UUIDv4 `request_id`. With `evaluate`, it calls create with `dry_run` and returns the effective config summary, digest, evaluation, and warnings, including paths outside the effective bind-mount targets. Otherwise it renders offline. |
-| `compute_launch(spec, request_id, allow_queue=False)` | Checks policy, then makes one create call with `SubmitOptions`. Requires a UUID `request_id`. Returns `job_id`, `replayed`, `submitted_at`, and `outcome`. Experiments need `allow_queue=True`. |
+| `compute_launch(spec, request_id, allow_queue=False)` | Checks policy, then makes one create call with `SubmitOptions`. Requires a UUID `request_id`. Returns `job_id`, `replayed`, `submitted_at`, and `outcome`. Experiments need `allow_queue=True`. With `allow_queue=False`, 1.0 evaluates first and submits only a `PLACEABLE_NOW` request (a point-in-time check); from 1.1 it submits with IMMEDIATE admission. |
 | `compute_status(job_id)` | `GetSubmission`, plus an explanation of the exit class. |
 | `compute_list(kind=None, state=None, limit=50, cursor=None)` | `ListSubmissions` for the caller, covering every client. |
 | `compute_logs(job_id, trial_id=None, tail=200)` | Task logs. |
@@ -611,30 +638,44 @@ and 8,600 with PR #1.
 
 ## Delivery plan
 
-### Fork (tag 0.41.0)
+### Phasing
+
+The first fork release carries only what removes MCP code: the ledger and evaluation,
+plus the exit classes that `GetSubmission` reports. Immediate admission, system retries,
+and the agent preflight follow in a second release.
+
+| Fork release | Fork PRs | MCP release |
+|---|---|---|
+| 0.41.0 | F1, F2, F3a | 1.0: M1, M2, M3 |
+| 0.42.0 | F3b, F4, F5 | 1.1: M4 |
+
+### Fork pull requests
 
 | PR | Content | Depends on |
 |---|---|---|
 | F1 Exit classes and fixes | `ExitClass` across all layers; new failure types; a total classifier; `closeOpenAllocations` class; `UnknownError` mapping; `crash(*msg)`; `allocations.exit_class` and `exit_detail`; the `IdentifyTask` fix. Until F4 adds the init boundary, `ResourcesFailed` and `TaskError` classify as `WORKLOAD_FAILED` | – |
-| F2 Ledger | `jobs` migration; `SubmitOptions` and `SubmitResult`; handler order with side-effect-free `dry_run` (no evaluation yet) and the `validate_only` alias; `ADMISSION_IMMEDIATE` returns `UNIMPLEMENTED` until F3; the single commit transaction; `ACTIVE` experiments; the never-placed restore rule; `Get`/`List`/`CancelSubmission`; `get_task.sql` fields | F1 |
-| F3 Evaluation and IMMEDIATE | `TaskList.Clone`; `rp.Evaluate`; the static fit behind the old checks, keeping each call site's outcome; `dry_run` evaluation and its rate limit; the tick decision and handler wait; IMMEDIATE restore; `Unimplemented` on other RMs; the provider-pool rejection | F2 |
-| F4 Init boundary and retries | `workload_started_at`, the internal RPC, and the `prep_container` post; `max_system_retries` with a derived budget; the trial case; command and shell re-allocation; blocked-node rows | F1, F3 |
-| F5 Devices and preflight | memory detection beside `device.Device`; `resources.accelerators`; `deviceSatisfied`; `cproto.Preflight`; the agent hook; mount-source mapping | F3, F4 |
+| F2 Ledger | `jobs` migration; `SubmitOptions` and `SubmitResult`; handler order with side-effect-free `dry_run` (no evaluation yet) and the `validate_only` alias; `ADMISSION_IMMEDIATE` returns `UNIMPLEMENTED` until F3b; the single commit transaction; `ACTIVE` experiments; the never-placed restore rule; `Get`/`List`/`CancelSubmission`; `get_task.sql` fields | F1 |
+| F3a Evaluation | `TaskList.Clone`; `rp.Evaluate`; the static fit behind the old checks, keeping each call site's outcome; `dry_run` evaluation and its rate limit; `Unimplemented` on other RMs | F2 |
+| F3b Immediate admission | the tick decision and handler wait; IMMEDIATE restore; the provider-pool rejection | F3a |
+| F4 Init boundary and retries | `workload_started_at`, the internal RPC, and the `prep_container` post; `max_system_retries` with a derived budget; the trial case; command and shell re-allocation; blocked-node rows | F1, F3b |
+| F5 Devices and preflight | memory detection beside `device.Device`; `resources.accelerators`; `deviceSatisfied`; `cproto.Preflight`; the agent hook; mount-source mapping | F3a, F4 |
 
 Master and agents are upgraded together. Running containers survive, because
 `device.Device` and the reconnect compare are unchanged.
 
-### MCP (1.0 requires fork 0.41.0)
+### MCP pull requests
 
 | PR | Content | Depends on |
 |---|---|---|
 | M1 Narrow the server | move consultation to its own entry point; delete `compute_cli.py`; close PR #1 | – |
-| M2 Cut to the ledger | `client.py`, the version gate, and the `job_id` handle; launch, status, list, logs, usage, and cancel over submissions; delete the store, markers, reconcile, discover, adopt, binding, and owner namespace | F2, F3 |
-| M3 Typed spec | `TaskSpec`, `spec.py`, `policy.py`, `context.py`, and `accelerators`; plan through `dry_run`; delete `admission.py`, `compute_resources`, `storage_check`, and path validation | F5 |
+| M2 Cut to the ledger | `client.py`, the version gate, and the `job_id` handle; launch, status, list, logs, usage, and cancel over submissions; delete the store, markers, reconcile, discover, adopt, binding, and owner namespace | F2, F3a |
+| M3 Typed spec | `TaskSpec`, `spec.py`, `policy.py`, and `context.py`; plan through `dry_run`; `allow_queue=false` as evaluate-then-submit; delete `admission.py`, `compute_resources`, `storage_check`, and path validation | F3a |
+| M4 Accelerators and immediate admission | `accelerators` in `TaskSpec`; `allow_queue=false` submits with IMMEDIATE admission | F3b, F5 |
 
 - **Merge order.** An MCP PR merges only after its fork dependencies are on fork `main`.
-  Integration tests run against 0.41.0 pre-release builds.
-- **Release.** MCP `main` is not released until the fork tags 0.41.0.
+  Integration tests run against pre-release builds of the target fork release.
+- **Release.** MCP 1.0 is not released until the fork tags 0.41.0, and MCP 1.1 waits for
+  0.42.0.
 - **Docs.** Each PR updates the English and Chinese docs it touches. M3 rewrites
   [Compute service reference](compute-service.md), [Agent workflow](agent-workflow.md),
   [Troubleshooting](troubleshooting.md), and the `AGENTS` routes.
@@ -671,7 +712,7 @@ Master and agents are upgraded together. Running containers survive, because
 5. **Docker bind errors.** Mount-source classification depends on Docker's bind error.
    Test it on the deployed Docker version.
 6. **Reconnect window.** Treating agents inside the reconnect window as enabled needs their
-   stashed state (`agent.go:80-83`). Verify in F3.
+   stashed state (`agent.go:80-83`). Verify in F3a.
 7. **Generic cancel.** `CancelSubmission` on a generic task can hit the global mutation lock
    (`api_generic_tasks.go:580-583`). It returns a retryable `UNAVAILABLE`.
 8. **Secrets in commands.** Secrets typed into a command line are stored as submitted. The
