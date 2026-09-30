@@ -417,7 +417,7 @@ owner 是已认证的用户，记录在 `jobs.owner_id` 中。MCP 的 `--owner` 
 
   无论命令采用何种形式（`a; b`、`a & b`、多行），失败的前导命令都会在任何用户语句之前终止作业。在 `main` 上，`mkdir -p OUT && cd WD && CMD` 在失败后仍会运行后续语句，并可能以 0 退出（`compute/service.py:585-599`）。前导命令在初始化边界之后运行，因此它的失败分类为 `WORKLOAD_FAILED`，永远不会被系统重试；MCP 根据退出码和日志把它们报告为代码交付失败。shell 运行 `sshd`，没有命令，因此只接受 `context` 和 `path`，也没有前导命令。旧式的 `module:Class` experiment entrypoint 会被拒绝，因为任何前缀都会破坏它（`launch.py:32-40`）。
 - **`git` 的规划检查。** `compute_plan` 通过配置的存储访问方式（本地挂载或 SSH）对仓库运行只读的 `git`。`repo` 必须位于某个 bind mount 目标之下。`revision` 必须解析为一个提交，该提交被固定为完整 SHA。该提交必须包含在某个分支或 tag 中（`commit_not_on_ref`），因为克隆通过 alternates 借用对象，而源仓库中的 `git gc` 会清除不可达的对象。partial clone 会被拒绝，因为延迟获取需要网络。缺失的 LFS 对象是错误（`lfs_object_missing`），submodule 会得到 `submodule_not_checked_out` 警告。镜像必须提供 `git`，容器用户必须能读取该仓库；规划无法检查这两点。
-- **`context` 的规划检查。** 大小按解码后的内容字节计算，与 harness 的计数方式一致（`harness/determined/common/context.py:19-28`），并与其 99,614,720 字节的限制比较（`constants.py:5-18`）。master 只强制执行 96 MiB 的 gRPC 消息限制（`master/internal/grpcutil/api.go:81-85`），失败时原因不明确，因此 MCP 先行检查，并返回 `context_too_large`，附带总大小、限制、最大的几个路径，以及改用 `git` 或共享存储的提示。解析后仍位于树内的相对符号链接会被保留；绝对的或越出树的符号链接是规划错误（`unsafe_symlink`），因为 harness 会在初始化时拒绝整个归档（`harness/determined/common/tarfile_utils.py:38-76`）。harness 会丢弃归档中的所有权信息，并把权限模式屏蔽为 0755（`tarfile_utils.py:78-89`）。命中硬性 secret 规则的文件从不上传，命中软性规则的文件只有在 `include` 中点名时才上传，两者都列为 `excluded`。LFS 指针会得到 `lfs_pointer` 警告，被跟踪的根目录 `startup-hook.sh`（Determined 会在命令之前 source 它）会得到 `startup_hook`。任何能读取该作业的人都能读取 context；在 basic authz 下，这意味着 experiment 的任何查看者（`experiment/authz_basic_impl.go:26-30`）。这就是 secret 规则只适用于 `context` 的原因。
+- **`context` 的规划检查。** 大小按 harness 的方式计算：每个文件的大小向上取整到 3 的倍数，即其 base64 内容长度乘以 3/4（`harness/determined/common/v1file_utils.py:9-13`），求和后超过 99,614,720 字节即拒绝（`context.py:19-28`、`constants.py:5-18`）。master 只强制执行 96 MiB 的 gRPC 消息限制（`master/internal/grpcutil/api.go:81-85`），失败时原因不明确，因此 MCP 先行检查，并返回 `context_too_large`，附带总大小、限制、最大的几个路径，以及改用 `git` 或共享存储的提示。解析后仍位于树内的相对符号链接会被保留；绝对的或越出树的符号链接是规划错误（`unsafe_symlink`），因为 harness 会在初始化时拒绝整个归档（`harness/determined/common/tarfile_utils.py:38-76`）。harness 会丢弃归档中的所有权信息，并把权限模式屏蔽为 0755（`tarfile_utils.py:78-89`）。命中硬性 secret 规则的文件从不上传，命中软性规则的文件只有在 `include` 中点名时才上传，两者都列为 `excluded`。LFS 指针会得到 `lfs_pointer` 警告，被跟踪的根目录 `startup-hook.sh`（Determined 会在命令之前 source 它）会得到 `startup_hook`。任何能读取该作业的人都能读取 context；在 basic authz 下，这意味着 experiment 的任何查看者（`experiment/authz_basic_impl.go:26-30`）。这就是 secret 规则只适用于 `context` 的原因。
 - **来源信息。** 配置携带 `COMPUTE_CODE_SOURCE`、`COMPUTE_CODE_ROOT`，对于 `git` 和 `context` 还有 `COMPUTE_CODE_COMMIT`。它们取代 `COMPUTE_WORKDIR` 和 `COMPUTE_CODE_REVISION`（`compute/service.py:426-431`）。`context` 还会附带 `.code-provenance.json`，内容为 `{commit, dirty, included, excluded, skipped}`，不含时间戳，因此未改变的树会渲染出相同的摘要。对于 `path`，规划报告它观察到的 HEAD 和 dirty 状态，并标注为未经验证。
 - **存储根目录。** 管理员挂载每个 bind 源路径：`task_container_defaults.bind_mounts`，以及 workspace 或 master `checkpoint_storage` 的 `shared_fs.host_path`。在任何作业运行之前，每个源路径都存在于该资源池的每个 agent 上。作业从不指定 bind 源路径。
 - **数据和输出**位于工作负载在这些根目录内创建的运行目录中，由 `storage_sync` 和 `storage_fetch` 移动。`git` 仓库和 `path` 目录也位于某个根目录之下。
@@ -435,7 +435,7 @@ owner 是已认证的用户，记录在 `jobs.owner_id` 中。MCP 的 `--owner` 
 | IMMEDIATE handler 等待 | 5 秒 | master |
 | agent 预检宽限期（`Preflight.Timeout`） | 30 秒 | master 默认值 |
 | 幂等键 | 最多 128 个 `[A-Za-z0-9._:-]` 字符 | API |
-| 任务 context 大小 | 99,614,720 内容字节（现有的 `MAX_CONTEXT_SIZE`） | harness 常量，由 MCP 检查 |
+| 任务 context 大小 | 按 harness 方式计数的 99,614,720 字节（现有的 `MAX_CONTEXT_SIZE`） | harness 常量，由 MCP 检查 |
 | 最低提交协议 | MCP 1.0 为 1，MCP 1.1 为 2 | MCP |
 
 <a id="what-remains-unverified"></a>
@@ -654,7 +654,7 @@ master 和 agent 一起升级。fork 保持重新挂接路径的兼容性。`dev
 | 前导命令失败后的多语句命令，针对每种来源 | `a; b`、`false \|\| b`、两行命令以及 `a & b; wait` 都以前导命令的状态退出，且不运行任何用户语句，在 `sh -c` 和 `bash -lc` 下均如此。 | M3 |
 | 渲染器形式 | 恰好是 `<prelude> \|\| exit $?`、一个换行符和命令；任何配置中都没有 `work_dir`；`module:Class` 被拒绝。 | M3 |
 | `git` 规划检查 | 固定的 SHA；`commit_not_on_ref`；partial clone 被拒绝；`lfs_object_missing`；使用 `git` 的 shell 被拒绝。 | M3 |
-| context 限制 | 99,614,720 字节可以通过，多一个字节则返回 `context_too_large`，且不发起创建调用；越出树的符号链接返回 `unsafe_symlink`；未改变的树渲染出相同的摘要。 | M3 |
+| context 限制 | 计数为 99,614,718 字节的 context 可以通过；单个 99,614,719 字节的文件计为 99,614,721 字节，返回 `context_too_large`，且不发起创建调用；越出树的符号链接返回 `unsafe_symlink`；未改变的树渲染出相同的摘要。 | M3 |
 | 协议门槛 | 没有 `submission_protocol` 或低于最低要求的 master 会被拒绝，无论其 release 字符串是什么。 | M2 |
 | 观察工具 | `compute_resources` 只返回投影字段和 `observed_at`；`storage_check` 总是说明其视角。 | M3 |
 

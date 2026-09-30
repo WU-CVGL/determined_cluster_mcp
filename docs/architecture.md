@@ -687,9 +687,10 @@ RBAC. A replay re-checks read authz on the stored job, so revoked access is hono
   object is an error (`lfs_object_missing`), and a submodule gets a
   `submodule_not_checked_out` warning. The image must provide `git`, and the container
   user must be able to read the repository; the plan cannot check either.
-- **Plan checks for `context`.** Size is decoded content bytes, as the harness counts it
-  (`harness/determined/common/context.py:19-28`), against its limit of 99,614,720 bytes
-  (`constants.py:5-18`). The master enforces only a 96 MiB gRPC message limit
+- **Plan checks for `context`.** Size is counted as the harness counts it: each file's
+  size rounded up to a multiple of three, the length of its base64 content times 3/4
+  (`harness/determined/common/v1file_utils.py:9-13`), summed and rejected when it exceeds
+  99,614,720 bytes (`context.py:19-28`, `constants.py:5-18`). The master enforces only a 96 MiB gRPC message limit
   (`master/internal/grpcutil/api.go:81-85`), which fails opaquely, so the MCP checks first
   and returns `context_too_large` with the total, the limit, the largest paths, and a hint
   to use `git` or shared storage. Relative symlinks that resolve inside the tree are kept;
@@ -732,7 +733,7 @@ RBAC. A replay re-checks read authz on the stored job, so revoked access is hono
 | IMMEDIATE handler wait | 5 s | master |
 | Agent preflight grace (`Preflight.Timeout`) | 30 s | master default |
 | Idempotency key | at most 128 characters of `[A-Za-z0-9._:-]` | API |
-| Task context size | 99,614,720 content bytes (`MAX_CONTEXT_SIZE`, existing) | harness constant, checked by the MCP |
+| Task context size | 99,614,720 bytes as the harness counts them (`MAX_CONTEXT_SIZE`, existing) | harness constant, checked by the MCP |
 | Minimum submission protocol | 1 for MCP 1.0, 2 for MCP 1.1 | MCP |
 
 ### What remains unverified
@@ -998,7 +999,7 @@ Each row is a required result. The owner is the PR that must prove it.
 | Multi-statement command after a failed prelude, for each source | `a; b`, `false \|\| b`, two lines, and `a & b; wait` exit with the prelude's status and run no user statement, under `sh -c` and `bash -lc`. | M3 |
 | Renderer shape | Exactly `<prelude> \|\| exit $?`, a newline, and the command; no `work_dir` in any config; `module:Class` rejected. | M3 |
 | `git` plan checks | Pinned SHA; `commit_not_on_ref`; partial clone rejected; `lfs_object_missing`; shell with `git` rejected. | M3 |
-| Context limits | 99,614,720 bytes pass and one more returns `context_too_large` with no create call; an escaping symlink returns `unsafe_symlink`; an unchanged tree renders the same digest. | M3 |
+| Context limits | A context counted at 99,614,718 bytes passes; one file of 99,614,719 bytes counts as 99,614,721 and returns `context_too_large` with no create call; an escaping symlink returns `unsafe_symlink`; an unchanged tree renders the same digest. | M3 |
 | Protocol gate | A master without `submission_protocol`, or below the minimum, is refused, whatever its release string. | M2 |
 | Observation tools | `compute_resources` returns only projected fields and `observed_at`; `storage_check` always states its viewpoint. | M3 |
 
