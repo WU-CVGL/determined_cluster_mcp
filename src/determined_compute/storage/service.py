@@ -1,9 +1,10 @@
-"""Safe local and SSH-backed access to profile-authorized shared storage."""
+"""Safe local and SSH-backed access to the shared storage that the policy maps."""
 
 from __future__ import annotations
 
 import os
 import posixpath
+import pwd
 import shlex
 import signal
 import subprocess
@@ -11,13 +12,16 @@ import threading
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
-from determined_compute.compute.profile import ComputeProfile, SharedMount
-from determined_compute.compute.models import ValidationError
+from determined_compute.policy import Mount, Policy, PolicyError
 from determined_compute.utils.secrets import default_secrets_path
 
 from .config import LocalMount, SSHConfig, StorageAccessConfig, StorageError, _within
 
 _OUTPUT_LIMIT = 16_384
+# A check answers for the account that runs it, not for the task's container user.
+_VIEWPOINT_NOTE = (
+    "Permissions are those of this user on this backend, not of the container user."
+)
 _SYNC_EXCLUDES = (
     ".git/",
     ".local/",
@@ -47,21 +51,22 @@ _SYNC_EXCLUDES = (
 
 
 class StorageService:
-    """Translate container paths through the compute profile, then access them safely."""
+    """Translate container paths through the policy's mount map, then access them safely."""
 
     def __init__(
         self,
-        profile: ComputeProfile,
+        policy: Policy,
         config: StorageAccessConfig,
         secrets_path: Optional[Path] = None,
     ) -> None:
-        self.profile = profile
+        self.policy = policy
+        self.mounts = policy.mounts
         self.config = config
         self.secrets_path = Path(secrets_path).expanduser() if secrets_path else None
         for mapping in config.local_mounts:
-            if not any(_within(mapping.host_path, mount.host_path) for mount in profile.mounts):
+            if not any(_within(mapping.host_path, mount.host_path) for mount in self.mounts.mounts):
                 raise StorageError(
-                    "local_mounts host_path is outside compute profile host roots",
+                    "local_mounts host_path is outside the policy's host roots",
                     code="invalid_storage_config",
                 )
         if config.mode == "ssh" and config.ssh is None:
@@ -86,7 +91,6 @@ class StorageService:
             else:
                 kind = "missing"
             return {
-                "backend": "local",
                 "path": path,
                 "host_path": host_path,
                 "local_path": str(target),
@@ -95,19 +99,34 @@ class StorageService:
                 "readable": exists and os.access(target, os.R_OK),
                 "writable": not read_only and exists and os.access(target, os.W_OK),
                 "read_only": read_only,
+                "viewpoint": {
+                    "backend": "local",
+                    "local_root": str(local.local_path),
+                    "user": _local_user(),
+                    "note": _VIEWPOINT_NOTE,
+                },
             }
         output = self._ssh_check(host_path)
+        user = output.pop("user")
         return {
-            "backend": "ssh",
             "path": path,
             "host_path": host_path,
-            "ssh_host": self._require_ssh().host,
             **output,
             "writable": not read_only and output["writable"],
             "read_only": read_only,
+            "viewpoint": {
+                "backend": "ssh",
+                "ssh_host": self._require_ssh().host,
+                "user": user,
+                "note": _VIEWPOINT_NOTE,
+            },
         }
 
-    def sync(self, local_dir: str, shared_dir: str, dry_run: bool = True) -> Dict[str, Any]:
+    def sync(
+        self, local_dir: str, shared_dir: str, dry_run: bool = True, overwrite: bool = False
+    ) -> Dict[str, Any]:
+        """Copy ``local_dir`` into ``shared_dir``; without ``overwrite`` existing files stay."""
+        self._check_overwrite(overwrite)
         mount, host_path = self._translate(shared_dir, "shared_dir")
         if self._read_only(shared_dir):
             raise StorageError("shared_dir is under a read-only shared mount", code="read_only_storage")
@@ -133,6 +152,7 @@ class StorageService:
                 dry_run,
                 excludes,
                 preserve_permissions=self.config.preserve_permissions,
+                overwrite=overwrite,
             )
             result = self._run(argv, timeout=self.config.timeout_seconds)
             return self._transfer_result(
@@ -146,9 +166,10 @@ class StorageService:
                 local_path=str(destination),
                 excludes=excludes,
                 preserve_permissions=self.config.preserve_permissions,
+                overwrite=overwrite,
             )
         destination = self._remote_spec(host_path)
-        result = self._run_remote_rsync(source, destination, dry_run, excludes)
+        result = self._run_remote_rsync(source, destination, dry_run, excludes, overwrite)
         return self._transfer_result(
             "sync",
             backend,
@@ -160,9 +181,14 @@ class StorageService:
             ssh_host=self._require_ssh().host,
             excludes=excludes,
             preserve_permissions=self.config.preserve_permissions,
+            overwrite=overwrite,
         )
 
-    def fetch(self, shared_dir: str, local_dir: str, dry_run: bool = True) -> Dict[str, Any]:
+    def fetch(
+        self, shared_dir: str, local_dir: str, dry_run: bool = True, overwrite: bool = False
+    ) -> Dict[str, Any]:
+        """Copy ``shared_dir`` into ``local_dir``; without ``overwrite`` existing files stay."""
+        self._check_overwrite(overwrite)
         mount, host_path = self._translate(shared_dir, "shared_dir")
         output = self._local_output_directory(local_dir, dry_run)
         backend, local = self._select_backend(host_path, mount)
@@ -177,6 +203,7 @@ class StorageService:
                 dry_run,
                 (),
                 preserve_permissions=self.config.preserve_permissions,
+                overwrite=overwrite,
             )
             result = self._run(argv, timeout=self.config.timeout_seconds)
             return self._transfer_result(
@@ -191,9 +218,10 @@ class StorageService:
                 local_output_path=str(output),
                 excludes=(),
                 preserve_permissions=self.config.preserve_permissions,
+                overwrite=overwrite,
             )
         source = self._remote_spec(host_path)
-        result = self._run_remote_rsync(source, output, dry_run, ())
+        result = self._run_remote_rsync(source, output, dry_run, (), overwrite)
         return self._transfer_result(
             "fetch",
             backend,
@@ -206,33 +234,33 @@ class StorageService:
             local_output_path=str(output),
             excludes=(),
             preserve_permissions=self.config.preserve_permissions,
+            overwrite=overwrite,
         )
 
-    def _translate(self, value: Any, field: str) -> Tuple[SharedMount, str]:
-        if not isinstance(value, str) or ".." in PurePosixPath(value).parts:
-            raise StorageError(f"{field} must be an absolute shared path without traversal", code="invalid_storage_path")
+    def _check_overwrite(self, overwrite: Any) -> None:
+        if not isinstance(overwrite, bool):
+            raise StorageError("overwrite must be a boolean", code="invalid_request")
         try:
-            container_path = self.profile.validate_container_path(value, field)
-        except (ValidationError, ValueError) as exc:
+            self.policy.check_overwrite(overwrite)
+        except PolicyError as exc:
+            raise StorageError(str(exc), code=exc.code) from exc
+
+    def _translate(self, value: Any, field: str) -> Tuple[Mount, str]:
+        try:
+            return self.mounts.to_host(value, field)
+        except PolicyError as exc:
             raise StorageError(str(exc), code="invalid_storage_path") from exc
-        for mount in self.profile.mounts:
-            if _within(container_path, mount.container_path):
-                relative = posixpath.relpath(container_path, mount.container_path)
-                host_path = mount.host_path if relative == "." else posixpath.join(mount.host_path, relative)
-                return mount, host_path
-        raise StorageError(f"{field} is outside configured shared roots", code="invalid_storage_path")
 
     def _read_only(self, container_path: str) -> bool:
         try:
-            self.profile.validate_writable_container_path(container_path, "path")
-        except (ValidationError, ValueError):
+            return self.mounts.read_only(container_path)
+        except PolicyError:
             return True
-        return False
 
     def _validate_local_write(self, path: Path) -> None:
         """Apply shared-mount policy when a download destination is a local shared view."""
         mappings = list(self.config.local_mounts)
-        for mount in self.profile.mounts:
+        for mount in self.mounts.mounts:
             local_root = Path(mount.host_path)
             if local_root != Path(local_root.anchor) and local_root.is_dir():
                 mappings.append(LocalMount(mount.host_path, local_root))
@@ -246,16 +274,16 @@ class StorageService:
             if len(root.parts) != specificity:
                 continue
             relative = path.relative_to(root).as_posix()
-            host_path = posixpath.join(mapping.host_path, relative)
-            try:
-                self.profile.validate_writable_host_path(host_path, "local_dir")
-            except (ValidationError, ValueError) as exc:
-                raise StorageError("local_dir maps to read-only shared storage", code="read_only_storage") from exc
+            host_path = posixpath.normpath(posixpath.join(mapping.host_path, relative))
+            if self.mounts.host_read_only(host_path):
+                raise StorageError(
+                    "local_dir maps to read-only shared storage", code="read_only_storage"
+                )
 
     def _select_backend(
-        self, host_path: str, profile_mount: SharedMount, *, write: bool = False
+        self, host_path: str, mount: Mount, *, write: bool = False
     ) -> Tuple[str, Optional[LocalMount]]:
-        local = self._local_mapping(host_path, profile_mount, write=write)
+        local = self._local_mapping(host_path, mount, write=write)
         if self.config.mode == "local":
             if local is None:
                 raise StorageError(
@@ -275,7 +303,7 @@ class StorageService:
         )
 
     def _local_mapping(
-        self, host_path: str, profile_mount: SharedMount, *, write: bool
+        self, host_path: str, mount: Mount, *, write: bool
     ) -> Optional[LocalMount]:
         access = os.R_OK | os.X_OK | (os.W_OK if write else 0)
         for mapping in self.config.local_mounts:
@@ -285,9 +313,9 @@ class StorageService:
                 and os.access(mapping.local_path, access)
             ):
                 return mapping
-        host_root = Path(profile_mount.host_path)
+        host_root = Path(mount.host_path)
         if host_root != Path(host_root.anchor) and host_root.is_dir() and os.access(host_root, access):
-            return LocalMount(host_path=profile_mount.host_path, local_path=host_root)
+            return LocalMount(host_path=mount.host_path, local_path=host_root)
         return None
 
     @staticmethod
@@ -377,10 +405,13 @@ class StorageService:
         excludes: Iterable[str],
         *,
         preserve_permissions: bool,
+        overwrite: bool,
     ) -> list[str]:
         argv = ["rsync", "-a", "--safe-links", "--mkpath", "--itemize-changes"]
         if not preserve_permissions:
             argv.extend(("--no-owner", "--no-group", "--no-perms", "--omit-dir-times"))
+        if not overwrite:
+            argv.append("--ignore-existing")
         if dry_run:
             argv.append("--dry-run")
         for pattern in excludes:
@@ -389,7 +420,12 @@ class StorageService:
         return argv
 
     def _run_remote_rsync(
-        self, source: Any, destination: Any, dry_run: bool, excludes: Iterable[str]
+        self,
+        source: Any,
+        destination: Any,
+        dry_run: bool,
+        excludes: Iterable[str],
+        overwrite: bool,
     ) -> Dict[str, Any]:
         ssh = self._require_ssh()
         from determined_compute.storage.auth import ssh_auth
@@ -408,6 +444,8 @@ class StorageService:
             ]
             if not self.config.preserve_permissions:
                 argv.extend(("--no-owner", "--no-group", "--no-perms", "--omit-dir-times"))
+            if not overwrite:
+                argv.append("--ignore-existing")
             if dry_run:
                 argv.append("--dry-run")
             for pattern in excludes:
@@ -436,7 +474,9 @@ class StorageService:
             'elif [ -f "$1" ]; then t=file; elif [ "$e" = 1 ]; then t=other; else t=missing; fi; '
             'if [ "$e" = 1 ] && [ -r "$1" ]; then r=1; else r=0; fi; '
             'if [ "$e" = 1 ] && [ -w "$1" ]; then w=1; else w=0; fi; '
-            'printf "exists=%s\\ntype=%s\\nreadable=%s\\nwritable=%s\\n" "$e" "$t" "$r" "$w"'
+            'u=$(id -un 2>/dev/null) || u=; '
+            'printf "exists=%s\\ntype=%s\\nreadable=%s\\nwritable=%s\\nuser=%s\\n" '
+            '"$e" "$t" "$r" "$w" "$u"'
         )
         remote_command = "sh -c " + shlex.quote(script) + " sh " + shlex.quote(host_path)
         with ssh_auth(ssh, self.secrets_path) as (env_overrides, auth_options):
@@ -454,13 +494,14 @@ class StorageService:
             if "=" in line:
                 key, value = line.split("=", 1)
                 parsed[key] = value
-        if set(parsed) != {"exists", "type", "readable", "writable"}:
+        if set(parsed) != {"exists", "type", "readable", "writable", "user"}:
             raise StorageError("SSH storage check returned an invalid response", code="storage_check_failed")
         return {
             "exists": parsed["exists"] == "1",
             "type": parsed["type"],
             "readable": parsed["readable"] == "1",
             "writable": parsed["writable"] == "1",
+            "user": _user_name(parsed["user"]),
         }
 
     @staticmethod
@@ -560,6 +601,18 @@ class StorageService:
                 code="storage_operation_failed",
             )
         return {"output": "".join(chunks["stdout"]), "truncated": was_truncated["stdout"]}
+
+
+def _user_name(value: str) -> Optional[str]:
+    return value if value and len(value) <= 256 and value.isprintable() else None
+
+
+def _local_user() -> Optional[str]:
+    uid = os.geteuid()
+    try:
+        return _user_name(pwd.getpwuid(uid).pw_name)
+    except KeyError:
+        return str(uid)
 
 
 def _directory_contents(value: Any) -> str:

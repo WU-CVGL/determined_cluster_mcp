@@ -1,4 +1,4 @@
-"""Safe access to profile-authorized shared storage."""
+"""Safe access to the shared storage that the policy maps."""
 
 from .config import LocalMount, SSHConfig, StorageAccessConfig, StorageError
 from .auth import SSHAuthError, ssh_auth

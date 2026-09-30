@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import pwd
 import shutil
 import sys
 import time
@@ -7,15 +9,17 @@ from pathlib import Path
 
 import pytest
 
-from determined_compute.compute import ComputeProfile
+from determined_compute.policy import Policy
 from determined_compute.storage import StorageAccessConfig, StorageError, StorageService
+from determined_compute.storage import service as storage_module
 
 
-def profile(host_root: str = "/cluster/shared") -> ComputeProfile:
-    return ComputeProfile.from_dict(
+def profile(host_root: str = "/cluster/shared", allow_overwrite: bool = False) -> Policy:
+    return Policy.from_dict(
         {
             "mounts": [{"host_path": host_root, "container_path": "/work"}],
             "defaults": {"image": "image", "pool": "pool", "slots": 1},
+            "allow_overwrite": allow_overwrite,
         }
     )
 
@@ -69,16 +73,16 @@ def test_storage_config_defaults_and_strict_validation(tmp_path):
         StorageAccessConfig.from_dict({"preserve_permissions": "false"})
 
 
-def test_check_translates_container_to_host_then_explicit_local_path(tmp_path):
+def test_check_translates_container_to_host_then_explicit_local_path(tmp_path, monkeypatch):
     local_root = tmp_path / "client-mount"
     target = local_root / "runs" / "one"
     target.mkdir(parents=True)
     service = StorageService(profile(), local_config(local_root))
 
+    monkeypatch.setattr(storage_module, "_local_user", lambda: "alice")
     result = service.check("/work/runs/one")
 
     assert result == {
-        "backend": "local",
         "path": "/work/runs/one",
         "host_path": "/cluster/shared/runs/one",
         "local_path": str(target),
@@ -87,7 +91,24 @@ def test_check_translates_container_to_host_then_explicit_local_path(tmp_path):
         "readable": True,
         "writable": True,
         "read_only": False,
+        "viewpoint": {
+            "backend": "local",
+            "local_root": str(local_root),
+            "user": "alice",
+            "note": storage_module._VIEWPOINT_NOTE,
+        },
     }
+
+
+def test_local_viewpoint_names_the_effective_user_and_never_credentials(tmp_path):
+    local_root = tmp_path / "client-mount"
+    local_root.mkdir()
+    service = StorageService(profile(), local_config(local_root), secrets_path=tmp_path / "s.env")
+
+    viewpoint = service.check("/work")["viewpoint"]
+
+    assert viewpoint["user"] == pwd.getpwuid(os.geteuid()).pw_name
+    assert set(viewpoint) == {"backend", "local_root", "user", "note"}
 
 
 def test_auto_uses_same_host_path_only_when_root_exists(tmp_path):
@@ -95,7 +116,7 @@ def test_auto_uses_same_host_path_only_when_root_exists(tmp_path):
     root.mkdir()
     service = StorageService(profile(str(root)), StorageAccessConfig())
     result = service.check("/work/missing")
-    assert result["backend"] == "local"
+    assert result["viewpoint"]["backend"] == "local"
     assert result["exists"] is False
     assert result["local_path"] == str(root / "missing")
 
@@ -153,6 +174,64 @@ def test_sync_builds_safe_local_rsync_and_excludes_nonstandard_secret(tmp_path, 
     assert result["local_path"] == str(local_root / "tasks" / "task-1")
     assert result["excludes"][-1] == "/operator-creds.txt"
     assert result["truncated"] is False
+    assert "--ignore-existing" in argv
+    assert result["overwrite"] is False
+
+
+@pytest.mark.parametrize("operation", ["sync", "fetch"])
+def test_overwrite_needs_the_policy_and_drops_ignore_existing(tmp_path, monkeypatch, operation):
+    source = tmp_path / "source"
+    source.mkdir()
+    local_root = tmp_path / "client-mount"
+    (local_root / "task").mkdir(parents=True)
+
+    def transfer(service, **kwargs):
+        if operation == "sync":
+            return service.sync(str(source), "/work/task", dry_run=True, **kwargs)
+        return service.fetch("/work/task", str(tmp_path / "download"), dry_run=True, **kwargs)
+
+    denied = StorageService(profile(), local_config(local_root))
+    monkeypatch.setattr(denied, "_run", lambda *a, **k: pytest.fail("transport called"))
+    with pytest.raises(StorageError) as caught:
+        transfer(denied, overwrite=True)
+    assert caught.value.code == "overwrite_not_allowed"
+    with pytest.raises(StorageError) as caught:
+        transfer(denied, overwrite="yes")
+    assert caught.value.code == "invalid_request"
+
+    allowed = StorageService(profile(allow_overwrite=True), local_config(local_root))
+    calls = []
+    monkeypatch.setattr(
+        allowed, "_run", lambda argv, **k: calls.append(argv) or {"output": "", "truncated": False}
+    )
+    assert transfer(allowed, overwrite=True)["overwrite"] is True
+    assert "--ignore-existing" not in calls[-1]
+    assert transfer(allowed)["overwrite"] is False
+    assert "--ignore-existing" in calls[-1]
+
+
+@pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync is not installed")
+def test_real_sync_keeps_existing_files_unless_overwrite(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    # Sizes differ, so rsync's size-and-time check cannot skip the file by itself.
+    (source / "result.txt").write_text("new result", encoding="utf-8")
+    (source / "added.txt").write_text("added", encoding="utf-8")
+    local_root = tmp_path / "client-mount"
+    shared = local_root / "task"
+    shared.mkdir(parents=True)
+    (shared / "result.txt").write_text("old", encoding="utf-8")
+
+    StorageService(profile(), local_config(local_root)).sync(
+        str(source), "/work/task", dry_run=False
+    )
+    assert (shared / "result.txt").read_text(encoding="utf-8") == "old"
+    assert (shared / "added.txt").read_text(encoding="utf-8") == "added"
+
+    StorageService(profile(allow_overwrite=True), local_config(local_root)).sync(
+        str(source), "/work/task", dry_run=False, overwrite=True
+    )
+    assert (shared / "result.txt").read_text(encoding="utf-8") == "new result"
 
 
 def test_sync_excludes_credentials_at_any_depth_and_escapes_secret_filter(tmp_path, monkeypatch):
@@ -348,7 +427,7 @@ def test_ssh_check_uses_fixed_quoted_script_and_no_shell(tmp_path, monkeypatch):
     def run(argv, **kwargs):
         calls.append((argv, kwargs))
         return {
-            "output": "exists=1\ntype=directory\nreadable=1\nwritable=0\n",
+            "output": "exists=1\ntype=directory\nreadable=1\nwritable=0\nuser=alice\n",
             "truncated": False,
         }
 
@@ -362,9 +441,43 @@ def test_ssh_check_uses_fixed_quoted_script_and_no_shell(tmp_path, monkeypatch):
     assert argv[-1].startswith("sh -c ")
     assert "a path" in argv[-1]
     assert set(kwargs["env_overrides"]) <= {"SSH_AUTH_SOCK"}
-    assert result["backend"] == "ssh"
-    assert result["ssh_host"] == "storage.example"
+    assert "id -un" in argv[-1]
+    assert result["viewpoint"] == {
+        "backend": "ssh",
+        "ssh_host": "storage.example",
+        "user": "alice",
+        "note": storage_module._VIEWPOINT_NOTE,
+    }
     assert result["writable"] is False
+    assert "user" not in result
+
+
+@pytest.mark.parametrize(
+    ("output", "user"),
+    [
+        ("exists=0\ntype=missing\nreadable=0\nwritable=0\nuser=\n", None),
+        ("exists=0\ntype=missing\nreadable=0\nwritable=0\nuser=bob\x1b[0m\n", None),
+    ],
+)
+def test_ssh_viewpoint_user_is_unknown_when_the_host_cannot_name_it(monkeypatch, output, user):
+    config = StorageAccessConfig.from_dict({"mode": "ssh", "ssh": {"host": "storage.example"}})
+    service = StorageService(profile(), config)
+    monkeypatch.setattr(service, "_run", lambda argv, **kwargs: {"output": output})
+
+    assert service.check("/work/x")["viewpoint"]["user"] is user
+
+
+def test_ssh_check_rejects_a_response_without_the_user_line(monkeypatch):
+    config = StorageAccessConfig.from_dict({"mode": "ssh", "ssh": {"host": "storage.example"}})
+    service = StorageService(profile(), config)
+    monkeypatch.setattr(
+        service,
+        "_run",
+        lambda argv, **kwargs: {"output": "exists=1\ntype=file\nreadable=1\nwritable=1\n"},
+    )
+    with pytest.raises(StorageError) as caught:
+        service.check("/work/x")
+    assert caught.value.code == "storage_check_failed"
 
 
 def test_remote_rsync_uses_secluded_args_and_safe_links(tmp_path, monkeypatch):
@@ -398,6 +511,7 @@ def test_remote_rsync_uses_secluded_args_and_safe_links(tmp_path, monkeypatch):
     assert argv[-1] == "storage.example:/cluster/shared/task one/"
     assert "--delete" not in argv
     assert "--copy-links" not in argv
+    assert "--ignore-existing" in argv
     for option in ("--no-owner", "--no-group", "--no-perms", "--omit-dir-times"):
         assert option in argv
     assert result["ssh_host"] == "storage.example"
@@ -456,9 +570,3 @@ def test_subprocess_reader_cleanup_is_bounded_when_grandchild_keeps_pipe_open():
     assert time.monotonic() - started < 3
     assert "parent complete" in result["output"]
 
-
-def test_config_is_separate_from_compute_profile_fingerprint(tmp_path):
-    compute_profile = profile()
-    before = compute_profile.fingerprint
-    StorageService(compute_profile, local_config(tmp_path))
-    assert compute_profile.fingerprint == before

@@ -300,10 +300,20 @@ def _runtime(args: argparse.Namespace) -> tuple[Any, str]:
 
     service = ComputeService(_LazyClient(make_client), store, profile)
 
+    from determined_compute.policy import Mount, MountMap, Policy
     from determined_compute.storage import StorageAccessConfig, StorageService
     access_path = args.storage_config or os.environ.get("DETERMINED_COMPUTE_STORAGE")
     access = StorageAccessConfig.from_file(access_path) if access_path else StorageAccessConfig()
-    storage = StorageService(profile, access, Path(args.secrets_file).expanduser() if args.secrets_file else None)
+    # Storage reads the policy's mount map; the profile keeps serving the rest until the cutover.
+    mounts = tuple(Mount(m.host_path, m.container_path, m.read_only) for m in profile.mounts)
+    policy = Policy(
+        mounts=MountMap(mounts),
+        image=profile.default_image,
+        pool=profile.default_pool,
+        slots=profile.default_slots,
+    )
+    secrets_path = Path(args.secrets_file).expanduser() if args.secrets_file else None
+    storage = StorageService(policy, access, secrets_path)
 
     from determined_compute.compute.admission import ResourceInspector
     return create_server(service, owner, storage, ResourceInspector(service.client)), owner

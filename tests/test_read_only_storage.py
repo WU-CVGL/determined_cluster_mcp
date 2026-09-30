@@ -3,7 +3,16 @@ from pathlib import Path
 import pytest
 
 from determined_compute.compute import ComputeProfile, ComputeService, SQLiteTaskStore, ValidationError
+from determined_compute.policy import Policy
 from determined_compute.storage import StorageAccessConfig, StorageError, StorageService
+
+
+def policy_of(profile):
+    mounts = [
+        {'host_path': m.host_path, 'container_path': m.container_path, 'read_only': m.read_only}
+        for m in profile.mounts
+    ]
+    return Policy.from_dict({'mounts': mounts, 'defaults': {'image': 'example', 'pool': 'example'}})
 
 
 @pytest.fixture
@@ -27,7 +36,7 @@ def test_readonly_upload_rejected_before_transport(setup, tmp_path, monkeypatch,
     profile, _, data = setup
     source = tmp_path / 'source'; source.mkdir()
     config = StorageAccessConfig.from_dict({'mode': mode, 'ssh': {'host': 'example-login'}})
-    storage = StorageService(profile, config)
+    storage = StorageService(policy_of(profile), config)
     monkeypatch.setattr(storage, '_run', lambda *a, **kw: pytest.fail('transport called'))
     with pytest.raises(StorageError) as error:
         storage.sync(str(source), '/data/new', dry_run)
@@ -37,7 +46,7 @@ def test_readonly_upload_rejected_before_transport(setup, tmp_path, monkeypatch,
 
 def test_readonly_check_is_policy_aware_and_fetch_allowed(setup, tmp_path):
     profile, _, data = setup
-    storage = StorageService(profile, StorageAccessConfig())
+    storage = StorageService(policy_of(profile), StorageAccessConfig())
     result = storage.check('/data')
     assert result['read_only'] is True
     assert result['writable'] is False
@@ -49,7 +58,7 @@ def test_readonly_check_is_policy_aware_and_fetch_allowed(setup, tmp_path):
 
 def test_shared_aliases_do_not_bypass_readonly_policy(setup, tmp_path):
     profile, shared, data = setup
-    storage = StorageService(profile, StorageAccessConfig())
+    storage = StorageService(policy_of(profile), StorageAccessConfig())
     source = tmp_path / 'source'; source.mkdir()
     assert storage.check('/work/data')['read_only'] is True
     with pytest.raises(StorageError, match='read-only'):
@@ -141,14 +150,14 @@ def test_fetch_cannot_write_through_readonly_subdirectory_mapping(tmp_path, exis
     target = mapped / 'download'
     if existing:
         target.mkdir()
-    profile = ComputeProfile.from_dict({
+    policy = Policy.from_dict({
         'mounts': [{'host_path': '/cluster', 'container_path': '/data', 'read_only': True}],
         'defaults': {'image': 'example', 'pool': 'example'},
     })
     access = StorageAccessConfig.from_dict({'local_mounts': [
         {'host_path': '/cluster/shared', 'local_path': str(mapped)},
     ]})
-    storage = StorageService(profile, access)
+    storage = StorageService(policy, access)
     with pytest.raises(StorageError) as error:
         storage.fetch('/data/shared', str(target), dry_run=False)
     assert error.value.code == 'read_only_storage'

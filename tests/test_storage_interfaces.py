@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from determined_compute.compute import ComputeProfile, ComputeService, SQLiteTaskStore
+from determined_compute.policy import Policy
 from determined_compute.storage import StorageAccessConfig, StorageService
 
 
@@ -26,7 +27,13 @@ def test_real_mcp_storage_preview_and_copy_round_trip(tmp_path):
     fetched = tmp_path / 'fetched'
     store = SQLiteTaskStore(':memory:')
     service = ComputeService(None, store, profile)
-    storage = StorageService(profile, StorageAccessConfig())
+    storage = StorageService(
+        Policy.from_dict({
+            'mounts': [{'host_path': str(shared), 'container_path': '/shared'}],
+            'defaults': {'image': 'example', 'pool': 'example'},
+        }),
+        StorageAccessConfig(),
+    )
     async def exercise():
         async with Client(create_server(service, 'fixture', storage_service=storage)) as client:
             tools = {tool.name: tool for tool in (await client.list_tools()).tools}
