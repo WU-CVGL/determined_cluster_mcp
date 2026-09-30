@@ -126,7 +126,7 @@ def test_the_table_has_the_eleven_tools_with_their_hints_and_defaults():
 def test_the_server_names_its_version_and_instructions():
     server = create_server(make_tools())
 
-    assert server.version == __version__
+    assert server.version == __version__ == "1.0.0"
     assert "compute_plan" in INSTRUCTIONS and "request_digest" in INSTRUCTIONS
     assert "allow_queue" not in INSTRUCTIONS and "task_id" not in INSTRUCTIONS
 

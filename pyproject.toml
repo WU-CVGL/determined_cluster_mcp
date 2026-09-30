@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "determined-compute"
-version = "0.6.0"
-description = "Persistent shared-storage compute service and MCP tools for Determined"
+version = "1.0.0"
+description = "MCP tools that plan, launch and observe Determined jobs on shared storage"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
