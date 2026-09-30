@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -11,10 +12,12 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
-from determined_compute import spec
+from determined_compute import code, spec
 from determined_compute.code import plan_context
+from determined_compute.policy import Resources
 from determined_compute.spec import (
     ContextCode,
     GitCode,
@@ -134,8 +137,8 @@ def test_resources_env_and_placement_fields() -> None:
         slots=0,
         env={"WANDB_PROJECT": "demo", "_EMPTY": ""},
         workspace="research",
-        project="baselines",
     )
+    experiment = build(**experiment_fields(workspace="research", project="baselines"))
 
     assert task.slots == 0
     assert task.env == {"WANDB_PROJECT": "demo", "_EMPTY": ""}
@@ -143,8 +146,9 @@ def test_resources_env_and_placement_fields() -> None:
         "registry.example/train:1",
         "gpu",
         "research",
-        "baselines",
+        None,
     )
+    assert (experiment.workspace, experiment.project) == ("research", "baselines")
 
 
 @pytest.mark.parametrize("kind", ["command", "experiment"])
@@ -342,6 +346,17 @@ INVALID = [
     (experiment_fields(experiment={"resources": "gpu"}), "resources must be an object"),
     (experiment_fields(experiment={"environment": []}), "environment must be an object"),
     (experiment_fields(experiment={"searcher": {"metric": "loss"}}), "searcher.name is required"),
+    (experiment_fields(experiment={"name": "x"}), "name duplicates the top-level name"),
+    (
+        experiment_fields(experiment={"workspace": "w", "project": "p"}),
+        "workspace duplicates the top-level workspace",
+    ),
+    (experiment_fields(experiment={"project": "p"}), "project duplicates the top-level project"),
+    (experiment_fields(workspace="w"), "sets workspace and project together"),
+    (experiment_fields(project="p"), "sets workspace and project together"),
+    # Workspaces and projects.
+    ({"project": "p"}, "a command runs in a workspace and has no project"),
+    (shell_fields(workspace="w", project="p"), "a shell runs in a workspace and has no project"),
 ]
 for _limit in (DROP, 0, True, "2", None, 1.5):
     _search = {key: value for key, value in SEARCH.items() if key != "max_concurrent_trials"}
@@ -1534,3 +1549,240 @@ def test_a_validated_anchored_exclude_drops_only_the_top_level_directory(tmp_pat
 
     assert "src/pkg/data/x.json" in paths
     assert "data/a.txt" not in paths
+
+
+# Compiler
+
+RESOURCES = Resources(image="registry.example/train:1", pool="gpu", slots=2)
+GIT_PLAN = code.GitCode(repo="/shared/app", commit=SHA, uses_lfs=False, content_digest=SHA)
+CONTEXT_FILES = (
+    {
+        "path": "train.py",
+        "type": 48,
+        "content": "cHJpbnQoKQo=",
+        "mtime": "0",
+        "mode": 420,
+        "uid": 0,
+        "gid": 0,
+    },
+)
+
+
+def context_plan(**fields: Any) -> code.ContextCode:
+    values: Dict[str, Any] = {
+        "repo": "/local/app",
+        "commit": SHA,
+        "dirty": False,
+        "files": CONTEXT_FILES,
+        "manifest": (),
+        "content_digest": "d" * 64,
+        "size": 6,
+        "included": (),
+        "excluded": (),
+        "skipped": (),
+    }
+    values.update(fields)
+    return code.ContextCode(**values)
+
+
+def env_list(*names: str, **values: str) -> list:
+    return [f"{name}={values[name]}" for name in names]
+
+
+def test_command_compiles_to_bash_with_the_prelude() -> None:
+    task = build(
+        code={"source": "git", "repo": "/shared/app"},
+        workdir="src",
+        env={"B": "2", "A": "1"},
+    )
+
+    request = spec.compile_request(task, GIT_PLAN, RESOURCES, workspace_id=7)
+
+    prelude = render_prelude(
+        "git", output_dir="/shared/out", location="/shared/app", commit=SHA, workdir="src"
+    )
+    assert request == spec.CreateRequest(
+        kind="command",
+        config={
+            "description": "train",
+            "resources": {"resource_pool": "gpu", "slots": 2},
+            "environment": {
+                "image": "registry.example/train:1",
+                "environment_variables": [
+                    "A=1",
+                    "B=2",
+                    "COMPUTE_CODE_SOURCE=git",
+                    "COMPUTE_CODE_ROOT=/run/determined/code",
+                    f"COMPUTE_CODE_COMMIT={SHA}",
+                    "COMPUTE_OUTPUT_DIR=/shared/out",
+                ],
+            },
+            "entrypoint": ["/bin/bash", "-lc", render_entrypoint(prelude, "python train.py")],
+        },
+        files=(),
+        workspace_id=7,
+    )
+
+
+def test_git_lfs_reaches_the_prelude() -> None:
+    task = build(code={"source": "git", "repo": "/shared/app"})
+    lfs = code.GitCode(repo="/shared/app", commit=SHA, uses_lfs=True, content_digest=SHA)
+
+    entrypoint = spec.compile_request(task, lfs, RESOURCES).config["entrypoint"][2]
+
+    assert "GIT_LFS_SKIP_SMUDGE=0" in entrypoint
+
+
+def test_shells_carry_code_but_no_entrypoint() -> None:
+    context = build(**shell_fields(code={"source": "context", "repo": "/local/app"}))
+    path = build(**shell_fields(code=PATH_CODE))
+
+    packed = spec.compile_request(context, context_plan(), RESOURCES)
+    in_place = spec.compile_request(path, code.PathCode(dir="/shared/app"), RESOURCES)
+
+    assert packed.files == CONTEXT_FILES
+    assert "entrypoint" not in packed.config and "entrypoint" not in in_place.config
+    assert packed.config["environment"]["environment_variables"] == [
+        "COMPUTE_CODE_SOURCE=context",
+        "COMPUTE_CODE_ROOT=/run/determined/workdir",
+        f"COMPUTE_CODE_COMMIT={SHA}",
+    ]
+    assert in_place.files == ()
+    assert in_place.config["environment"]["environment_variables"] == [
+        "COMPUTE_CODE_SOURCE=path",
+        "COMPUTE_CODE_ROOT=/shared/app",
+    ]
+
+
+def test_experiment_merges_its_config_and_sends_the_model_definition() -> None:
+    settings = {
+        "searcher": dict(SEARCH),
+        "resources": {"max_slots": 4, "priority": 10},
+        "environment": {"force_pull_image": True},
+        "checkpoint_storage": {"type": "shared_fs", "storage_path": "runs/a"},
+    }
+    task = build(
+        **experiment_fields(
+            code={"source": "context", "repo": "/local/app"},
+            experiment=settings,
+            env={"WANDB_PROJECT": "demo"},
+            workspace="research",
+            project="baselines",
+        )
+    )
+    before = json.dumps(task.experiment, sort_keys=True)
+
+    request = spec.compile_request(task, context_plan(), RESOURCES)
+
+    prelude = render_prelude("context", output_dir="/shared/out", commit=SHA)
+    assert request.kind == "experiment" and request.workspace_id is None
+    assert request.files == CONTEXT_FILES
+    assert request.config == {
+        "searcher": SEARCH,
+        "resources": {"max_slots": 4, "priority": 10, "resource_pool": "gpu", "slots_per_trial": 2},
+        "environment": {
+            "force_pull_image": True,
+            "image": "registry.example/train:1",
+            "environment_variables": [
+                "WANDB_PROJECT=demo",
+                "COMPUTE_CODE_SOURCE=context",
+                "COMPUTE_CODE_ROOT=/run/determined/workdir",
+                f"COMPUTE_CODE_COMMIT={SHA}",
+                "COMPUTE_OUTPUT_DIR=/shared/out",
+            ],
+        },
+        "checkpoint_storage": {"type": "shared_fs", "storage_path": "runs/a"},
+        "name": "train",
+        "entrypoint": render_entrypoint(prelude, "python train.py"),
+        "workspace": "research",
+        "project": "baselines",
+    }
+    # The spec is untouched, and the config is plain enough to send as YAML.
+    assert json.dumps(task.experiment, sort_keys=True) == before
+    assert yaml.safe_load(yaml.safe_dump(request.config)) == request.config
+
+
+def test_experiment_sections_may_be_null() -> None:
+    task = build(**experiment_fields(experiment={"resources": None, "environment": None}))
+
+    config = spec.compile_request(task, None, RESOURCES).config
+
+    assert config["resources"] == {"resource_pool": "gpu", "slots_per_trial": 2}
+    assert config["environment"]["image"] == "registry.example/train:1"
+    assert "workspace" not in config and "project" not in config
+
+
+def test_an_experiment_takes_no_workspace_id() -> None:
+    with pytest.raises(ValueError, match="names its workspace in the config"):
+        spec.compile_request(build(**experiment_fields()), None, RESOURCES, workspace_id=3)
+
+
+@pytest.mark.parametrize(
+    "kind, source",
+    [
+        (kind, source)
+        for kind in ("command", "shell", "experiment")
+        for source in (None, "git", "context", "path")
+        if (kind, source) != ("shell", "git")
+    ],
+)
+def test_no_config_carries_work_dir_or_bind_mounts(kind: str, source: Optional[str]) -> None:
+    specs = {
+        None: (None, None),
+        "git": ({"source": "git", "repo": "/shared/app"}, GIT_PLAN),
+        "context": ({"source": "context", "repo": "/local/app"}, context_plan()),
+        "path": (PATH_CODE, code.PathCode(dir="/shared/app")),
+    }
+    fields, planned = specs[source]
+    extra = {"code": fields} if fields else {}
+    task = build(**(shell_fields(**extra) if kind == "shell" else {"kind": kind, **extra}))
+
+    config = spec.compile_request(task, planned, RESOURCES).config
+
+    assert "work_dir" not in json.dumps(config)
+    assert "bind_mounts" not in config
+    if kind != "shell":
+        entrypoint = config["entrypoint"] if kind == "experiment" else config["entrypoint"][2]
+        assert entrypoint.endswith(" || exit $?\npython train.py")
+
+
+def test_the_request_is_deterministic() -> None:
+    first = build(env={"A": "1", "B": "2"}, code=PATH_CODE)
+    second = build(env={"B": "2", "A": "1"}, code=PATH_CODE)
+    planned = code.PathCode(dir="/shared/app")
+
+    assert spec.compile_request(first, planned, RESOURCES) == spec.compile_request(
+        second, planned, RESOURCES
+    )
+
+
+def test_the_planned_code_must_match_the_spec() -> None:
+    with pytest.raises(ValueError, match="the planned code is None, but the spec's is git"):
+        spec.compile_request(build(code={"source": "git", "repo": "/a"}), None, RESOURCES)
+    with pytest.raises(ValueError, match="the planned code is git, but the spec's is None"):
+        spec.resolve(build(), GIT_PLAN, RESOURCES)
+
+
+def test_concurrent_trials() -> None:
+    assert spec.concurrent_trials(build()) == 1
+    assert spec.concurrent_trials(build(**experiment_fields())) == 1
+    single = {"searcher": {"name": "single", "metric": "loss"}}
+    assert spec.concurrent_trials(build(**experiment_fields(experiment=single))) == 1
+    search = {"searcher": SEARCH}
+    assert spec.concurrent_trials(build(**experiment_fields(experiment=search))) == 2
+
+
+def test_resolve_pins_the_revision_and_fills_the_resources() -> None:
+    git = build(code={"source": "git", "repo": "/shared/app", "revision": "main"})
+    context = build(**shell_fields(code={"source": "context", "repo": "/local/app"}))
+    path = build(code=PATH_CODE, slots=0)
+
+    pinned = spec.resolve(git, GIT_PLAN, RESOURCES)
+    packed = spec.resolve(context, context_plan(), RESOURCES)
+    in_place = spec.resolve(path, code.PathCode(dir="/shared/app"), RESOURCES)
+
+    assert pinned.code.revision == SHA and packed.code.revision == SHA
+    assert (pinned.image, pinned.pool, pinned.slots) == ("registry.example/train:1", "gpu", 2)
+    assert in_place.code == path.code
+    # The resolved spec round-trips through JSON as a tool argument.
+    assert TaskSpec.model_validate(json.loads(pinned.model_dump_json())) == pinned

@@ -1,4 +1,4 @@
-"""Typed task specification and the code prelude rendered before every command.
+"""Typed task specification, its compiler into a create request, and the code prelude.
 
 Commands run under ``bash -lc`` and experiment entrypoints under ``sh -c``, so the
 rendered text is POSIX sh with one shape for every code source::
@@ -13,12 +13,14 @@ one subshell in that list, so what it changes to isolate git never reaches the c
 
 from __future__ import annotations
 
+import json
 import os
 import posixpath
 import re
 import shlex
 import unicodedata
-from typing import Annotated, Any, Dict, List, Literal, Mapping, Optional, Union
+from dataclasses import dataclass
+from typing import Annotated, Any, Dict, List, Literal, Mapping, Optional, Tuple, Union
 
 from pydantic import (
     AfterValidator,
@@ -30,6 +32,9 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+from determined_compute import code as code_plan
+from determined_compute.policy import Resources
 
 CodeSource = Literal["git", "context", "path"]
 
@@ -246,11 +251,15 @@ _EXPERIMENT_DUPLICATES = {
     ("environment", "image"): "image",
     ("environment", "environment_variables"): "env",
 }
+_EXPERIMENT_TOP_LEVEL = ("name", "workspace", "project")
 
 
 def _check_experiment(config: Mapping[str, Any]) -> None:
     if "entrypoint" in config:
         raise ValueError("entrypoint is rendered from command; set command instead")
+    for key in _EXPERIMENT_TOP_LEVEL:
+        if key in config:
+            raise ValueError(f"{key} duplicates the top-level {key}; set {key} instead")
     if "bind_mounts" in config:
         raise ValueError("bind_mounts is not allowed; the administrator mounts every bind source")
     for (section, key), field in _EXPERIMENT_DUPLICATES.items():
@@ -306,9 +315,9 @@ class TaskSpec(_Model):
     The MCP types only its own fields. ``experiment`` may not set what the MCP renders or never
     allows, including the settings of ``pool``, ``slots``, ``image`` and ``env``, so the
     compiled request is unambiguous; Determined validates the rest of the experiment config
-    through ``dry_run``, and the MCP does not vendor the expconf schemas. How ``name``,
-    ``workspace`` and ``project`` are rendered, and the pool policy, apply when the spec is wired
-    to the master. ``frozen`` only makes an instance immutable; it is not a persisted plan.
+    through ``dry_run``, and the MCP does not vendor the expconf schemas. ``workspace`` and
+    ``project`` are names; a command or shell has only a workspace. ``frozen`` only makes an
+    instance immutable; it is not a persisted plan.
     """
 
     kind: Literal["command", "shell", "experiment"]
@@ -358,8 +367,15 @@ class TaskSpec(_Model):
                     "a legacy 'module:Class' entrypoint is not supported; "
                     "launch the trial with a command"
                 )
-        elif self.experiment is not None:
-            raise ValueError("experiment applies only to kind experiment")
+            # The master finds a project by its name within the workspace, and refuses one
+            # without the other.
+            if (self.workspace is None) != (self.project is None):
+                raise ValueError("an experiment sets workspace and project together")
+        else:
+            if self.experiment is not None:
+                raise ValueError("experiment applies only to kind experiment")
+            if self.project is not None:
+                raise ValueError(f"a {self.kind} runs in a workspace and has no project")
         return self
 
 
@@ -495,3 +511,127 @@ def code_environment(
         "COMPUTE_CODE_ROOT": GIT_CODE_ROOT if source == "git" else CODE_ROOT,
         "COMPUTE_CODE_COMMIT": _full_sha(commit, source),
     }
+
+
+# Compiler
+
+PlannedCode = Union[code_plan.GitCode, code_plan.ContextCode, code_plan.PathCode, None]
+_BASH = ("/bin/bash", "-lc")
+
+
+@dataclass(frozen=True)
+class CreateRequest:
+    """One create request. ``files`` is the task context, or an experiment's model definition."""
+
+    kind: str
+    config: Dict[str, Any]
+    files: Tuple[Dict[str, Any], ...] = ()
+    workspace_id: Optional[int] = None
+
+
+def concurrent_trials(spec: TaskSpec) -> int:
+    """How many trials may hold slots at once; the policy bounds slots times this."""
+
+    searcher = (spec.experiment or {}).get("searcher") or {}
+    if spec.kind != "experiment" or searcher.get("name") in (None, "single"):
+        return 1
+    # TaskSpec requires a positive integer for every search.
+    return int(searcher["max_concurrent_trials"])
+
+
+def resolve(spec: TaskSpec, planned: PlannedCode, resources: Resources) -> TaskSpec:
+    """The spec as planned: its revision pinned to the commit and its resources explicit.
+
+    Launching this spec compiles the planned request again, even after the policy defaults or
+    the branch the revision named have moved.
+    """
+
+    _check_planned(spec, planned)
+    fields = spec.model_dump()
+    fields.update(image=resources.image, pool=resources.pool, slots=resources.slots)
+    if isinstance(planned, (code_plan.GitCode, code_plan.ContextCode)):
+        fields["code"]["revision"] = planned.commit
+    return TaskSpec.model_validate(fields)
+
+
+def compile_request(
+    spec: TaskSpec,
+    planned: PlannedCode,
+    resources: Resources,
+    *,
+    workspace_id: Optional[int] = None,
+) -> CreateRequest:
+    """Render ``spec`` into the one create request of its kind.
+
+    ``planned`` is the code as ``code.py`` planned it, and ``resources`` the policy's answer.
+    Nothing here reads a file or calls the master, and the result is deterministic, so an
+    unchanged spec always yields the same request digest. No config ever carries ``work_dir``
+    or ``bind_mounts``: the prelude enters the workdir and the administrator mounts storage.
+    """
+
+    _check_planned(spec, planned)
+    source: Optional[CodeSource] = None
+    location = commit = None
+    uses_lfs = False
+    files: Tuple[Dict[str, Any], ...] = ()
+    if isinstance(planned, code_plan.GitCode):
+        source, location, commit, uses_lfs = "git", planned.repo, planned.commit, planned.uses_lfs
+    elif isinstance(planned, code_plan.ContextCode):
+        source, commit, files = "context", planned.commit, planned.files
+    elif isinstance(planned, code_plan.PathCode):
+        source, location = "path", planned.dir
+
+    # Sorted, so the order a caller wrote the variables in never changes the digest.
+    variables = [f"{name}={value}" for name, value in sorted(spec.env.items())]
+    provenance = code_environment(source, location=location, commit=commit)
+    if spec.output_dir is not None:
+        provenance["COMPUTE_OUTPUT_DIR"] = spec.output_dir
+    variables += [f"{name}={value}" for name, value in provenance.items()]
+    environment = {"image": resources.image, "environment_variables": variables}
+
+    entrypoint = None
+    if spec.command is not None:
+        prelude = render_prelude(
+            source,
+            output_dir=spec.output_dir or "",  # TaskSpec requires it with a command
+            location=location,
+            commit=commit,
+            workdir=spec.workdir,
+            uses_lfs=uses_lfs,
+        )
+        entrypoint = render_entrypoint(prelude, spec.command)
+
+    if spec.kind == "experiment":
+        # A JSON round trip leaves only plain dicts and lists, which YAML can write, and a copy
+        # the spec does not share.
+        config: Dict[str, Any] = json.loads(json.dumps(spec.experiment or {}))
+        config["name"] = spec.name
+        config["entrypoint"] = entrypoint
+        config["resources"] = {
+            **(config.get("resources") or {}),
+            "resource_pool": resources.pool,
+            "slots_per_trial": resources.slots,
+        }
+        config["environment"] = {**(config.get("environment") or {}), **environment}
+        if spec.workspace is not None:
+            # The master resolves both names; an experiment takes no workspace id.
+            config["workspace"], config["project"] = spec.workspace, spec.project
+        if workspace_id is not None:
+            raise ValueError("an experiment names its workspace in the config")
+        return CreateRequest("experiment", config, files)
+
+    config = {
+        "description": spec.name,
+        "resources": {"resource_pool": resources.pool, "slots": resources.slots},
+        "environment": environment,
+    }
+    if entrypoint is not None:
+        config["entrypoint"] = [*_BASH, entrypoint]
+    return CreateRequest(spec.kind, config, files, workspace_id)
+
+
+def _check_planned(spec: TaskSpec, planned: PlannedCode) -> None:
+    expected = spec.code.source if spec.code is not None else None
+    found = planned.source if planned is not None else None
+    if expected != found:
+        raise ValueError(f"the planned code is {found}, but the spec's is {expected}")
