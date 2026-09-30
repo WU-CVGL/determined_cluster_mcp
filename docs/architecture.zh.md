@@ -69,7 +69,7 @@ Fork 路径相对于 `8e26a69`（release 0.40.1）处的 fork 根目录，MCP �
 ALTER TABLE jobs
   ADD COLUMN idempotency_key text,
   ADD COLUMN request_digest  text,
-  ADD COLUMN request         jsonb,                        -- canonical, redacted
+  ADD COLUMN cancel_requested_at timestamptz,
   ADD COLUMN admission       text NOT NULL DEFAULT 'QUEUE';
 CREATE UNIQUE INDEX jobs_owner_idempotency_key ON jobs (owner_id, idempotency_key)
   WHERE idempotency_key IS NOT NULL;
@@ -152,7 +152,7 @@ message Submission {
   string name = 8;
   optional string idempotency_key = 9;       // owner and admins only
   optional string request_digest = 10;       // owner and admins only
-  google.protobuf.Struct request = 11;       // redacted; absent before the upgrade
+  reserved 11;                               // no request body is stored
   Admission admission = 12;
   google.protobuf.Timestamp submitted_at = 13; optional google.protobuf.Timestamp ended_at = 14;
   State state = 15;        // QUEUED RUNNING PAUSED COMPLETED FAILED CANCELED DELETED
@@ -165,7 +165,7 @@ message Submission {
 
 - **来源。** `master/static/srv/` 下的一个命名查询，只读取数据库。它把 `jobs` 与 task 或 experiment、allocation 以及 `allocation_accelerators` 连接，并过滤 `job_type IN (COMMAND, SHELL, GENERIC, EXPERIMENT)`。
 - **Workspace** 通过推导得到，不单独存储：experiment 经由 project 推导（experiment 可以移动），任务经由 `command_state` 推导。
-- **任务状态**来自 `end_time`、`task_state` 和最后一个 allocation。没有存活 allocation、且最后一个 allocation 已结束的任务视为已结束，其状态取自该 allocation 的类别，因此它不会永远显示 QUEUED。
+- **任务状态**来自 `end_time`、`task_state` 和最后一个 allocation。没有存活 allocation、且最后一个 allocation 已结束的任务视为已结束，其状态取自该 allocation 的类别，因此它不会永远显示 QUEUED。设置了 `cancel_requested_at` 的已结束作业为 `CANCELED`；`CancelSubmission` 和现有的 kill endpoint 会设置它。
 - **Experiment 状态**来自 `experiments.state`。已删除的 experiment 为 `DELETED`，因为 `DeleteExperiments` 会保留 job 行（`db/postgres_experiments.go:783-806`）。
 - **授权。** 每一行都要通过现有的按类型读取授权。`DELETED` experiment 已经没有 experiment 行可供检查（`db/postgres_experiments.go:800-803`），因此只有其 owner 和管理员能看到它。
 - **`get_task.sql`** 还会选取 `slots`、`exit_reason` 和 `status_code`。这些是现有的 `taskv1.Allocation` 字段（`proto/src/determined/task/v1/task.proto:93-98`）。
@@ -217,27 +217,25 @@ message SchedulingEvaluation {
 
 ```proto
 enum ExitClass {
-  EXIT_CLASS_UNSPECIFIED = 0;                // allocations that ended before the upgrade
-  EXIT_CLASS_NONE = 1;                       // completed, preempted, or paused
-  EXIT_CLASS_CANCELED = 2;
-  EXIT_CLASS_PLACEMENT_UNSATISFIED = 3;
-  EXIT_CLASS_NODE_PREFLIGHT_FAILED = 4;
-  EXIT_CLASS_WORKLOAD_INITIALIZATION_FAILED = 5;
-  EXIT_CLASS_WORKLOAD_FAILED = 6;
-  EXIT_CLASS_INFRASTRUCTURE_FAILED = 7;
+  EXIT_CLASS_UNSPECIFIED = 0;                // ended before the upgrade, or never started
+  EXIT_CLASS_NONE = 1;                       // did not fail: completed, stopped, preempted, killed
+  EXIT_CLASS_PLACEMENT_UNSATISFIED = 2;
+  EXIT_CLASS_NODE_PREFLIGHT_FAILED = 3;
+  EXIT_CLASS_WORKLOAD_INITIALIZATION_FAILED = 4;
+  EXIT_CLASS_WORKLOAD_FAILED = 5;
+  EXIT_CLASS_INFRASTRUCTURE_FAILED = 6;
 }
 ```
 
-`allocations` 增加 `exit_class text` 和 `exit_detail jsonb`，由 `SetExitStatus`（`task/allocation.go:1074-1095`）写入。`closeOpenAllocations`（`core.go:957-963`）不经过该调用就会关闭 allocation，它写入 `INFRASTRUCTURE_FAILED`。分类器覆盖所有情况：
+`allocations` 增加 `exit_class text` 和 `exit_detail jsonb`，由 `SetExitStatus`（`task/allocation.go:1074-1095`）写入。`closeOpenAllocations`（`core.go:957-963`）不经过该调用就会关闭 allocation，对已启动（`start_time` 已设置）的 allocation 写入 `INFRASTRUCTURE_FAILED`，从未启动的保持未分类，由恢复规则决定。类别描述的是结果而不是原因：是谁要求停止作业只记录一次，即 `jobs.cancel_requested_at`。分类器覆盖所有情况：
 
 | 退出情况 | 类别 |
 |---|---|
-| 用户请求的终止（kill endpoint 通过 `Signal` 传递一个标志，`allocation.go:317-327`；抢占超时和 `crash` 也会到达该处） | `CANCELED` |
-| 无错误 | `NONE` |
+| 无错误，包括被终止、被抢占或在启动前中止（`TaskAborted`、`ResourcesAborted`） | `NONE` |
 | `PlacementUnsatisfied` | `PLACEMENT_UNSATISFIED` |
 | `PreflightFailed` | `NODE_PREFLIGHT_FAILED` |
 | `ResourcesFailed` 或 `TaskError` | 如果失败的资源从未报告工作负载启动，则为 `WORKLOAD_INITIALIZATION_FAILED`，否则为 `WORKLOAD_FAILED` |
-| 其他所有情况：agent 错误、`RestoreError`、`ResourcesMissing`、中止、未知 | `INFRASTRUCTURE_FAILED` |
+| 其他所有情况：agent 错误、`RestoreError`、`ResourcesMissing`、handler 错误、未知 | `INFRASTRUCTURE_FAILED` |
 
 **所有层一次性改动。** `calculateExitStatus` 遇到未列出的类型会 panic（`allocation.go:1219-1220`），因此以下改动必须一起落地：
 
@@ -326,7 +324,7 @@ enum ExitClass {
 | `WORKLOAD_INITIALIZATION_FAILED` | 否 | 在 `max_system_retries` 内新建 allocation | 否 |
 | `WORKLOAD_FAILED` | 仅 trial | trial，与目前相同 | 通过日志策略，与目前相同 |
 | `INFRASTRUCTURE_FAILED` | 否 | 与目前相同（trial 视为瞬时） | 否 |
-| `CANCELED`、`NONE` | 否 | 无 | 否 |
+| `NONE` | 否 | 无 | 否 |
 
 系统重试适用于 trial、command 和 shell。
 
@@ -335,7 +333,7 @@ enum ExitClass {
 
 - **范围。** 键的范围是 `(jobs.owner_id, key)`，因此同一用户的所有客户端共享它。键永不过期，正如 job 行永不删除。
 - **绑定。** dry run 从不绑定键。事务提交前出现的错误不绑定任何内容。任何已完成事务提交的提交请求都会消耗该键，包括以 `PLACEMENT_UNSATISFIED` 结束的请求，因此新的尝试需要新的键。
-- **摘要。** 摘要是对客户端请求的 JCS 规范化 JSON 计算的 SHA-256，在应用 master 默认值之前计算。合并后的 spec 不能作为身份：petname、sshd 端口、SSH 密钥、会话 token 和资源池默认值在完全相同的请求之间也会变化。
+- **摘要。** 摘要是对客户端请求的 master 规范 JSON（键排序、UTF-8、不做 HTML 转义）计算的 SHA-256，在应用 master 默认值之前计算。只有 master 计算它，因此客户端无需复现这一形式，也不需要规范化库。合并后的 spec 不能作为身份：petname、sshd 端口、SSH 密钥、会话 token 和资源池默认值在完全相同的请求之间也会变化。
 
   | 包含 | 排除 |
   |---|---|
@@ -345,7 +343,7 @@ enum ExitClass {
   | parent、fork、inherit、`no_pause`、`activate`、`admission` | |
 
 - **准入方式是摘要的一部分**，因此用同一个键、不同的 `allow_queue` 重试会返回 409。
-- **存储的请求。** 环境变量的值替换为 `"<redacted>"`，文件以清单形式存储。存储的请求与 config 的可见性相同。
+- **不存储请求。** 作业只保留摘要。生效配置与现在一样从任务或 experiment 读取，因此不会再保存一份可能包含 secret 的请求副本。
 - **键与摘要的可见性。** 只有 owner 和管理员能看到它们，因此不带密钥的普通摘要也不会向其他读取者暴露任何可被暴力破解的内容。
 
 <a id="ownership"></a>
@@ -562,6 +560,6 @@ master 和 agent 一起升级。运行中的容器不受影响，因为 `device.
 5. **Docker bind 错误。** 挂载源分类依赖 Docker 的 bind 错误。应在实际部署的 Docker 版本上测试。
 6. **重连窗口。** 把处于重连窗口内的 agent 视为已启用，需要用到它们暂存的状态（`agent.go:80-83`）。在 F3a 中验证。
 7. **Generic 取消。** 对 generic 任务调用 `CancelSubmission` 可能遇到全局变更锁（`api_generic_tasks.go:580-583`），此时返回可重试的 `UNAVAILABLE`。
-8. **命令中的 secret。** 在命令行中输入的 secret 会按提交时的内容存储。文档必须说明这一点。
+8. **命令中的 secret。** 在命令行中输入的 secret 与现在一样存储在任务或 experiment 的配置中。文档必须说明这一点。
 9. **重试预算。** `max_system_retries` 的默认值 3 是否合适？
-10. **旧版 allocation。** 升级前已结束的 allocation 显示为 `EXIT_CLASS_UNSPECIFIED`，这是唯一未分类的状态。
+10. **旧版记录。** 升级前已结束的 allocation 显示为 `EXIT_CLASS_UNSPECIFIED`，升级前的作业没有键和摘要。F2 针对这类记录测试 `GetSubmission` 和 `ListSubmissions`。

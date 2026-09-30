@@ -78,7 +78,7 @@ following the fork's own precedent.
 ALTER TABLE jobs
   ADD COLUMN idempotency_key text,
   ADD COLUMN request_digest  text,
-  ADD COLUMN request         jsonb,                        -- canonical, redacted
+  ADD COLUMN cancel_requested_at timestamptz,
   ADD COLUMN admission       text NOT NULL DEFAULT 'QUEUE';
 CREATE UNIQUE INDEX jobs_owner_idempotency_key ON jobs (owner_id, idempotency_key)
   WHERE idempotency_key IS NOT NULL;
@@ -183,7 +183,7 @@ message Submission {
   string name = 8;
   optional string idempotency_key = 9;       // owner and admins only
   optional string request_digest = 10;       // owner and admins only
-  google.protobuf.Struct request = 11;       // redacted; absent before the upgrade
+  reserved 11;                               // no request body is stored
   Admission admission = 12;
   google.protobuf.Timestamp submitted_at = 13; optional google.protobuf.Timestamp ended_at = 14;
   State state = 15;        // QUEUED RUNNING PAUSED COMPLETED FAILED CANCELED DELETED
@@ -201,7 +201,9 @@ message Submission {
   move), and through `command_state` for tasks.
 - **Task state** comes from `end_time`, `task_state`, and the last allocation. A task with
   no live allocation whose last allocation has ended counts as ended, with its state taken
-  from that allocation's class, so it never shows QUEUED forever.
+  from that allocation's class, so it never shows QUEUED forever. An ended job with
+  `cancel_requested_at` set is `CANCELED`; `CancelSubmission` and the existing kill
+  endpoints set it.
 - **Experiment state** comes from `experiments.state`. A deleted experiment is `DELETED`,
   because `DeleteExperiments` keeps the job row (`db/postgres_experiments.go:783-806`).
 - **Authorization.** Every row passes the existing per-kind read authz. A `DELETED`
@@ -282,29 +284,30 @@ message SchedulingEvaluation {
 
 ```proto
 enum ExitClass {
-  EXIT_CLASS_UNSPECIFIED = 0;                // allocations that ended before the upgrade
-  EXIT_CLASS_NONE = 1;                       // completed, preempted, or paused
-  EXIT_CLASS_CANCELED = 2;
-  EXIT_CLASS_PLACEMENT_UNSATISFIED = 3;
-  EXIT_CLASS_NODE_PREFLIGHT_FAILED = 4;
-  EXIT_CLASS_WORKLOAD_INITIALIZATION_FAILED = 5;
-  EXIT_CLASS_WORKLOAD_FAILED = 6;
-  EXIT_CLASS_INFRASTRUCTURE_FAILED = 7;
+  EXIT_CLASS_UNSPECIFIED = 0;                // ended before the upgrade, or never started
+  EXIT_CLASS_NONE = 1;                       // did not fail: completed, stopped, preempted, killed
+  EXIT_CLASS_PLACEMENT_UNSATISFIED = 2;
+  EXIT_CLASS_NODE_PREFLIGHT_FAILED = 3;
+  EXIT_CLASS_WORKLOAD_INITIALIZATION_FAILED = 4;
+  EXIT_CLASS_WORKLOAD_FAILED = 5;
+  EXIT_CLASS_INFRASTRUCTURE_FAILED = 6;
 }
 ```
 
 `allocations` gains `exit_class text` and `exit_detail jsonb`, written by `SetExitStatus`
 (`task/allocation.go:1074-1095`). `closeOpenAllocations` (`core.go:957-963`), which closes
-allocations without that call, writes `INFRASTRUCTURE_FAILED`. The classifier is total:
+allocations without that call, writes `INFRASTRUCTURE_FAILED` for an allocation that
+started (`start_time` set) and leaves a never-started one unclassified, so the restore rule
+decides it. The class is an outcome, not a cause: who asked to stop a job is recorded once,
+as `jobs.cancel_requested_at`. The classifier is total:
 
 | Exit | Class |
 |---|---|
-| User-requested kill (the kill endpoints pass a flag through `Signal`, `allocation.go:317-327`, which preemption timeouts and `crash` also reach) | `CANCELED` |
-| No error | `NONE` |
+| No error, including a kill, a preemption, or an abort before start (`TaskAborted`, `ResourcesAborted`) | `NONE` |
 | `PlacementUnsatisfied` | `PLACEMENT_UNSATISFIED` |
 | `PreflightFailed` | `NODE_PREFLIGHT_FAILED` |
 | `ResourcesFailed` or `TaskError` | `WORKLOAD_INITIALIZATION_FAILED` if the failing resource never posted workload start, otherwise `WORKLOAD_FAILED` |
-| All others: agent errors, `RestoreError`, `ResourcesMissing`, aborts, unknown | `INFRASTRUCTURE_FAILED` |
+| All others: agent errors, `RestoreError`, `ResourcesMissing`, handler errors, unknown | `INFRASTRUCTURE_FAILED` |
 
 **One change for every layer.** `calculateExitStatus` panics on unlisted types
 (`allocation.go:1219-1220`), so all of the following land together:
@@ -442,7 +445,7 @@ misses the value-typed switch and lands in "handler crashed".
 | `WORKLOAD_INITIALIZATION_FAILED` | no | new allocation within `max_system_retries` | no |
 | `WORKLOAD_FAILED` | trials only | trials, as today | through log policies, as today |
 | `INFRASTRUCTURE_FAILED` | no | as today (transient for trials) | no |
-| `CANCELED`, `NONE` | no | none | no |
+| `NONE` | no | none | no |
 
 System retries apply to trials, commands, and shells.
 
@@ -453,8 +456,10 @@ System retries apply to trials, commands, and shells.
 - **Binding.** A dry run never binds a key. An error before commit binds nothing. Any
   committed submit consumes the key, including one that ends `PLACEMENT_UNSATISFIED`, so
   a new attempt needs a new key.
-- **Digest.** The digest is SHA-256 over JCS-canonical JSON of the client request, taken
-  before master defaults. The merged spec cannot be the identity: petnames, sshd ports,
+- **Digest.** The digest is SHA-256 over the master's canonical JSON of the client request
+  (sorted keys, UTF-8, no HTML escaping), taken before master defaults. Only the master
+  computes it, so no client has to reproduce the form and no canonicalization library is
+  needed. The merged spec cannot be the identity: petnames, sshd ports,
   SSH keys, session tokens, and pool defaults vary between identical requests.
 
   | Included | Excluded |
@@ -466,8 +471,9 @@ System retries apply to trials, commands, and shells.
 
 - **Admission is part of the digest,** so retrying the same key with a different
   `allow_queue` returns 409.
-- **Stored request.** Environment values are replaced with `"<redacted>"`, and files are
-  stored as a manifest. The stored request has the same visibility as config.
+- **No stored request.** The job keeps only the digest. The effective config is read from
+  the task or experiment, as today, so no second copy of a request that may carry secrets
+  is kept.
 - **Key and digest visibility.** Only the owner and admins see them, so a plain digest
   exposes nothing that could be brute-forced by other readers.
 
@@ -715,8 +721,9 @@ Master and agents are upgraded together. Running containers survive, because
    stashed state (`agent.go:80-83`). Verify in F3a.
 7. **Generic cancel.** `CancelSubmission` on a generic task can hit the global mutation lock
    (`api_generic_tasks.go:580-583`). It returns a retryable `UNAVAILABLE`.
-8. **Secrets in commands.** Secrets typed into a command line are stored as submitted. The
-   docs must say so.
+8. **Secrets in commands.** Secrets typed into a command line are stored in the task or
+   experiment config, as today. The docs must say so.
 9. **Retry budget.** Is 3 the right default for `max_system_retries`?
-10. **Legacy allocations.** Allocations that ended before the upgrade show
-    `EXIT_CLASS_UNSPECIFIED`, the only unclassified state.
+10. **Legacy rows.** Allocations that ended before the upgrade show
+    `EXIT_CLASS_UNSPECIFIED`, and jobs from before the upgrade have no key or digest. F2
+    tests `GetSubmission` and `ListSubmissions` against such rows.
