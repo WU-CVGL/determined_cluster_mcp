@@ -643,7 +643,7 @@ RBAC. A replay re-checks read authz on the stored job, so revoked access is hono
 
   | Source | Code root (`$COMPUTE_CODE_ROOT`) | Delivery | Mutable | Size |
   |---|---|---|---|---|
-  | `git` | `/run/determined/workdir` | The prelude clones `repo` with `--shared --no-checkout` into container-local scratch and checks out the pinned commit with `--detach`. Nothing is uploaded. | no | no cap; node disk |
+  | `git` | `/run/determined/code` | The prelude clones `repo` with `--shared --no-checkout` into container-local scratch and checks out the pinned commit with `--detach`. Nothing is uploaded. | no | no cap; node disk |
   | `context` | `/run/determined/workdir` | Tracked files at `revision` plus explicit `include` paths, sent as the task context (`files` or `model_definition`). Determined extracts it before the startup hooks (`harness/determined/exec/prep_container.py:28-36`). | no | 99,614,720 bytes |
   | `path` | `dir` on shared storage | Runs in place. | yes | none |
 
@@ -663,10 +663,15 @@ RBAC. A replay re-checks read authz on the stored job, so revoked access is hono
   <command>
   ```
 
-  - `git`: `git -c safe.directory=R clone -q --shared --no-checkout -- R /run/determined/workdir && git -C /run/determined/workdir checkout -q --detach SHA && mkdir -p -- OUT && cd -- /run/determined/workdir/WD`.
-    When the revision has LFS pointers, the checkout adds
-    `-c filter.lfs.process='git-lfs filter-process' -c filter.lfs.required=true`, so a
-    missing `git-lfs` fails instead of leaving pointers. Submodules are never recursed.
+  - `git`: `git -c safe.directory=R clone -q --shared --no-checkout -- R /run/determined/code && git -C /run/determined/code checkout -q --detach SHA && mkdir -p -- OUT && cd -- /run/determined/code/WD`.
+    When the revision has LFS pointers, the checkout runs with `GIT_LFS_SKIP_SMUDGE=0` and
+    adds `-c filter.lfs.process='git-lfs filter-process' -c filter.lfs.required=true -c
+    lfs.fetchinclude= -c lfs.fetchexclude=`, so a missing `git-lfs` fails instead of
+    leaving pointers, and no image or environment setting skips the smudge. Submodules are
+    never recursed. The clone target is not the workdir, because `git clone` needs an empty
+    target and `/run/determined/workdir` can be the task user's `HOME`
+    (`master/pkg/tasks/task.go:384-388`, `task-setup.sh:49-54`), where startup hooks may
+    write. `/run/determined` belongs to the task user (`task.go:336`).
   - `context`: `mkdir -p -- OUT && cd -- /run/determined/workdir/WD`.
   - `path`: `mkdir -p -- OUT && cd -- DIR/WD`.
 
@@ -683,15 +688,21 @@ RBAC. A replay re-checks read authz on the stored job, so revoked access is hono
   bind-mount target. `revision` must resolve to a commit, which is pinned as a full SHA.
   The commit must be contained in a branch or tag (`commit_not_on_ref`), because the clone
   borrows objects through alternates and `git gc` in the source prunes unreachable ones.
-  Partial clones are rejected, because a lazy fetch needs the network. A missing LFS
+  Partial clones are rejected, because a lazy fetch needs the network, and so are linked
+  worktrees and repositories with alternates, whose objects may sit at paths the container
+  cannot resolve. A missing LFS
   object is an error (`lfs_object_missing`), and a submodule gets a
   `submodule_not_checked_out` warning. The image must provide `git`, and the container
   user must be able to read the repository; the plan cannot check either.
+- **Read-only planning.** The plan runs `git` from an argument list, without user or system
+  config, with every filter driver blanked and lazy fetches disabled, so no command a
+  repository configures runs. It trusts the repository through `safe.directory`, as the
+  container clone does, and needs git 2.31 or later.
 - **Plan checks for `context`.** Size is counted as the harness counts it: each file's
   size rounded up to a multiple of three, the length of its base64 content times 3/4
   (`harness/determined/common/v1file_utils.py:9-13`), summed and rejected when it exceeds
-  99,614,720 bytes (`context.py:19-28`, `constants.py:5-18`). The master enforces only a 96 MiB gRPC message limit
-  (`master/internal/grpcutil/api.go:81-85`), which fails opaquely, so the MCP checks first
+  99,614,720 bytes (`context.py:19-28`, `constants.py:5-18`). The master enforces only a
+  96 MiB gRPC message limit (`master/internal/grpcutil/api.go:81-85`), which fails opaquely, so the MCP checks first
   and returns `context_too_large` with the total, the limit, the largest paths, and a hint
   to use `git` or shared storage. Relative symlinks that resolve inside the tree are kept;
   absolute or escaping ones are a plan error (`unsafe_symlink`), because the harness
@@ -1058,7 +1069,5 @@ owns them:
 11. **Source prune.** A `git` clone borrows objects from the source repository. If the
     branch or tag that contained a pinned commit moves or is deleted and the source runs
     `git gc`, a later start of that job fails.
-12. **Clone target.** `git clone` needs an empty target, but `/run/determined/workdir` can
-    be the task user's `HOME` (`master/pkg/tasks/task.go:384-388`, `task-setup.sh:49-54`)
-    and the startup hooks' working directory, so a hook that writes there breaks the clone.
-    Choose the clone directory in M3.
+12. **Clone target.** Resolved in M3: `git` code clones into `/run/determined/code`, not
+    the workdir, which can be the task user's `HOME` (see [Code and storage](#code-and-storage)).
