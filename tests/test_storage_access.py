@@ -570,3 +570,29 @@ def test_subprocess_reader_cleanup_is_bounded_when_grandchild_keeps_pipe_open():
     assert time.monotonic() - started < 3
     assert "parent complete" in result["output"]
 
+
+def test_local_path_maps_a_container_path_through_a_local_mount(tmp_path):
+    root = tmp_path / "mounted"
+    (root / "repos" / "app").mkdir(parents=True)
+    service = StorageService(profile(), local_config(root))
+
+    assert service.local_path("/work/repos/app") == (root / "repos" / "app").resolve()
+    with pytest.raises(StorageError) as caught:
+        service.local_path("/elsewhere/app", "code.repo")
+    assert caught.value.code == "invalid_storage_path"
+    assert "code.repo /elsewhere/app is not under a mounted root" in str(caught.value)
+
+
+@pytest.mark.parametrize("mode", ["auto", "ssh"])
+def test_local_path_refuses_what_only_ssh_reaches(tmp_path, mode):
+    config = {"mode": mode, "ssh": {"host": "storage.example"}}
+    if mode == "ssh":
+        root = tmp_path / "mounted"
+        root.mkdir()
+        config["local_mounts"] = [{"host_path": "/cluster/shared", "local_path": str(root)}]
+    service = StorageService(profile(), StorageAccessConfig.from_dict(config))
+
+    with pytest.raises(StorageError) as caught:
+        service.local_path("/work/app", "code.repo")
+    assert caught.value.code == "storage_not_local"
+    assert "code.repo /work/app is not readable through a local mount" in str(caught.value)

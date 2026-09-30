@@ -874,3 +874,37 @@ def test_redaction_leaves_its_input_alone():
     before = copy.deepcopy(value)
     redact(value)
     assert value == before
+
+
+# Workspaces
+
+
+def test_workspace_lookup_escapes_the_pattern_and_matches_exactly(monkeypatch):
+    master = Master(monkeypatch)
+    master.route("GET", "/api/v1/workspaces", Response({"workspaces": [
+        {"id": 4, "name": "Team_A"},
+        {"id": 5, "name": "team_a"},
+        {"id": 6, "name": "teamXa"},
+    ], "pagination": {}}))
+
+    assert client().find_workspace_id("team_a") == 5
+    assert master.calls[-1]["params"] == {"name": "team\\_a", "limit": 0}
+
+
+def test_a_missing_workspace_is_not_found(monkeypatch):
+    master = Master(monkeypatch)
+    master.route("GET", "/api/v1/workspaces", Response({"workspaces": [{"id": 4, "name": "A"}]}))
+
+    with pytest.raises(APIError) as caught:
+        client().find_workspace_id("a")
+    assert (caught.value.code, caught.value.details) == ("not_found", {"workspace": "a"})
+
+
+@pytest.mark.parametrize("payload", [{}, {"workspaces": [{"id": "4", "name": "a"}]}])
+def test_a_malformed_workspace_list_is_refused(monkeypatch, payload):
+    master = Master(monkeypatch)
+    master.route("GET", "/api/v1/workspaces", Response(payload))
+
+    with pytest.raises(APIError) as caught:
+        client().find_workspace_id("a")
+    assert caught.value.code == "invalid_response"

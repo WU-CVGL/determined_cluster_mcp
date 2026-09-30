@@ -139,7 +139,7 @@ def _check_arguments(
     return list(dict.fromkeys(metrics))
 
 
-def _select_task(
+def select_task(
     submission: Mapping[str, Any], trial_id: Optional[int]
 ) -> Tuple[Mapping[str, Any], Optional[Dict[str, Any]]]:
     """Return the task to measure and, for an experiment, what the submission says of its trial.
@@ -228,7 +228,7 @@ def summarize(
     """
 
     metrics = _check_arguments(window_seconds, allocation_id, trial_id, metrics, include_samples)
-    task, trial = _select_task(submission, trial_id)
+    task, trial = select_task(submission, trial_id)
     allocations = [dict(item) for item in task["allocations"]]
     selected = [
         item

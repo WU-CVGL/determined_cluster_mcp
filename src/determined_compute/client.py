@@ -800,6 +800,27 @@ class Client:
         )
         return parse_submission(response.get("submission"))
 
+    def find_workspace_id(self, name: str) -> int:
+        """The id of the workspace called exactly ``name``, as this user can see it."""
+
+        if not isinstance(name, str) or not name:
+            raise ValueError("workspace must be a non-empty string")
+        # The master matches the name as a case-insensitive LIKE pattern, so its wildcards are
+        # escaped and the answer is compared exactly.
+        pattern = "".join("\\" + char if char in "\\%_" else char for char in name)
+        response = self._get("api/v1/workspaces", params={"name": pattern, "limit": 0})
+        workspaces = response.get("workspaces")
+        if not isinstance(workspaces, list):
+            raise _malformed("workspace list")
+        for workspace in workspaces:
+            if isinstance(workspace, Mapping) and workspace.get("name") == name:
+                return _integer(workspace.get("id"), "workspace list")
+        raise APIError(
+            f"workspace {name!r} does not exist or is not visible to this user",
+            code="not_found",
+            details={"workspace": name},
+        )
+
     # Logs and trials
 
     def task_logs(self, task_id: str, tail: int = 200) -> List[Dict[str, Any]]:

@@ -122,6 +122,25 @@ class StorageService:
             },
         }
 
+    def local_path(self, path: str, field: str = "path") -> Path:
+        """Where this machine reads the container ``path`` through a local mount.
+
+        Planning reads git repositories here and never over SSH, so a path that no local mount
+        reaches is refused, and so is every path when the configuration selects SSH.
+        """
+        mount, host_path = self._translate(path, field)
+        local = None
+        if self.config.mode != "ssh":
+            local = self._local_mapping(host_path, mount, write=False)
+        if local is None:
+            raise StorageError(
+                f"{field} {path} is not readable through a local mount; configure "
+                "local_mounts for its root",
+                code="storage_not_local",
+            )
+        target, _root = self._safe_mapped_path(local, host_path)
+        return target
+
     def sync(
         self, local_dir: str, shared_dir: str, dry_run: bool = True, overwrite: bool = False
     ) -> Dict[str, Any]:
