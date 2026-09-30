@@ -865,6 +865,7 @@ and the container's allocation is classified without the init boundary.
 | M1 Narrow the server | remove the consultation worker; delete `compute_cli.py`; close PR #1 | – |
 | M2 Cut to the ledger | `client.py`, the protocol gate, and the `job_id` handle; launch, status, list, logs, usage, and cancel over submissions; delete the store, markers, reconcile, discover, adopt, binding, and owner namespace | F2 |
 | M3 Typed spec | `TaskSpec`, `spec.py`, `policy.py`, and `code.py`; the three code sources and the prelude renderer; plan through `dry_run` and launch bound by `expected_digest`; `admission` passed through; `compute_resources` as a projection and `storage_check` with its viewpoint; delete `admission.py` and path validation | F2 |
+| M2 + M3 wiring | One cutover PR carries M2 and the M3 wiring (`policy.py`, the compiler, plan and launch, `compute_resources`, `storage_check`, and the M3 deletions), stacked on the M3 core (`TaskSpec`, `code.py`, and the prelude renderer) | F2 |
 | M4 Accelerators | `accelerators` in `TaskSpec` | Deferred; F3b, F5 |
 
 - **Merge order.** An MCP PR merges only after its fork dependencies are on fork `main`.

@@ -530,6 +530,7 @@ master 和 agent 一起升级。fork 保持重新挂接路径的兼容性。`dev
 | M1 收窄 server | 移除咨询 worker；删除 `compute_cli.py`；关闭 PR #1 | – |
 | M2 改用台账 | `client.py`、协议门槛以及 `job_id` 句柄；基于 submission 的 launch、status、list、logs、usage 和 cancel；删除 store、提交标记、reconcile、discover、adopt、绑定和 owner 命名空间 | F2 |
 | M3 类型化 spec | `TaskSpec`、`spec.py`、`policy.py` 和 `code.py`；三种代码来源与前导命令渲染器；通过 `dry_run` 规划，并通过 `expected_digest` 绑定启动；透传 `admission`；作为投影的 `compute_resources` 和带视角的 `storage_check`；删除 `admission.py` 和路径校验 | F2 |
+| M2 + M3 接入 | 一个切换 PR 同时包含 M2 和 M3 的接入部分（`policy.py`、编译器、规划与启动、`compute_resources`、`storage_check` 以及 M3 的删除项），叠加在 M3 核心（`TaskSpec`、`code.py` 和前导命令渲染器）之上 | F2 |
 | M4 加速器 | `TaskSpec` 中的 `accelerators` | 推迟；F3b, F5 |
 
 - **合并顺序。** MCP PR 只有在其 fork 依赖进入 fork `main` 之后才能合并。集成测试针对目标 fork 版本的预发布构建运行。
