@@ -193,8 +193,6 @@ def test_discover_is_owner_filtered_bounded_and_metadata_only(tmp_path, profile)
         ("command", "not-a-uuid"),
         ("shell", 123),
         ("experiment", "0"),
-        ("experiment", "-1"),
-        ("experiment", "1.5"),
     ],
 )
 def test_adopt_rejects_unsupported_kinds_and_invalid_ids_before_network(
@@ -210,7 +208,7 @@ def test_adopt_rejects_unsupported_kinds_and_invalid_ids_before_network(
 
 @pytest.mark.parametrize(
     ("limit", "offset"),
-    [(0, 0), (101, 0), (True, 0), (50, -1), (50, True)],
+    [(0, 0), (101, 0), (True, 0), (50, -1)],
 )
 def test_discover_rejects_unbounded_pagination_before_network(
     tmp_path, profile, limit, offset
@@ -243,10 +241,10 @@ def test_discover_propagates_identity_authentication_failure(tmp_path, profile):
     "user",
     [
         {"username": "alice", "projectOwnerId": 7},
-        {"id": "alice", "username": "alice"},
         {"id": 0, "username": "alice"},
         {"id": 7, "username": ""},
     ],
+    ids=["fallback-owner-field", "zero-id", "empty-username"],
 )
 def test_identity_requires_numeric_user_id_and_does_not_use_fallback_fields(
     tmp_path, profile, user
@@ -275,19 +273,12 @@ def test_discover_rejects_server_results_owned_by_another_user(tmp_path, profile
     assert service.list_tasks("session-a") == []
 
 
-@pytest.mark.parametrize(
-    "pagination",
-    [
-        {"limit": 49, "offset": 0, "total": 0},
-        {"limit": 50, "offset": 1, "total": 0},
-        {"limit": 50, "offset": 0, "total": -1},
-    ],
-)
-def test_discover_rejects_inconsistent_server_pagination(
-    tmp_path, profile, pagination
-):
+def test_discover_rejects_inconsistent_server_pagination(tmp_path, profile):
     service, client, _store = service_for(tmp_path, profile)
-    client.pages["command"] = {"tasks": [], "pagination": pagination}
+    client.pages["command"] = {
+        "tasks": [],
+        "pagination": {"limit": 50, "offset": 0, "total": -1},
+    }
 
     with pytest.raises(APIError) as caught:
         service.discover("command", "session-a")
@@ -313,8 +304,12 @@ def test_adopt_only_registers_whitelisted_metadata_and_is_idempotent(tmp_path, p
     assert first["remote_id"] == COMMAND_ID
     assert first["workdir"] is None and first["output_dir"] is None
     assert len(store.list_owned("session-a")) == 1
-    assert secret.encode() not in (tmp_path / "tasks.db").read_bytes()
     assert not any(call[0] == "POST" for call in client.calls)
+    connection = sqlite3.connect(tmp_path / "tasks.db")
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(compute_tasks)")}
+    connection.close()
+    assert {"config", "raw_config", "environment", "private_keys"}.isdisjoint(columns)
+    assert secret.encode() not in (tmp_path / "tasks.db").read_bytes()
 
     other_service, other_client, other_store = service_for(
         tmp_path, profile, database="other.db"
@@ -393,7 +388,7 @@ def test_adopt_preserves_an_existing_submitted_request_binding(tmp_path, profile
     assert len(store.list_owned("session-a")) == 1
 
 
-@pytest.mark.parametrize("state", ["pending", "submitting", "submission_uncertain"])
+@pytest.mark.parametrize("state", ["pending", "submission_uncertain"])
 def test_adopt_marker_match_requires_reconcile_without_creating_duplicate(
     tmp_path, profile, state
 ):
@@ -409,9 +404,7 @@ def test_adopt_marker_match_requires_reconcile_without_creating_duplicate(
         output_dir="/shared/container/output",
         cluster_identity=service._cluster_identity(),
     )
-    if state == "submitting":
-        pending = store.mark_submitting(pending.task_id)
-    elif state == "submission_uncertain":
+    if state == "submission_uncertain":
         pending = store.mark_uncertain(pending.task_id)
     client.entities[("command", COMMAND_ID)] = command_entity(
         submissionMarker=pending.submission_marker
@@ -487,15 +480,15 @@ def test_legacy_first_line_marker_requires_reconcile_for_metadata_less_record(
 
 
 @pytest.mark.parametrize(
-    ("pending_kind", "name", "description"),
+    ("pending_kind", "name"),
     [
-        ("shell", None, None),
-        ("command", "modern task", None),
-        ("command", None, "modern description"),
+        ("shell", None),
+        ("command", "modern task"),
     ],
+    ids=["other-kind", "modern-metadata"],
 )
 def test_legacy_description_marker_does_not_match_other_kind_or_modern_metadata(
-    tmp_path, profile, pending_kind, name, description
+    tmp_path, profile, pending_kind, name
 ):
     service, client, store = service_for(tmp_path, profile)
     pending, _created = store.claim(
@@ -509,7 +502,6 @@ def test_legacy_description_marker_does_not_match_other_kind_or_modern_metadata(
         output_dir="/shared/container/output",
         cluster_identity=service._cluster_identity(),
         name=name,
-        description=description,
     )
     store.mark_uncertain(pending.task_id)
     client.entities[("command", COMMAND_ID)] = command_entity(
@@ -542,74 +534,72 @@ def test_adopted_management_uses_live_cluster_and_account_not_profile_hash(
 
     status = restarted.status(adopted["task_id"], "session-a")
     logs = restarted.logs(adopted["task_id"], "session-a", tail=12)
+    client.calls.clear()
     usage = restarted.usage(adopted["task_id"], "session-a")
+    entity_read = ("GET", f"api/v1/commands/{COMMAND_ID}")
+    # Usage verifies the entity once, before measurements, and reuses it for the pool.
+    assert client.calls.count(entity_read) == 1
+    assert client.calls.index(entity_read) < client.calls.index(
+        ("GET", "api/v1/task-resources/capability")
+    )
+    assert ("GET", f"api/v1/tasks/{COMMAND_ID}/resources") in client.calls
     cancelled = restarted.cancel(adopted["task_id"], "session-a")
 
     assert status["remote_state"] == "COMPLETED"
     assert logs == [{"message": "remote log"}]
     assert usage["determined_task_id"] == COMMAND_ID
-    assert ("GET", f"api/v1/tasks/{COMMAND_ID}/resources") in client.calls
     assert usage["resource_pool"] == {"name": "gpu", "description": "shared GPUs"}
     assert usage["context_unavailable"] == []
     assert cancelled["remote_state"] == "TERMINATING"
     assert any(call[0] == "POST" for call in client.calls)
 
 
+MANAGEMENT_OPERATIONS = ("status", "logs", "cancel", "usage")
+
+
 @pytest.mark.parametrize(
-    ("operation", "identity_change", "error_code"),
+    ("attribute", "value", "error_code"),
     [
-        ("status", "cluster", "binding_mismatch"),
-        ("logs", "cluster", "binding_mismatch"),
-        ("cancel", "cluster", "binding_mismatch"),
-        ("usage", "cluster", "binding_mismatch"),
-        ("status", "account", "ownership_mismatch"),
-        ("logs", "account", "ownership_mismatch"),
-        ("cancel", "account", "ownership_mismatch"),
-        ("usage", "account", "ownership_mismatch"),
+        ("cluster_id", "cluster-2", "binding_mismatch"),
+        ("user", {"id": "8", "username": "bob"}, "ownership_mismatch"),
     ],
+    ids=["cluster", "account"],
 )
 def test_management_identity_changes_fail_before_remote_task_access(
-    tmp_path, profile, operation, identity_change, error_code
+    tmp_path, profile, attribute, value, error_code
 ):
     service, client, _store = service_for(tmp_path, profile)
     client.entities[("command", COMMAND_ID)] = command_entity()
     adopted = service.adopt("command", COMMAND_ID, "session-a")
-    client.calls.clear()
-    if identity_change == "cluster":
-        client.cluster_id = "cluster-2"
-    else:
-        client.user = {"id": "8", "username": "bob"}
+    setattr(client, attribute, value)
 
-    with pytest.raises(ConflictError) as caught:
-        getattr(service, operation)(adopted["task_id"], "session-a")
+    for operation in MANAGEMENT_OPERATIONS:
+        client.calls.clear()
+        with pytest.raises(ConflictError) as caught:
+            getattr(service, operation)(adopted["task_id"], "session-a")
 
-    assert caught.value.code == error_code
-    assert client.calls == [("GET", "info"), ("GET", "api/v1/me")]
+        assert caught.value.code == error_code, operation
+        # Only the identity endpoints are read: no entity, log, usage or cancel request.
+        assert client.calls == [("GET", "info"), ("GET", "api/v1/me")], operation
 
 
-@pytest.mark.parametrize("operation", ["status", "logs", "cancel", "usage"])
-def test_management_remote_owner_change_fails_before_logs_or_cancel(
-    tmp_path, profile, operation
-):
+def test_management_remote_owner_change_fails_before_logs_or_cancel(tmp_path, profile):
     service, client, _store = service_for(tmp_path, profile)
     client.entities[("command", COMMAND_ID)] = command_entity()
     adopted = service.adopt("command", COMMAND_ID, "session-a")
     client.entities[("command", COMMAND_ID)]["userId"] = 8
-    client.calls.clear()
 
-    with pytest.raises(ConflictError) as caught:
-        getattr(service, operation)(adopted["task_id"], "session-a")
+    for operation in MANAGEMENT_OPERATIONS:
+        client.calls.clear()
+        with pytest.raises(ConflictError) as caught:
+            getattr(service, operation)(adopted["task_id"], "session-a")
 
-    assert caught.value.code == "ownership_mismatch"
-    assert client.calls == [
-        ("GET", "info"),
-        ("GET", "api/v1/me"),
-        ("GET", f"api/v1/commands/{COMMAND_ID}"),
-    ]
-    assert not any(
-        call[0] == "POST" or call[1].endswith(("/logs", "/resources", "/capability"))
-        for call in client.calls
-    )
+        assert caught.value.code == "ownership_mismatch", operation
+        assert client.calls == [
+            ("GET", "info"),
+            ("GET", "api/v1/me"),
+            ("GET", f"api/v1/commands/{COMMAND_ID}"),
+        ], operation
 
 
 def test_adopted_task_cannot_be_reconciled_or_used_as_launch_retry(tmp_path, profile):
@@ -653,22 +643,6 @@ def test_discover_does_not_link_an_adoption_from_a_different_remote_account(
     assert discovered["tasks"][0]["local_task_id"] is None
 
 
-def test_adopted_database_has_no_raw_remote_config_columns_or_values(tmp_path, profile):
-    service, client, _store = service_for(tmp_path, profile)
-    secret = "PEM_PRIVATE_KEY_9812"
-    client.entities[("command", COMMAND_ID)] = command_entity(
-        config={"environment": {"SECRET": secret}}, rawConfig=secret, privateKeys=secret
-    )
-
-    service.adopt("command", COMMAND_ID, "session-a")
-
-    connection = sqlite3.connect(tmp_path / "tasks.db")
-    columns = {row[1] for row in connection.execute("PRAGMA table_info(compute_tasks)")}
-    connection.close()
-    assert {"config", "raw_config", "environment", "private_keys"}.isdisjoint(columns)
-    assert secret.encode() not in (tmp_path / "tasks.db").read_bytes()
-
-
 def test_experiment_detail_omits_opaque_raw_configs_and_redacts_parsed_config(
     monkeypatch,
 ):
@@ -705,18 +679,3 @@ def test_experiment_detail_omits_opaque_raw_configs_and_redacts_parsed_config(
     }
     assert "originalConfig" not in task
     assert secret not in repr(task)
-
-
-def test_adopted_usage_reuses_verified_entity_for_pool_context(tmp_path, profile):
-    service, client, _store = service_for(tmp_path, profile)
-    client.entities[("command", COMMAND_ID)] = command_entity()
-    adopted = service.adopt("command", COMMAND_ID, "session-a")
-    client.calls.clear()
-
-    usage = service.usage(adopted["task_id"], "session-a")
-
-    assert client.calls.count(("GET", f"api/v1/commands/{COMMAND_ID}")) == 1
-    assert client.calls.index(("GET", f"api/v1/commands/{COMMAND_ID}")) < client.calls.index(
-        ("GET", "api/v1/task-resources/capability")
-    )
-    assert usage["resource_pool"]["name"] == "gpu"

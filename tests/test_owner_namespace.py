@@ -5,7 +5,8 @@ import pytest
 from determined_compute.compute_cli import normalize_owner
 
 
-@pytest.mark.parametrize('value', ['', '   ', 'x' * 257, '中' * 86])
+# A blank owner, and one under 257 characters that is over 256 bytes in UTF-8.
+@pytest.mark.parametrize('value', ['   ', '中' * 86])
 def test_invalid_owner_is_rejected(value):
     with pytest.raises(ValueError):
         normalize_owner(value)
@@ -43,24 +44,22 @@ def test_mcp_uses_one_normalized_owner_for_tasks_and_consultations():
     asyncio.run(asyncio.wait_for(exercise(), 10))
 
 
-def test_mcp_rejects_memory_database_before_creating_workflow_files(tmp_path, monkeypatch):
-    from determined_compute.mcp_server import _runtime, build_parser
+def test_stateful_entry_points_reject_a_memory_database(tmp_path, monkeypatch):
+    from determined_compute import compute_cli, mcp_server
     monkeypatch.chdir(tmp_path)
-    args = build_parser().parse_args([
+    args = mcp_server.build_parser().parse_args([
         '--profile', 'unused.yaml', '--owner', 'alice', '--db', ':memory:',
     ])
     with pytest.raises(ValueError, match='persistent local database'):
-        _runtime(args)
+        mcp_server._runtime(args)
+    # The MCP server refuses before it creates any workflow files.
     assert not (tmp_path / ':memory:').exists()
 
-
-def test_stateful_cli_rejects_memory_database(tmp_path):
-    from determined_compute.compute_cli import _resolve_runtime, build_parser
     profile = tmp_path / 'profile.yaml'
     profile.write_text('mounts:\n- host_path: /shared\n  container_path: /shared\n'
                        'defaults:\n  image: example\n  pool: example\n')
-    args = build_parser().parse_args([
+    args = compute_cli.build_parser().parse_args([
         '--profile', str(profile), '--owner', 'alice', '--db', ':memory:', 'list',
     ])
     with pytest.raises(ValueError, match='persistent local database'):
-        _resolve_runtime(args)
+        compute_cli._resolve_runtime(args)

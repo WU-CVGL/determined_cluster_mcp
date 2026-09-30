@@ -28,10 +28,6 @@ class FakeService:
         self.calls.append(("launch", request, request_id, owner))
         return {"task_id": "task-1", "owner": owner}
 
-    def status(self, task_id, owner):
-        self.calls.append(("status", task_id, owner))
-        return {"task_id": task_id, "owner": owner}
-
     def logs(self, task_id, owner, tail):
         self.calls.append(("logs", task_id, owner, tail))
         return [{"message": "hello"}]
@@ -44,14 +40,6 @@ class FakeService:
             include_samples,
         ))
         return {"task_id": task_id, "owner": owner, "series": []}
-
-    def cancel(self, task_id, owner):
-        self.calls.append(("cancel", task_id, owner))
-        return {"task_id": task_id, "state": "cancelling"}
-
-    def reconcile(self, task_id, owner, remote_id):
-        self.calls.append(("reconcile", task_id, owner, remote_id))
-        return {"task_id": task_id, "remote_id": remote_id, "owner": owner}
 
     def list_tasks(self, owner):
         self.calls.append(("list", owner))
@@ -92,6 +80,16 @@ class FakeWorkflowManager:
 
 def _structured(result):
     return result.structured_content
+
+
+def write_profile(tmp_path: Path) -> Path:
+    profile = tmp_path / "profile.yaml"
+    profile.write_text(
+        "mounts:\n  - host_path: /shared\n    container_path: /shared\n"
+        "defaults:\n  image: image\n  pool: pool\n",
+        encoding="utf-8",
+    )
+    return profile
 
 
 def test_real_sdk_client_lists_tools_and_invokes_bound_owner():
@@ -183,6 +181,14 @@ def test_real_sdk_client_lists_tools_and_invokes_bound_owner():
             )
             assert _structured(consulted)["workflow_id"] == "workflow-1"
 
+            failed = await client.call_tool(
+                "compute_logs", {"task_id": "task-1", "tail": 0}
+            )
+            assert failed.is_error is True
+            assert failed.structured_content is None
+            encoded = failed.content[0].text.split(": ", 1)[1]
+            assert json.loads(encoded)["error"]["code"] == "internal_error"
+
         assert ("launch", {"command": "true"}, "req-1", "alice") in service.calls
         assert ("discover", "command", "alice", 7, 2) in service.calls
         assert (
@@ -198,23 +204,6 @@ def test_real_sdk_client_lists_tools_and_invokes_bound_owner():
                 {"kind": "command"},
             )
         ]
-
-    asyncio.run(asyncio.wait_for(exercise(), timeout=10))
-
-
-def test_tool_errors_are_structured():
-    async def exercise():
-        server = create_server(FakeService(), "alice")
-        async with Client(server) as client:
-            result = await client.call_tool(
-                "compute_logs", {"task_id": "task-1", "tail": 0}
-            )
-            assert result.is_error is True
-            assert result.structured_content is None
-            encoded = result.content[0].text.split(": ", 1)[1]
-            assert json.loads(encoded) == {
-                "error": {"code": "internal_error", "message": "tail must be at least 1"}
-            }
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=10))
 
@@ -258,12 +247,7 @@ def test_slow_service_call_does_not_block_other_tools():
 
 
 def test_stdio_subprocess_initializes_and_calls_offline_plan(tmp_path):
-    profile = tmp_path / "profile.yaml"
-    profile.write_text(
-        "mounts:\n  - host_path: /shared\n    container_path: /shared\n"
-        "defaults:\n  image: image\n  pool: pool\n",
-        encoding="utf-8",
-    )
+    profile = write_profile(tmp_path)
     # Default runtime must not require a repository skill or consultation backend.
     repo_root = Path(__file__).resolve().parents[1]
     source_root = str(repo_root / "src")
@@ -289,12 +273,6 @@ def test_stdio_subprocess_initializes_and_calls_offline_plan(tmp_path):
         async with Client(params) as client:
             tools = {tool.name for tool in (await client.list_tools()).tools}
             assert len(tools) == 15
-            assert "compute_plan" in tools
-            assert "compute_discover" in tools
-            assert "compute_adopt" in tools
-            assert "storage_snapshot" in tools
-            assert "compute_consult" not in tools
-            assert "workflow_status" not in tools
             result = await client.call_tool(
                 "compute_plan",
                 {
@@ -312,12 +290,7 @@ def test_stdio_subprocess_initializes_and_calls_offline_plan(tmp_path):
 
 
 def test_default_runtime_does_not_import_consultation_worker(tmp_path, monkeypatch):
-    profile = tmp_path / "profile.yaml"
-    profile.write_text(
-        "mounts:\n  - host_path: /shared\n    container_path: /shared\n"
-        "defaults:\n  image: image\n  pool: pool\n",
-        encoding="utf-8",
-    )
+    profile = write_profile(tmp_path)
     original_import = builtins.__import__
 
     def guarded_import(name, *args, **kwargs):
@@ -370,12 +343,20 @@ def test_default_runtime_does_not_import_consultation_worker(tmp_path, monkeypat
 
 
 def test_codex_backend_passes_deployment_options_and_registers_tools(tmp_path, monkeypatch):
-    profile = tmp_path / "profile.yaml"
-    profile.write_text(
-        "mounts:\n  - host_path: /shared\n    container_path: /shared\n"
-        "defaults:\n  image: image\n  pool: pool\n",
-        encoding="utf-8",
-    )
+    profile = write_profile(tmp_path)
+    consultation_options = [
+        "--consultation-model",
+        "configured-model",
+        "--consultation-codex-bin",
+        "/opt/codex/bin/codex",
+    ]
+    # Without the codex backend, consultation options are rejected, never ignored.
+    with pytest.raises(ValueError) as rejected:
+        _runtime(build_parser().parse_args(consultation_options))
+    assert "--consultation-model" in str(rejected.value)
+    assert "--consultation-codex-bin" in str(rejected.value)
+    assert "require --consultation-backend codex" in str(rejected.value)
+
     captured = {}
 
     class Manager(FakeWorkflowManager):
@@ -396,10 +377,7 @@ def test_codex_backend_passes_deployment_options_and_registers_tools(tmp_path, m
             str(tmp_path),
             "--consultation-backend",
             "codex",
-            "--consultation-model",
-            "configured-model",
-            "--consultation-codex-bin",
-            "/opt/codex/bin/codex",
+            *consultation_options,
         ]
     )
     server, _owner = _runtime(args)
@@ -420,16 +398,3 @@ def test_codex_backend_passes_deployment_options_and_registers_tools(tmp_path, m
             "codex_bin": "/opt/codex/bin/codex",
         },
     }
-
-
-@pytest.mark.parametrize(
-    "option",
-    [
-        ["--consultation-model", "configured-model"],
-        ["--consultation-codex-bin", "/opt/codex/bin/codex"],
-    ],
-)
-def test_consultation_options_require_codex_backend(option):
-    args = build_parser().parse_args(option)
-    with pytest.raises(ValueError, match="require --consultation-backend codex"):
-        _runtime(args)

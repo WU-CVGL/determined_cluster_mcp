@@ -230,20 +230,22 @@ def test_exact_legacy_retry_returns_existing_without_admission_or_submit(
     assert inspector.calls == 0
 
 
-def test_legacy_retry_rejects_changed_payload_and_native_experiment_metadata(
-    tmp_path, profile
-):
+def test_legacy_retry_matches_only_the_exact_legacy_request(tmp_path, profile):
     service = ComputeService(
         NoRemoteClient(), SQLiteTaskStore(tmp_path / "tasks.db"), profile, inspector=NoAdmission()
     )
     command = _requests()["command"]
     _insert_legacy(service, profile, command, "legacy-command")
-    with pytest.raises(ConflictError, match="different request"):
-        service.launch(
-            dict(command, command=["python", "changed.py"]),
-            "legacy-command",
-            "session-a",
-        )
+    changed_requests = [
+        dict(command, command=["python", "changed.py"]),
+        # Fields added after the legacy release never match, even at their default values.
+        dict(command, name="new"),
+        dict(command, description="new"),
+        dict(command, allow_queue=False),
+    ]
+    for changed in changed_requests:
+        with pytest.raises(ConflictError, match="different request"):
+            service.launch(changed, "legacy-command", "session-a")
 
     experiment = _requests()["experiment"]
     _insert_legacy(service, profile, experiment, "legacy-experiment")
@@ -252,29 +254,7 @@ def test_legacy_retry_rejects_changed_payload_and_native_experiment_metadata(
     with pytest.raises(ConflictError, match="different request"):
         service.launch(changed, "legacy-experiment", "session-a")
 
-
-@pytest.mark.parametrize(
-    "new_field", [{"name": "new"}, {"description": "new"}, {"allow_queue": False}]
-)
-def test_legacy_retry_rejects_explicit_new_request_fields(tmp_path, profile, new_field):
-    service = ComputeService(
-        NoRemoteClient(), SQLiteTaskStore(tmp_path / "tasks.db"), profile, inspector=NoAdmission()
-    )
-    request = _requests()["command"]
-    _insert_legacy(service, profile, request, "legacy-command")
-
+    # A record written with current metadata never falls back to the legacy hash.
+    _insert_legacy(service, profile, command, "current-record", current_metadata=True)
     with pytest.raises(ConflictError, match="different request"):
-        service.launch(dict(request, **new_field), "legacy-command", "session-a")
-
-
-def test_current_metadata_record_never_uses_legacy_hash_fallback(tmp_path, profile):
-    service = ComputeService(
-        NoRemoteClient(), SQLiteTaskStore(tmp_path / "tasks.db"), profile, inspector=NoAdmission()
-    )
-    request = _requests()["command"]
-    _insert_legacy(
-        service, profile, request, "current-record", current_metadata=True
-    )
-
-    with pytest.raises(ConflictError, match="different request"):
-        service.launch(request, "current-record", "session-a")
+        service.launch(command, "current-record", "session-a")

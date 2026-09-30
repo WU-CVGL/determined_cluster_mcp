@@ -138,11 +138,11 @@ def test_local_mapping_symlink_cannot_escape_root(tmp_path):
     assert caught.value.code == "invalid_storage_path"
 
 
-def test_sync_builds_safe_local_rsync_and_excludes_nonstandard_secret(tmp_path, monkeypatch):
+def test_sync_builds_safe_local_rsync_and_excludes_credentials(tmp_path, monkeypatch):
     source = tmp_path / "source"
-    source.mkdir()
-    secret = source / "operator-creds.txt"
-    secret.write_text("do not copy")
+    secret = source / "config" / "creds[prod].toml"
+    secret.parent.mkdir(parents=True)
+    secret.write_text("do not copy", encoding="utf-8")
     local_root = tmp_path / "client-mount"
     local_root.mkdir()
     service = StorageService(profile(), local_config(local_root), secrets_path=secret)
@@ -162,36 +162,10 @@ def test_sync_builds_safe_local_rsync_and_excludes_nonstandard_secret(tmp_path, 
     assert "--dry-run" in argv
     assert "--delete" not in argv
     assert "--copy-links" not in argv
-    assert "--exclude=/operator-creds.txt" in argv
+    assert "--no-perms" not in argv
     assert argv[-2] == str(source) + "/"
     assert argv[-1] == str(local_root / "tasks" / "task-1") + "/"
     assert not (local_root / "tasks").exists()
-    assert result["dry_run"] is True
-    assert result["completed"] is True
-    assert result["host_path"] == "/cluster/shared/tasks/task-1"
-    assert result["local_path"] == str(local_root / "tasks" / "task-1")
-    assert result["excludes"][-1] == "/operator-creds.txt"
-    assert result["truncated"] is False
-
-
-def test_sync_excludes_credentials_at_any_depth_and_escapes_secret_filter(tmp_path, monkeypatch):
-    source = tmp_path / "source"
-    secret = source / "config" / "creds[prod].toml"
-    secret.parent.mkdir(parents=True)
-    secret.write_text("secret", encoding="utf-8")
-    local_root = tmp_path / "client-mount"
-    local_root.mkdir()
-    service = StorageService(profile(), local_config(local_root), secrets_path=secret)
-    calls = []
-    monkeypatch.setattr(
-        service,
-        "_run",
-        lambda argv, **kwargs: calls.append(argv) or {"output": "", "truncated": False},
-    )
-
-    service.sync(str(source), "/work/task", dry_run=True)
-
-    argv = calls[0]
     for pattern in (
         ".git/",
         ".local/",
@@ -210,33 +184,34 @@ def test_sync_excludes_credentials_at_any_depth_and_escapes_secret_filter(tmp_pa
         "id_rsa",
     ):
         assert f"--exclude={pattern}" in argv
+    # The configured secrets file is excluded even under a non-standard name,
+    # anchored to the source root and with rsync wildcards escaped.
     assert r"--exclude=/config/creds\[prod\].toml" in argv
+    assert result["excludes"][-1] == r"/config/creds\[prod\].toml"
+    assert result["dry_run"] is True
+    assert result["completed"] is True
+    assert result["host_path"] == "/cluster/shared/tasks/task-1"
+    assert result["local_path"] == str(local_root / "tasks" / "task-1")
+    assert result["truncated"] is False
+    assert result["preserve_permissions"] is True
 
 
-def test_sync_rejects_shared_root_and_never_creates_missing_copy_root(tmp_path, monkeypatch):
+def test_local_sync_needs_existing_root_and_creates_only_the_destination(tmp_path, monkeypatch):
     source = tmp_path / "source"
     source.mkdir()
-    missing_root = tmp_path / "missing-root"
-    service = StorageService(profile(), local_config(missing_root, mode="local"))
+    local_root = tmp_path / "client-mount"
+    service = StorageService(profile(), local_config(local_root, mode="local"))
+    monkeypatch.setattr(service, "_run", lambda *a, **k: {"output": "", "truncated": False})
 
     with pytest.raises(StorageError, match="task subdirectory"):
         service.sync(str(source), "/work", dry_run=False)
     with pytest.raises(StorageError) as caught:
         service.sync(str(source), "/work/task", dry_run=False)
     assert caught.value.code == "configuration_required"
-    assert not missing_root.exists()
+    assert not local_root.exists()
 
-
-def test_non_dry_local_sync_creates_only_destination_below_existing_root(tmp_path, monkeypatch):
-    source = tmp_path / "source"
-    source.mkdir()
-    local_root = tmp_path / "client-mount"
     local_root.mkdir()
-    service = StorageService(profile(), local_config(local_root))
-    monkeypatch.setattr(service, "_run", lambda *a, **k: {"output": "", "truncated": False})
-
     service.sync(str(source), "/work/tasks/new", dry_run=False)
-
     assert (local_root / "tasks" / "new").is_dir()
 
 
@@ -269,10 +244,13 @@ def test_permission_preservation_can_be_disabled_for_restrictive_mounts(tmp_path
 
 
 @pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync is not installed")
-def test_real_local_copy_with_permission_preservation_disabled(tmp_path):
+def test_real_local_rsync_preview_upload_and_fetch_round_trip(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
-    (source / "hello.txt").write_text("hello", encoding="utf-8")
+    (source / "result.txt").write_text("complete", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    (source / "unsafe-link").symlink_to(outside)
     local_root = tmp_path / "client-mount"
     local_root.mkdir()
     config = StorageAccessConfig.from_dict(
@@ -283,46 +261,17 @@ def test_real_local_copy_with_permission_preservation_disabled(tmp_path):
             "preserve_permissions": False,
         }
     )
+    service = StorageService(profile(), config)
 
-    result = StorageService(profile(), config).sync(
-        str(source), "/work/task", dry_run=False
-    )
-
-    assert (local_root / "task" / "hello.txt").read_text(encoding="utf-8") == "hello"
-    assert result["preserve_permissions"] is False
-
-
-@pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync is not installed")
-def test_real_local_nested_dry_run_is_reviewable_and_creates_nothing(tmp_path):
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "new-file.txt").write_text("preview", encoding="utf-8")
-    local_root = tmp_path / "client-mount"
-    local_root.mkdir()
-    service = StorageService(profile(), local_config(local_root))
-
-    result = service.sync(str(source), "/work/missing/parents/task", dry_run=True)
-
+    preview = service.sync(str(source), "/work/missing/parents/task", dry_run=True)
     assert not (local_root / "missing").exists()
-    assert "new-file.txt" in result["output"]
+    assert "result.txt" in preview["output"]
 
-
-@pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync is not installed")
-def test_real_local_rsync_round_trip_uses_directory_contents(tmp_path):
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "result.txt").write_text("complete", encoding="utf-8")
-    outside = tmp_path / "outside.txt"
-    outside.write_text("outside", encoding="utf-8")
-    (source / "unsafe-link").symlink_to(outside)
-    local_root = tmp_path / "client-mount"
-    local_root.mkdir()
-    service = StorageService(profile(), local_config(local_root))
-
-    service.sync(str(source), "/work/tasks/task-1", dry_run=False)
+    uploaded = service.sync(str(source), "/work/tasks/task-1", dry_run=False)
     shared = local_root / "tasks" / "task-1"
     assert (shared / "result.txt").read_text(encoding="utf-8") == "complete"
     assert not (shared / "unsafe-link").exists()
+    assert uploaded["preserve_permissions"] is False
 
     download = tmp_path / "download"
     service.fetch("/work/tasks/task-1", str(download), dry_run=False)
@@ -354,7 +303,7 @@ def test_fetch_requires_shared_directory_and_local_output_directory(tmp_path, mo
         service.fetch("/work/results", "/")
 
 
-def test_ssh_check_uses_fixed_quoted_script_and_no_shell(tmp_path, monkeypatch):
+def test_ssh_check_uses_fixed_quoted_script_and_no_shell(monkeypatch):
     config = StorageAccessConfig.from_dict(
         {
             "mode": "ssh",

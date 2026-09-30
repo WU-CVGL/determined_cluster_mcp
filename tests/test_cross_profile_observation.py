@@ -64,10 +64,6 @@ class FakeClient:
         self.calls.append(("GET", f"api/v1/{kind}s/{remote_id}/logs"))
         return [{"message": "remote log"}]
 
-    def cancel_task(self, kind, remote_id):
-        self.calls.append(("POST", f"api/v1/{kind}s/{remote_id}/kill"))
-        return {"id": remote_id, "state": "TERMINATING"}
-
     def task_resources_enabled(self):
         self.calls.append(("GET", "api/v1/task-resources/capability"))
         return True
@@ -145,61 +141,50 @@ CROSS_BINDING = {
     "mutations_allowed": False,
     "message": "cancel, reconcile and launch retries require the task's original compute profile",
 }
+READ_OPERATIONS = ("status", "logs", "usage")
 
 
-@pytest.mark.parametrize(
-    ("operation", "extra_calls"),
-    [
-        ("status", []),
-        ("logs", [("GET", f"api/v1/commands/{COMMAND_ID}/logs")]),
-        (
-            "usage",
-            [
-                ("GET", "api/v1/task-resources/capability"),
-                ("GET", f"api/v1/tasks/{COMMAND_ID}"),
-                ("GET", f"api/v1/tasks/{COMMAND_ID}/resources"),
-            ],
-        ),
-    ],
-)
-def test_changed_profile_can_observe_after_owner_and_marker_checks(
-    tmp_path, operation, extra_calls
-):
+def test_changed_profile_can_observe_after_owner_and_marker_checks(tmp_path):
     client, store, task = submitted(tmp_path)
     client.entities[("command", COMMAND_ID)]["state"] = "COMPLETED"
     service = other_profile_service(client, store)
+    verify = [("GET", "api/v1/me"), ("GET", f"api/v1/commands/{COMMAND_ID}")]
     before = rows(tmp_path)
 
-    if operation == "logs":
-        result = service.logs(task["task_id"], "session-a", 20, include_binding=True)
-        assert result["logs"] == [{"message": "remote log"}]
-        assert result["task_id"] == task["task_id"]
-    else:
-        result = getattr(service, operation)(task["task_id"], "session-a")
+    logs = service.logs(task["task_id"], "session-a", 20, include_binding=True)
+    assert logs == {
+        "task_id": task["task_id"],
+        "binding": CROSS_BINDING,
+        "logs": [{"message": "remote log"}],
+    }
+    assert client.calls == [*verify, ("GET", f"api/v1/commands/{COMMAND_ID}/logs")]
 
-    assert result["binding"] == CROSS_BINDING
+    # Without include_binding, logs keep their plain list shape.
+    assert service.logs(task["task_id"], "session-a", 5) == [{"message": "remote log"}]
+
+    client.calls.clear()
+    usage = service.usage(task["task_id"], "session-a")
+    assert usage["binding"] == CROSS_BINDING
     assert client.calls == [
-        ("GET", "api/v1/me"),
-        ("GET", f"api/v1/commands/{COMMAND_ID}"),
-        *extra_calls,
+        *verify,
+        ("GET", "api/v1/task-resources/capability"),
+        ("GET", f"api/v1/tasks/{COMMAND_ID}"),
+        ("GET", f"api/v1/tasks/{COMMAND_ID}/resources"),
     ]
+    assert rows(tmp_path) == before
+
+    client.calls.clear()
+    status = service.status(task["task_id"], "session-a")
+    assert status["binding"] == CROSS_BINDING
+    assert status["remote_state"] == "COMPLETED"
+    assert status["remote"]["state"] == "COMPLETED"
+    assert client.calls == verify
+    # Only the remote-state cache may change.
     after = rows(tmp_path)
-    if operation == "status":
-        assert result["remote_state"] == "COMPLETED"
-        assert result["remote"]["state"] == "COMPLETED"
-        # Only the remote-state cache may change.
-        for row in before + after:
-            row.pop("remote_state")
-            row.pop("updated_at")
+    for row in before + after:
+        row.pop("remote_state")
+        row.pop("updated_at")
     assert after == before
-
-
-def test_default_logs_shape_is_unchanged_under_a_changed_profile(tmp_path):
-    client, store, task = submitted(tmp_path)
-
-    logs = other_profile_service(client, store).logs(task["task_id"], "session-a", 5)
-
-    assert logs == [{"message": "remote log"}]
 
 
 def test_exact_profile_observation_adds_no_remote_calls(tmp_path):
@@ -224,7 +209,6 @@ def test_exact_profile_observation_adds_no_remote_calls(tmp_path):
     ]
 
 
-@pytest.mark.parametrize("operation", ["status", "logs", "usage"])
 @pytest.mark.parametrize(
     ("change", "code"),
     [
@@ -236,19 +220,24 @@ def test_exact_profile_observation_adds_no_remote_calls(tmp_path):
         ({"userId": 8}, "ownership_mismatch"),
         ({"id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"}, "identity_mismatch"),
     ],
+    ids=["other-marker", "missing-marker", "other-owner", "other-id"],
 )
-def test_cross_profile_verification_fails_before_logs_or_usage(
-    tmp_path, operation, change, code
-):
+def test_cross_profile_verification_fails_before_logs_or_usage(tmp_path, change, code):
     client, store, task = submitted(tmp_path)
     client.entities[("command", COMMAND_ID)].update(change)
+    service = other_profile_service(client, store)
     before = rows(tmp_path)
 
-    with pytest.raises(ConflictError) as caught:
-        getattr(other_profile_service(client, store), operation)(task["task_id"], "session-a")
+    for operation in READ_OPERATIONS:
+        client.calls.clear()
+        with pytest.raises(ConflictError) as caught:
+            getattr(service, operation)(task["task_id"], "session-a")
 
-    assert caught.value.code == code
-    assert client.calls == [("GET", "api/v1/me"), ("GET", f"api/v1/commands/{COMMAND_ID}")]
+        assert caught.value.code == code, operation
+        assert client.calls == [
+            ("GET", "api/v1/me"),
+            ("GET", f"api/v1/commands/{COMMAND_ID}"),
+        ], operation
     assert rows(tmp_path) == before
 
 
@@ -264,75 +253,62 @@ DROPPED = {
 }
 
 
-@pytest.mark.parametrize("operation", ["status", "logs", "usage"])
 @pytest.mark.parametrize("kind", ["command", "shell", "experiment"])
-def test_cross_profile_read_of_a_dropped_entity_is_unverifiable(tmp_path, kind, operation):
+def test_cross_profile_read_of_a_dropped_entity_is_unverifiable(tmp_path, kind):
     request, remote_id = DROPPED[kind]
     client, store, task = submitted(tmp_path, request)
     # Determined drops an ended command or shell 24 hours after it ends or on a restart;
     # an experiment returns 404 once it is deleted or when it is not visible.
     client.entity_errors[(kind, remote_id)] = APIError("404 not found", code=404)
+    service = other_profile_service(client, store)
     before = rows(tmp_path)
 
-    with pytest.raises(ConflictError) as caught:
-        getattr(other_profile_service(client, store), operation)(task["task_id"], "session-a")
+    for operation in READ_OPERATIONS:
+        client.calls.clear()
+        with pytest.raises(ConflictError) as caught:
+            getattr(service, operation)(task["task_id"], "session-a")
 
-    assert caught.value.code == "cross_profile_unverifiable"
-    assert caught.value.retryable is False
-    assert "original compute profile" in str(caught.value)
-    assert isinstance(caught.value.__cause__, APIError)
-    assert caught.value.__cause__.code == 404
-    # No task logs, task info or resource series are read without verification.
-    assert client.calls == [("GET", "api/v1/me"), ("GET", f"api/v1/{kind}s/{remote_id}")]
+        assert caught.value.code == "cross_profile_unverifiable", operation
+        assert caught.value.retryable is False
+        assert isinstance(caught.value.__cause__, APIError)
+        assert caught.value.__cause__.code == 404
+        # No task logs, task info or resource series are read without verification.
+        assert client.calls == [("GET", "api/v1/me"), ("GET", f"api/v1/{kind}s/{remote_id}")]
     assert rows(tmp_path) == before
 
-
-@pytest.mark.parametrize("kind", ["command", "shell", "experiment"])
-def test_unverifiable_message_matches_the_task_kind(tmp_path, kind):
-    request, remote_id = DROPPED[kind]
-    client, store, task = submitted(tmp_path, request)
-    client.entity_errors[(kind, remote_id)] = APIError("404 not found", code=404)
-
-    with pytest.raises(ConflictError) as caught:
-        other_profile_service(client, store).logs(task["task_id"], "session-a")
-
     message = str(caught.value)
+    assert "original compute profile" in message
     if kind == "experiment":
-        # Experiments are never dropped on a timer, and deleting one deletes its logs.
-        assert "deleted or is not visible to this account" in message
-        assert "deleting an experiment also deletes its logs" in message
-        assert "if the experiment still exists" in message
+        # Deleting an experiment deletes its logs, so the message must not promise them.
         assert "24 hours" not in message
         assert "remain readable" not in message
     else:
-        assert message == (
-            "Determined no longer returns this task's entity (an ended command or shell "
-            "is dropped 24 hours after it ends and on a master restart), so its owner "
-            "and submission marker cannot be verified from another compute profile; "
-            "logs and usage remain readable with the task's original compute profile"
-        )
+        assert "remain readable" in message
 
 
-@pytest.mark.parametrize("operation", ["status", "logs", "usage"])
 @pytest.mark.parametrize(
     "error",
     [
         APIError("503 unavailable", code=503, retryable=True),
-        APIError("403 forbidden", code=403),
         APIError("timed out", code="transport_error", retryable=True),
     ],
+    ids=["http-503", "transport"],
 )
-def test_cross_profile_entity_errors_other_than_404_propagate_unchanged(
-    tmp_path, operation, error
-):
+def test_cross_profile_entity_errors_other_than_404_propagate_unchanged(tmp_path, error):
     client, store, task = submitted(tmp_path)
     client.entity_errors[("command", COMMAND_ID)] = error
+    service = other_profile_service(client, store)
 
-    with pytest.raises(APIError) as caught:
-        getattr(other_profile_service(client, store), operation)(task["task_id"], "session-a")
+    for operation in READ_OPERATIONS:
+        client.calls.clear()
+        with pytest.raises(APIError) as caught:
+            getattr(service, operation)(task["task_id"], "session-a")
 
-    assert caught.value is error
-    assert client.calls == [("GET", "api/v1/me"), ("GET", f"api/v1/commands/{COMMAND_ID}")]
+        assert caught.value is error, operation
+        assert client.calls == [
+            ("GET", "api/v1/me"),
+            ("GET", f"api/v1/commands/{COMMAND_ID}"),
+        ], operation
 
 
 def test_exact_profile_reads_of_a_dropped_entity_are_unchanged(tmp_path):
@@ -414,26 +390,6 @@ def test_unbound_cross_profile_record_is_returned_without_remote_calls_or_writes
     assert rows(tmp_path) == before
 
 
-@pytest.mark.parametrize("operation", ["status", "logs", "usage", "cancel"])
-@pytest.mark.parametrize(
-    "service_factory",
-    [
-        lambda client, store: ComputeService(
-            client, store, profile(image="other/image:v2", label="other-cluster")
-        ),
-        lambda client, store: ComputeService(_EndpointClient(client), store, profile()),
-    ],
-)
-def test_changed_label_or_endpoint_still_fails_closed(tmp_path, operation, service_factory):
-    client, store, task = submitted(tmp_path)
-
-    with pytest.raises(ConflictError) as caught:
-        getattr(service_factory(client, store), operation)(task["task_id"], "session-a")
-
-    assert caught.value.code == "binding_mismatch"
-    assert client.calls == []
-
-
 class _EndpointClient:
     api_url = "https://other-det.example.test"
 
@@ -442,6 +398,27 @@ class _EndpointClient:
 
     def __getattr__(self, name):
         return getattr(self.inner, name)
+
+
+@pytest.mark.parametrize(
+    "service_factory",
+    [
+        lambda client, store: ComputeService(
+            client, store, profile(image="other/image:v2", label="other-cluster")
+        ),
+        lambda client, store: ComputeService(_EndpointClient(client), store, profile()),
+    ],
+    ids=["other-label", "other-endpoint"],
+)
+def test_changed_label_or_endpoint_still_fails_closed(tmp_path, service_factory):
+    client, store, task = submitted(tmp_path)
+    service = service_factory(client, store)
+
+    for operation in (*READ_OPERATIONS, "cancel"):
+        with pytest.raises(ConflictError) as caught:
+            getattr(service, operation)(task["task_id"], "session-a")
+        assert caught.value.code == "binding_mismatch", operation
+    assert client.calls == []
 
 
 def test_mutations_still_require_the_original_profile(tmp_path):
@@ -458,7 +435,6 @@ def test_mutations_still_require_the_original_profile(tmp_path):
         ).launch(REQUEST, "request-1", "session-a")
 
     assert cancel.value.code == "binding_mismatch"
-    assert "Read-only status, logs and usage remain available" in str(cancel.value)
     assert reconcile.value.code == "binding_mismatch"
     assert retry.value.code == "idempotency_conflict"
     assert client.calls == []

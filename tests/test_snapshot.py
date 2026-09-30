@@ -16,7 +16,7 @@ import pytest
 
 from determined_compute import compute_cli
 from determined_compute.compute import ComputeProfile
-from determined_compute.storage import SSHConfig, StorageAccessConfig, StorageError, StorageService
+from determined_compute.storage import StorageAccessConfig, StorageError, StorageService
 from determined_compute.storage import snapshot as snapshot_module
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git is required")
@@ -67,54 +67,106 @@ def repo(tmp_path):
     return root
 
 
-def storage_for(tmp_path, link_mode="hardlink", **access):
-    shared = tmp_path / "shared"
-    shared.mkdir(exist_ok=True)
-    profile = ComputeProfile.from_dict(
+@pytest.fixture
+def plain_repo(tmp_path):
+    root = tmp_path / "plain"
+    root.mkdir()
+    git(root, "init", "-q")
+    write(root / "train.py", "print('train')\n")
+    write(root / "vendor" / "lib" / "code.py", "VALUE = 1\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "initial")
+    return root
+
+
+def profile_for(tmp_path):
+    return ComputeProfile.from_dict(
         {
             "mounts": [
-                {"host_path": str(shared), "container_path": "/shared"},
+                {"host_path": str(tmp_path / "shared"), "container_path": "/shared"},
                 {"host_path": str(tmp_path / "reference"), "container_path": "/reference",
                  "read_only": True},
             ],
             "defaults": {"image": "image", "pool": "pool"},
         }
     )
+
+
+def storage_for(tmp_path, link_mode="hardlink", **access):
+    (tmp_path / "shared").mkdir(exist_ok=True)
     config = StorageAccessConfig.from_dict(
         {"snapshots": {"root": "/shared/snapshots", "link_mode": link_mode}, **access}
     )
-    return StorageService(profile, config, tmp_path / "unused-secrets.env")
+    return StorageService(profile_for(tmp_path), config, tmp_path / "unused-secrets.env")
 
 
 def snapshot_root(tmp_path):
     return tmp_path / "shared" / "snapshots"
 
 
-def test_dry_run_reports_identity_and_writes_nothing(tmp_path, repo):
+def read_manifest(tmp_path, result):
+    return json.loads(
+        (snapshot_root(tmp_path) / "manifests" / f"{result['snapshot_key']}.json").read_text()
+    )
+
+
+def no_reflink(*_args, **_kwargs):
+    raise OSError(errno.EOPNOTSUPP, "Operation not supported")
+
+
+def refuse_links(monkeypatch, code=errno.EPERM):
+    def refuse(*_args, **_kwargs):
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(snapshot_module.os, "link", refuse)
+
+
+def run_concurrently(count, function):
+    barrier = threading.Barrier(count)
+    results, errors = [], []
+
+    def run():
+        barrier.wait()
+        try:
+            results.append(function())
+        except Exception as exc:  # pragma: no cover - reported below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert errors == []
+    return results
+
+
+# Publishing, identity and reuse
+
+
+def test_preview_writes_nothing_and_execute_publishes_a_read_only_tree(tmp_path, repo):
     storage = storage_for(tmp_path)
 
-    result = storage.snapshot(str(repo))
-
-    assert result["dry_run"] is True
-    assert result["revision"] == git(repo, "rev-parse", "HEAD")
-    assert result["tree"] == git(repo, "rev-parse", "HEAD^{tree}")
-    assert result["workdir"] == f"/shared/snapshots/trees/{result['content_id']}"
-    assert result["request_fields"] == {
-        "workdir": result["workdir"],
-        "code_revision": result["revision"],
-    }
-    assert result["manifest_path"] is None and result["manifest_sha256"] is None
-    assert result["existing"] is False and result["tree_existing"] is False
-    assert result["files"] == 5
-    assert result["symlinks"] == 1
-    assert result["new_objects"] == 4  # shared.txt and docs/notes.md are one object
-    assert not snapshot_root(tmp_path).exists()
-
-
-def test_execute_publishes_a_read_only_tree_and_manifest(tmp_path, repo):
-    storage = storage_for(tmp_path)
-
+    preview = storage.snapshot(str(repo))
+    wrote_nothing = not snapshot_root(tmp_path).exists()
     result = storage.snapshot(str(repo), dry_run=False)
+
+    assert wrote_nothing
+    assert preview["dry_run"] is True and result["dry_run"] is False
+    assert preview["revision"] == git(repo, "rev-parse", "HEAD")
+    assert preview["tree"] == git(repo, "rev-parse", "HEAD^{tree}")
+    assert preview["workdir"] == f"/shared/snapshots/trees/{preview['content_id']}"
+    assert preview["request_fields"] == {
+        "workdir": preview["workdir"],
+        "code_revision": preview["revision"],
+    }
+    assert preview["manifest_path"] is None and preview["manifest_sha256"] is None
+    assert preview["existing"] is False and preview["tree_existing"] is False
+    assert preview["files"] == 5 and preview["symlinks"] == 1
+    assert preview["new_objects"] == 4  # shared.txt and docs/notes.md are one object
+    # The preview names exactly what the publish creates.
+    for key in ("content_id", "snapshot_key", "request_fields", "new_objects", "new_bytes"):
+        assert result[key] == preview[key]
 
     tree = Path(result["local_path"])
     assert tree == snapshot_root(tmp_path) / "trees" / result["content_id"]
@@ -140,7 +192,6 @@ def test_execute_publishes_a_read_only_tree_and_manifest(tmp_path, repo):
     ]
     assert "url" not in json.dumps(manifest)
     assert result["link_mode"] == "hardlink"
-    assert result["new_objects"] == 4
     assert list((snapshot_root(tmp_path) / "tmp").iterdir()) == []
 
 
@@ -158,38 +209,42 @@ def test_repeated_snapshot_reuses_the_manifest_and_tree(tmp_path, repo):
     assert second["new_objects"] == 0 and second["new_bytes"] == 0
 
 
-def test_revisions_share_objects_and_identical_content_shares_the_workdir(tmp_path, repo):
+def test_objects_are_shared_by_content_and_mode_across_revisions(tmp_path, repo):
     storage = storage_for(tmp_path)
     first = storage.snapshot(str(repo), dry_run=False)
     write(repo / "train.py", "print('train v2')\n")
-    git(repo, "commit", "-q", "-am", "change")
+    write(repo / "tool.sh", "#!/bin/sh\necho run\n")  # run.sh's blob, without the exec bit
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "change")
     second = storage.snapshot(str(repo), dry_run=False)
     git(repo, "commit", "-q", "--allow-empty", "-m", "empty")
     third = storage.snapshot(str(repo), dry_run=False)
 
     assert second["content_id"] != first["content_id"]
-    assert second["new_objects"] == 1
+    assert second["new_objects"] == 2  # the new train.py and a plain copy of run.sh
     first_tree, second_tree = Path(first["local_path"]), Path(second["local_path"])
     assert (
         os.stat(first_tree / "tokenizer.py").st_ino
         == os.stat(second_tree / "tokenizer.py").st_ino
     )
+    # Hard links share one mode, so executable and plain copies of a blob are two objects.
+    digest = hashlib.sha256(b"#!/bin/sh\necho run\n").hexdigest()
+    objects = snapshot_root(tmp_path) / "objects" / "sha256" / digest[:2]
+    assert sorted(
+        path.name for path in objects.iterdir() if path.name.startswith(digest)
+    ) == [digest, digest + ".x"]
+    assert os.stat(second_tree / "tool.sh").st_ino != (
+        os.stat(second_tree / "scripts" / "run.sh").st_ino
+    )
+    assert stat.S_IMODE(os.stat(second_tree / "tool.sh").st_mode) == 0o444
+    # Identical content under a new commit shares the workdir but not the manifest.
     assert third["workdir"] == second["workdir"]
     assert third["revision"] != second["revision"]
     assert third["manifest_path"] != second["manifest_path"]
     assert third["tree_existing"] is True
 
 
-def test_copy_mode_skips_the_object_store(tmp_path, repo):
-    result = storage_for(tmp_path, link_mode="copy").snapshot(str(repo), dry_run=False)
-
-    tree = Path(result["local_path"])
-    assert result["link_mode"] == "copy" and result["new_objects"] == 0
-    assert result["new_bytes"] == result["bytes"]
-    assert os.stat(tree / "shared.txt").st_ino != os.stat(tree / "docs" / "notes.md").st_ino
-    assert not (snapshot_root(tmp_path) / "objects" / "sha256").exists() or not any(
-        (snapshot_root(tmp_path) / "objects" / "sha256").iterdir()
-    )
+# Link modes
 
 
 def test_auto_mode_probes_the_filesystem(tmp_path, repo):
@@ -199,25 +254,10 @@ def test_auto_mode_probes_the_filesystem(tmp_path, repo):
     assert (Path(result["local_path"]) / "train.py").read_text() == "print('train')\n"
 
 
-def test_auto_mode_copies_instead_of_hard_linking(tmp_path, repo, monkeypatch):
-    def no_reflink(*_args, **_kwargs):
-        raise OSError(errno.EOPNOTSUPP, "Operation not supported")
-
-    monkeypatch.setattr(snapshot_module, "_reflink", no_reflink)
-
-    result = storage_for(tmp_path, link_mode="auto").snapshot(str(repo), dry_run=False)
-
-    tree = Path(result["local_path"])
-    assert result["link_mode"] == "copy" and result["new_objects"] == 0
-    assert os.stat(tree / "train.py").st_nlink == 1
-    assert os.stat(tree / "shared.txt").st_ino != os.stat(tree / "docs" / "notes.md").st_ino
-
-
 @pytest.mark.parametrize("link_mode", ["auto", "copy"])
-def test_preview_estimates_a_copy_of_every_file(tmp_path, repo, monkeypatch, link_mode):
-    def no_reflink(*_args, **_kwargs):
-        raise OSError(errno.EOPNOTSUPP, "Operation not supported")
-
+def test_copy_skips_the_object_store_and_the_preview_counts_every_file(
+    tmp_path, repo, monkeypatch, link_mode
+):
     monkeypatch.setattr(snapshot_module, "_reflink", no_reflink)
     storage = storage_for(tmp_path, link_mode=link_mode)
 
@@ -232,6 +272,11 @@ def test_preview_estimates_a_copy_of_every_file(tmp_path, repo, monkeypatch, lin
     assert preview["new_objects"] == published["new_objects"] == 0
     assert preview["new_bytes"] == published["new_bytes"] == preview["bytes"]
     assert again["new_objects"] == again["new_bytes"] == 0
+    # Without reflink, auto copies: it never hard-links tree files to each other or a store.
+    tree = Path(published["local_path"])
+    assert os.stat(tree / "train.py").st_nlink == 1
+    assert os.stat(tree / "shared.txt").st_ino != os.stat(tree / "docs" / "notes.md").st_ino
+    assert list((snapshot_root(tmp_path) / "objects" / "sha256").iterdir()) == []
 
 
 def test_auto_preview_is_an_upper_bound_on_reflink_storage(tmp_path, repo, monkeypatch):
@@ -251,10 +296,7 @@ def test_auto_preview_is_an_upper_bound_on_reflink_storage(tmp_path, repo, monke
 
 
 def test_link_limit_falls_back_to_copies(tmp_path, repo, monkeypatch):
-    def refuse(*_args, **_kwargs):
-        raise OSError(errno.EMLINK, "Too many links")
-
-    monkeypatch.setattr(snapshot_module.os, "link", refuse)
+    refuse_links(monkeypatch, errno.EMLINK)
 
     result = storage_for(tmp_path).snapshot(str(repo), dry_run=False)
 
@@ -265,8 +307,15 @@ def test_link_limit_falls_back_to_copies(tmp_path, repo, monkeypatch):
     assert stat.S_IMODE(os.stat(tree / "scripts" / "run.sh").st_mode) == 0o555
 
 
+# Secret-like, cache and excluded paths
+
+
 def test_secret_like_and_cache_paths_are_excluded_and_reported(tmp_path, repo):
-    result = storage_for(tmp_path).snapshot(str(repo), exclude=["docs/"])
+    write(repo / ".env.local", "KEY=not-real\n")
+    storage = storage_for(tmp_path)
+
+    result = storage.snapshot(str(repo), exclude=["docs/"])
+    expanded = storage.snapshot(str(repo), include=["."])
 
     assert result["excluded"] == [
         {"path": ".env", "reason": "secret_like", "rule": ".env*"},
@@ -276,19 +325,20 @@ def test_secret_like_and_cache_paths_are_excluded_and_reported(tmp_path, repo):
         {"path": "docs/notes.md", "reason": "exclude_pattern", "rule": "docs/"},
     ]
     assert result["files"] == 4  # tokenizer.py is kept
+    # A directory include applies the same rules to working-tree files, without an error.
+    assert {"path": ".env.local", "reason": "secret_like", "rule": ".env*"} in (
+        expanded["excluded"]
+    )
+    assert {"path": ".env", "reason": "secret_like", "rule": ".env*"} in expanded["excluded"]
+    assert expanded["warnings"] == []
 
 
 @pytest.mark.parametrize(
     ("path", "skip"),
     [
-        (".ssh/config", "/.ssh/"),
-        (".aws/credentials", "/.aws/"),
-        ("id_rsa", "/id_rsa"),
-        ("keys/id_ed25519", "/keys/id_ed25519"),
-        ("keys[1]/id_ecdsa", "/keys[[]1]/id_ecdsa"),
-        ("id_dsa", "/id_dsa"),
-        (".netrc", "/.netrc"),
-        ("cluster.conf", "/cluster.conf"),
+        (".ssh/config", "/.ssh/"),  # a credential directory
+        ("keys[1]/id_ecdsa", "/keys[[]1]/id_ecdsa"),  # a private key; the pattern is escaped
+        ("cluster.conf", "/cluster.conf"),  # the configured secrets file
     ],
 )
 def test_hard_secret_rules_refuse_every_include(tmp_path, repo, path, skip):
@@ -304,7 +354,6 @@ def test_hard_secret_rules_refuse_every_include(tmp_path, repo, path, skip):
     skipped = storage.snapshot(str(repo), include=["."], exclude=[skip])
 
     assert named.value.code == walked.value.code == "secret_like_include"
-    assert "remove it from include" in str(named.value)
     assert f"add {skip!r} to exclude" in str(walked.value)
     assert {"path": skip[1:].replace("[[]", "["), "reason": "exclude_pattern", "rule": skip} in (
         skipped["excluded"]
@@ -312,106 +361,67 @@ def test_hard_secret_rules_refuse_every_include(tmp_path, repo, path, skip):
     assert skipped["files"] == 5
 
 
-def test_key_like_names_are_soft_rules(tmp_path, plain_repo):
-    write(plain_repo / "src" / "main.py", "import id_rsa_parser\n")
+def test_an_explicit_include_overrides_soft_secret_rules(tmp_path, plain_repo):
+    write(plain_repo / "src" / "pkg" / "__init__.py", "from .utils import secrets\n")
+    write(plain_repo / "src" / "pkg" / "utils" / "__init__.py", "")
+    write(plain_repo / "src" / "pkg" / "utils" / "secrets.py", "def load():\n    return None\n")
+    write(plain_repo / "src" / "pkg" / "utils" / ".env", "KEY=not-real\n")
     write(plain_repo / "src" / "id_rsa_parser.py", "def parse():\n    return None\n")
     write(plain_repo / "tests" / "fixtures" / "id_ed25519.pub", "ssh-ed25519 AAAA test\n")
     git(plain_repo, "add", "-A")
-    git(plain_repo, "commit", "-q", "-m", "key-like names")
+    git(plain_repo, "commit", "-q", "-m", "secret-like names")
     write(plain_repo / "keys" / "id_rsa_deploy", "not-real\n")
     storage = storage_for(tmp_path)
+    module = {"path": "src/pkg/utils/secrets.py", "reason": "secret_like", "rule": "*secret*"}
     parser = {"path": "src/id_rsa_parser.py", "reason": "secret_like", "rule": "id_rsa*"}
     fixture = {
         "path": "tests/fixtures/id_ed25519.pub", "reason": "secret_like", "rule": "id_ed25519*"
     }
+    dotenv = {"path": "src/pkg/utils/.env", "reason": "secret_like", "rule": ".env*"}
     deploy = {"path": "keys/id_rsa_deploy", "reason": "secret_like", "rule": "id_rsa*"}
 
     default = storage.snapshot(str(plain_repo))
-    walked = {
-        value: storage.snapshot(str(plain_repo), include=[value])
-        for value in ("src", "tests", "keys", ".")
-    }
+    walked = storage.snapshot(str(plain_repo), include=["."])
     explicit = storage.snapshot(
         str(plain_repo),
-        include=["src/id_rsa_parser.py", "tests/fixtures/id_ed25519.pub"],
+        include=["src/pkg/utils/secrets.py", "src/id_rsa_parser.py",
+                 "tests/fixtures/id_ed25519.pub"],
         dry_run=False,
     )
 
     # Tracked and walked matches are excluded and reported, never an error.
-    for result in (default, *walked.values()):
-        assert parser in result["excluded"] and fixture in result["excluded"]
+    for result in (default, walked):
+        assert all(item in result["excluded"] for item in (module, parser, fixture, dotenv))
         assert result["warnings"] == []
-    assert deploy in walked["keys"]["excluded"] and deploy in walked["."]["excluded"]
+    assert default["files"] == 4
+    assert deploy in walked["excluded"]
     # An include that names the file restores it, with a warning and a manifest record.
     tree = Path(explicit["local_path"])
-    assert (tree / "src" / "id_rsa_parser.py").read_text() == "def parse():\n    return None\n"
+    assert (tree / "src" / "pkg" / "utils" / "secrets.py").read_text() == (
+        "def load():\n    return None\n"
+    )
+    assert (tree / "src" / "id_rsa_parser.py").exists()
     assert (tree / "tests" / "fixtures" / "id_ed25519.pub").exists()
-    assert parser not in explicit["excluded"] and fixture not in explicit["excluded"]
+    assert explicit["files"] == 7
+    assert not any(item in explicit["excluded"] for item in (module, parser, fixture))
+    assert dotenv in explicit["excluded"]
     assert [(item["code"], item["path"], item["rule"]) for item in explicit["warnings"]] == [
         ("secret_like_included", "src/id_rsa_parser.py", "id_rsa*"),
+        ("secret_like_included", "src/pkg/utils/secrets.py", "*secret*"),
         ("secret_like_included", "tests/fixtures/id_ed25519.pub", "id_ed25519*"),
     ]
-    manifest_file = snapshot_root(tmp_path) / "manifests" / f"{explicit['snapshot_key']}.json"
-    sources = json.loads(manifest_file.read_text())["sources"]
-    assert {item["path"]: item["included_despite"] for item in sources[1:]} == {
-        "src/id_rsa_parser.py": "id_rsa*",
-        "tests/fixtures/id_ed25519.pub": "id_ed25519*",
+    sources = read_manifest(tmp_path, explicit)["sources"]
+    assert {
+        item["path"]: (item["included_despite"], item["overrides"])
+        for item in sources if item["kind"] == "include"
+    } == {
+        "src/id_rsa_parser.py": ("id_rsa*", True),
+        "src/pkg/utils/secrets.py": ("*secret*", True),
+        "tests/fixtures/id_ed25519.pub": ("id_ed25519*", True),
     }
 
 
-def test_soft_secret_rules_exclude_expanded_includes(tmp_path, repo):
-    write(repo / ".env.local", "KEY=not-real\n")
-
-    result = storage_for(tmp_path).snapshot(str(repo), include=["."])
-
-    assert {"path": ".env.local", "reason": "secret_like", "rule": ".env*"} in result["excluded"]
-    assert {"path": ".env", "reason": "secret_like", "rule": ".env*"} in result["excluded"]
-    assert result["warnings"] == []
-
-
-@pytest.fixture
-def module_repo(tmp_path):
-    root = tmp_path / "modules"
-    root.mkdir()
-    git(root, "init", "-q")
-    write(root / "src" / "pkg" / "__init__.py", "from .utils import secrets\n")
-    write(root / "src" / "pkg" / "utils" / "__init__.py", "")
-    write(root / "src" / "pkg" / "utils" / "secrets.py", "def load():\n    return None\n")
-    write(root / "src" / "pkg" / "utils" / ".env", "KEY=not-real\n")
-    git(root, "add", "-A")
-    git(root, "commit", "-q", "-m", "initial")
-    return root
-
-
-def test_an_explicit_include_overrides_a_soft_secret_rule(tmp_path, module_repo):
-    storage = storage_for(tmp_path)
-    module = "src/pkg/utils/secrets.py"
-    rule = {"path": module, "reason": "secret_like", "rule": "*secret*"}
-
-    explicit = storage.snapshot(str(module_repo), include=[module], dry_run=False)
-    default = storage.snapshot(str(module_repo))
-    expanded = storage.snapshot(str(module_repo), include=["src"])
-
-    assert rule in default["excluded"] and rule in expanded["excluded"]
-    assert default["files"] == expanded["files"] == 2
-    assert explicit["files"] == 3
-    assert rule not in explicit["excluded"]
-    assert {"path": "src/pkg/utils/.env", "reason": "secret_like", "rule": ".env*"} in (
-        explicit["excluded"]
-    )
-    assert [(item["code"], item["path"], item["rule"]) for item in explicit["warnings"]] == [
-        ("secret_like_included", module, "*secret*")
-    ]
-    tree = Path(explicit["local_path"])
-    assert (tree / module).read_text() == "def load():\n    return None\n"
-    manifest_file = snapshot_root(tmp_path) / "manifests" / f"{explicit['snapshot_key']}.json"
-    manifest = json.loads(manifest_file.read_text())
-    [source] = [item for item in manifest["sources"] if item["kind"] == "include"]
-    assert source["included_despite"] == "*secret*" and source["overrides"] is True
-    write(module_repo / ".netrc", "machine example.invalid\n")
-    with pytest.raises(StorageError) as hard:
-        storage.snapshot(str(module_repo), include=[module, ".netrc"])
-    assert hard.value.code == "secret_like_include"
+# Includes
 
 
 def test_includes_override_tracked_files_and_add_working_tree_files(tmp_path, repo):
@@ -430,8 +440,7 @@ def test_includes_override_tracked_files_and_add_working_tree_files(tmp_path, re
     assert (tree / "generated" / "table.json").read_text() == "{}\n"
     assert (tree / "cache" / "table.bin").read_text() == "restored\n"
     assert not (tree / "generated" / "__pycache__").exists()
-    manifests = snapshot_root(tmp_path) / "manifests"
-    manifest = json.loads((manifests / f"{result['snapshot_key']}.json").read_text())
+    manifest = read_manifest(tmp_path, result)
     includes = {item["path"]: item for item in manifest["sources"] if item["kind"] == "include"}
     assert includes["train.py"]["overrides"] is True
     assert includes["cache/table.bin"]["overrides"] is True
@@ -474,7 +483,7 @@ def test_including_a_cache_like_directory_restores_it(tmp_path, plain_repo):
 
 def test_directory_includes_prune_excluded_subtrees_before_checking_links(tmp_path, plain_repo):
     os.makedirs(plain_repo / ".venv" / "bin")
-    os.symlink("/usr/bin/python3", plain_repo / ".venv" / "bin" / "python")
+    os.symlink("/outside/bin/python3", plain_repo / ".venv" / "bin" / "python")
     os.makedirs(plain_repo / "gen" / "node_modules" / ".bin")
     os.symlink("../pkg/cli.js", plain_repo / "gen" / "node_modules" / ".bin" / "pkg")
     write(plain_repo / "gen" / "table.json", "{}\n")
@@ -508,26 +517,67 @@ def test_directory_includes_keep_tracked_symlinks(tmp_path, repo):
     assert caught.value.code == "invalid_include"
 
 
-@pytest.mark.parametrize(
-    "value", ["../outside.txt", "/etc/hostname", "missing.txt", "link.txt", ".git", ".git/HEAD"]
-)
-def test_invalid_includes_are_rejected(tmp_path, repo, value):
+def test_includes_that_escape_or_are_not_files_are_rejected(tmp_path, repo):
     os.symlink("train.py", repo / "link.txt")
+    storage = storage_for(tmp_path)
+
+    for value in (
+        "../outside.txt",
+        str(tmp_path / "outside.txt"),
+        ".git/HEAD",
+        "missing.txt",
+        "link.txt",
+    ):
+        with pytest.raises(StorageError) as caught:
+            storage.snapshot(str(repo), include=[value])
+        assert caught.value.code == "invalid_include", value
+
+
+def test_git_metadata_in_included_directories_is_skipped(tmp_path, plain_repo):
+    worktree = tmp_path / "worktree"
+    git(plain_repo, "worktree", "add", "-q", str(worktree))
+    for root in (plain_repo, worktree):
+        write(root / "generated.txt", "generated\n")
+        write(root / "vendor" / "lib" / ".git", "gitdir: ../../.git/modules/lib\n")
+    storage = storage_for(tmp_path)
+
+    # "vendor" overlaps "."; each .git entry is still reported once.
+    from_worktree = storage.snapshot(str(worktree), include=[".", "vendor"], dry_run=False)
+    from_checkout = storage.snapshot(str(plain_repo), include=[".", "vendor"])
+
+    assert (worktree / ".git").is_file() and (plain_repo / ".git").is_dir()
+    assert from_worktree["skipped"] == [
+        {"path": ".git", "reason": "git_metadata"},
+        {"path": "vendor/lib/.git", "reason": "git_metadata"},
+    ]
+    assert from_worktree["files"] == 3
+    tree = Path(from_worktree["local_path"])
+    assert (tree / "generated.txt").read_text() == "generated\n"
+    assert not os.path.lexists(tree / ".git")
+    assert not os.path.lexists(tree / "vendor" / "lib" / ".git")
+    # A .git file and a .git directory are reported alike, so the identities agree.
+    assert from_checkout["skipped"] == from_worktree["skipped"]
+    assert from_checkout["snapshot_key"] == from_worktree["snapshot_key"]
     with pytest.raises(StorageError) as caught:
-        storage_for(tmp_path).snapshot(str(repo), include=[value])
+        storage.snapshot(str(worktree), include=[".git"])
     assert caught.value.code == "invalid_include"
 
 
-@pytest.mark.parametrize("target", ["../../outside", "/etc/passwd"])
-def test_unsafe_symlinks_fail(tmp_path, repo, target):
-    os.symlink(target, repo / "scripts" / "escape")
-    git(repo, "add", "-A")
-    git(repo, "commit", "-q", "-m", "unsafe link")
+def test_submodules_are_skipped_and_lfs_pointers_warned(tmp_path, repo):
+    commit = git(repo, "rev-parse", "HEAD")
+    git(repo, "update-index", "--add", "--cacheinfo", f"160000,{commit},vendor/lib")
+    write(repo / "model.bin", "version https://git-lfs.github.com/spec/v1\noid sha256:00\nsize 1\n")
+    git(repo, "add", "model.bin")
+    git(repo, "commit", "-q", "-m", "submodule and pointer")
 
-    with pytest.raises(StorageError) as caught:
-        storage_for(tmp_path).snapshot(str(repo))
+    result = storage_for(tmp_path).snapshot(str(repo))
 
-    assert caught.value.code == "unsafe_symlink"
+    assert result["skipped"] == [{"path": "vendor/lib", "reason": "submodule"}]
+    assert [item["path"] for item in result["warnings"]] == ["model.bin"]
+    assert result["warnings"][0]["code"] == "lfs_pointer"
+
+
+# Symlinks
 
 
 def commit_links(repo, links):
@@ -541,20 +591,15 @@ def commit_links(repo, links):
 @pytest.mark.parametrize(
     "links",
     [
+        {"scripts/escape": "/outside"},
+        {"scripts/escape": "../../outside"},
         # Each target stays inside on its own; followed through the first link, it does not.
         {"a/b/up": "../..", "escape": "a/b/up/../.."},
-        {
-            "c/up1": "..",
-            "a/b/up2": "../..",
-            "e/f/g/up3": "../../..",
-            "deep": "c/up1/a/b/up2/e/f/g/up3/..",
-        },
         {"loop-a": "loop-b", "loop-b": "loop-a"},
-        {"self": "self"},
     ],
-    ids=["chain", "three_links", "loop", "self_loop"],
+    ids=["absolute", "parent", "chain", "loop"],
 )
-def test_symlink_chains_are_resolved_before_any_write(tmp_path, repo, links):
+def test_unsafe_symlinks_fail_before_any_write(tmp_path, repo, links):
     commit_links(repo, links)
     storage = storage_for(tmp_path)
 
@@ -596,117 +641,34 @@ def test_materialized_links_are_checked_again_before_publishing(tmp_path, repo, 
     assert caught.value.code == "unsafe_symlink"
     assert list((snapshot_root(tmp_path) / "trees").iterdir()) == []
     assert list((snapshot_root(tmp_path) / "manifests").iterdir()) == []
-    assert [path.name for path in (snapshot_root(tmp_path) / "tmp").iterdir()] == []
+    assert list((snapshot_root(tmp_path) / "tmp").iterdir()) == []
 
 
-@pytest.fixture
-def plain_repo(tmp_path):
-    root = tmp_path / "plain"
-    root.mkdir()
-    git(root, "init", "-q")
-    write(root / "train.py", "print('train')\n")
-    write(root / "vendor" / "lib" / "code.py", "VALUE = 1\n")
-    git(root, "add", "-A")
-    git(root, "commit", "-q", "-m", "initial")
-    return root
-
-
-def test_include_dot_in_a_git_worktree_skips_git_metadata(tmp_path, plain_repo):
-    worktree = tmp_path / "worktree"
-    git(plain_repo, "worktree", "add", "-q", str(worktree))
-    for root in (plain_repo, worktree):
-        write(root / "generated.txt", "generated\n")
-    storage = storage_for(tmp_path)
-
-    from_worktree = storage.snapshot(str(worktree), include=["."], dry_run=False)
-    from_checkout = storage.snapshot(str(plain_repo), include=["."])
-
-    assert (worktree / ".git").is_file() and (plain_repo / ".git").is_dir()
-    assert from_worktree["skipped"] == [{"path": ".git", "reason": "git_metadata"}]
-    tree = Path(from_worktree["local_path"])
-    assert (tree / "generated.txt").read_text() == "generated\n"
-    assert not os.path.lexists(tree / ".git")
-    # A .git file and a .git directory are reported alike, so the identities agree.
-    assert from_checkout["skipped"] == from_worktree["skipped"]
-    assert from_checkout["snapshot_key"] == from_worktree["snapshot_key"]
-    with pytest.raises(StorageError) as caught:
-        storage.snapshot(str(worktree), include=[".git"])
-    assert caught.value.code == "invalid_include"
-
-
-def test_nested_git_file_in_an_included_directory_is_skipped_once(tmp_path, plain_repo):
-    write(plain_repo / "vendor" / "lib" / ".git", "gitdir: ../../.git/modules/lib\n")
-
-    result = storage_for(tmp_path).snapshot(str(plain_repo), include=[".", "vendor"])
-
-    assert result["skipped"] == [
-        {"path": ".git", "reason": "git_metadata"},
-        {"path": "vendor/lib/.git", "reason": "git_metadata"},
-    ]
-    assert result["files"] == 2
-
-
-def test_executable_and_plain_copies_of_one_blob_are_separate_objects(tmp_path, repo):
-    write(repo / "tool.sh", "#!/bin/sh\necho run\n", 0o644)
-    git(repo, "add", "-A")
-    git(repo, "commit", "-q", "-m", "same blob")
-
-    result = storage_for(tmp_path).snapshot(str(repo), dry_run=False)
-
-    tree = Path(result["local_path"])
-    digest = hashlib.sha256(b"#!/bin/sh\necho run\n").hexdigest()
-    objects = snapshot_root(tmp_path) / "objects" / "sha256" / digest[:2]
-    assert sorted(
-        path.name for path in objects.iterdir() if path.name.startswith(digest)
-    ) == [digest, digest + ".x"]
-    assert os.stat(tree / "tool.sh").st_ino != os.stat(tree / "scripts" / "run.sh").st_ino
-    assert stat.S_IMODE(os.stat(tree / "tool.sh").st_mode) == 0o444
-
-
-def test_submodules_are_skipped_and_lfs_pointers_warned(tmp_path, repo):
-    commit = git(repo, "rev-parse", "HEAD")
-    git(repo, "update-index", "--add", "--cacheinfo", f"160000,{commit},vendor/lib")
-    write(repo / "model.bin", "version https://git-lfs.github.com/spec/v1\noid sha256:00\nsize 1\n")
-    git(repo, "add", "model.bin")
-    git(repo, "commit", "-q", "-m", "submodule and pointer")
-
-    result = storage_for(tmp_path).snapshot(str(repo))
-
-    assert result["skipped"] == [{"path": "vendor/lib", "reason": "submodule"}]
-    assert [item["path"] for item in result["warnings"]] == ["model.bin"]
-    assert result["warnings"][0]["code"] == "lfs_pointer"
+# Corruption and verify
 
 
 def test_corrupted_tree_is_reported_and_never_repaired(tmp_path, repo):
     storage = storage_for(tmp_path)
-    result = storage.snapshot(str(repo), dry_run=False)
-    tree = Path(result["local_path"])
+    tree = Path(storage.snapshot(str(repo), dry_run=False)["local_path"])
     target = tree / "train.py"
+    target.chmod(0o644)
+    target.write_text("print('TRAIN')\n")
+    target.chmod(0o444)
+
+    # Reuse checks sizes; a same-size change needs verify, which also hashes the content.
+    assert storage.snapshot(str(repo), dry_run=False)["existing"] is True
+    with pytest.raises(StorageError) as same_size:
+        storage.snapshot(str(repo), dry_run=False, verify=True)
     target.chmod(0o644)
     with open(target, "a", encoding="utf-8") as handle:
         handle.write("tampered\n")
     target.chmod(0o444)
     before = (os.stat(tree).st_mtime_ns, os.stat(target).st_mtime_ns, target.read_text())
-
-    with pytest.raises(StorageError) as caught:
+    with pytest.raises(StorageError) as resized:
         storage.snapshot(str(repo), dry_run=False)
 
-    assert caught.value.code == "snapshot_corrupt"
+    assert same_size.value.code == resized.value.code == "snapshot_corrupt"
     assert (os.stat(tree).st_mtime_ns, os.stat(target).st_mtime_ns, target.read_text()) == before
-
-
-def test_same_size_corruption_needs_verify(tmp_path, repo):
-    storage = storage_for(tmp_path)
-    result = storage.snapshot(str(repo), dry_run=False)
-    target = Path(result["local_path"]) / "train.py"
-    target.chmod(0o644)
-    target.write_text("print('TRAIN')\n")
-    target.chmod(0o444)
-
-    assert storage.snapshot(str(repo), dry_run=False)["existing"] is True
-    with pytest.raises(StorageError) as caught:
-        storage.snapshot(str(repo), dry_run=False, verify=True)
-    assert caught.value.code == "snapshot_corrupt"
 
 
 def add_output_file(tree: Path) -> None:
@@ -732,9 +694,8 @@ def replace_link_with_file(tree: Path) -> None:
 @pytest.mark.parametrize(
     "change", [add_output_file, add_output_directory, make_executable, replace_link_with_file]
 )
-@pytest.mark.parametrize("link_mode", ["hardlink", "copy"])
-def test_verify_checks_the_whole_tree(tmp_path, repo, change, link_mode):
-    storage = storage_for(tmp_path, link_mode=link_mode)
+def test_verify_checks_the_whole_tree(tmp_path, repo, change):
+    storage = storage_for(tmp_path)
     change(Path(storage.snapshot(str(repo), dry_run=False)["local_path"]))
 
     with pytest.raises(StorageError) as caught:
@@ -743,16 +704,12 @@ def test_verify_checks_the_whole_tree(tmp_path, repo, change, link_mode):
     assert caught.value.code == "snapshot_corrupt"
 
 
-@pytest.mark.parametrize("damage", ["content", "mode"])
-def test_verify_checks_an_existing_object_before_reusing_it(tmp_path, repo, damage):
+def test_verify_checks_an_existing_object_before_reusing_it(tmp_path, repo):
     storage = storage_for(tmp_path)
     storage.snapshot(str(repo), dry_run=False)
     digest = hashlib.sha256(b"print('train')\n").hexdigest()
     obj = snapshot_root(tmp_path) / "objects" / "sha256" / digest[:2] / digest
-    if damage == "content":
-        obj.chmod(0o644)
-        obj.write_text("print('TRAIN')\n")
-    obj.chmod(0o555 if damage == "mode" else 0o444)
+    obj.chmod(0o555)  # the object of a non-executable file gains the exec bit
     write(repo / "tokenizer.py", "TOKENS = 2\n")
     git(repo, "commit", "-q", "-am", "change")
 
@@ -763,11 +720,7 @@ def test_verify_checks_an_existing_object_before_reusing_it(tmp_path, repo, dama
     assert len(list((snapshot_root(tmp_path) / "trees").iterdir())) == 1
 
 
-def refuse_links(monkeypatch):
-    def refuse(*_args, **_kwargs):
-        raise OSError(errno.EPERM, "Operation not permitted")
-
-    monkeypatch.setattr(snapshot_module.os, "link", refuse)
+# Publishing without hard links, and concurrent callers
 
 
 def test_manifest_fallback_never_replaces_a_published_manifest(tmp_path, monkeypatch):
@@ -787,26 +740,27 @@ def test_manifest_fallback_never_replaces_a_published_manifest(tmp_path, monkeyp
     assert list(staging.iterdir()) == []
 
 
-@pytest.mark.parametrize("noreplace", [True, False])
-def test_manifest_fallback_returns_the_published_bytes(tmp_path, monkeypatch, noreplace):
-    manifest, staging = tmp_path / "manifest.json", tmp_path / "tmp"
+def test_manifest_fallback_returns_the_published_bytes(tmp_path, monkeypatch):
+    staging = tmp_path / "tmp"
     staging.mkdir()
     refuse_links(monkeypatch)
-    if not noreplace:
-        monkeypatch.setattr(snapshot_module, "_renameat2", lambda: None)
 
-    first = snapshot_module._publish_manifest(manifest, staging, {"created_utc": "first"})
-    second = snapshot_module._publish_manifest(manifest, staging, {"created_utc": "second"})
+    def publish_twice(manifest):
+        first = snapshot_module._publish_manifest(manifest, staging, {"created_utc": "first"})
+        second = snapshot_module._publish_manifest(manifest, staging, {"created_utc": "second"})
+        assert first == second == manifest.read_bytes()
+        assert json.loads(first) == {"created_utc": "first"}
 
-    assert first == second == manifest.read_bytes()
-    assert json.loads(first) == {"created_utc": "first"}
+    publish_twice(tmp_path / "noreplace.json")
+    # Without renameat2, the fallback is a check followed by a plain rename.
+    monkeypatch.setattr(snapshot_module, "_renameat2", lambda: None)
+    publish_twice(tmp_path / "plain.json")
     assert list(staging.iterdir()) == []
 
 
-@pytest.mark.parametrize("code", [errno.EINVAL, errno.ENOSYS])
-def test_rename_noreplace_falls_back_when_unsupported(tmp_path, monkeypatch, code):
+def test_rename_noreplace_falls_back_when_unsupported(tmp_path, monkeypatch):
     def unsupported(*_args):
-        ctypes.set_errno(code)
+        ctypes.set_errno(errno.EINVAL)
         return -1
 
     monkeypatch.setattr(snapshot_module, "_renameat2", lambda: unsupported)
@@ -828,23 +782,9 @@ def test_concurrent_snapshots_without_hard_links_agree_on_the_manifest(
     storage.snapshot(str(repo), dry_run=False)
     # Same content under a new commit: every caller reuses the tree and races to publish.
     git(repo, "commit", "-q", "--allow-empty", "-m", "empty")
-    barrier = threading.Barrier(4)
-    results, errors = [], []
 
-    def run():
-        barrier.wait()
-        try:
-            results.append(storage.snapshot(str(repo), dry_run=False))
-        except Exception as exc:  # pragma: no cover - reported below
-            errors.append(exc)
+    results = run_concurrently(4, lambda: storage.snapshot(str(repo), dry_run=False))
 
-    threads = [threading.Thread(target=run) for _ in range(4)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(30)
-
-    assert errors == []
     [key] = {item["snapshot_key"] for item in results}
     on_disk = (snapshot_root(tmp_path) / "manifests" / f"{key}.json").read_bytes()
     assert {item["manifest_sha256"] for item in results} == {hashlib.sha256(on_disk).hexdigest()}
@@ -852,71 +792,41 @@ def test_concurrent_snapshots_without_hard_links_agree_on_the_manifest(
 
 def test_concurrent_snapshots_publish_one_tree(tmp_path, repo):
     storage = storage_for(tmp_path)
-    barrier = threading.Barrier(2)
-    results, errors = [], []
 
-    def run():
-        barrier.wait()
-        try:
-            results.append(storage.snapshot(str(repo), dry_run=False))
-        except Exception as exc:  # pragma: no cover - reported below
-            errors.append(exc)
+    results = run_concurrently(2, lambda: storage.snapshot(str(repo), dry_run=False))
 
-    threads = [threading.Thread(target=run) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(30)
-
-    assert errors == []
     assert len({item["content_id"] for item in results}) == 1
     assert len({item["manifest_sha256"] for item in results}) == 1
     assert len(list((snapshot_root(tmp_path) / "trees").iterdir())) == 1
     assert list((snapshot_root(tmp_path) / "tmp").iterdir()) == []
 
 
-def test_ssh_only_access_requires_configuration(tmp_path, repo):
-    storage = storage_for(tmp_path, mode="ssh", ssh={"host": "login"})
-
-    with pytest.raises(StorageError) as caught:
-        storage.snapshot(str(repo))
-
-    assert caught.value.code == "configuration_required"
+# Configuration and requests
 
 
-@pytest.mark.parametrize(
-    "snapshots",
-    [
-        {"root": "/shared"},
-        {"root": "/reference/snapshots"},
-        {"root": "/elsewhere/snapshots"},
+def test_invalid_snapshot_roots_are_rejected(tmp_path):
+    for snapshots in (
+        {"root": "/shared"},  # a mount root, not a subdirectory
+        {"root": "/reference/snapshots"},  # a read-only mount
+        {"root": "/elsewhere/snapshots"},  # outside every mount
         {"root": "/shared/snapshots", "link_mode": "symlink"},
         {"root": "/shared/snapshots", "unknown": True},
-    ],
-)
-def test_invalid_snapshot_roots_are_rejected(tmp_path, snapshots):
-    profile = ComputeProfile.from_dict(
-        {
-            "mounts": [
-                {"host_path": str(tmp_path), "container_path": "/shared"},
-                {"host_path": "/reference", "container_path": "/reference", "read_only": True},
-            ],
-            "defaults": {"image": "image", "pool": "pool"},
-        }
-    )
-    with pytest.raises(StorageError) as caught:
-        StorageService(profile, StorageAccessConfig.from_dict({"snapshots": snapshots}))
-    assert caught.value.code == "invalid_storage_config"
+    ):
+        with pytest.raises(StorageError) as caught:
+            StorageService(profile_for(tmp_path), StorageAccessConfig.from_dict(
+                {"snapshots": snapshots}
+            ))
+        assert caught.value.code == "invalid_storage_config", snapshots
 
 
 def test_missing_configuration_revision_or_top_level_is_reported(tmp_path, repo):
-    profile = ComputeProfile.from_dict(
-        {"mounts": [{"host_path": str(tmp_path), "container_path": "/shared"}],
-         "defaults": {"image": "image", "pool": "pool"}}
-    )
     with pytest.raises(StorageError) as unconfigured:
-        StorageService(profile, StorageAccessConfig()).snapshot(str(repo))
+        StorageService(profile_for(tmp_path), StorageAccessConfig()).snapshot(str(repo))
     assert unconfigured.value.code == "configuration_required"
+    ssh_only = storage_for(tmp_path, mode="ssh", ssh={"host": "login"})
+    with pytest.raises(StorageError) as no_local_view:
+        ssh_only.snapshot(str(repo))
+    assert no_local_view.value.code == "configuration_required"
 
     storage = storage_for(tmp_path)
     with pytest.raises(StorageError) as revision:

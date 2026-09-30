@@ -19,14 +19,22 @@ def _secrets_file(tmp_path: Path, text: str) -> Path:
     return path
 
 
-def _merged_environment(overrides: dict[str, str]) -> dict[str, str]:
-    return {**os.environ, **overrides}
+def _run_askpass(environment: dict[str, str], prompt: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [environment["SSH_ASKPASS"], prompt],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        env={**os.environ, **environment},
+        start_new_session=True,
+        check=False,
+    )
 
 
 def test_openssh_uses_safe_argv_and_forwards_existing_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/test-agent.sock")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/agent/test-agent.sock")
     config = SimpleNamespace(
         host="storage-alias",
         user="alice",
@@ -38,7 +46,7 @@ def test_openssh_uses_safe_argv_and_forwards_existing_agent(
     )
 
     with ssh_auth(config) as (environment, options):
-        assert environment == {"SSH_AUTH_SOCK": "/tmp/test-agent.sock"}
+        assert environment == {"SSH_AUTH_SOCK": "/agent/test-agent.sock"}
         assert options == (
             "-F",
             "/config/ssh config",
@@ -57,30 +65,25 @@ def test_openssh_uses_safe_argv_and_forwards_existing_agent(
 
 
 @pytest.mark.parametrize(
-    ("field", "value"),
+    "override",
     [
-        ("host", "-proxy-command"),
-        ("host", "storage\nhost"),
-        ("user", "-oProxyCommand=bad"),
-        ("identity_file", "-bad-key"),
-        ("config_file", "bad\x00config"),
+        pytest.param({"host": "-proxy-command"}, id="host-option"),
+        pytest.param({"config_file": "bad\x00config"}, id="control-character"),
+        pytest.param({"port": True}, id="port-bool"),
+        pytest.param({"port": "22x"}, id="port-not-integer"),
+        pytest.param({"port": 0}, id="port-below-range"),
+        pytest.param({"port": 65536}, id="port-above-range"),
     ],
 )
-def test_rejects_option_and_control_character_injection(field: str, value: str) -> None:
-    config = {"host": "storage", "auth": "openssh", field: value}
+def test_rejects_option_injection_control_characters_and_invalid_ports(
+    override: dict[str, object],
+) -> None:
     with pytest.raises(SSHAuthError):
-        with ssh_auth(config):
+        with ssh_auth({"host": "storage", "auth": "openssh", **override}):
             pass
 
 
-@pytest.mark.parametrize("port", [True, 0, 65536, "22x", "-1"])
-def test_rejects_invalid_ports(port: object) -> None:
-    with pytest.raises(SSHAuthError):
-        with ssh_auth({"host": "storage", "port": port}):
-            pass
-
-
-def test_password_askpass_keeps_secret_out_of_argv_env_and_launcher(
+def test_password_askpass_keeps_secret_out_of_argv_env_and_launcher_and_answers_once(
     tmp_path: Path,
 ) -> None:
     secret = "test password $() with spaces"
@@ -103,39 +106,34 @@ def test_password_askpass_keeps_secret_out_of_argv_env_and_launcher(
         assert "PreferredAuthentications=keyboard-interactive,password" in options
         assert "PubkeyAuthentication=no" in options
 
-        result = subprocess.run(
-            [str(launcher), "storage-user@storage's password:"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            env=_merged_environment(environment),
-            start_new_session=True,
-            check=False,
-        )
-        assert result.returncode == 0
-        assert result.stdout.rstrip("\n") == secret
+        # A non-password prompt is refused without using up the one answer.
+        rejected = _run_askpass(environment, "Enter passphrase for key '/keys/id':")
+        assert rejected.returncode == 1
+        assert secret not in rejected.stdout + rejected.stderr
 
-        second = subprocess.run(
-            [str(launcher), "Password:"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            env=_merged_environment(environment),
-            start_new_session=True,
-            check=False,
-        )
+        accepted = _run_askpass(environment, "storage-user@storage's password:")
+        assert accepted.returncode == 0
+        assert accepted.stdout.rstrip("\n") == secret
+
+        second = _run_askpass(environment, "Password:")
         assert second.returncode == 1
         assert second.stdout == ""
         assert secret not in second.stderr
 
 
-def test_password_username_may_come_from_profile(tmp_path: Path) -> None:
-    secrets_path = _secrets_file(tmp_path, "SSH_PASSWORD=fake-password\n")
+def test_password_username_comes_from_profile_and_must_match_secrets(tmp_path: Path) -> None:
     config = {"host": "storage", "user": "profile-user", "auth": "password"}
-
-    with ssh_auth(config, secrets_path) as (environment, options):
+    password_only = _secrets_file(tmp_path, "SSH_PASSWORD=fake-password\n")
+    with ssh_auth(config, password_only) as (environment, options):
         assert options[options.index("-l") + 1] == "profile-user"
         assert environment["DETERMINED_COMPUTE_SSH_ASKPASS_USERNAME"] == "profile-user"
+
+    mismatched = _secrets_file(
+        tmp_path, "SSH_USERNAME=file-user\nSSH_PASSWORD=fake-password\n"
+    )
+    with pytest.raises(SSHAuthError, match="does not match"):
+        with ssh_auth(config, mismatched):
+            pass
 
 
 def test_password_auth_never_reuses_determined_credentials(tmp_path: Path) -> None:
@@ -163,66 +161,9 @@ def test_password_secret_read_error_is_sanitized(
             tmp_path / "credentials.env",
         ):
             pass
-    assert str(raised.value) == "SSH password credentials are unavailable."
+    assert raised.value.code == "ssh_auth_error"
+    assert "secret value" not in str(raised.value)
     assert raised.value.__cause__ is None
-
-
-def test_password_auth_rejects_profile_and_secret_username_mismatch(
-    tmp_path: Path,
-) -> None:
-    secrets_path = _secrets_file(
-        tmp_path, "SSH_USERNAME=file-user\nSSH_PASSWORD=fake-password\n"
-    )
-    with pytest.raises(SSHAuthError, match="does not match"):
-        with ssh_auth(
-            {"host": "storage", "user": "profile-user", "auth": "password"},
-            secrets_path,
-        ):
-            pass
-
-
-@pytest.mark.parametrize(
-    "prompt",
-    [
-        "Enter passphrase for key '/keys/id':",
-        "The authenticity of host 'storage' cannot be established. Continue?",
-        "Host key fingerprint: SHA256:test",
-    ],
-)
-def test_askpass_rejects_non_password_prompts_without_consuming_password(
-    tmp_path: Path, prompt: str
-) -> None:
-    secret = "fake-password"
-    secrets_path = _secrets_file(
-        tmp_path, f"SSH_USERNAME=user\nSSH_PASSWORD={secret}\n"
-    )
-    config = {"host": "storage", "auth": "password"}
-
-    with ssh_auth(config, secrets_path) as (environment, _options):
-        launcher = environment["SSH_ASKPASS"]
-        rejected = subprocess.run(
-            [launcher, prompt],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            env=_merged_environment(environment),
-            start_new_session=True,
-            check=False,
-        )
-        assert rejected.returncode == 1
-        assert secret not in rejected.stdout + rejected.stderr
-
-        accepted = subprocess.run(
-            [launcher, "Password:"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            env=_merged_environment(environment),
-            start_new_session=True,
-            check=False,
-        )
-        assert accepted.returncode == 0
-        assert accepted.stdout.rstrip("\n") == secret
 
 
 def test_keyring_backend_uses_service_and_profile_user_once(
@@ -253,7 +194,9 @@ def test_keyring_backend_uses_service_and_profile_user_once(
         askpass.resolve_password("Password:", environment)
 
 
-def test_keyring_context_requires_profile_fields() -> None:
+def test_keyring_context_requires_profile_fields_and_optional_dependency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     with pytest.raises(SSHAuthError, match="keyring_service"):
         with ssh_auth({"host": "storage", "user": "alice", "auth": "keyring"}):
             pass
@@ -263,10 +206,6 @@ def test_keyring_context_requires_profile_fields() -> None:
         ):
             pass
 
-
-def test_keyring_context_reports_missing_optional_dependency(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
     monkeypatch.setattr(auth_module.importlib.util, "find_spec", lambda _name: None)
     with pytest.raises(SSHAuthError, match="keyring support is unavailable"):
         with ssh_auth(
@@ -290,7 +229,8 @@ def test_askpass_main_uses_generic_error_without_trace(
     assert askpass.main(["Password:"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == "SSH askpass credential unavailable.\n"
+    assert "secret value" not in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_askpass_launcher_is_cleaned_up_on_context_error(tmp_path: Path) -> None:

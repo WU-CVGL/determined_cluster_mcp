@@ -85,31 +85,28 @@ def test_command_round_trip_keeps_shared_paths_and_identity_after_restart(tmp_pa
     new_store.close()
 
 
-def test_http_auth_failure_does_not_become_uncertain_submission(tmp_path, monkeypatch):
-    monkeypatch.setattr(requests, 'post', lambda *a, **kw: response({'message': 'denied'}, 403))
+def test_definite_rejection_fails_but_ambiguous_timeout_is_never_reposted(tmp_path, monkeypatch):
     store = SQLiteTaskStore(tmp_path / 'tasks.sqlite3')
     client = DeterminedAPIClient(api_url='https://cluster.example:443', api_token='test-token')
     service = ComputeService(client, store, profile())
+
+    # A definite HTTP rejection is a plain failure, not an uncertain submission.
+    monkeypatch.setattr(requests, 'post', lambda *a, **kw: response({'message': 'denied'}, 403))
     with pytest.raises(Exception):
         service.launch(request(), 'auth-test', 'session-a')
-    record = service.list_tasks('session-a')[0]
-    assert record['state'] == 'failed'
-    assert record['error_code'] != 'submission_uncertain'
-    store.close()
+    rejected = service.list_tasks('session-a')[0]
+    assert rejected['state'] == 'failed'
+    assert rejected['error_code'] != 'submission_uncertain'
 
-
-def test_timeout_persists_identity_and_repeated_request_never_reposts(tmp_path, monkeypatch):
+    # A timeout may have been accepted remotely: persist it as uncertain and never POST again.
     calls = []
     def uncertain(url, **kw):
         calls.append(url)
         raise requests.ReadTimeout('simulated ambiguous acceptance')
     monkeypatch.setattr(requests, 'post', uncertain)
-    store = SQLiteTaskStore(tmp_path / 'tasks.sqlite3')
-    client = DeterminedAPIClient(api_url='https://cluster.example:443', api_token='test-token')
-    service = ComputeService(client, store, profile())
     with pytest.raises(Exception):
         service.launch(request(), 'uncertain-test', 'session-a')
-    record = service.list_tasks('session-a')[0]
+    [record] = [t for t in service.list_tasks('session-a') if t['request_id'] == 'uncertain-test']
     assert record['state'] == 'submission_uncertain'
     repeated = service.launch(request(), 'uncertain-test', 'session-a')
     assert repeated['task_id'] == record['task_id']

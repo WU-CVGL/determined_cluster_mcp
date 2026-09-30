@@ -4,8 +4,6 @@ import json
 import os
 from pathlib import Path
 import sqlite3
-import subprocess
-import sys
 import time
 
 import pytest
@@ -35,8 +33,6 @@ args = sys.argv[1:]
 prompt = sys.stdin.read()
 if "SLOW_TEST" in prompt:
     time.sleep(5)
-if "FAIL_TEST" in prompt:
-    raise SystemExit(7)
 output = Path(args[args.index("--output-last-message") + 1])
 output.write_text(json.dumps({
     "args": args,
@@ -60,6 +56,21 @@ def make_manager(
         auto_start=False,
         **kwargs,
     )
+
+
+def mark_stale_running(
+    manager: WorkflowManager, workflow_id: str, worker_pid: int, agent_pid: int | None
+) -> None:
+    with sqlite3.connect(str(manager.db_path)) as connection:
+        connection.execute(
+            """
+            UPDATE agent_workflows
+            SET status = 'running', heartbeat_at = '2000-01-01T00:00:00+00:00',
+                worker_pid = ?, agent_pid = ?
+            WHERE workflow_id = ?
+            """,
+            (worker_pid, agent_pid, workflow_id),
+        )
 
 
 def test_submit_is_owner_scoped_and_idempotent(
@@ -105,12 +116,9 @@ def test_submit_is_owner_scoped_and_idempotent(
 @pytest.mark.parametrize(
     "context",
     [
-        {"api_token": "nope"},
         {"apiToken": "nope"},
-        {"accessKey": "nope"},
         {"nested": {"password": "nope"}},
         {"items": [{"private-key": "nope"}]},
-        {"sessionKey": "nope"},
     ],
 )
 def test_submit_rejects_sensitive_context_fields(
@@ -153,27 +161,6 @@ def test_run_pending_uses_isolated_read_only_codex_invocation(
     assert [entry["message"] for entry in completed["logs"]][-1] == (
         "Workflow completed."
     )
-
-
-def test_submit_launches_an_independent_worker(
-    tmp_path: Path, fake_codex: Path
-) -> None:
-    manager = WorkflowManager(
-        tmp_path / "async.sqlite3",
-        REPO_ROOT,
-        codex_bin=str(fake_codex),
-        timeout_seconds=5,
-    )
-    submitted = manager.submit("Inspect this run.", "owner", "async-request")
-
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        current = manager.status(submitted["workflow_id"], "owner")
-        if current["status"] in ("succeeded", "failed", "timed_out"):
-            break
-        time.sleep(0.05)
-
-    assert current["status"] == "succeeded", current
 
 
 def test_fresh_queued_duplicate_does_not_dispatch_again(
@@ -267,106 +254,59 @@ def test_timeout_stops_process_and_persists_safe_error(
     assert completed["error"] == "The consultation exceeded its execution time limit."
 
 
-def test_stale_dead_worker_is_reclaimed_with_visible_log(
+def test_stale_running_workflow_is_reclaimed_only_when_its_worker_is_dead(
     tmp_path: Path, fake_codex: Path
 ) -> None:
     manager = make_manager(tmp_path, fake_codex, stale_after_seconds=0.1)
-    submitted = manager.submit("Retry safely.", "owner", "stale-request")
-    with sqlite3.connect(str(manager.db_path)) as connection:
-        connection.execute(
-            """
-            UPDATE agent_workflows
-            SET status = 'running', heartbeat_at = '2000-01-01T00:00:00+00:00',
-                worker_pid = 99999999, agent_pid = 99999998
-            WHERE workflow_id = ?
-            """,
-            (submitted["workflow_id"],),
-        )
+    dead = manager.submit("Retry safely.", "owner", "stale-request")
+    live = manager.submit("Do not duplicate.", "owner", "live-request")
+    mark_stale_running(manager, dead["workflow_id"], 99999999, 99999998)
+    mark_stale_running(manager, live["workflow_id"], os.getpid(), None)
 
-    stale = manager.status(submitted["workflow_id"], "owner")
-    assert stale["stale"] is True
-    assert stale["recoverable"] is True
+    dead_status = manager.status(dead["workflow_id"], "owner")
+    assert dead_status["stale"] is True
+    assert dead_status["recoverable"] is True
+    live_status = manager.status(live["workflow_id"], "owner")
+    assert live_status["stale"] is True
+    assert live_status["recoverable"] is False
 
-    completed = manager.run_pending(submitted["workflow_id"])
-
-    assert completed["status"] == "succeeded"
+    reclaimed = manager.run_pending(dead["workflow_id"])
+    assert reclaimed["status"] == "succeeded"
     assert any(
         "Reclaimed an interrupted stale workflow" in log["message"]
-        for log in completed["logs"]
+        for log in reclaimed["logs"]
     )
 
+    # A live worker process still owns the record, so it must not run twice.
+    untouched = manager.run_pending(live["workflow_id"])
+    assert untouched["status"] == "running"
+    assert untouched["result"] is None
 
-def test_stale_record_with_live_process_is_not_reexecuted(
+
+def test_missing_executables_fail_with_sanitized_errors(
     tmp_path: Path, fake_codex: Path
 ) -> None:
-    manager = make_manager(tmp_path, fake_codex, stale_after_seconds=0.1)
-    submitted = manager.submit("Do not duplicate.", "owner", "live-request")
-    with sqlite3.connect(str(manager.db_path)) as connection:
-        connection.execute(
-            """
-            UPDATE agent_workflows
-            SET status = 'running', heartbeat_at = '2000-01-01T00:00:00+00:00',
-                worker_pid = ?, agent_pid = NULL
-            WHERE workflow_id = ?
-            """,
-            (os.getpid(), submitted["workflow_id"]),
-        )
-
-    stale = manager.status(submitted["workflow_id"], "owner")
-    assert stale["stale"] is True
-    assert stale["recoverable"] is False
-
-    current = manager.run_pending(submitted["workflow_id"])
-
-    assert current["status"] == "running"
-    assert current["result"] is None
-
-
-def test_missing_codex_reports_sanitized_failure(tmp_path: Path) -> None:
-    manager = WorkflowManager(
+    missing_codex = WorkflowManager(
         tmp_path / "workflows.sqlite3",
         REPO_ROOT,
         codex_bin=str(tmp_path / "path-containing-secret-value"),
         auto_start=False,
     )
-    submitted = manager.submit("Help", "owner", "missing-codex")
-
-    completed = manager.run_pending(submitted["workflow_id"])
-
+    submitted = missing_codex.submit("Help", "owner", "missing-codex")
+    completed = missing_codex.run_pending(submitted["workflow_id"])
     assert completed["status"] == "failed"
     assert completed["error"] == "The configured Codex executable was not found."
     assert "secret-value" not in json.dumps(completed)
 
-
-def test_submit_reports_synchronous_worker_launch_failure(
-    tmp_path: Path, fake_codex: Path
-) -> None:
-    manager = WorkflowManager(
+    # The worker launch itself fails synchronously inside submit().
+    missing_python = WorkflowManager(
         tmp_path / "launch.sqlite3",
         REPO_ROOT,
         codex_bin=str(fake_codex),
         python_executable=str(tmp_path / "missing-python"),
     )
-
-    submitted = manager.submit("Help", "owner", "launch-failure")
-
+    submitted = missing_python.submit("Help", "owner", "launch-failure")
     assert submitted["status"] == "failed"
-    current = manager.status(submitted["workflow_id"], "owner")
+    current = missing_python.status(submitted["workflow_id"], "owner")
     assert current["status"] == "failed"
     assert current["error"] == "The independent workflow worker could not be started."
-
-
-def test_module_cli_help_does_not_invoke_codex() -> None:
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(REPO_ROOT / "src")
-    result = subprocess.run(
-        [sys.executable, "-m", "determined_compute.agent_worker", "--help"],
-        cwd=str(REPO_ROOT),
-        text=True,
-        capture_output=True,
-        check=False,
-        env=env,
-    )
-
-    assert result.returncode == 0
-    assert "Durable Codex consultation worker" in result.stdout

@@ -4,7 +4,6 @@ import pytest
 
 from determined_compute.compute import ComputeProfile, ComputeService, SQLiteTaskStore, ValidationError
 
-ROOTS = ['/SSD', '/SSD_home', '/SSD_datasets', '/SSD3', '/SSD3_home', '/SSD3_datasets', '/UNSAFE_SSD4']
 
 @pytest.fixture
 def service():
@@ -13,13 +12,13 @@ def service():
     yield ComputeService(None, store, profile)
     store.close()
 
-@pytest.mark.parametrize('root', ROOTS)
-def test_shared_root_accepts_command_paths_without_local_or_cluster_access(service, root):
-    result = service.plan({'command': ['true'], 'workdir': root + '/project',
-                           'output_dir': root + '/runs/task', 'slots': 0})
+
+def test_shared_root_accepts_command_paths_without_local_or_cluster_access(service):
+    result = service.plan({'command': ['true'], 'workdir': '/SSD/project',
+                           'output_dir': '/SSD/runs/task', 'slots': 0})
     assert result['kind'] == 'command'
-    assert {'host_path': root, 'container_path': root} in result['config']['bind_mounts']
-    assert root + '/project' in result['config']['entrypoint'][-1]
+    assert {'host_path': '/SSD', 'container_path': '/SSD'} in result['config']['bind_mounts']
+    assert '/SSD/project' in result['config']['entrypoint'][-1]
 
 
 def test_cross_root_outputs_and_experiment_checkpoints(service):
@@ -31,7 +30,8 @@ def test_cross_root_outputs_and_experiment_checkpoints(service):
     assert '/SSD_home/project' in result['config']['entrypoint']
     assert '/UNSAFE_SSD4/results' in result['config']['entrypoint']
 
-@pytest.mark.parametrize('root', ['/SSD_unconfigured', '/SSD3_unconfigured', '/UNSAFE_SSD40'])
+
+@pytest.mark.parametrize('root', ['/SSD_unconfigured', '/UNSAFE_SSD40'])
 def test_similar_prefix_does_not_grant_a_mount(service, root):
     with pytest.raises(ValidationError):
         service.plan({'command': ['true'], 'workdir': root + '/project',

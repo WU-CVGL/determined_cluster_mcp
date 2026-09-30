@@ -85,6 +85,8 @@ def test_legacy_schema_migration_preserves_submitted_record(tmp_path):
     record = store.get_owned("task-1", "session-a")
 
     assert record.origin == "submitted"
+    assert record.name is None
+    assert record.description is None
     assert record.remote_user_id is None
     assert record.remote_cluster_id is None
     assert record.workdir == "/shared/code"
@@ -101,9 +103,19 @@ def test_legacy_schema_migration_preserves_submitted_record(tmp_path):
         "remote_user_id",
         "remote_cluster_id",
     }.issubset(columns)
+    store.close()
+
+    # A column added by a newer release does not stop this release from reading rows.
+    connection = sqlite3.connect(database)
+    connection.execute("ALTER TABLE compute_tasks ADD COLUMN future_field TEXT")
+    connection.commit()
+    connection.close()
+    reopened = SQLiteTaskStore(database)
+    assert reopened.get_owned("task-1", "session-a").remote_id == "remote-1"
+    assert [item.task_id for item in reopened.list_owned("session-a")] == ["task-1"]
 
 
-def test_adopt_stores_unknown_paths_as_empty_and_exposes_none(tmp_path):
+def test_adopt_stores_unknown_paths_as_empty_and_repeats_without_changes(tmp_path):
     database = tmp_path / "tasks.db"
     store = SQLiteTaskStore(database)
 
@@ -123,31 +135,25 @@ def test_adopt_stores_unknown_paths_as_empty_and_exposes_none(tmp_path):
     public = record.public_dict()
     assert public["workdir"] is None
     assert public["output_dir"] is None
-
     raw = sqlite3.connect(database).execute(
         "SELECT workdir, output_dir FROM compute_tasks WHERE task_id = ?",
         (record.task_id,),
     ).fetchone()
     assert raw == ("", "")
 
-
-def test_duplicate_adopt_returns_same_record_without_changes(tmp_path):
-    store = SQLiteTaskStore(tmp_path / "tasks.db")
-    first, first_created = _adopt(store)
-    second, second_created = _adopt(
+    again, again_created = _adopt(
         store,
         remote_state="TERMINATED",
         name="replacement name",
         description="replacement description",
     )
 
-    assert first_created is True
-    assert second_created is False
-    assert second.task_id == first.task_id
-    assert second.request_id == first.request_id
-    assert second.remote_state == "RUNNING"
-    assert second.name == "remote command"
-    assert second.description == "Adopted from Determined."
+    assert again_created is False
+    assert again.task_id == record.task_id
+    assert again.request_id == record.request_id
+    assert again.remote_state == "RUNNING"
+    assert again.name == "remote command"
+    assert again.description == "Adopted from Determined."
 
 
 def test_concurrent_adopt_across_connections_creates_one_record(tmp_path):
@@ -204,9 +210,30 @@ def test_remote_identity_is_separated_by_owner_kind_and_cluster(tmp_path):
     )
 
 
-def test_adopt_returns_existing_submitted_binding_unchanged(tmp_path):
+def test_submitted_binding_is_found_by_local_cluster_and_never_replaced_by_adopt(tmp_path):
     store = SQLiteTaskStore(tmp_path / "tasks.db")
     submitted = _submitted(store)
+
+    # A submitted record is matched by its local cluster identity; the remote cluster
+    # id is not part of its binding.
+    found = store.lookup_remote(
+        owner="session-a",
+        kind="command",
+        remote_id="remote-1",
+        cluster_identity=LOCAL_CLUSTER,
+        remote_cluster_id="ignored-for-submitted",
+    )
+    assert found.task_id == submitted.task_id
+    assert (
+        store.lookup_remote(
+            owner="session-a",
+            kind="command",
+            remote_id="remote-1",
+            cluster_identity="different-local-cluster",
+            remote_cluster_id="ignored-for-submitted",
+        )
+        is None
+    )
 
     record, created = _adopt(
         store,
@@ -224,30 +251,6 @@ def test_adopt_returns_existing_submitted_binding_unchanged(tmp_path):
     assert record.remote_user_id is None
     assert record.name == "submitted command"
     assert record.request_id == "original-request"
-
-
-def test_lookup_submitted_uses_legacy_cluster_identity(tmp_path):
-    store = SQLiteTaskStore(tmp_path / "tasks.db")
-    submitted = _submitted(store)
-
-    found = store.lookup_remote(
-        owner="session-a",
-        kind="command",
-        remote_id="remote-1",
-        cluster_identity=LOCAL_CLUSTER,
-        remote_cluster_id="ignored-for-submitted",
-    )
-    missing = store.lookup_remote(
-        owner="session-a",
-        kind="command",
-        remote_id="remote-1",
-        cluster_identity="different-local-cluster",
-        remote_cluster_id="ignored-for-submitted",
-    )
-
-    assert found is not None
-    assert found.task_id == submitted.task_id
-    assert missing is None
 
 
 def test_adopted_remote_user_mismatch_is_rejected(tmp_path):

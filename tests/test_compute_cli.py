@@ -23,26 +23,6 @@ class FakeService:
         self.calls.append(("launch", request, request_id, owner))
         return {"task_id": "task-1", "state": "submitted"}
 
-    def status(self, task_id, owner):
-        self.calls.append(("status", task_id, owner))
-        return {"task_id": task_id, "owner": owner}
-
-    def logs(self, task_id, owner, tail):
-        self.calls.append(("logs", task_id, owner, tail))
-        return [{"message": "hello"}]
-
-    def cancel(self, task_id, owner):
-        self.calls.append(("cancel", task_id, owner))
-        return {"task_id": task_id, "state": "cancelling"}
-
-    def reconcile(self, task_id, owner, remote_id):
-        self.calls.append(("reconcile", task_id, owner, remote_id))
-        return {"task_id": task_id, "remote_id": remote_id}
-
-    def list_tasks(self, owner):
-        self.calls.append(("list", owner))
-        return [{"task_id": "task-1", "owner": owner}]
-
     def discover(self, kind, owner, limit=50, offset=0):
         self.calls.append(("discover", kind, owner, limit, offset))
         return {
@@ -58,14 +38,24 @@ class FakeService:
         return {"task_id": "adopted-1", "kind": kind, "remote_id": remote_id}
 
 
-def test_plan_outputs_json_and_passes_request(monkeypatch, capsys):
-    service = FakeService()
-    monkeypatch.setattr(compute_cli, "_resolve_runtime", lambda args: (service, "alice"))
+PROFILE_YAML = (
+    "mounts:\n  - host_path: /shared\n    container_path: /shared\n"
+    "defaults:\n  image: image\n  pool: pool\n"
+)
 
-    code = compute_cli.main(["plan", "--request", '{"command":["echo","hello"]}'])
 
-    assert code == 0
-    assert service.calls == [("plan", {"command": ["echo", "hello"]})]
+@pytest.fixture
+def service(monkeypatch):
+    fake = FakeService()
+    monkeypatch.setattr(compute_cli, "_resolve_runtime", lambda args: (fake, "alice"))
+    return fake
+
+
+def test_plan_reads_json_or_yaml_request_and_prints_envelope(tmp_path, service, capsys):
+    request = tmp_path / "request.yaml"
+    request.write_text("command:\n  - echo\n  - hello\n", encoding="utf-8")
+
+    assert compute_cli.main(["plan", "--request", '{"command":["echo","hello"]}']) == 0
     assert json.loads(capsys.readouterr().out) == {
         "ok": True,
         "result": {
@@ -73,24 +63,16 @@ def test_plan_outputs_json_and_passes_request(monkeypatch, capsys):
             "config": {"command": ["echo", "hello"]},
         },
     }
+    assert compute_cli.main(["plan", "--request-file", str(request)]) == 0
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+    assert service.calls == [("plan", {"command": ["echo", "hello"]})] * 2
 
 
-def test_launch_binds_owner_outside_request(monkeypatch, capsys):
-    service = FakeService()
-    monkeypatch.setattr(compute_cli, "_resolve_runtime", lambda args: (service, "alice"))
-
-    code = compute_cli.main(
+def test_launch_discover_and_adopt_bind_owner_outside_request(service, capsys):
+    assert compute_cli.main(
         ["launch", "--request", '{"command":"true"}', "--request-id", "req-1"]
-    )
-
-    assert code == 0
-    assert service.calls == [("launch", {"command": "true"}, "req-1", "alice")]
+    ) == 0
     assert json.loads(capsys.readouterr().out)["result"]["task_id"] == "task-1"
-
-
-def test_discover_and_adopt_bind_owner_and_forward_pagination(monkeypatch, capsys):
-    service = FakeService()
-    monkeypatch.setattr(compute_cli, "_resolve_runtime", lambda args: (service, "alice"))
 
     assert compute_cli.main(["discover", "shell", "--limit", "7", "--offset", "2"]) == 0
     discovered = json.loads(capsys.readouterr().out)["result"]
@@ -106,13 +88,13 @@ def test_discover_and_adopt_bind_owner_and_forward_pagination(monkeypatch, capsy
     adopted = json.loads(capsys.readouterr().out)["result"]
     assert adopted["task_id"] == "adopted-1"
     assert service.calls == [
+        ("launch", {"command": "true"}, "req-1", "alice"),
         ("discover", "shell", "alice", 7, 2),
         ("adopt", "experiment", "remote-9", "alice"),
     ]
 
 
-def test_usage_binds_owner_and_forwards_options(monkeypatch, capsys):
-    service = FakeService()
+def test_usage_binds_owner_and_forwards_options(service, capsys):
     calls = []
 
     def usage(*args):
@@ -120,7 +102,6 @@ def test_usage_binds_owner_and_forwards_options(monkeypatch, capsys):
         return {"task_id": args[0], "series": []}
 
     service.usage = usage
-    monkeypatch.setattr(compute_cli, "_resolve_runtime", lambda args: (service, "alice"))
 
     assert compute_cli.main(["usage", "task-1"]) == 0
     assert json.loads(capsys.readouterr().out)["result"]["task_id"] == "task-1"
@@ -135,27 +116,11 @@ def test_usage_binds_owner_and_forwards_options(monkeypatch, capsys):
     ]
 
 
-def test_plan_accepts_yaml_request_file(tmp_path, monkeypatch, capsys):
-    service = FakeService()
-    request = tmp_path / "request.yaml"
-    request.write_text("command:\n  - echo\n  - hello\n", encoding="utf-8")
-    monkeypatch.setattr(compute_cli, "_resolve_runtime", lambda args: (service, "alice"))
-
-    code = compute_cli.main(["plan", "--request-file", str(request)])
-
-    assert code == 0
-    assert service.calls == [("plan", {"command": ["echo", "hello"]})]
-    assert json.loads(capsys.readouterr().out)["ok"] is True
-
-
-def test_compute_error_is_structured_json(monkeypatch, capsys):
-    service = FakeService()
-
+def test_compute_error_is_structured_json(service, capsys):
     def fail(_request):
         raise APIError("master unavailable", code="transport_error", retryable=True)
 
     service.plan = fail
-    monkeypatch.setattr(compute_cli, "_resolve_runtime", lambda args: (service, "alice"))
 
     code = compute_cli.main(["plan", "--request", '{"command":"true"}'])
 
@@ -170,15 +135,23 @@ def test_compute_error_is_structured_json(monkeypatch, capsys):
     }
 
 
-def test_lazy_client_is_not_constructed_until_attribute_access():
+def test_lazy_client_constructs_on_first_access_and_delegates_api_get():
     clients = []
 
     class Client:
         cluster_identity = "cluster"
 
+        def _get(self, endpoint, params=None):
+            return {"endpoint": endpoint, "params": params}
+
     lazy = compute_cli._LazyClient(lambda: clients.append(Client()) or clients[-1])
     assert clients == []
     assert lazy.cluster_identity == "cluster"
+    assert len(clients) == 1
+    # _get must reach the real client rather than being shadowed by the wrapper.
+    assert lazy._get("api/v1/resource-pools", params={"limit": 0}) == {
+        "endpoint": "api/v1/resource-pools", "params": {"limit": 0},
+    }
     assert len(clients) == 1
 
 
@@ -232,32 +205,11 @@ def test_lazy_client_factory_failure_is_not_cached():
     assert attempts == 2
 
 
-def test_missing_explicit_owner_is_an_error(tmp_path, monkeypatch, capsys):
+def test_owner_is_required_for_stored_tasks_but_not_for_offline_plan(
+    tmp_path, monkeypatch, capsys
+):
     profile = tmp_path / "profile.yaml"
-    profile.write_text(
-        "mounts:\n  - host_path: /shared\n    container_path: /shared\n"
-        "defaults:\n  image: image\n  pool: pool\n",
-        encoding="utf-8",
-    )
-    monkeypatch.delenv("DETERMINED_COMPUTE_OWNER", raising=False)
-
-    code = compute_cli.main(
-        ["--profile", str(profile), "--db", str(tmp_path / "tasks.db"), "list"]
-    )
-
-    assert code == 2
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["error"]["code"] == "internal_error"
-    assert "OWNER" in payload["error"]["message"]
-
-
-def test_real_plan_needs_no_owner_database_or_api_client(tmp_path, monkeypatch, capsys):
-    profile = tmp_path / "profile.yaml"
-    profile.write_text(
-        "mounts:\n  - host_path: /shared\n    container_path: /shared\n"
-        "defaults:\n  image: image\n  pool: pool\n",
-        encoding="utf-8",
-    )
+    profile.write_text(PROFILE_YAML, encoding="utf-8")
     monkeypatch.delenv("DETERMINED_COMPUTE_OWNER", raising=False)
     monkeypatch.delenv("DETERMINED_COMPUTE_DB", raising=False)
     monkeypatch.setattr(
@@ -275,16 +227,13 @@ def test_real_plan_needs_no_owner_database_or_api_client(tmp_path, monkeypatch, 
             '{"command":"true","workdir":"/shared/work","output_dir":"/shared/out"}',
         ]
     )
-
     assert code == 0
     assert json.loads(capsys.readouterr().out)["result"]["kind"] == "command"
 
-
-def test_lazy_client_delegates_api_get_instead_of_shadowing_it():
-    class API:
-        def _get(self, endpoint, params=None):
-            return {'endpoint': endpoint, 'params': params}
-    lazy = compute_cli._LazyClient(API)
-    assert lazy._get('api/v1/resource-pools', params={'limit': 0}) == {
-        'endpoint': 'api/v1/resource-pools', 'params': {'limit': 0},
-    }
+    code = compute_cli.main(
+        ["--profile", str(profile), "--db", str(tmp_path / "tasks.db"), "list"]
+    )
+    assert code == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["error"]["code"] == "internal_error"
+    assert "OWNER" in payload["error"]["message"]

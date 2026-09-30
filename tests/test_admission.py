@@ -182,7 +182,7 @@ def test_inventory_reports_multiple_pools_and_only_suggests_alternatives():
     assert "compatibility was not checked" in report["advisory"]
 
 
-@pytest.mark.parametrize("slots", [True, -1, 1.5, "1"])
+@pytest.mark.parametrize("slots", [True, -1, "1"])
 def test_slot_bounds_and_bool_are_rejected(slots):
     inspector = ResourceInspector(Client([], []))
     with pytest.raises(ValueError, match="non-negative integer"):

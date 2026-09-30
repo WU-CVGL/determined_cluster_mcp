@@ -27,7 +27,6 @@ class UsageClient:
     def __init__(self) -> None:
         self.calls = []
         self.enabled = True
-        self.launched = 0
         self.task_info = {}
         self.latest = {"trial": None, "total": 0}
         self.trials = {}
@@ -39,7 +38,6 @@ class UsageClient:
         self.failing = set()
 
     def launch_task(self, kind, config):
-        self.launched += 1
         remote_id = "cmd-1" if kind == "command" else "9"
         return {"id": remote_id, "state": "QUEUED"}
 
@@ -149,6 +147,21 @@ def series(metric, samples, allocation="cmd-1.1", node="node-a", gpu=None):
     }
 
 
+def allocation(allocation_id, start_time, end_time):
+    return {"allocation_id": allocation_id, "state": "STATE_TERMINATED", "is_ready": False,
+            "start_time": start_time, "end_time": end_time}
+
+
+def three_allocations():
+    return {
+        "task_id": "cmd-1", "start_time": TASK_START, "end_time": None,
+        "allocations": [allocation(f"cmd-1.{index}", None, None) for index in (3, 2, 1)],
+    }
+
+
+# Summary of a running command.
+
+
 def test_running_command_uses_trailing_window_and_summarizes_non_null_samples(
     tmp_path, profile
 ):
@@ -205,36 +218,7 @@ def test_running_command_uses_trailing_window_and_summarizes_non_null_samples(
     assert "samples" not in cpu and "samples_omitted" not in result
 
 
-def test_ended_task_uses_window_before_end_and_never_before_start(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile)
-    client.task_info["cmd-1"] = {
-        "task_id": "cmd-1",
-        "start_time": "2027-01-15T06:58:00.9Z",
-        "end_time": "2027-01-15T07:00:00.999999999+00:00",
-        "allocations": [],
-    }
-
-    result = service.usage(task["task_id"], "session-a", window_seconds=604800)
-
-    end = NOW - 3600
-    assert result["window"]["start"] == end - 120
-    assert result["window"]["end"] == end
-    assert result["window"]["step"] == 15
-    assert result["explanation"].startswith("No measurements were returned")
-
-
-def test_week_window_step_respects_point_limit(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile)
-    client.task_info["cmd-1"] = {
-        "task_id": "cmd-1", "start_time": "2020-01-01T00:00:00Z",
-        "end_time": None, "allocations": [],
-    }
-
-    window = service.usage(task["task_id"], "session-a", window_seconds=604800)["window"]
-
-    assert window["end"] - window["start"] == 604800
-    assert window["step"] == 421
-    assert window["expected_points"] <= 1440
+# Access, ownership and argument checks.
 
 
 def test_disabled_monitoring_stops_before_task_reads(tmp_path, profile):
@@ -249,134 +233,27 @@ def test_disabled_monitoring_stops_before_task_reads(tmp_path, profile):
     assert client.calls == [("capability",)]
 
 
-def test_allocation_must_belong_to_selected_task(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile)
-
-    with pytest.raises(NotFoundError) as caught:
-        service.usage(task["task_id"], "session-a", allocation_id="other.1")
-    assert caught.value.code == "allocation_not_found"
-    assert not any(call[0] == "resources" for call in client.calls)
-
-    service.usage(task["task_id"], "session-a", allocation_id="cmd-1.1")
-    assert resources_call(client)[-1] == "cmd-1.1"
-
-
-def test_metric_filter_and_bounded_samples(tmp_path, profile, monkeypatch):
-    service, client, task = launched(tmp_path, profile)
-    client.series = [
-        series("cpu_cores", [[NOW, 1.0]]),
-        series("memory_rss_bytes", [[NOW, 0], [NOW - 15, 0]]),
-    ]
-
-    filtered = service.usage(
-        task["task_id"], "session-a", metrics=["memory_rss_bytes"], include_samples=True
-    )
-    assert [item["metric"] for item in filtered["series"]] == ["memory_rss_bytes"]
-    assert filtered["samples_omitted"] is False
-    assert filtered["series"][0]["samples"] == [[NOW, 0], [NOW - 15, 0]]
-    assert filtered["series"][0]["first_at"] == "2027-01-15T07:59:45+00:00"
-    assert filtered["series"][0]["last"] == 0
-
-    monkeypatch.setattr(service_module, "_USAGE_MAX_RETURNED_SAMPLES", 2)
-    bounded = service.usage(task["task_id"], "session-a", include_samples=True)
-    assert bounded["samples_omitted"] is True
-    assert bounded["samples_limit"] == 2
-    assert all("samples" not in item for item in bounded["series"])
-
-
-def test_experiment_reports_latest_trial_task(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile, kind="experiment")
-    client.latest = {
-        "trial": {"id": 17, "experimentId": 9, "state": "RUNNING",
-                  "taskIds": ["9.aaaa", "9.aaaa-1"]},
-        "total": 3,
-    }
-
-    result = service.usage(task["task_id"], "session-a")
-
-    assert client.calls == [
-        ("capability",),
-        ("latest_trial", "9"),
-        ("task_info", "9.aaaa-1"),
-        ("resources", "9.aaaa-1", NOW - 3600, NOW, 15, None),
-    ] + context_calls(["9.aaaa-1.1"], entity=("entity", "experiment", "9"))
-    assert result["determined_task_id"] == "9.aaaa-1"
-    assert result["trial"] == {
-        "id": 17,
-        "state": "RUNNING",
-        "selection": "latest",
-        "experiment_trial_count": 3,
-        "task_count": 2,
-        "total_batches_processed": None,
-        "wall_clock_seconds": None,
-        "restarts": None,
-        "batches_per_second_lower_bound": None,
-        "summary_metrics": {},
-        "summary_metrics_truncated": False,
-    }
-    assert "has 3 trials" in result["explanation"]
-    assert "reports trial 17" in result["explanation"]
-
-
-def test_experiment_requested_trial_must_belong_to_experiment(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile, kind="experiment")
-    client.trials["4"] = {"id": 4, "experimentId": 9, "taskId": "9.bbbb"}
-    client.trials["5"] = {"id": 5, "experimentId": 10, "taskIds": ["10.cccc"]}
-
-    result = service.usage(task["task_id"], "session-a", trial_id=4)
-    assert client.calls == [
-        ("capability",),
-        ("trial", "4"),
-        ("task_info", "9.bbbb"),
-        ("resources", "9.bbbb", NOW - 3600, NOW, 15, None),
-    ] + context_calls(["9.bbbb.1"], entity=("entity", "experiment", "9"))
-    assert result["determined_task_id"] == "9.bbbb"
-    assert result["trial"]["selection"] == "requested"
-    assert result["trial"]["experiment_trial_count"] is None
-    assert "pass trial_id" not in result["explanation"]
-
-    client.calls.clear()
-    with pytest.raises(NotFoundError) as caught:
-        service.usage(task["task_id"], "session-a", trial_id=5)
-    assert caught.value.code == "trial_not_found"
-    assert client.calls == [("capability",), ("trial", "5")]
-
-
-def test_experiment_without_trials_is_not_started(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile, kind="experiment")
-
-    with pytest.raises(ConflictError) as caught:
-        service.usage(task["task_id"], "session-a")
-
-    assert caught.value.code == "task_not_started"
-
-
-def test_trial_id_requires_experiment(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile)
-
-    with pytest.raises(ValidationError, match="experiment"):
-        service.usage(task["task_id"], "session-a", trial_id=1)
-    assert client.calls == []
-
-
 @pytest.mark.parametrize(
-    "arguments",
+    ("kind", "arguments", "invalid"),
     [
-        {"window_seconds": 59},
-        {"window_seconds": 604801},
-        {"window_seconds": True},
-        {"allocation_id": " a.1"},
-        {"allocation_id": ""},
-        {"metrics": "cpu_cores"},
-        {"metrics": []},
-        {"metrics": ["cpu_cores", "disk_bytes"]},
-        {"include_samples": "yes"},
+        ("command", {"window_seconds": 59}, "window_seconds"),
+        ("command", {"window_seconds": 604801}, "window_seconds"),
+        ("command", {"window_seconds": True}, "window_seconds"),
+        ("command", {"allocation_id": " a.1"}, "allocation_id"),
+        ("command", {"allocation_id": ""}, "allocation_id"),
+        ("command", {"metrics": "cpu_cores"}, "metrics"),
+        ("command", {"metrics": []}, "metrics"),
+        ("command", {"metrics": ["cpu_cores", "disk_bytes"]}, "metrics"),
+        ("command", {"include_samples": "yes"}, "include_samples"),
+        ("command", {"trial_id": 1}, "trial_id"),  # trial_id applies only to experiments
+        ("experiment", {"trial_id": 0}, "trial_id"),
+        ("experiment", {"trial_id": True}, "trial_id"),
     ],
 )
-def test_invalid_arguments_fail_before_any_access(tmp_path, profile, arguments):
-    service, client, task = launched(tmp_path, profile)
+def test_invalid_arguments_fail_before_any_access(tmp_path, profile, kind, arguments, invalid):
+    service, client, task = launched(tmp_path, profile, kind=kind)
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError, match=f"^{invalid} "):
         service.usage(task["task_id"], "session-a", **arguments)
     assert client.calls == []
 
@@ -427,48 +304,19 @@ def test_other_owner_and_changed_profile_cannot_read_usage(tmp_path, profile):
     assert client.calls == []
 
 
-def test_single_trial_experiment_omits_trial_hint(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile, kind="experiment")
-    client.latest = {"trial": {"id": 17, "experimentId": 9, "taskIds": ["9.a"]}, "total": 1}
-
-    result = service.usage(task["task_id"], "session-a")
-
-    assert result["trial"]["experiment_trial_count"] == 1
-    assert "pass trial_id" not in result["explanation"]
+# Measurement window.
 
 
-def test_experiment_allocation_checked_against_trial_task(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile, kind="experiment")
-    client.latest = {"trial": {"id": 17, "experimentId": 9, "taskIds": ["9.a", "9.a-1"]}, "total": 1}
-
-    service.usage(task["task_id"], "session-a", allocation_id="9.a-1.1")
-    assert resources_call(client) == ("resources", "9.a-1", NOW - 3600, NOW, 15, "9.a-1.1")
-
-    client.calls.clear()
-    with pytest.raises(NotFoundError) as caught:
-        service.usage(task["task_id"], "session-a", allocation_id="9.1")
-    assert caught.value.code == "allocation_not_found"
-    assert not any(call[0] == "resources" for call in client.calls)
-
-
-@pytest.mark.parametrize("trial_id", [0, -1, True, "abc", 1.5])
-def test_invalid_trial_id_rejected_before_access_for_experiment(tmp_path, profile, trial_id):
-    service, client, task = launched(tmp_path, profile, kind="experiment")
-
-    with pytest.raises(ValidationError, match="positive integer"):
-        service.usage(task["task_id"], "session-a", trial_id=trial_id)
-    assert client.calls == []
-
-
-def test_ended_task_longer_than_window_anchors_window_at_task_end(tmp_path, profile):
+def test_window_follows_task_lifetime_and_point_limit(tmp_path, profile):
     service, client, task = launched(tmp_path, profile)
-    client.task_info["cmd-1"] = {
+    info = client.task_info["cmd-1"] = {
         "task_id": "cmd-1",
         "start_time": TASK_START,
         "end_time": "2027-01-15T06:00:00Z",
         "allocations": [],
     }
 
+    # An ended task shows the window preceding its end.
     result = service.usage(task["task_id"], "session-a")
 
     assert result["window"] == {
@@ -481,19 +329,30 @@ def test_ended_task_longer_than_window_anchors_window_at_task_end(tmp_path, prof
         "expected_points": 241,
     }
     assert resources_call(client) == ("resources", "cmd-1", NOW - 10800, NOW - 7200, 15, None)
+    assert result["explanation"].startswith("No measurements were returned")
+
+    # A window longer than the task never starts before the task started.
+    info.update(
+        start_time="2027-01-15T06:58:00.9Z", end_time="2027-01-15T07:00:00.999999999+00:00"
+    )
+    window = service.usage(task["task_id"], "session-a", window_seconds=604800)["window"]
+    end = NOW - 3600
+    assert (window["start"], window["end"], window["step"]) == (end - 120, end, 15)
+
+    # A week-long window of a long-running task widens the step to respect the point limit.
+    info.update(start_time="2020-01-01T00:00:00Z", end_time=None)
+    window = service.usage(task["task_id"], "session-a", window_seconds=604800)["window"]
+    assert window["end"] - window["start"] == 604800
+    assert window["step"] == 421
+    assert window["expected_points"] <= 1440
 
 
-def allocation(allocation_id, start_time, end_time):
-    return {"allocation_id": allocation_id, "state": "STATE_TERMINATED", "is_ready": False,
-            "start_time": start_time, "end_time": end_time}
-
-
-def test_paused_trial_window_ends_at_last_allocation_end(tmp_path, profile):
+def test_window_ends_when_the_last_allocation_ended(tmp_path, profile):
     service, client, task = launched(tmp_path, profile, kind="experiment")
     client.latest = {"trial": {"id": 3, "experimentId": 9, "state": "PAUSED",
                                "taskIds": ["9.p"]}, "total": 1}
     # Pausing leaves tasks.end_time NULL while every allocation has ended.
-    client.task_info["9.p"] = {
+    info = client.task_info["9.p"] = {
         "task_id": "9.p", "start_time": TASK_START, "end_time": None,
         "allocations": [
             allocation("9.p.1", "2027-01-15T01:00:00.5", "2027-01-15T02:00:00"),
@@ -513,18 +372,10 @@ def test_paused_trial_window_ends_at_last_allocation_end(tmp_path, profile):
     ]
     assert result["allocations"][0]["start_time"] == "2027-01-15T01:00:00.5Z"
 
-
-def test_paused_then_cancelled_trial_uses_allocation_end_before_task_end(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile)
-    client.task_info["cmd-1"] = {
-        "task_id": "cmd-1", "start_time": TASK_START, "end_time": "2027-01-15T07:00:00Z",
-        "allocations": [allocation("cmd-1.1", "2027-01-15T03:00:00", "2027-01-15T04:00:00")],
-    }
-
+    # Cancelling the paused trial later sets a task end after the last allocation end.
+    info["end_time"] = "2027-01-15T07:00:00Z"
     window = service.usage(task["task_id"], "session-a")["window"]
-
-    assert (window["start"], window["end"]) == (NOW - 5 * 3600, NOW - 4 * 3600)
-    assert window["anchor"] == "allocation_end"
+    assert (window["end"], window["anchor"]) == (end, "allocation_end")
 
 
 def test_requested_finished_allocation_of_running_task_uses_its_lifetime(tmp_path, profile):
@@ -589,26 +440,203 @@ def test_window_is_never_empty_or_inverted(
     )
 
 
-def test_sample_limit_counts_only_selected_metrics_and_keeps_nulls(
+# Experiment trials and allocation selection.
+
+
+def test_experiment_reports_latest_trial_task(tmp_path, profile):
+    service, client, task = launched(tmp_path, profile, kind="experiment")
+
+    with pytest.raises(ConflictError) as caught:
+        service.usage(task["task_id"], "session-a")
+    assert caught.value.code == "task_not_started"
+
+    client.latest = {
+        "trial": {"id": 17, "experimentId": 9, "state": "RUNNING",
+                  "taskIds": ["9.aaaa", "9.aaaa-1"]},
+        "total": 3,
+    }
+    client.calls.clear()
+
+    result = service.usage(task["task_id"], "session-a")
+
+    assert client.calls == [
+        ("capability",),
+        ("latest_trial", "9"),
+        ("task_info", "9.aaaa-1"),
+        ("resources", "9.aaaa-1", NOW - 3600, NOW, 15, None),
+    ] + context_calls(["9.aaaa-1.1"], entity=("entity", "experiment", "9"))
+    assert result["determined_task_id"] == "9.aaaa-1"
+    assert result["trial"] == {
+        "id": 17,
+        "state": "RUNNING",
+        "selection": "latest",
+        "experiment_trial_count": 3,
+        "task_count": 2,
+        "total_batches_processed": None,
+        "wall_clock_seconds": None,
+        "restarts": None,
+        "batches_per_second_lower_bound": None,
+        "summary_metrics": {},
+        "summary_metrics_truncated": False,
+    }
+    assert "pass trial_id" in result["explanation"]
+
+    # With a single trial there is no other trial to point to.
+    client.latest["total"] = 1
+    result = service.usage(task["task_id"], "session-a")
+    assert result["trial"]["experiment_trial_count"] == 1
+    assert "pass trial_id" not in result["explanation"]
+
+
+def test_experiment_requested_trial_must_belong_to_experiment(tmp_path, profile):
+    service, client, task = launched(tmp_path, profile, kind="experiment")
+    client.trials["4"] = {"id": 4, "experimentId": 9, "taskId": "9.bbbb"}
+    client.trials["5"] = {"id": 5, "experimentId": 10, "taskIds": ["10.cccc"]}
+
+    result = service.usage(task["task_id"], "session-a", trial_id=4)
+    assert client.calls == [
+        ("capability",),
+        ("trial", "4"),
+        ("task_info", "9.bbbb"),
+        ("resources", "9.bbbb", NOW - 3600, NOW, 15, None),
+    ] + context_calls(["9.bbbb.1"], entity=("entity", "experiment", "9"))
+    assert result["determined_task_id"] == "9.bbbb"
+    assert result["trial"]["selection"] == "requested"
+    assert result["trial"]["experiment_trial_count"] is None
+    assert "pass trial_id" not in result["explanation"]
+
+    client.calls.clear()
+    with pytest.raises(NotFoundError) as caught:
+        service.usage(task["task_id"], "session-a", trial_id=5)
+    assert caught.value.code == "trial_not_found"
+    assert client.calls == [("capability",), ("trial", "5")]
+
+
+def test_experiment_allocation_checked_against_trial_task(tmp_path, profile):
+    service, client, task = launched(tmp_path, profile, kind="experiment")
+    client.latest = {"trial": {"id": 17, "experimentId": 9, "taskIds": ["9.a", "9.a-1"]}, "total": 1}
+
+    service.usage(task["task_id"], "session-a", allocation_id="9.a-1.1")
+    assert resources_call(client) == ("resources", "9.a-1", NOW - 3600, NOW, 15, "9.a-1.1")
+
+    client.calls.clear()
+    with pytest.raises(NotFoundError) as caught:
+        service.usage(task["task_id"], "session-a", allocation_id="9.1")
+    assert caught.value.code == "allocation_not_found"
+    assert not any(call[0] == "resources" for call in client.calls)
+
+
+def test_trial_throughput_context(tmp_path, profile):
+    service, client, task = launched(tmp_path, profile, kind="experiment")
+    trial = {"id": 17, "experimentId": 9, "taskIds": ["9.a"], "totalBatchesProcessed": 1000,
+             "wallClockTime": 500.0, "restarts": 1}
+    client.latest = {"trial": trial, "total": 1}
+
+    context = service.usage(task["task_id"], "session-a")["trial"]
+    assert (context["total_batches_processed"], context["wall_clock_seconds"]) == (1000, 500.0)
+    assert (context["restarts"], context["batches_per_second_lower_bound"]) == (1, 2.0)
+
+    trial.update(totalBatchesProcessed=0, wallClockTime=0)
+    result = service.usage(task["task_id"], "session-a")
+    assert result["trial"]["batches_per_second_lower_bound"] is None
+    assert "Core API" in result["explanation"]
+
+    trial.update(totalBatchesProcessed=True, wallClockTime="500", restarts=-1)
+    context = service.usage(task["task_id"], "session-a")["trial"]
+    assert (context["total_batches_processed"], context["wall_clock_seconds"]) == (None, None)
+    assert context["restarts"] is None
+
+
+def test_summary_metrics_keep_numeric_statistics_and_report_truncation(
     tmp_path, profile, monkeypatch
 ):
+    service, client, task = launched(tmp_path, profile, kind="experiment")
+    client.latest = {"trial": {
+        "id": 17, "experimentId": 9, "taskIds": ["9.a"],
+        "summaryMetrics": {
+            "avg_metrics": {
+                "loss": {"type": "number", "count": 10, "min": 0.1, "max": 2.0, "last": 0.2,
+                         "sum": 5.0, "mean": 0.5, "extra": "drop"},
+                "note": {"type": "string", "last": "user text"},
+            },
+            "perf": {"step_s": {"type": "number", "last": 0.3, "min": True}},
+            "broken": ["not", "a", "map"],
+        },
+    }, "total": 1}
+
+    context = service.usage(task["task_id"], "session-a")["trial"]
+    assert context["summary_metrics"] == {
+        "avg_metrics": {
+            "loss": {"type": "number", "count": 10, "sum": 5.0, "min": 0.1, "max": 2.0,
+                     "last": 0.2, "mean": 0.5},
+            "note": {"type": "string"},
+        },
+        "perf": {"step_s": {"type": "number", "last": 0.3}},
+    }
+    assert context["summary_metrics_truncated"] is False
+
+    monkeypatch.setattr(service_module, "_USAGE_MAX_SUMMARY_METRICS", 2)
+    context = service.usage(task["task_id"], "session-a")["trial"]
+    assert context["summary_metrics"] == {
+        "avg_metrics": {
+            "loss": {"type": "number", "count": 10, "sum": 5.0, "min": 0.1, "max": 2.0,
+                     "last": 0.2, "mean": 0.5},
+            "note": {"type": "string"},
+        },
+    }
+    assert context["summary_metrics_truncated"] is True
+
+
+def test_validation_metrics_survive_the_summary_cap(tmp_path, profile, monkeypatch):
+    service, client, task = launched(tmp_path, profile, kind="experiment")
+    client.latest = {"trial": {
+        "id": 17, "experimentId": 9, "taskIds": ["9.a"],
+        "summaryMetrics": {
+            "avg_metrics": {f"grad_{index:03}": {"type": "number", "last": 1.0}
+                            for index in range(5)},
+            "inference": {"latency": {"type": "number", "last": 2.0}},
+            "validation_metrics": {"loss": {"type": "number", "last": 0.5}},
+        },
+    }, "total": 1}
+    monkeypatch.setattr(service_module, "_USAGE_MAX_SUMMARY_METRICS", 3)
+
+    context = service.usage(task["task_id"], "session-a")["trial"]
+
+    assert list(context["summary_metrics"]) == ["validation_metrics", "avg_metrics"]
+    assert context["summary_metrics"]["validation_metrics"]["loss"]["last"] == 0.5
+    assert list(context["summary_metrics"]["avg_metrics"]) == ["grad_000", "grad_001"]
+    assert context["summary_metrics_truncated"] is True
+
+
+# Series selection and samples.
+
+
+def test_metric_filter_and_bounded_samples(tmp_path, profile, monkeypatch):
     service, client, task = launched(tmp_path, profile)
     client.series = [
         series("cpu_cores", [[NOW - 15, None], [NOW, 1.0]]),
+        series("memory_rss_bytes", [[NOW, 0], [NOW - 15, 0]]),
         series("gpu_power_watts", [[NOW - i * 15, 50.0] for i in range(5)], gpu="GPU-1"),
     ]
-    monkeypatch.setattr(service_module, "_USAGE_MAX_RETURNED_SAMPLES", 2)
+    monkeypatch.setattr(service_module, "_USAGE_MAX_RETURNED_SAMPLES", 4)
 
+    # The sample limit counts only the selected metrics; unavailable samples stay null.
     selected = service.usage(
-        task["task_id"], "session-a", metrics=["cpu_cores"], include_samples=True
+        task["task_id"], "session-a", metrics=["memory_rss_bytes", "cpu_cores"],
+        include_samples=True,
     )
+    assert [item["metric"] for item in selected["series"]] == ["cpu_cores", "memory_rss_bytes"]
     assert selected["samples_omitted"] is False
     assert "samples_limit" not in selected
-    assert selected["series"][0]["samples"] == [[NOW - 15, None], [NOW, 1.0]]
+    cpu, memory = selected["series"]
+    assert cpu["samples"] == [[NOW - 15, None], [NOW, 1.0]]
+    assert memory["samples"] == [[NOW, 0], [NOW - 15, 0]]
+    assert memory["first_at"] == "2027-01-15T07:59:45+00:00"
+    assert memory["last"] == 0
 
     everything = service.usage(task["task_id"], "session-a", include_samples=True)
     assert everything["samples_omitted"] is True
-    assert everything["samples_limit"] == 2
+    assert everything["samples_limit"] == 4
     assert all("samples" not in item for item in everything["series"])
 
 
@@ -626,6 +654,286 @@ def test_filter_that_removes_every_series_names_the_returned_metrics(tmp_path, p
     assert result["series"] == []
     assert not result["explanation"].startswith("No measurements were returned")
     assert "allocation_active, cpu_cores" in result["explanation"]
+
+
+@pytest.mark.parametrize(
+    ("values", "p50", "p95"),
+    [([5, 1, 4, 2, 3], 3, 5), (list(range(1, 21)), 10, 19)],
+)
+def test_percentiles_are_nearest_rank(tmp_path, profile, values, p50, p95):
+    service, client, task = launched(tmp_path, profile)
+    client.series = [series("cpu_cores", [[NOW - index, value] for index, value in enumerate(values)])]
+
+    (summary,) = service.usage(task["task_id"], "session-a")["series"]
+
+    assert (summary["p50"], summary["p95"]) == (p50, p95)
+    assert "idle_fraction" not in summary
+
+
+# GPU comparison.
+
+
+def test_gpu_comparison_uses_every_returned_gpu_series(tmp_path, profile):
+    service, client, task = launched(tmp_path, profile)
+    client.series = [
+        series("cpu_cores", [[NOW, 2.0]]),
+        series("gpu_utilization_percent", [[NOW - 15, 100], [NOW, 80]], gpu="GPU-A"),
+        series("gpu_utilization_percent", [[NOW - 30, 0], [NOW - 15, 20], [NOW, 10]],
+               gpu="GPU-B"),
+        series("gpu_memory_used_bytes", [[NOW, 4e9], [NOW - 15, None]], gpu="GPU-A"),
+        series("gpu_memory_used_bytes", [[NOW, 6e9]], gpu="GPU-B"),
+        series("gpu_utilization_percent", [[NOW, 50]], allocation="cmd-1.0", gpu="GPU-C"),
+    ]
+    client.gpu_models = {"GPU-A": "Model X", "GPU-C": "Model Z"}
+    client.allocation_details["cmd-1.1"] = {
+        "allocation_id": "cmd-1.1", "slots": 2, "exit_reason": None, "status_code": None,
+    }
+
+    result = service.usage(task["task_id"], "session-a", metrics=["cpu_cores"])
+
+    assert [item["metric"] for item in result["series"]] == ["cpu_cores"]
+    assert result["gpus"] == [
+        {
+            "allocation_id": "cmd-1.0",
+            "gpu_count": 1,
+            "requested_slots": None,
+            "gpu_models": ["Model Z"],
+            "mean_utilization_percent": 50.0,
+            "min_gpu_mean_utilization_percent": 50.0,
+            "max_gpu_mean_utilization_percent": 50.0,
+            "utilization_spread_percent": 0.0,
+            "least_utilized_gpu_uuid": "GPU-C",
+            "idle_fraction": 0.0,
+            "idle_threshold_percent": 10,
+            "max_memory_used_bytes": None,
+        },
+        {
+            "allocation_id": "cmd-1.1",
+            "gpu_count": 2,
+            "requested_slots": 2,
+            "gpu_models": ["Model X"],
+            "mean_utilization_percent": 50.0,
+            "min_gpu_mean_utilization_percent": 10.0,
+            "max_gpu_mean_utilization_percent": 90.0,
+            "utilization_spread_percent": 80.0,
+            "least_utilized_gpu_uuid": "GPU-B",
+            "idle_fraction": 0.2,
+            "idle_threshold_percent": 10,
+            "max_memory_used_bytes": 6e9,
+        },
+    ]
+
+    gpu_series = service.usage(
+        task["task_id"], "session-a", metrics=["gpu_utilization_percent"]
+    )["series"]
+    by_gpu = {item["gpu_uuid"]: item for item in gpu_series}
+    assert by_gpu["GPU-A"]["gpu_model"] == "Model X"
+    assert by_gpu["GPU-B"]["gpu_model"] is None
+    assert by_gpu["GPU-B"]["idle_fraction"] == pytest.approx(1 / 3, abs=1e-6)
+    assert (by_gpu["GPU-B"]["p50"], by_gpu["GPU-B"]["p95"]) == (10, 20)
+
+
+def test_null_gpu_samples_are_unavailable_not_idle(tmp_path, profile):
+    service, client, task = launched(tmp_path, profile)
+    client.series = [
+        series("gpu_utilization_percent", [[NOW - 15, 50], [NOW, None]], gpu="GPU-A"),
+        series("gpu_utilization_percent", [[NOW - 15, None], [NOW, None]], gpu="GPU-B"),
+        series("gpu_memory_used_bytes", [[NOW, 1e9]], gpu="GPU-B"),
+    ]
+
+    result = service.usage(task["task_id"], "session-a")
+
+    by_gpu = {
+        item["gpu_uuid"]: item for item in result["series"]
+        if item["metric"] == "gpu_utilization_percent"
+    }
+    assert by_gpu["GPU-A"]["idle_fraction"] == 0.0
+    assert by_gpu["GPU-B"]["idle_fraction"] is None
+    (gpus,) = result["gpus"]
+    assert gpus["gpu_count"] == 2
+    assert gpus["mean_utilization_percent"] == 50.0
+    assert gpus["min_gpu_mean_utilization_percent"] == 50.0
+    assert gpus["least_utilized_gpu_uuid"] == "GPU-A"
+    assert gpus["idle_fraction"] == 0.0
+    assert gpus["max_memory_used_bytes"] == 1e9
+
+
+def test_idle_threshold_is_ten_percent(tmp_path, profile):
+    service, client, task = launched(tmp_path, profile)
+    client.series = [series(
+        "gpu_utilization_percent",
+        [[NOW - 60, 0], [NOW - 45, 5], [NOW - 30, 9.9], [NOW - 15, 10], [NOW, 50]],
+        gpu="GPU-A",
+    )]
+
+    result = service.usage(task["task_id"], "session-a")
+
+    assert result["series"][0]["idle_fraction"] == 0.6
+    assert result["gpus"][0]["idle_fraction"] == 0.6
+
+
+def test_gpus_group_by_allocation_label_and_ties_pick_the_first_uuid(tmp_path, profile):
+    service, client, task = launched(tmp_path, profile)
+    client.series = [
+        series("gpu_utilization_percent", [[NOW, 40]], allocation=None, gpu="GPU-A"),
+        series("gpu_utilization_percent", [[NOW, 30]], gpu="GPU-Z"),
+        series("gpu_utilization_percent", [[NOW, 30]], gpu="GPU-M"),
+    ]
+
+    unlabelled, labelled = service.usage(task["task_id"], "session-a")["gpus"]
+
+    assert (unlabelled["allocation_id"], unlabelled["requested_slots"]) == (None, None)
+    assert (labelled["allocation_id"], labelled["requested_slots"]) == ("cmd-1.1", 1)
+    assert labelled["least_utilized_gpu_uuid"] == "GPU-M"
+
+
+# Best-effort context lookups.
+
+
+def test_pool_description_matches_task_pool_and_lookups_run_only_when_needed(
+    tmp_path, profile
+):
+    service, client, task = launched(tmp_path, profile)
+    client.series = [series("cpu_cores", [[NOW, 1.0]])]
+    client.pools = [{"name": "cpu", "description": "CPU only"},
+                    {"name": "gpu", "description": "Shared GPU agents"}]
+
+    result = service.usage(task["task_id"], "session-a")
+
+    assert result["resource_pool"] == {"name": "gpu", "description": "Shared GPU agents"}
+    # Without a GPU series there are no device models to look up.
+    assert ("agents",) not in client.calls
+    assert result["gpus"] == []
+
+    client.pools = [{"name": "cpu", "description": "CPU only"}]
+    assert service.usage(task["task_id"], "session-a")["resource_pool"] == {
+        "name": "gpu", "description": None,
+    }
+
+    # Without a pool name there is no pool to describe.
+    client.get_task = lambda kind, remote_id: {"id": remote_id}
+    client.calls.clear()
+    assert service.usage(task["task_id"], "session-a")["resource_pool"] is None
+    assert ("pools",) not in client.calls
+
+
+def test_allocation_details_are_bounded_but_include_the_requested_allocation(
+    tmp_path, profile
+):
+    service, client, task = launched(tmp_path, profile)
+    names = [f"cmd-1.{index}" for index in range(10, 0, -1)]
+    client.task_info["cmd-1"] = {
+        "task_id": "cmd-1", "start_time": TASK_START, "end_time": None,
+        "allocations": [allocation(name, None, None) for name in names],
+    }
+    client.allocation_details["cmd-1.1"] = {
+        "allocation_id": "cmd-1.1", "slots": 2, "exit_reason": "OOM killed", "status_code": 137,
+    }
+
+    result = service.usage(task["task_id"], "session-a", allocation_id="cmd-1.1")
+
+    detailed = [call[1] for call in client.calls if call[0] == "allocation"]
+    assert detailed == names[:8] + ["cmd-1.1"]
+    assert result["allocation_details_limit"] == 8
+    by_id = {item["allocation_id"]: item for item in result["allocations"]}
+    requested = by_id["cmd-1.1"]
+    assert (requested["slots"], requested["exit_reason"], requested["status_code"]) == (
+        2, "OOM killed", 137,
+    )
+    assert by_id["cmd-1.2"]["slots"] is None
+
+    client.task_info["cmd-1"]["allocations"] = client.task_info["cmd-1"]["allocations"][:8]
+    assert "allocation_details_limit" not in service.usage(task["task_id"], "session-a")
+
+
+@pytest.mark.parametrize(
+    ("failing", "name"),
+    [("pools", "resource_pool"), ("allocation", "allocation_details"),
+     ("agents", "gpu_models")],
+)
+def test_failed_context_lookup_keeps_measurements_and_is_reported_once(
+    tmp_path, profile, failing, name
+):
+    service, client, task = launched(tmp_path, profile)
+    client.task_info["cmd-1"] = three_allocations()
+    client.series = [series("gpu_utilization_percent", [[NOW, 70]], gpu="GPU-A")]
+    client.gpu_models = {"GPU-A": "Model X"}
+    client.failing = {failing}
+
+    result = service.usage(task["task_id"], "session-a")
+
+    assert result["context_unavailable"] == [name]
+    assert result["series"][0]["last"] == 70
+    assert [call[0] for call in client.calls].count("allocation") == 3
+    if failing == "pools":
+        assert result["resource_pool"] == {"name": "gpu", "description": None}
+    if failing == "allocation":
+        assert [item["slots"] for item in result["allocations"]] == [None, None, None]
+        assert result["gpus"][0]["requested_slots"] is None
+    if failing == "agents":
+        assert result["series"][0]["gpu_model"] is None
+
+
+@pytest.mark.parametrize(
+    ("end_time", "code", "reported"),
+    [("2027-01-15T07:00:00Z", 404, []), (None, 404, ["resource_pool"]),
+     ("2027-01-15T07:00:00Z", 503, ["resource_pool"])],
+)
+def test_ended_command_missing_from_master_leaves_pool_unknown(
+    tmp_path, profile, end_time, code, reported
+):
+    service, client, task = launched(tmp_path, profile)
+    client.task_info["cmd-1"] = {
+        "task_id": "cmd-1", "start_time": TASK_START, "end_time": end_time, "allocations": [],
+    }
+
+    def missing(kind, remote_id):
+        raise APIError(f"{code} command not found", code=code, retryable=code >= 500)
+
+    client.get_task = missing
+    result = service.usage(task["task_id"], "session-a")
+
+    assert result["resource_pool"] is None
+    assert result["context_unavailable"] == reported
+    assert ("pools",) not in client.calls
+
+
+def test_transport_failure_skips_remaining_context_lookups(tmp_path, profile):
+    service, client, task = launched(tmp_path, profile)
+    client.series = [series("gpu_utilization_percent", [[NOW, 70]], gpu="GPU-A")]
+    client.task_info["cmd-1"] = three_allocations()
+
+    def timeout(*args):
+        client.calls.append(("timeout",))
+        raise APIError("Determined request failed", code="transport_error", retryable=True)
+
+    client.get_task = timeout
+    result = service.usage(task["task_id"], "session-a")
+
+    assert client.calls[client.calls.index(resources_call(client)) + 1:] == [("timeout",)]
+    assert result["context_unavailable"] == ["resource_pool", "allocation_details", "gpu_models"]
+    assert result["series"][0]["last"] == 70
+
+    # Any other error leaves the remaining lookups running.
+    client.get_task = lambda kind, remote_id: {"id": remote_id, "resourcePool": "gpu"}
+    client.failing = {"pools"}
+    client.calls.clear()
+    assert service.usage(task["task_id"], "session-a")["context_unavailable"] == ["resource_pool"]
+    assert [call[0] for call in client.calls].count("allocation") == 3
+
+
+def test_non_api_errors_from_context_lookups_are_not_hidden(tmp_path, profile):
+    service, client, task = launched(tmp_path, profile)
+
+    def broken():
+        raise RuntimeError("bug")
+
+    client.list_resource_pools = broken
+    with pytest.raises(RuntimeError):
+        service.usage(task["task_id"], "session-a")
+
+
+# End to end through the real client.
 
 
 def test_experiment_usage_through_real_client_wire_format(tmp_path, profile, monkeypatch):
@@ -741,387 +1049,3 @@ def test_experiment_usage_through_real_client_wire_format(tmp_path, profile, mon
     )
     assert gpu["gpu_model"] == "Model X"
     assert result["warnings"] == [{"code": "gpu_full_device", "message": "whole device"}]
-
-
-def test_gpu_comparison_uses_every_returned_gpu_series(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile)
-    client.series = [
-        series("cpu_cores", [[NOW, 2.0]]),
-        series("gpu_utilization_percent", [[NOW - 15, 100], [NOW, 80]], gpu="GPU-A"),
-        series("gpu_utilization_percent", [[NOW - 30, 0], [NOW - 15, 20], [NOW, 10]],
-               gpu="GPU-B"),
-        series("gpu_memory_used_bytes", [[NOW, 4e9], [NOW - 15, None]], gpu="GPU-A"),
-        series("gpu_memory_used_bytes", [[NOW, 6e9]], gpu="GPU-B"),
-        series("gpu_utilization_percent", [[NOW, 50]], allocation="cmd-1.0", gpu="GPU-C"),
-    ]
-    client.gpu_models = {"GPU-A": "Model X", "GPU-C": "Model Z"}
-    client.allocation_details["cmd-1.1"] = {
-        "allocation_id": "cmd-1.1", "slots": 2, "exit_reason": None, "status_code": None,
-    }
-
-    result = service.usage(task["task_id"], "session-a", metrics=["cpu_cores"])
-
-    assert [item["metric"] for item in result["series"]] == ["cpu_cores"]
-    assert result["gpus"] == [
-        {
-            "allocation_id": "cmd-1.0",
-            "gpu_count": 1,
-            "requested_slots": None,
-            "gpu_models": ["Model Z"],
-            "mean_utilization_percent": 50.0,
-            "min_gpu_mean_utilization_percent": 50.0,
-            "max_gpu_mean_utilization_percent": 50.0,
-            "utilization_spread_percent": 0.0,
-            "least_utilized_gpu_uuid": "GPU-C",
-            "idle_fraction": 0.0,
-            "idle_threshold_percent": 10,
-            "max_memory_used_bytes": None,
-        },
-        {
-            "allocation_id": "cmd-1.1",
-            "gpu_count": 2,
-            "requested_slots": 2,
-            "gpu_models": ["Model X"],
-            "mean_utilization_percent": 50.0,
-            "min_gpu_mean_utilization_percent": 10.0,
-            "max_gpu_mean_utilization_percent": 90.0,
-            "utilization_spread_percent": 80.0,
-            "least_utilized_gpu_uuid": "GPU-B",
-            "idle_fraction": 0.2,
-            "idle_threshold_percent": 10,
-            "max_memory_used_bytes": 6e9,
-        },
-    ]
-
-    gpu_series = service.usage(
-        task["task_id"], "session-a", metrics=["gpu_utilization_percent"]
-    )["series"]
-    by_gpu = {item["gpu_uuid"]: item for item in gpu_series}
-    assert by_gpu["GPU-A"]["gpu_model"] == "Model X"
-    assert by_gpu["GPU-B"]["gpu_model"] is None
-    assert by_gpu["GPU-B"]["idle_fraction"] == pytest.approx(1 / 3, abs=1e-6)
-    assert (by_gpu["GPU-B"]["p50"], by_gpu["GPU-B"]["p95"]) == (10, 20)
-
-
-def test_equal_gpu_means_pick_the_first_uuid(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile)
-    client.series = [
-        series("gpu_utilization_percent", [[NOW, 30]], gpu="GPU-Z"),
-        series("gpu_utilization_percent", [[NOW, 30]], gpu="GPU-M"),
-    ]
-
-    (gpus,) = service.usage(task["task_id"], "session-a")["gpus"]
-
-    assert gpus["least_utilized_gpu_uuid"] == "GPU-M"
-
-
-@pytest.mark.parametrize(
-    ("values", "p50", "p95"),
-    [([4, 1, 3, 2], 2, 4), ([5, 1, 4, 2, 3], 3, 5), (list(range(1, 21)), 10, 19)],
-)
-def test_percentiles_are_nearest_rank(tmp_path, profile, values, p50, p95):
-    service, client, task = launched(tmp_path, profile)
-    client.series = [series("cpu_cores", [[NOW - index, value] for index, value in enumerate(values)])]
-
-    (summary,) = service.usage(task["task_id"], "session-a")["series"]
-
-    assert (summary["p50"], summary["p95"]) == (p50, p95)
-    assert "idle_fraction" not in summary
-
-
-@pytest.mark.parametrize(
-    ("failing", "name"),
-    [("entity", "resource_pool"), ("pools", "resource_pool"),
-     ("allocation", "allocation_details"), ("agents", "gpu_models")],
-)
-def test_failed_context_lookup_keeps_measurements(tmp_path, profile, failing, name):
-    service, client, task = launched(tmp_path, profile)
-    client.series = [series("gpu_utilization_percent", [[NOW, 70]], gpu="GPU-A")]
-    client.gpu_models = {"GPU-A": "Model X"}
-    client.failing = {failing}
-
-    result = service.usage(task["task_id"], "session-a")
-
-    assert result["context_unavailable"] == [name]
-    assert result["series"][0]["last"] == 70
-    if failing == "entity":
-        assert result["resource_pool"] is None
-        assert ("pools",) not in client.calls
-    if failing == "pools":
-        assert result["resource_pool"] == {"name": "gpu", "description": None}
-    if failing == "allocation":
-        assert result["allocations"][0]["slots"] is None
-        assert result["gpus"][0]["requested_slots"] is None
-    if failing == "agents":
-        assert result["series"][0]["gpu_model"] is None
-
-
-def test_non_api_errors_from_context_lookups_are_not_hidden(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile)
-
-    def broken():
-        raise RuntimeError("bug")
-
-    client.list_resource_pools = broken
-    with pytest.raises(RuntimeError):
-        service.usage(task["task_id"], "session-a")
-
-
-def test_pool_context_and_agent_lookup_only_when_needed(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile)
-    client.series = [series("cpu_cores", [[NOW, 1.0]])]
-
-    result = service.usage(task["task_id"], "session-a")
-
-    assert result["resource_pool"] == {"name": "gpu", "description": "Shared GPU agents"}
-    assert ("agents",) not in client.calls
-    assert result["gpus"] == []
-
-    client.get_task = lambda kind, remote_id: {"id": remote_id}
-    client.calls.clear()
-    assert service.usage(task["task_id"], "session-a")["resource_pool"] is None
-    assert ("pools",) not in client.calls
-
-
-def test_allocation_details_are_bounded_but_include_the_requested_allocation(
-    tmp_path, profile
-):
-    service, client, task = launched(tmp_path, profile)
-    names = [f"cmd-1.{index}" for index in range(10, 0, -1)]
-    client.task_info["cmd-1"] = {
-        "task_id": "cmd-1", "start_time": TASK_START, "end_time": None,
-        "allocations": [allocation(name, None, None) for name in names],
-    }
-
-    result = service.usage(task["task_id"], "session-a", allocation_id="cmd-1.1")
-
-    detailed = [call[1] for call in client.calls if call[0] == "allocation"]
-    assert detailed == names[:8] + ["cmd-1.1"]
-    assert result["allocation_details_limit"] == 8
-    slots = {item["allocation_id"]: item["slots"] for item in result["allocations"]}
-    assert slots["cmd-1.1"] == 1 and slots["cmd-1.2"] is None
-
-    client.task_info["cmd-1"]["allocations"] = client.task_info["cmd-1"]["allocations"][:8]
-    assert "allocation_details_limit" not in service.usage(task["task_id"], "session-a")
-
-
-def test_trial_throughput_context(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile, kind="experiment")
-    trial = {"id": 17, "experimentId": 9, "taskIds": ["9.a"], "totalBatchesProcessed": 1000,
-             "wallClockTime": 500.0, "restarts": 1}
-    client.latest = {"trial": trial, "total": 1}
-
-    context = service.usage(task["task_id"], "session-a")["trial"]
-    assert (context["total_batches_processed"], context["wall_clock_seconds"]) == (1000, 500.0)
-    assert (context["restarts"], context["batches_per_second_lower_bound"]) == (1, 2.0)
-
-    trial.update(totalBatchesProcessed=0, wallClockTime=0)
-    result = service.usage(task["task_id"], "session-a")
-    assert result["trial"]["batches_per_second_lower_bound"] is None
-    assert "Core API" in result["explanation"]
-
-    trial.update(totalBatchesProcessed=True, wallClockTime="500", restarts=-1)
-    context = service.usage(task["task_id"], "session-a")["trial"]
-    assert (context["total_batches_processed"], context["wall_clock_seconds"]) == (None, None)
-    assert context["restarts"] is None
-
-
-def test_summary_metrics_keep_numeric_statistics_and_report_truncation(
-    tmp_path, profile, monkeypatch
-):
-    service, client, task = launched(tmp_path, profile, kind="experiment")
-    client.latest = {"trial": {
-        "id": 17, "experimentId": 9, "taskIds": ["9.a"],
-        "summaryMetrics": {
-            "avg_metrics": {
-                "loss": {"type": "number", "count": 10, "min": 0.1, "max": 2.0, "last": 0.2,
-                         "sum": 5.0, "mean": 0.5, "extra": "drop"},
-                "note": {"type": "string", "last": "user text"},
-            },
-            "perf": {"step_s": {"type": "number", "last": 0.3, "min": True}},
-            "broken": ["not", "a", "map"],
-        },
-    }, "total": 1}
-
-    context = service.usage(task["task_id"], "session-a")["trial"]
-    assert context["summary_metrics"] == {
-        "avg_metrics": {
-            "loss": {"type": "number", "count": 10, "sum": 5.0, "min": 0.1, "max": 2.0,
-                     "last": 0.2, "mean": 0.5},
-            "note": {"type": "string"},
-        },
-        "perf": {"step_s": {"type": "number", "last": 0.3}},
-    }
-    assert context["summary_metrics_truncated"] is False
-
-    monkeypatch.setattr(service_module, "_USAGE_MAX_SUMMARY_METRICS", 2)
-    context = service.usage(task["task_id"], "session-a")["trial"]
-    assert context["summary_metrics"] == {
-        "avg_metrics": {
-            "loss": {"type": "number", "count": 10, "sum": 5.0, "min": 0.1, "max": 2.0,
-                     "last": 0.2, "mean": 0.5},
-            "note": {"type": "string"},
-        },
-    }
-    assert context["summary_metrics_truncated"] is True
-
-
-def test_transport_failure_skips_remaining_context_lookups(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile)
-    client.series = [series("gpu_utilization_percent", [[NOW, 70]], gpu="GPU-A")]
-    client.task_info["cmd-1"] = {
-        "task_id": "cmd-1", "start_time": TASK_START, "end_time": None,
-        "allocations": [allocation(f"cmd-1.{index}", None, None) for index in (3, 2, 1)],
-    }
-
-    def timeout(*args):
-        client.calls.append(("timeout",))
-        raise APIError("Determined request failed", code="transport_error", retryable=True)
-
-    client.get_task = timeout
-    result = service.usage(task["task_id"], "session-a")
-
-    assert client.calls[client.calls.index(resources_call(client)) + 1:] == [("timeout",)]
-    assert result["context_unavailable"] == ["resource_pool", "allocation_details", "gpu_models"]
-    assert result["series"][0]["last"] == 70
-
-    client.get_task = lambda kind, remote_id: {"id": remote_id, "resourcePool": "gpu"}
-    client.failing = {"pools"}
-    client.calls.clear()
-    assert service.usage(task["task_id"], "session-a")["context_unavailable"] == ["resource_pool"]
-    assert [call[0] for call in client.calls].count("allocation") == 3
-
-
-@pytest.mark.parametrize(
-    ("end_time", "code", "reported"),
-    [("2027-01-15T07:00:00Z", 404, []), (None, 404, ["resource_pool"]),
-     ("2027-01-15T07:00:00Z", 503, ["resource_pool"])],
-)
-def test_ended_command_missing_from_master_leaves_pool_unknown(
-    tmp_path, profile, end_time, code, reported
-):
-    service, client, task = launched(tmp_path, profile)
-    client.task_info["cmd-1"] = {
-        "task_id": "cmd-1", "start_time": TASK_START, "end_time": end_time, "allocations": [],
-    }
-
-    def missing(kind, remote_id):
-        raise APIError(f"{code} command not found", code=code, retryable=code >= 500)
-
-    client.get_task = missing
-    result = service.usage(task["task_id"], "session-a")
-
-    assert result["resource_pool"] is None
-    assert result["context_unavailable"] == reported
-
-
-def test_validation_metrics_survive_the_summary_cap(tmp_path, profile, monkeypatch):
-    service, client, task = launched(tmp_path, profile, kind="experiment")
-    client.latest = {"trial": {
-        "id": 17, "experimentId": 9, "taskIds": ["9.a"],
-        "summaryMetrics": {
-            "avg_metrics": {f"grad_{index:03}": {"type": "number", "last": 1.0}
-                            for index in range(5)},
-            "inference": {"latency": {"type": "number", "last": 2.0}},
-            "validation_metrics": {"loss": {"type": "number", "last": 0.5}},
-        },
-    }, "total": 1}
-    monkeypatch.setattr(service_module, "_USAGE_MAX_SUMMARY_METRICS", 3)
-
-    context = service.usage(task["task_id"], "session-a")["trial"]
-
-    assert list(context["summary_metrics"]) == ["validation_metrics", "avg_metrics"]
-    assert context["summary_metrics"]["validation_metrics"]["loss"]["last"] == 0.5
-    assert list(context["summary_metrics"]["avg_metrics"]) == ["grad_000", "grad_001"]
-    assert context["summary_metrics_truncated"] is True
-
-
-def test_null_gpu_samples_are_unavailable_not_idle(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile)
-    client.series = [
-        series("gpu_utilization_percent", [[NOW - 15, 50], [NOW, None]], gpu="GPU-A"),
-        series("gpu_utilization_percent", [[NOW - 15, None], [NOW, None]], gpu="GPU-B"),
-        series("gpu_memory_used_bytes", [[NOW, 1e9]], gpu="GPU-B"),
-    ]
-
-    result = service.usage(task["task_id"], "session-a")
-
-    by_gpu = {
-        item["gpu_uuid"]: item for item in result["series"]
-        if item["metric"] == "gpu_utilization_percent"
-    }
-    assert by_gpu["GPU-A"]["idle_fraction"] == 0.0
-    assert by_gpu["GPU-B"]["idle_fraction"] is None
-    (gpus,) = result["gpus"]
-    assert gpus["gpu_count"] == 2
-    assert gpus["mean_utilization_percent"] == 50.0
-    assert gpus["min_gpu_mean_utilization_percent"] == 50.0
-    assert gpus["least_utilized_gpu_uuid"] == "GPU-A"
-    assert gpus["idle_fraction"] == 0.0
-    assert gpus["max_memory_used_bytes"] == 1e9
-
-
-def test_idle_threshold_is_ten_percent(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile)
-    client.series = [series(
-        "gpu_utilization_percent",
-        [[NOW - 60, 0], [NOW - 45, 5], [NOW - 30, 9.9], [NOW - 15, 10], [NOW, 50]],
-        gpu="GPU-A",
-    )]
-
-    result = service.usage(task["task_id"], "session-a")
-
-    assert result["series"][0]["idle_fraction"] == 0.6
-    assert result["gpus"][0]["idle_fraction"] == 0.6
-
-
-def test_pool_description_matches_task_pool_by_name(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile)
-    client.pools = [{"name": "cpu", "description": "CPU only"},
-                    {"name": "gpu", "description": "Shared GPU agents"}]
-    assert service.usage(task["task_id"], "session-a")["resource_pool"] == {
-        "name": "gpu", "description": "Shared GPU agents",
-    }
-
-    client.pools = [{"name": "cpu", "description": "CPU only"}]
-    assert service.usage(task["task_id"], "session-a")["resource_pool"] == {
-        "name": "gpu", "description": None,
-    }
-
-
-def test_allocation_exit_details_are_reported(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile)
-    client.allocation_details["cmd-1.1"] = {
-        "allocation_id": "cmd-1.1", "slots": 2, "exit_reason": "OOM killed", "status_code": 137,
-    }
-
-    (item,) = service.usage(task["task_id"], "session-a")["allocations"]
-
-    assert (item["slots"], item["exit_reason"], item["status_code"]) == (2, "OOM killed", 137)
-
-
-def test_repeated_context_failures_are_reported_once(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile)
-    client.task_info["cmd-1"] = {
-        "task_id": "cmd-1", "start_time": TASK_START, "end_time": None,
-        "allocations": [allocation(f"cmd-1.{index}", None, None) for index in (3, 2, 1)],
-    }
-    client.failing = {"allocation"}
-
-    result = service.usage(task["task_id"], "session-a")
-
-    assert result["context_unavailable"] == ["allocation_details"]
-    assert sum(call[0] == "allocation" for call in client.calls) == 3
-
-
-def test_gpu_series_without_allocation_label(tmp_path, profile):
-    service, client, task = launched(tmp_path, profile)
-    client.series = [
-        series("gpu_utilization_percent", [[NOW, 40]], allocation=None, gpu="GPU-A"),
-        series("gpu_utilization_percent", [[NOW, 60]], gpu="GPU-B"),
-    ]
-
-    gpus = service.usage(task["task_id"], "session-a")["gpus"]
-
-    assert [item["allocation_id"] for item in gpus] == [None, "cmd-1.1"]
-    assert gpus[0]["requested_slots"] is None
