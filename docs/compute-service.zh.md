@@ -98,8 +98,9 @@ shell_inactivity_seconds: 7200
 `name` 时，服务会生成名称并添加提示。command 和 shell 把名称放在 description 第一行；
 experiment 使用原生 name 字段。顶层显示元数据会覆盖同名的 experiment 字段。
 
-command 和 experiment 的入口先创建 `output_dir`，再切换到 `workdir`，最后通过
-`/bin/bash -lc` 运行命令。command 和 shell 配置使用 `resources.slots`，experiment 使用
+command 和 experiment 的入口渲染为 `mkdir -p <output_dir> && cd <workdir> || exit $?`，
+换行后再接命令，因此准备步骤失败时会以其退出码退出，命令中的任何语句都不会运行。command
+通过 `/bin/bash -lc` 运行这段文本。command 和 shell 配置使用 `resources.slots`，experiment 使用
 `resources.slots_per_trial`。服务提供配置中的 bind mount，并管理 `COMPUTE_WORKDIR`、
 `COMPUTE_OUTPUT_DIR`、`COMPUTE_CODE_REVISION` 和私有提交标记；请求不能覆盖这些环境变量或
 bind mount。

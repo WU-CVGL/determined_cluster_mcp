@@ -108,8 +108,10 @@ adds an advisory. Commands and shells place the name on the first description li
 experiments use their native name field. Top-level display metadata overrides matching
 experiment fields.
 
-Command and experiment entrypoints create `output_dir`, change to `workdir`, and then
-run the command through `/bin/bash -lc`. Command and shell configs use
+Command and experiment entrypoints render as
+`mkdir -p <output_dir> && cd <workdir> || exit $?`, a newline, and then the command, so a
+failed setup step exits with its status before any statement of the command runs.
+Commands run this text through `/bin/bash -lc`. Command and shell configs use
 `resources.slots`; experiments use `resources.slots_per_trial`. The service supplies
 profile bind mounts and manages `COMPUTE_WORKDIR`, `COMPUTE_OUTPUT_DIR`,
 `COMPUTE_CODE_REVISION`, and the private submission marker. A request cannot override

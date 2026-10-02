@@ -593,10 +593,38 @@ class ComputeService:
             rendered = " ".join(shlex.quote(part) for part in command)
         else:
             raise ValidationError("command must be a string or string-list")
-        return (
-            f"mkdir -p {shlex.quote(output_dir)} && "
-            f"cd {shlex.quote(workdir)} && {rendered}"
+        # The prelude ends in "|| exit $?" on its own line, so a failed mkdir or cd exits with
+        # its status before the shell reads any statement of the command, whatever its form.
+        return f"{ComputeService._prelude(workdir, output_dir)} || exit $?\n{rendered}"
+
+    @staticmethod
+    def _prelude(workdir: str, output_dir: str) -> str:
+        return f"mkdir -p {shlex.quote(output_dir)} && cd {shlex.quote(workdir)}"
+
+    def _previous_render(
+        self, plan: Mapping[str, Any], request: Mapping[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Return ``plan`` with its entrypoint as earlier releases rendered it, or None.
+
+        Those releases joined the prelude and the command with ``&&``. A row they claimed holds
+        the hash of that rendering, so a retry of the same request is recognized through it.
+        """
+
+        if plan["kind"] not in {"command", "experiment"}:
+            return None
+        prelude = self._prelude(
+            self.profile.validate_writable_container_path(request.get("workdir"), "workdir"),
+            self.profile.validate_writable_container_path(request.get("output_dir"), "output_dir"),
         )
+        previous = copy.deepcopy(dict(plan))
+        config = previous["config"]
+        holder, key = (config["entrypoint"], 2) if plan["kind"] == "command" else (config, "entrypoint")
+        current = holder[key]
+        head = prelude + " || exit $?\n"
+        if not isinstance(current, str) or not current.startswith(head):
+            return None
+        holder[key] = prelude + " && " + current[len(head):]
+        return previous
 
     def launch(self, request: Dict[str, Any], request_id: str, owner: str) -> Dict[str, Any]:
         request_id = _required_text(request_id, "request_id")
@@ -680,13 +708,22 @@ class ComputeService:
             )
         if record.payload_hash == payload_hash:
             return
+        plans = [plan]
+        previous = self._previous_render(plan, request)
+        if previous is not None:
+            if record.payload_hash == self._payload_hash(previous):
+                return
+            plans.append(previous)
         new_fields = {"name", "description", "allow_queue"}
         legacy_record = record.name is None and record.description is None
         legacy_request = not new_fields.intersection(request)
         if (
             legacy_record
             and legacy_request
-            and record.payload_hash == self._legacy_payload_hash(plan, request)
+            and any(
+                record.payload_hash == self._legacy_payload_hash(candidate, request)
+                for candidate in plans
+            )
         ):
             return
         raise ConflictError(

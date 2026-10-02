@@ -278,3 +278,48 @@ def test_current_metadata_record_never_uses_legacy_hash_fallback(tmp_path, profi
 
     with pytest.raises(ConflictError, match="different request"):
         service.launch(request, "current-record", "session-a")
+
+
+@pytest.mark.parametrize("kind", ["command", "experiment"])
+def test_retry_of_a_row_claimed_with_the_and_joined_entrypoint_returns_it(
+    tmp_path, profile, kind
+):
+    # Releases before "|| exit $?" joined the prelude and the command with "&&".
+    inspector = NoAdmission()
+    service = ComputeService(
+        NoRemoteClient(), SQLiteTaskStore(tmp_path / "tasks.db"), profile, inspector=inspector
+    )
+    request = dict(_requests()[kind], name="named task")
+    plan = service.plan(request)
+    previous = copy.deepcopy(plan)
+    config = previous["config"]
+    holder, key = (config["entrypoint"], 2) if kind == "command" else (config, "entrypoint")
+    holder[key] = holder[key].replace(" || exit $?\n", " && ", 1)
+    record, created = service.store.claim(
+        request_id="before-fix",
+        owner="session-a",
+        payload_hash=service._payload_hash(previous),
+        profile_hash=profile.fingerprint,
+        kind=plan["kind"],
+        code_revision=plan["code_revision"],
+        name=plan["name"],
+        description=plan["description"],
+        workdir=request["workdir"],
+        output_dir=request["output_dir"],
+        cluster_identity=service._cluster_identity(),
+    )
+    assert created
+    service.store.mark_uncertain(record.task_id)
+
+    result = service.launch(request, "before-fix", "session-a")
+
+    assert result["task_id"] == record.task_id
+    assert result["state"] == "submission_uncertain"
+    assert inspector.calls == 0
+    changed = copy.deepcopy(request)
+    if kind == "command":
+        changed["command"] = ["python", "changed.py"]
+    else:
+        changed["experiment_config"]["entrypoint"] = "python changed.py"
+    with pytest.raises(ConflictError, match="different request"):
+        service.launch(changed, "before-fix", "session-a")
