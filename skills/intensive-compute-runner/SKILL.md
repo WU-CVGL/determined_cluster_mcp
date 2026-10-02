@@ -1,11 +1,11 @@
 ---
 name: intensive-compute-runner
-description: Plan, launch, inspect, and stop resource-intensive GPU or CPU work through this repository's Determined compute service. Use for heavy compute or managed cluster tasks; small local checks and hardware inspection alone are outside scope.
+description: Plan, launch, inspect, and stop resource-intensive GPU or CPU work on a Determined cluster through the determined-compute MCP tools (compute_* and storage_*). Use for heavy compute or managed cluster tasks; small local checks and hardware inspection alone are outside scope.
 ---
 
 # Intensive Compute Runner
 
-Use this repository's `ComputeService` for heavy-compute planning, idempotent launch, task state, logs, measured usage, and cancellation. Any MCP-capable agent can use the tools with its own model.
+Use this repository's `ComputeService` for heavy-compute planning, idempotent launch, task state, logs, measured usage, and cancellation. Any MCP-capable agent can use the tools with its own model. Install the skill by linking this directory into the agent's skills directory, as the repository README describes; relative links such as `../../docs/` then resolve through that link to the repository checkout.
 
 ## Choose a mode
 
