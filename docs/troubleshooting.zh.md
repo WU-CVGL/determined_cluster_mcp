@@ -29,6 +29,8 @@ DET_MASTER=https://determined.example.org
 DET_API_TOKEN=replace-with-your-token
 ```
 
+Secrets 文件设置了 `DET_MASTER` 时，其凭据只发送给该 master。若报错说明 `--api-url` 或 `DET_MASTER` 指向的 master 与 secrets 文件不同，表示有覆盖项指向了别处：取消该覆盖项，或改用属于该 master 的 secrets 文件。
+
 不要把凭据放进计算 profile、任务请求、owner、任务名称或描述。限制 secrets 文件的访问权限；排查时只检查必需变量名是否存在，不要读取其值。
 
 配置的 `owner` 不会选择 Determined 用户，它只是本地 SQLite 数据库中的命名空间。远端权限来自 API 凭据。因此更换 owner 无法修复 API 权限错误，共享 owner 也不代表共享远端权限。

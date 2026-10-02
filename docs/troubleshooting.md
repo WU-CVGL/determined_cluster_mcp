@@ -26,6 +26,8 @@ DET_MASTER=https://determined.example.org
 DET_API_TOKEN=replace-with-your-token
 ```
 
+When the secrets file sets `DET_MASTER`, its credentials go only to that master. An error that `--api-url` or `DET_MASTER` names a different master than the secrets file means an override points elsewhere: unset the override, or use a secrets file for that master.
+
 Do not put credentials in the compute profile, request, owner, task name, or description. Restrict access to the secrets file and inspect only whether required variable names are present, not their values.
 
 The configured `owner` does not select a Determined user. It is only a namespace in the local SQLite database. Remote authorization comes from the API credentials. Therefore changing owner cannot fix an API permission error, and sharing an owner does not share remote permissions.
