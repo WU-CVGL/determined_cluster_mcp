@@ -48,7 +48,19 @@ def test_url_normalization(given, expected):
     assert _normalize_api_url(given) == expected
 
 
-def test_master_and_token_can_come_from_secret_file(tmp_path):
+@pytest.fixture
+def clean_env(monkeypatch):
+    for name in ("DET_MASTER", "DET_MASTER_ADDR", "DET_MASTER_HOST", "DET_API_TOKEN",
+                 "DET_USERNAME", "DET_PASSWORD", "DETERMINED_COMPUTE_SECRETS"):
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+def no_request(*args, **kwargs):
+    raise AssertionError("no request may be sent")
+
+
+def test_master_and_token_can_come_from_secret_file(tmp_path, clean_env):
     secrets = tmp_path / "secrets.env"
     secrets.write_text("DET_MASTER=https://cluster.example.org\nDET_API_TOKEN=secret-token\n")
     resolved = DeterminedAPIClient(secrets_path=secrets)
@@ -56,12 +68,87 @@ def test_master_and_token_can_come_from_secret_file(tmp_path):
     assert resolved.api_token == "secret-token"
 
 
-def test_environment_master_precedes_secret_file(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("environment", "explicit", "source"),
+    [
+        ({"DET_MASTER": "https://environment.example"}, {}, "DET_MASTER"),
+        ({"DET_MASTER_HOST": "environment.example"}, {}, "DET_MASTER"),
+        ({}, {"api_url": "https://chosen.example"}, "--api-url"),
+        # An explicit token does not make another master acceptable for this file.
+        ({}, {"api_url": "https://chosen.example", "api_token": "explicit"}, "--api-url"),
+    ],
+)
+def test_secrets_file_credentials_never_go_to_another_master(
+    tmp_path, clean_env, environment, explicit, source
+):
     secrets = tmp_path / "secrets.env"
-    secrets.write_text("DET_MASTER=https://secret.example\nDET_API_TOKEN=secret-token\n")
-    monkeypatch.setenv("DET_MASTER", "https://environment.example")
-    resolved = DeterminedAPIClient(secrets_path=secrets)
-    assert resolved.api_url == "https://environment.example"
+    secrets.write_text("DET_MASTER=https://secret.example\nDET_USERNAME=alice\nDET_PASSWORD=pw-value\n")
+    for name, value in environment.items():
+        clean_env.setenv(name, value)
+    clean_env.setattr(requests, "post", no_request)
+    clean_env.setattr(requests, "get", no_request)
+
+    with pytest.raises(ValueError, match="different master than the secrets file") as caught:
+        DeterminedAPIClient(secrets_path=secrets, **explicit)
+
+    message = str(caught.value)
+    assert message.startswith(source)
+    for value in ("secret.example", "environment.example", "chosen.example", "alice", "pw-value", "explicit"):
+        assert value not in message
+
+
+def test_the_same_master_named_twice_is_accepted(tmp_path, clean_env):
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("DET_MASTER=secret.example\nDET_API_TOKEN=file-token\n")
+    clean_env.setenv("DET_MASTER", "http://secret.example:8080/")
+    assert DeterminedAPIClient(secrets_path=secrets).api_url == "http://secret.example:8080"
+    # An explicit URL for the file's master is used, and the environment's is not consulted.
+    clean_env.setenv("DET_MASTER", "https://environment.example")
+    resolved = DeterminedAPIClient("http://secret.example:8080", secrets_path=secrets)
+    assert (resolved.api_url, resolved.api_token) == ("http://secret.example:8080", "file-token")
+
+
+def test_a_file_that_names_its_master_ignores_ambient_credentials(tmp_path, clean_env):
+    logins = []
+
+    def login(url, **kwargs):
+        logins.append((url, kwargs["json"]))
+        return Response({"token": "session-token"})
+
+    clean_env.setattr(requests, "post", login)
+    clean_env.setenv("DET_API_TOKEN", "ambient-token")
+    clean_env.setenv("DET_USERNAME", "mallory")
+    clean_env.setenv("DET_PASSWORD", "ambient-pw")
+    named = tmp_path / "named.env"
+    named.write_text("DET_MASTER=https://secret.example\nDET_USERNAME=alice\nDET_PASSWORD=pw\n")
+
+    resolved = DeterminedAPIClient(secrets_path=named)
+
+    assert resolved.api_token == "session-token"
+    assert logins == [("https://secret.example/api/v1/auth/login", {"username": "alice", "password": "pw"})]
+    # A file with a master and no credentials does not borrow the environment's.
+    bare = tmp_path / "bare.env"
+    bare.write_text("DET_MASTER=https://secret.example\n")
+    unauthenticated = DeterminedAPIClient(secrets_path=bare)
+    assert unauthenticated.api_token is None and "Authorization" not in unauthenticated.headers
+    assert len(logins) == 1
+    # An explicit token replaces the file's credentials and goes to the file's master.
+    explicit = DeterminedAPIClient(api_token="explicit-token", secrets_path=named)
+    assert (explicit.api_url, explicit.api_token) == ("https://secret.example", "explicit-token")
+    assert len(logins) == 1
+
+
+def test_a_file_without_a_master_keeps_the_environment_master_and_token(tmp_path, clean_env):
+    unnamed = tmp_path / "unnamed.env"
+    unnamed.write_text("DET_API_TOKEN=file-token\n")
+    clean_env.setenv("DET_MASTER", "https://environment.example")
+    clean_env.setenv("DET_API_TOKEN", "ambient-token")
+
+    resolved = DeterminedAPIClient(secrets_path=unnamed)
+
+    assert (resolved.api_url, resolved.api_token) == ("https://environment.example", "ambient-token")
+    explicit = DeterminedAPIClient("https://chosen.example", secrets_path=unnamed)
+    assert explicit.api_url == "https://chosen.example"
 
 
 def test_api_error_fields_and_mutation_uncertainty(monkeypatch):
@@ -328,7 +415,7 @@ def test_get_experiment_unwrap_and_true_tail(monkeypatch):
     assert responses["/api/v1/trials/17/logs"].closed is True
 
 
-def test_experiment_launch_sends_only_yaml_config_and_activation(monkeypatch):
+def test_experiment_launch_sends_only_config_text_and_activation(monkeypatch):
     import yaml
     calls = []
     def post(url, **kwargs):
@@ -343,6 +430,45 @@ def test_experiment_launch_sends_only_yaml_config_and_activation(monkeypatch):
     assert set(payload) == {'config', 'activate'}
     assert payload['activate'] is True
     assert yaml.safe_load(payload['config']) == config
+
+
+def test_experiment_config_values_reach_the_master_unchanged(monkeypatch):
+    import yaml
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(kwargs['json'])
+        return Response({'experiment': {'id': 12}})
+
+    monkeypatch.setattr(requests, 'post', post)
+    config = {
+        'name': 'x-\U0001F600',
+        'entrypoint': 'mkdir -p /out && cd /code || exit $?\npython train.py --lr 1e-3',
+        'searcher': {'name': 'single', 'metric': 'loss', 'max_length': {'batches': 10}},
+        # YAML 1.1 reads a plain y, n or 1e-3 as a bool or a float; JSON quotes every string.
+        'hyperparameters': {'n': 1, 'y': 2, 'v': 'y', 'no': 'n', 'lr': '1e-3', 'flag': 'on',
+                            'empty': '', 'version': '1.10', 'null': 'null',
+                            'breaks': 'a\u2028b\u2029c\u0085d', 'control': 'x\x7fy'},
+    }
+
+    client().launch_task('experiment', config)
+
+    text = calls[0]['config']
+    assert json.loads(text) == config
+    for quoted in ('"y"', '"n"', '"1e-3"', '"on"', '"1.10"', '"null"'):
+        assert quoted in text
+    # YAML folds raw line separators in a quoted string and refuses surrogate-pair escapes.
+    assert '\\u2028' in text and '\\u2029' in text and '\\u0085' in text and '\\u007f' in text
+    assert not any(character in text for character in '\u2028\u2029\x85\x7f')
+    assert '\U0001F600' in text and '\\ud83d' not in text
+    # A YAML parser reads the text as the same config.
+    assert yaml.safe_load(text) == config
+
+
+def test_experiment_config_rejects_non_finite_numbers_before_any_request(monkeypatch):
+    monkeypatch.setattr(requests, 'post', lambda *a, **kw: pytest.fail('no request may be sent'))
+    with pytest.raises(ValueError):
+        client().launch_task('experiment', {'hyperparameters': {'lr': float('nan')}})
 
 
 def test_shell_cancel_unwraps_response_and_removes_private_key(monkeypatch):

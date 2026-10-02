@@ -108,8 +108,10 @@ adds an advisory. Commands and shells place the name on the first description li
 experiments use their native name field. Top-level display metadata overrides matching
 experiment fields.
 
-Command and experiment entrypoints create `output_dir`, change to `workdir`, and then
-run the command through `/bin/bash -lc`. Command and shell configs use
+Command and experiment entrypoints render as
+`mkdir -p <output_dir> && cd <workdir> || exit $?`, a newline, and then the command, so a
+failed setup step exits with its status before any statement of the command runs.
+Commands run this text through `/bin/bash -lc`. Command and shell configs use
 `resources.slots`; experiments use `resources.slots_per_trial`. The service supplies
 profile bind mounts and manages `COMPUTE_WORKDIR`, `COMPUTE_OUTPUT_DIR`,
 `COMPUTE_CODE_REVISION`, and the private submission marker. A request cannot override
@@ -138,9 +140,15 @@ determined-compute-mcp \
 `DETERMINED_COMPUTE_PROFILE`, `DETERMINED_COMPUTE_DB`, and
 `DETERMINED_COMPUTE_OWNER`. `--storage-config` corresponds to
 `DETERMINED_COMPUTE_STORAGE`; `--secrets-file` can instead be supplied through
-`DETERMINED_COMPUTE_SECRETS`. The API URL, token, and TLS verification default to
-`DET_MASTER`, `DET_API_TOKEN`, and `DET_VERIFY_SSL`; keep credentials in the existing
-provider or secrets file rather than the profile, database, tool arguments, or reports.
+`DETERMINED_COMPUTE_SECRETS`. TLS verification defaults to `DET_VERIFY_SSL`. A secrets
+file that sets `DET_MASTER` supplies the API URL and the credentials together: the
+environment's `DET_API_TOKEN`, `DET_USERNAME`, and `DET_PASSWORD` are then ignored, and an
+`--api-url` or environment `DET_MASTER` that names a different master is rejected before
+any request. A secrets file without `DET_MASTER` uses `--api-url` or else `DET_MASTER`,
+and `DET_API_TOKEN` from the environment before the file. `--api-token` replaces any
+other token or login and is sent only to the selected master. Keep credentials in the
+existing provider or secrets file rather than the profile, database, tool arguments, or
+reports.
 
 The default database path used by the CLI is
 `~/.local/state/determined-compute/tasks.sqlite3`, but MCP deployments should specify
@@ -191,7 +199,8 @@ returns `idempotency_conflict`. Once a local row has claimed an ID, a retry cann
 submit a second remote task, even after restart.
 
 The adapter sends command and shell configs as mappings. It serializes experiment
-configs as YAML and requests activation. It rejects source upload aliases, never
+configs as JSON text, which the master's YAML parser reads literally, so a string such as
+`y`, `n`, or `1e-3` stays a string, and requests activation. It rejects source upload aliases, never
 creates a project, removes API envelopes, sanitizes retained identity material, and
 returns an entity with an `id`.
 

@@ -98,8 +98,9 @@ shell_inactivity_seconds: 7200
 `name` 时，服务会生成名称并添加提示。command 和 shell 把名称放在 description 第一行；
 experiment 使用原生 name 字段。顶层显示元数据会覆盖同名的 experiment 字段。
 
-command 和 experiment 的入口先创建 `output_dir`，再切换到 `workdir`，最后通过
-`/bin/bash -lc` 运行命令。command 和 shell 配置使用 `resources.slots`，experiment 使用
+command 和 experiment 的入口渲染为 `mkdir -p <output_dir> && cd <workdir> || exit $?`，
+换行后再接命令，因此准备步骤失败时会以其退出码退出，命令中的任何语句都不会运行。command
+通过 `/bin/bash -lc` 运行这段文本。command 和 shell 配置使用 `resources.slots`，experiment 使用
 `resources.slots_per_trial`。服务提供配置中的 bind mount，并管理 `COMPUTE_WORKDIR`、
 `COMPUTE_OUTPUT_DIR`、`COMPUTE_CODE_REVISION` 和私有提交标记；请求不能覆盖这些环境变量或
 bind mount。
@@ -127,8 +128,12 @@ determined-compute-mcp \
 `--profile`、`--db` 和 `--owner` 分别对应 `DETERMINED_COMPUTE_PROFILE`、
 `DETERMINED_COMPUTE_DB` 和 `DETERMINED_COMPUTE_OWNER`；`--storage-config` 对应
 `DETERMINED_COMPUTE_STORAGE`；`--secrets-file` 也可通过 `DETERMINED_COMPUTE_SECRETS`
-提供。API URL、token 和 TLS 验证默认来自 `DET_MASTER`、`DET_API_TOKEN` 和
-`DET_VERIFY_SSL`。凭据应放在现有凭据提供方或 secrets 文件中，不要写入配置、数据库、工具
+提供。TLS 验证默认来自 `DET_VERIFY_SSL`。设置了 `DET_MASTER` 的 secrets 文件同时提供 API
+URL 和凭据：此时忽略环境中的 `DET_API_TOKEN`、`DET_USERNAME` 和 `DET_PASSWORD`；若
+`--api-url` 或环境中的 `DET_MASTER` 指向另一个 master，会在发出任何请求前被拒绝。没有
+`DET_MASTER` 的 secrets 文件使用 `--api-url`，否则使用 `DET_MASTER`；环境中的
+`DET_API_TOKEN` 优先于文件中的 token。`--api-token` 取代其他 token 或登录方式，且只发送给
+选定的 master。凭据应放在现有凭据提供方或 secrets 文件中，不要写入配置、数据库、工具
 参数或报告。
 
 CLI 的默认数据库路径是 `~/.local/state/determined-compute/tasks.sqlite3`，但 MCP 部署应显式
@@ -175,8 +180,8 @@ CLI 的默认数据库路径是 `~/.local/state/determined-compute/tasks.sqlite3
 `idempotency_conflict`。本地记录一旦认领该 ID，即使服务重启，重试也不会提交第二个远端
 任务。
 
-适配器把 command 和 shell 配置作为 mapping 发送；experiment 配置会序列化为 YAML 并请求
-激活。适配器拒绝源码上传别名，从不自动创建项目，会移除 API envelope、清理用于身份调和的
+适配器把 command 和 shell 配置作为 mapping 发送；experiment 配置会序列化为 JSON 文本并请求
+激活。master 的 YAML 解析器按字面读取该文本，因此 `y`、`n` 或 `1e-3` 这类字符串仍是字符串。适配器拒绝源码上传别名，从不自动创建项目，会移除 API envelope、清理用于身份调和的
 材料，并返回含 `id` 的实体。
 
 <a id="task-records-status-logs-and-cancellation"></a>
