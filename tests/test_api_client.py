@@ -415,7 +415,7 @@ def test_get_experiment_unwrap_and_true_tail(monkeypatch):
     assert responses["/api/v1/trials/17/logs"].closed is True
 
 
-def test_experiment_launch_sends_only_yaml_config_and_activation(monkeypatch):
+def test_experiment_launch_sends_only_config_text_and_activation(monkeypatch):
     import yaml
     calls = []
     def post(url, **kwargs):
@@ -430,6 +430,45 @@ def test_experiment_launch_sends_only_yaml_config_and_activation(monkeypatch):
     assert set(payload) == {'config', 'activate'}
     assert payload['activate'] is True
     assert yaml.safe_load(payload['config']) == config
+
+
+def test_experiment_config_values_reach_the_master_unchanged(monkeypatch):
+    import yaml
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(kwargs['json'])
+        return Response({'experiment': {'id': 12}})
+
+    monkeypatch.setattr(requests, 'post', post)
+    config = {
+        'name': 'x-\U0001F600',
+        'entrypoint': 'mkdir -p /out && cd /code || exit $?\npython train.py --lr 1e-3',
+        'searcher': {'name': 'single', 'metric': 'loss', 'max_length': {'batches': 10}},
+        # YAML 1.1 reads a plain y, n or 1e-3 as a bool or a float; JSON quotes every string.
+        'hyperparameters': {'n': 1, 'y': 2, 'v': 'y', 'no': 'n', 'lr': '1e-3', 'flag': 'on',
+                            'empty': '', 'version': '1.10', 'null': 'null',
+                            'breaks': 'a\u2028b\u2029c\u0085d', 'control': 'x\x7fy'},
+    }
+
+    client().launch_task('experiment', config)
+
+    text = calls[0]['config']
+    assert json.loads(text) == config
+    for quoted in ('"y"', '"n"', '"1e-3"', '"on"', '"1.10"', '"null"'):
+        assert quoted in text
+    # YAML folds raw line separators in a quoted string and refuses surrogate-pair escapes.
+    assert '\\u2028' in text and '\\u2029' in text and '\\u0085' in text and '\\u007f' in text
+    assert not any(character in text for character in '\u2028\u2029\x85\x7f')
+    assert '\U0001F600' in text and '\\ud83d' not in text
+    # A YAML parser reads the text as the same config.
+    assert yaml.safe_load(text) == config
+
+
+def test_experiment_config_rejects_non_finite_numbers_before_any_request(monkeypatch):
+    monkeypatch.setattr(requests, 'post', lambda *a, **kw: pytest.fail('no request may be sent'))
+    with pytest.raises(ValueError):
+        client().launch_task('experiment', {'hyperparameters': {'lr': float('nan')}})
 
 
 def test_shell_cancel_unwraps_response_and_removes_private_key(monkeypatch):

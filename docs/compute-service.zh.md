@@ -180,8 +180,8 @@ CLI 的默认数据库路径是 `~/.local/state/determined-compute/tasks.sqlite3
 `idempotency_conflict`。本地记录一旦认领该 ID，即使服务重启，重试也不会提交第二个远端
 任务。
 
-适配器把 command 和 shell 配置作为 mapping 发送；experiment 配置会序列化为 YAML 并请求
-激活。适配器拒绝源码上传别名，从不自动创建项目，会移除 API envelope、清理用于身份调和的
+适配器把 command 和 shell 配置作为 mapping 发送；experiment 配置会序列化为 JSON 文本并请求
+激活。master 的 YAML 解析器按字面读取该文本，因此 `y`、`n` 或 `1e-3` 这类字符串仍是字符串。适配器拒绝源码上传别名，从不自动创建项目，会移除 API envelope、清理用于身份调和的
 材料，并返回含 `id` 的实体。
 
 <a id="task-records-status-logs-and-cancellation"></a>

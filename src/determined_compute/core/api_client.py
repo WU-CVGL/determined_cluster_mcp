@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Union
@@ -16,6 +17,8 @@ import yaml
 from determined_compute.utils.secrets import load_secrets
 
 ErrorCode = Union[int, str, None]
+# Characters that YAML reads as line breaks, or refuses as unprintable, inside a quoted string.
+_YAML_UNSAFE = re.compile("[\x7f-\x9f\u2028\u2029\ufffe\uffff]")
 
 
 class APIError(RuntimeError):
@@ -47,7 +50,20 @@ def _normalize_api_url(api_url: Optional[str]) -> str:
 
 
 def _master_from(values: Mapping[str, str]) -> Optional[str]:
-    return next((values[name] for name in ("DET_MASTER", "DET_MASTER_ADDR", "DET_MASTER_HOST") if values.get(name)), None)
+    names = ("DET_MASTER", "DET_MASTER_ADDR", "DET_MASTER_HOST")
+    return next((values[name] for name in names if values.get(name)), None)
+
+
+def _experiment_text(config: Mapping[str, Any]) -> str:
+    """An experiment config as the YAML text the master reads: JSON, with every string quoted.
+
+    The master's YAML 1.1 parser reads a plain ``y``, ``n`` or ``1e-3`` as a bool or a float,
+    and PyYAML writes them plain. It refuses the surrogate pairs that JSON escapes characters
+    outside the BMP with, so only the characters YAML itself would misread are escaped.
+    """
+
+    text = json.dumps(dict(config), ensure_ascii=False, allow_nan=False)
+    return _YAML_UNSAFE.sub(lambda match: f"\\u{ord(match.group()):04x}", text)
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -485,7 +501,7 @@ class DeterminedAPIClient:
         present = self._upload_fields(config)
         if present:
             raise ValueError("Code/data uploads are not supported; remove: " + ", ".join(present))
-        body = {"config": yaml.safe_dump(config, sort_keys=False), "activate": True} if kind == "experiment" else {"config": config}
+        body = {"config": _experiment_text(config), "activate": True} if kind == "experiment" else {"config": config}
         entity = self._entity(self._post(f"api/v1/{kind}s", data=body), kind, mutation=True)
         return self._safe_shell(entity) if kind == "shell" else entity
 

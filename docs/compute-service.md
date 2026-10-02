@@ -199,7 +199,8 @@ returns `idempotency_conflict`. Once a local row has claimed an ID, a retry cann
 submit a second remote task, even after restart.
 
 The adapter sends command and shell configs as mappings. It serializes experiment
-configs as YAML and requests activation. It rejects source upload aliases, never
+configs as JSON text, which the master's YAML parser reads literally, so a string such as
+`y`, `n`, or `1e-3` stays a string, and requests activation. It rejects source upload aliases, never
 creates a project, removes API envelopes, sanitizes retained identity material, and
 returns an entity with an `id`.
 
