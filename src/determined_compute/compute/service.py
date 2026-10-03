@@ -677,7 +677,7 @@ class ComputeService:
                 entity = self.client.launch_task(kind, launch_config, launch_options)
             remote_id = self._launched_id(kind, entity)
         except SubmissionUncertainError as exc:
-            raise self._uncertain(kind, marker, str(exc)) from exc
+            raise self._uncertain(kind, marker, str(exc), exc.details) from exc
         except APIError:
             # The master answered with a definite rejection, so nothing was submitted.
             raise
@@ -709,7 +709,9 @@ class ComputeService:
             raise SubmissionUncertainError("launch response contained a malformed task id") from exc
 
     @staticmethod
-    def _uncertain(kind: str, marker: str, reason: str) -> SubmissionUncertainError:
+    def _uncertain(
+        kind: str, marker: str, reason: str, cause: Any = None
+    ) -> SubmissionUncertainError:
         error = SubmissionUncertainError(
             f"The {kind} submission is unconfirmed ({reason}); Determined may or may not have "
             f"created it, and it may still appear. Look for it with compute_list(kind={kind!r}, "
@@ -717,7 +719,13 @@ class ComputeService:
             "Do not launch again automatically: whether to resubmit is the user's decision "
             "after checking."
         )
-        error.details = {"kind": kind, "submission_marker": marker}
+        details: Dict[str, Any] = {"kind": kind, "submission_marker": marker}
+        if isinstance(cause, Mapping) and cause.get("source") == "proxy":
+            # An HTTP proxy, not Determined, answered; keep that label for the caller.
+            details.update(
+                (key, cause[key]) for key in ("source", "status_code", "proxy_error") if key in cause
+            )
+        error.details = details
         return error
 
     def _generic_launch_options(self, options: Mapping[str, Any]) -> Dict[str, Any]:

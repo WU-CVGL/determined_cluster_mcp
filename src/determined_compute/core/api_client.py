@@ -73,14 +73,169 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return default if raw is None else raw.lower() in {"1", "true", "yes", "y", "on"}
 
 
+# RFC 9209 error types with which a proxy reports that it never connected to the next hop,
+# so the request cannot have reached Determined.
+_PROXY_CONNECT_ERRORS = frozenset({
+    "dns_error",
+    "dns_timeout",
+    "destination_not_found",
+    "destination_unavailable",
+    "connection_refused",
+    "connection_timeout",
+    "destination_ip_prohibited",
+    "destination_ip_unroutable",
+})
+_SF_KEY = re.compile(r"[a-z*][a-z0-9_\-.*]*")
+_SF_TOKEN = re.compile(r"[A-Za-z*][!#$%&'*+\-.^_`|~0-9A-Za-z:/]*")
+_SF_NUMBER = re.compile(r"-?[0-9]{1,15}(?:\.[0-9]{1,3})?")
+_SF_BYTES = re.compile(r":[A-Za-z0-9+/=]*:")
+
+
+def _sf_bare_item(text: str, index: int) -> tuple[Any, int]:
+    """Parse one RFC 8941 bare item at ``index``; return its value and the next index."""
+    if index >= len(text):
+        raise ValueError("missing item")
+    head = text[index]
+    if head == '"':
+        value, index = [], index + 1
+        while index < len(text):
+            character = text[index]
+            if character == "\\":
+                if index + 1 >= len(text) or text[index + 1] not in '"\\':
+                    raise ValueError("bad escape")
+                value.append(text[index + 1])
+                index += 2
+            elif character == '"':
+                return "".join(value), index + 1
+            elif not " " <= character <= "~":
+                raise ValueError("bad string character")
+            else:
+                value.append(character)
+                index += 1
+        raise ValueError("unterminated string")
+    if head == "?":
+        if text[index + 1:index + 2] not in {"0", "1"}:
+            raise ValueError("bad boolean")
+        return text[index + 1] == "1", index + 2
+    for pattern in (_SF_BYTES, _SF_NUMBER, _SF_TOKEN):
+        match = pattern.match(text, index)
+        if match:
+            return match.group(), match.end()
+    raise ValueError("bad item")
+
+
+def _sf_parameters(text: str, index: int) -> tuple[Dict[str, Any], int]:
+    parameters: Dict[str, Any] = {}
+    while index < len(text) and text[index] == ";":
+        index += 1
+        while index < len(text) and text[index] == " ":
+            index += 1
+        match = _SF_KEY.match(text, index)
+        if not match:
+            raise ValueError("bad parameter key")
+        key, index = match.group(), match.end()
+        value: Any = True
+        if index < len(text) and text[index] == "=":
+            value, index = _sf_bare_item(text, index + 1)
+        parameters[key] = value
+    return parameters, index
+
+
+def _proxy_status_errors(value: str) -> List[str]:
+    """Return the ``error`` parameter of each member of an RFC 9209 Proxy-Status field.
+
+    The field is an RFC 8941 structured-field list; a field that does not parse is ignored
+    as a whole, as RFC 8941 requires, and yields no errors.
+    """
+    errors: List[str] = []
+    text, index = value.strip(" \t"), 0
+    try:
+        while index < len(text):
+            if text[index] == "(":
+                index += 1
+                while True:
+                    while index < len(text) and text[index] == " ":
+                        index += 1
+                    if index < len(text) and text[index] == ")":
+                        index += 1
+                        break
+                    _item, index = _sf_bare_item(text, index)
+                    _parameters, index = _sf_parameters(text, index)
+                    if index >= len(text) or text[index] not in " )":
+                        raise ValueError("bad inner list")
+            else:
+                _item, index = _sf_bare_item(text, index)
+            parameters, index = _sf_parameters(text, index)
+            error = parameters.get("error")
+            if isinstance(error, str):
+                errors.append(error)
+            while index < len(text) and text[index] in " \t":
+                index += 1
+            if index < len(text):
+                if text[index] != ",":
+                    raise ValueError("expected a comma")
+                index += 1
+                while index < len(text) and text[index] in " \t":
+                    index += 1
+                if index >= len(text):
+                    raise ValueError("trailing comma")
+    except ValueError:
+        return []
+    return errors
+
+
+def _header(response: requests.Response, name: str) -> Optional[str]:
+    headers = getattr(response, "headers", None) or {}
+    for key, value in headers.items():
+        if key.lower() == name.lower():
+            return value
+    return None
+
+
+def _proxy_answer(response: requests.Response, payload: Any) -> Optional[Dict[str, Any]]:
+    """Describe an error response that an HTTP proxy produced instead of Determined.
+
+    A Proxy-Status error that means the proxy never connected upstream always counts. Any
+    other response counts only when it is a 5xx whose body is empty or not JSON, so it is no
+    Determined error, and it carries a proxy header: Proxy-Connection, Via or Proxy-Status.
+    """
+    status = response.status_code
+    proxy_status = _header(response, "Proxy-Status")
+    errors = _proxy_status_errors(proxy_status) if proxy_status else []
+    connect_error = next((error for error in errors if error in _PROXY_CONNECT_ERRORS), None)
+    if connect_error is not None:
+        return {"source": "proxy", "status_code": status, "proxy_error": connect_error}
+    indicated = any(
+        _header(response, name) is not None for name in ("Proxy-Connection", "Via", "Proxy-Status")
+    )
+    if status >= 500 and payload is None and indicated:
+        answer: Dict[str, Any] = {"source": "proxy", "status_code": status}
+        if errors:
+            answer["proxy_error"] = errors[-1]
+        return answer
+    return None
+
+
 def _error_from_response(response: requests.Response) -> APIError:
     try:
-        payload = response.json()
+        payload = response.json() if (getattr(response, "content", None) or response.text) else None
     except (ValueError, requests.exceptions.JSONDecodeError):
-        payload = {}
+        payload = None
+    status = response.status_code
+    proxy = _proxy_answer(response, payload)
+    if proxy is not None and "proxy_error" in proxy and proxy["proxy_error"] in _PROXY_CONNECT_ERRORS:
+        return APIError(
+            f"{status} An HTTP proxy could not connect to Determined "
+            f"({proxy['proxy_error']}); the request did not reach the master",
+            code="transport_error", details=proxy, retryable=True,
+        )
+    if proxy is not None:
+        return APIError(
+            f"{status} An HTTP proxy, not Determined, answered; the master was probably unreachable",
+            code=status, details=proxy, retryable=status != 501,
+        )
     if not isinstance(payload, dict):
         payload = {}
-    status = response.status_code
     error = payload.get("error")
     if isinstance(error, dict):
         # The gRPC gateway nests its message: {"error": {"code", "reason", "error"}}.
@@ -189,7 +344,14 @@ class DeterminedAPIClient:
     def _json_response(response: requests.Response, *, mutation: bool = False) -> Dict[str, Any]:
         if response.status_code >= 400:
             error = _error_from_response(response)
-            if mutation and response.status_code >= 500:
+            if mutation and response.status_code >= 500 and error.code != "transport_error":
+                details = error.details if isinstance(error.details, dict) else {}
+                if details.get("source") == "proxy":
+                    raise SubmissionUncertainError(
+                        f"an HTTP proxy, not Determined, answered with HTTP {response.status_code}; "
+                        "the master was probably unreachable, but the outcome is unknown",
+                        details=details,
+                    ) from error
                 raise SubmissionUncertainError(
                     "Determined mutation outcome is unknown after a server error",
                     details={"status_code": response.status_code, "error": str(error)},
@@ -709,7 +871,9 @@ class DeterminedAPIClient:
         except SubmissionUncertainError as exc:
             # The master reports rejected preconditions, such as a task that is already
             # paused, as untyped server errors; keep that message visible to the caller.
-            if isinstance(exc.__cause__, APIError):
+            # A proxy's answer is already labelled as such.
+            proxy = isinstance(exc.details, dict) and exc.details.get("source") == "proxy"
+            if isinstance(exc.__cause__, APIError) and not proxy:
                 raise SubmissionUncertainError(
                     f"Determined {action} outcome is unknown after a server error: {exc.__cause__}",
                     details=exc.details,

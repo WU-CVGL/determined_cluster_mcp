@@ -211,7 +211,9 @@ def test_unconfirmed_launch_error_carries_the_marker():
             error = _error(result)
             assert error["code"] == "submission_uncertain"
             assert error["retryable"] is False
-            assert error["details"] == {"kind": "command", "submission_marker": MARKER}
+            assert error["details"] == {
+                "kind": "command", "submission_marker": MARKER, "status_code": 502,
+            }
             assert MARKER in error["message"]
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=10))

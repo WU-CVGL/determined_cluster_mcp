@@ -44,8 +44,8 @@ class _LazyClient:
 def safe_error_details(exc: BaseException) -> dict[str, Any]:
     details = getattr(exc, "details", None)
     allowed = {
-        "kind", "submission_marker", "resource_pool", "requested_slots", "available",
-        "candidate_pools",
+        "kind", "submission_marker", "source", "status_code", "proxy_error", "resource_pool",
+        "requested_slots", "available", "candidate_pools",
     }
     return {key: value for key, value in details.items() if key in allowed} if isinstance(details, dict) else {}
 

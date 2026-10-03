@@ -256,9 +256,21 @@ HTTP 5xx，或响应中没有任务 ID。此时 Determined 可能创建了任务
 提交任何任务。
 
 在连接建立之前发生的失败（连接被拒绝、域名解析失败、连接超时或 HTTP 代理不可达）是可重试的
-`transport_error`：请求从未发出，因此没有创建任何任务。连接建立之后的所有失败，包括读取超时、
-连接中断、TLS 错误，以及 master 前方代理返回的 HTTP 5xx，都属于未确认。取消、暂停和恢复遵循
-同样的规则；出现未确认的结果后，先用 `compute_status` 检查。
+`transport_error`：请求从未发出，因此没有创建任何任务。HTTP 代理的应答若带有 RFC 9209
+`Proxy-Status` 头，并以 `dns_error`、`dns_timeout`、`destination_not_found`、
+`destination_unavailable`、`connection_refused`、`connection_timeout`、
+`destination_ip_prohibited` 或 `destination_ip_unroutable` 错误类型表明它从未连上下一跳，也
+同样处理；其 `details` 包含 `source: "proxy"`、`status_code` 和 `proxy_error`。服务按 RFC 8941
+结构化字段列表解析该头，读取每个成员的 `error` 参数，无法解析的头会被忽略。
+
+连接建立之后的所有失败，包括读取超时、连接中断、TLS 错误以及其他 HTTP 5xx，都属于未确认。
+如果 5xx 的响应体为空或不是 JSON（因而不是 Determined 的错误），并且带有 `Proxy-Connection`、
+`Via` 或 `Proxy-Status` 头，就视为 HTTP 代理而不是 Determined 的应答。此时错误会说明是代理而
+不是 Determined 作出了应答、master 很可能无法访问，`details` 另外包含 `source: "proxy"`、
+`status_code`，以及 `Proxy-Status` 给出时的 `proxy_error`。它仍属于未确认，因为代理也可能在
+转发请求之后才失败。带有 Determined JSON 错误响应体的 5xx 从不归因于代理。读取请求得到这样的
+应答时，会以同样的标注失败，并且可以重试。取消、暂停和恢复遵循同样的规则；出现未确认的结果
+后，先用 `compute_status` 检查。
 
 <a id="task-identity-and-ownership"></a>
 ### 任务身份与所有权
@@ -491,7 +503,8 @@ MCP 失败使用 `isError: true`；其文本内容是如下形式的紧凑 JSON�
 ```
 
 `retryable` 和 `details` 仅在可用时出现，structured content 为 null。安全 details 可包含
-未确认提交的 kind 和提交标记，以及容量信息。认证、权限、传输和响应结构错误都会返回错误，
+未确认提交的 kind 和提交标记；HTTP 代理代替 Determined 作出应答时的 `source: "proxy"`、
+`status_code` 和 `proxy_error`；以及容量信息。认证、权限、传输和响应结构错误都会返回错误，
 而不是空结果。错误消息和报告可以包含清理后的命令、路径、ID、状态和错误类别，但不能包含
 凭据或 secrets 文件内容。
 

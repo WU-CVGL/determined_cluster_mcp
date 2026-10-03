@@ -285,10 +285,26 @@ was submitted.
 
 A failure before any connection was open (a refused connection, a failed name lookup, a
 connect timeout, or an unreachable HTTP proxy) is a retryable `transport_error`: the
-request was never sent, so nothing was created. Everything after the connection opened,
-including a read timeout, a dropped connection, a TLS error, or an HTTP 5xx from a proxy
-in front of the master, is unconfirmed. Cancel, pause, and resume follow the same rule;
-check `compute_status` after an unconfirmed one.
+request was never sent, so nothing was created. So is an answer from an HTTP proxy whose
+RFC 9209 `Proxy-Status` header reports that it never connected to the next hop, with the
+error type `dns_error`, `dns_timeout`, `destination_not_found`,
+`destination_unavailable`, `connection_refused`, `connection_timeout`,
+`destination_ip_prohibited`, or `destination_ip_unroutable`; its `details` carry
+`source: "proxy"`, `status_code`, and `proxy_error`. The service parses the header as an
+RFC 8941 structured-field list, reads the `error` parameter of every member, and ignores
+a header that does not parse.
+
+Everything after the connection opened, including a read timeout, a dropped connection,
+a TLS error, or any other HTTP 5xx, is unconfirmed. A 5xx counts as an HTTP proxy's
+answer rather than Determined's when its body is empty or not JSON, so it is no Determined
+error, and it carries a `Proxy-Connection`, `Via`, or `Proxy-Status` header. The error
+then says that a proxy, not Determined, answered and that the master was probably
+unreachable, and its `details` add `source: "proxy"`, `status_code`, and, when
+`Proxy-Status` names one, `proxy_error`. It stays unconfirmed, because a proxy can also
+fail after forwarding the request. A 5xx with a Determined JSON error body is never
+attributed to a proxy. A read answered this way fails with the same label and is
+retryable. Cancel, pause, and resume follow the same rules; check `compute_status` after
+an unconfirmed one.
 
 ### Task identity and ownership
 
@@ -566,8 +582,9 @@ MCP failures use `isError: true`; their text content is compact JSON of this for
 ```
 
 `retryable` and `details` appear only when available, and structured content is null.
-Safe details can include the kind and submission marker of an unconfirmed launch and
-capacity information. Authentication, permission, transport, and response-shape failures
+Safe details can include the kind and submission marker of an unconfirmed launch;
+`source: "proxy"`, `status_code`, and `proxy_error` when an HTTP proxy answered instead
+of Determined; and capacity information. Authentication, permission, transport, and response-shape failures
 are errors rather than empty results. Error messages and reports may contain sanitized
 commands, paths, IDs, states, and error classes, but must not include credentials or
 secret-file contents.
