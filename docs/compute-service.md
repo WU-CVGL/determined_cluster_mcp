@@ -29,7 +29,7 @@ namespace boundary, not multi-user authentication. A remotely exposed service ne
 its own authenticated transport.
 
 `ComputeService` owns planning, idempotent submission, status, logs, usage measurements,
-cancellation, pause and resume of generic tasks, discovery, adoption, and conservative
+cancellation, pause and resume, discovery, adoption, and conservative
 reconciliation. Its local `task_id`
 remains stable across restarts and is distinct from the Determined `remote_id`. Keep the
 SQLite database on durable local storage. Keep source, data, packages, checkpoints,
@@ -99,7 +99,7 @@ reconciliation operations on those records.
 | `parent` | string or null | Generic only: local `task_id` of a generic parent task in the same owner namespace |
 | `inherit_context` | boolean | Generic only: inherit the parent's context directory; requires `parent`; default `false` |
 | `no_pause` | boolean | Generic only: the task cannot be paused; default `false` |
-| `preemption_timeout` | non-negative integer | Generic only: seconds a task gets to stop after a pause request; Determined's default is 0 |
+| `preemption_timeout` | non-negative integer | Generic only: seconds a task gets to stop after a pause request; Determined's default is 0. An experiment sets it in `experiment_config` |
 
 Unknown request fields and upload/context fields are rejected. In auto mode,
 `interactive` selects `shell`, then `overnight` or `experiment_config` selects
@@ -212,8 +212,8 @@ namespace and never a tool argument.
 | `compute_logs` | `task_id`, optional `tail=200` | Chronological list of the newest remote log records |
 | `compute_usage` | `task_id`, optional `window_seconds=3600`, `allocation_id`, `trial_id`, `metrics`, `include_samples=false` | Read-only summary of one task's measured CPU, memory, and GPU use |
 | `compute_cancel` | `task_id` | Updated record, remote cancellation response, and acknowledgement |
-| `compute_pause` | `task_id` | Generic only: record, remote response, and `pause_acknowledged` |
-| `compute_resume` | `task_id` | Generic only: record, remote response, and `resume_acknowledged` |
+| `compute_pause` | `task_id` | Experiments and generic tasks: record, remote response, and `pause_acknowledged` |
+| `compute_resume` | `task_id` | Experiments and generic tasks: record, remote response, and `resume_acknowledged` |
 | `compute_reconcile` | `task_id`, `remote_id` | Record bound only after marker verification |
 | `compute_list_tasks` | none | Local records in the bound owner namespace |
 | `compute_discover` | `kind`, optional `limit=50`, `offset=0` | One current-account remote page; no local mutation |
@@ -300,21 +300,33 @@ the task's descendants but never its ancestors, for generic tasks. It requires a
 `cancellation_acknowledged: true` when the API call completes. Remote termination alone
 does not prove success; inspect exit information and expected shared-storage artifacts.
 
-### Pause and resume generic tasks
+### Pause and resume
 
-`compute_pause(task_id)` and `compute_resume(task_id)` apply only to generic tasks;
-another kind returns `unsupported_kind`. They apply the same owner and binding checks as
-`compute_cancel`, and a record without a remote ID returns `remote_id_unknown`. Each
-returns the local record, the remote acknowledgement as `remote`, and
-`pause_acknowledged` or `resume_acknowledged`; poll `compute_status` for the resulting
-state. A paused task first reports `STATE_STOPPING_PAUSED`, then `STATE_PAUSED`.
+`compute_pause(task_id)` and `compute_resume(task_id)` apply to experiments and generic
+tasks; a command or shell returns `unsupported_kind`. They apply the same owner,
+binding, and adoption checks as `compute_cancel`, and a record without a remote ID
+returns `remote_id_unknown`. Each returns the local record, the remote acknowledgement
+as `remote`, and `pause_acknowledged` or `resume_acknowledged`; poll `compute_status`
+for the resulting state.
 
-Resume is accepted only for a task in `STATE_PAUSED` whose descendants have finished
-stopping, and it runs the entrypoint again from the start; see
-[Generic tasks](#generic-tasks). The master reports rejected requests, such as pausing a
-paused task or a task with `no_pause: true`, or a concurrent pause, resume, or kill, as
-server errors. These therefore arrive as `submission_uncertain` errors whose message
-includes the master's reason; check `compute_status` before repeating the call.
+For an experiment, pause and resume call Determined's experiment pause and activate
+endpoints. The experiment reports `STATE_PAUSED` as soon as the pause is accepted, while
+its trials receive the preemption signal and get the experiment's `preemption_timeout`
+(one hour by default) to save a checkpoint and exit. Resuming continues each trial from
+its latest checkpoint, or from the beginning when it has none. Determined refuses a
+pause or resume of an experiment in an incompatible state with HTTP 400.
+
+For a generic task, pause and resume call the task pause and unpause endpoints, which
+also act on its pausable descendants; see [Generic tasks](#generic-tasks). The task
+reports `STATE_STOPPING_PAUSED`, then `STATE_PAUSED`. Resume is accepted only for a task
+in `STATE_PAUSED` whose descendants have finished stopping, and it runs the entrypoint
+again from the start. A master with the research-cluster fork's generic-task fixes
+refuses a pause, resume, or kill with HTTP 404 for a missing task, HTTP 400 for a state
+that does not allow it (such as pausing a paused task or a task with `no_pause: true`),
+and HTTP 409 while another pause, resume, or kill is in progress; these are ordinary
+errors that carry the master's reason. An older master reports the same refusals as
+server errors, which arrive as `submission_uncertain` errors whose message includes the
+master's reason; check `compute_status` before repeating the call.
 
 For a running shell, use the sanitized `reconnectCommand`, currently
 `det shell show_ssh_command <remote-id>`. The adapter removes `privateKey`; never put
@@ -550,7 +562,8 @@ experiments. For a task owned by another account, `compute_cancel` therefore ret
 HTTP 403 for a command or shell and HTTP 404 `experiment '<id>' not found` for an
 experiment. Submitted records bind to the profile and endpoint rather than the account,
 so switching credentials to another account can produce these errors. Cancel with the
-owning account or ask an administrator. Generic task kill, pause, and resume are likewise
+owning account or ask an administrator. Experiment pause and resume need the same
+permission as cancelling the experiment. Generic task kill, pause, and resume are likewise
 limited to the task's owner or an administrator and return HTTP 403 otherwise.
 
 ## CLI equivalents

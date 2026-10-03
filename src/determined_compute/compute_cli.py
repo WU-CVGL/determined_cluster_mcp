@@ -215,11 +215,11 @@ def build_parser() -> argparse.ArgumentParser:
     cancel = commands.add_parser("cancel", help="Cancel one task")
     cancel.add_argument("task_id")
 
-    pause = commands.add_parser("pause", help="Pause one generic task")
+    pause = commands.add_parser("pause", help="Pause one experiment or generic task")
     pause.add_argument("task_id")
 
     resume = commands.add_parser(
-        "resume", help="Resume one paused generic task; its command runs again from the start"
+        "resume", help="Resume one paused experiment or generic task"
     )
     resume.add_argument("task_id")
 

@@ -1308,18 +1308,19 @@ class ComputeService:
         return updated
 
     def pause(self, task_id: str, owner: str) -> Dict[str, Any]:
-        """Pause a generic task: its containers stop and the task keeps its id."""
-        return self._generic_control(task_id, owner, "pause")
+        """Pause an experiment or a generic task; its containers stop and it keeps its id."""
+        return self._pause_control(task_id, owner, "pause")
 
     def resume(self, task_id: str, owner: str) -> Dict[str, Any]:
-        """Resume a paused generic task, which runs its command again from the start."""
-        return self._generic_control(task_id, owner, "resume")
+        """Resume a paused experiment or generic task."""
+        return self._pause_control(task_id, owner, "resume")
 
-    def _generic_control(self, task_id: str, owner: str, action: str) -> Dict[str, Any]:
+    def _pause_control(self, task_id: str, owner: str, action: str) -> Dict[str, Any]:
         record = self.store.get_owned(task_id, owner)
-        if record.kind != "generic":
+        if record.kind not in {"experiment", "generic"}:
             raise ValidationError(
-                f"{action} applies only to generic tasks; this task is a {record.kind}",
+                f"{action} applies only to experiments and generic tasks; "
+                f"this task is a {record.kind}",
                 code="unsupported_kind",
             )
         self._validate_binding(record)
@@ -1327,6 +1328,10 @@ class ComputeService:
             raise ConflictError(
                 f"remote task id is unknown; reconcile the submission before {action}",
                 code="remote_id_unknown",
+            )
+        if record.origin == "adopted":
+            self._check_adopted_entity(
+                record, self.client.get_task(record.kind, record.remote_id)
             )
         operation = self.client.pause_task if action == "pause" else self.client.unpause_task
         entity = operation(record.kind, record.remote_id)

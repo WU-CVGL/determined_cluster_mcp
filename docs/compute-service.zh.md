@@ -27,8 +27,8 @@ MCP server 是供一个可信用户使用的本地 stdio 服务。进程启动�
 owner 参数。多个进程可以在同一个数据库中使用不同 owner；需要协作时也可以有意共用 owner。
 这只是命名空间边界，不是多用户认证。若要远程暴露服务，需要另行设计带认证的传输层。
 
-`ComputeService` 负责规划、幂等提交、状态、日志、用量测量、取消、generic 任务的暂停与
-恢复、发现、接管以及保守的调和。其本地 `task_id` 在服务重启后保持稳定，与 Determined 的 `remote_id` 不同。SQLite
+`ComputeService` 负责规划、幂等提交、状态、日志、用量测量、取消、暂停与恢复、
+发现、接管以及保守的调和。其本地 `task_id` 在服务重启后保持稳定，与 Determined 的 `remote_id` 不同。SQLite
 数据库应放在持久的本地存储上；源码、数据、包、检查点、日志和输出应放在映射的共享存储上。
 
 咨询后端默认为 `none`。此模式注册 16 个基础工具，不导入咨询 worker，不要求安装 Codex，
@@ -91,7 +91,7 @@ shell_inactivity_seconds: 7200
 | `parent` | 字符串或 null | 仅 generic：同一 owner 命名空间中某个 generic 父任务的本地 `task_id` |
 | `inherit_context` | 布尔值 | 仅 generic：继承父任务的 context 目录；要求 `parent`；默认 `false` |
 | `no_pause` | 布尔值 | 仅 generic：该任务不能暂停；默认 `false` |
-| `preemption_timeout` | 非负整数 | 仅 generic：收到暂停请求后任务可用于停止的秒数；Determined 默认为 0 |
+| `preemption_timeout` | 非负整数 | 仅 generic：收到暂停请求后任务可用于停止的秒数；Determined 默认为 0。experiment 在 `experiment_config` 中设置 |
 
 服务拒绝未知字段以及上传/context 字段。在 auto 模式中，`interactive` 优先选择 `shell`，
 其次由 `overnight` 或 `experiment_config` 选择 `experiment`，其余请求选择 `command`。
@@ -190,8 +190,8 @@ CLI 的默认数据库路径是 `~/.local/state/determined-compute/tasks.sqlite3
 | `compute_logs` | `task_id`，可选 `tail=200` | 最新远端日志按时间正序排列的列表 |
 | `compute_usage` | `task_id`，可选 `window_seconds=3600`、`allocation_id`、`trial_id`、`metrics`、`include_samples=false` | 一个任务实测 CPU、内存和 GPU 用量的只读摘要 |
 | `compute_cancel` | `task_id` | 更新后的记录、远端取消响应与确认标志 |
-| `compute_pause` | `task_id` | 仅 generic：记录、远端响应和 `pause_acknowledged` |
-| `compute_resume` | `task_id` | 仅 generic：记录、远端响应和 `resume_acknowledged` |
+| `compute_pause` | `task_id` | experiment 和 generic 任务：记录、远端响应和 `pause_acknowledged` |
+| `compute_resume` | `task_id` | experiment 和 generic 任务：记录、远端响应和 `resume_acknowledged` |
 | `compute_reconcile` | `task_id`、`remote_id` | 仅在验证标记后绑定的记录 |
 | `compute_list_tasks` | 无 | 已绑定 owner 命名空间内的本地记录 |
 | `compute_discover` | `kind`，可选 `limit=50`、`offset=0` | 当前账户的一页远端任务；不修改本地状态 |
@@ -269,20 +269,28 @@ cancel endpoint，对 generic 任务使用 generic task kill endpoint；后者�
 `cancellation_acknowledged: true`。远端终止并不能单独证明成功，还应检查退出信息和预期的
 共享存储产物。
 
-<a id="pause-and-resume-generic-tasks"></a>
-### 暂停与恢复 generic 任务
+<a id="pause-and-resume"></a>
+### 暂停与恢复
 
-`compute_pause(task_id)` 和 `compute_resume(task_id)` 只适用于 generic 任务；其他 kind 返回
-`unsupported_kind`。它们执行与 `compute_cancel` 相同的 owner 和绑定检查；没有 remote ID 的
-记录返回 `remote_id_unknown`。每个工具返回本地记录、作为 `remote` 的远端确认，以及
-`pause_acknowledged` 或 `resume_acknowledged`；结果状态需用 `compute_status` 轮询。暂停中的
-任务先报告 `STATE_STOPPING_PAUSED`，再报告 `STATE_PAUSED`。
+`compute_pause(task_id)` 和 `compute_resume(task_id)` 适用于 experiment 和 generic 任务；
+command 或 shell 返回 `unsupported_kind`。它们执行与 `compute_cancel` 相同的 owner、绑定和
+接管检查；没有 remote ID 的记录返回 `remote_id_unknown`。每个工具返回本地记录、作为
+`remote` 的远端确认，以及 `pause_acknowledged` 或 `resume_acknowledged`；结果状态需用
+`compute_status` 轮询。
 
-只有处于 `STATE_PAUSED` 且后代都已停止的任务才能恢复，恢复会从头再次运行入口命令；见
-[Generic 任务](#generic-tasks)。master 把被拒绝的请求（例如暂停已暂停的任务、暂停设置了
-`no_pause: true` 的任务，或并发的暂停、恢复、终止）报告为服务器错误，因此这些请求会以
-`submission_uncertain` 错误返回，消息中包含 master 给出的原因；重复调用前先检查
-`compute_status`。
+对于 experiment，暂停与恢复调用 Determined 的 experiment pause 和 activate 端点。暂停被接受后
+experiment 立即报告 `STATE_PAUSED`，而其 trial 收到抢占信号，并有 experiment 的
+`preemption_timeout`（默认一小时）用于保存检查点后退出。恢复时每个 trial 从其最新检查点继续，
+没有检查点则从头开始。Determined 以 HTTP 400 拒绝对处于不兼容状态的 experiment 的暂停或恢复。
+
+对于 generic 任务，暂停与恢复调用任务的 pause 和 unpause 端点，它们也作用于可暂停的后代；见
+[Generic 任务](#generic-tasks)。任务先报告 `STATE_STOPPING_PAUSED`，再报告 `STATE_PAUSED`。
+只有处于 `STATE_PAUSED` 且后代都已停止的任务才能恢复，恢复会从头再次运行入口命令。包含
+research-cluster fork 中 generic 任务修复的 master 拒绝暂停、恢复或终止时，对不存在的任务返回
+HTTP 404，对不允许该操作的状态（例如暂停已暂停的任务或设置了 `no_pause: true` 的任务）返回
+HTTP 400，在另一个暂停、恢复或终止进行中时返回 HTTP 409；这些都是带有 master 原因的普通错误。
+较旧的 master 把同样的拒绝报告为服务器错误，因此会以 `submission_uncertain` 错误返回，消息中
+包含 master 给出的原因；重复调用前先检查 `compute_status`。
 
 对于正在运行的 shell，应使用已清理的 `reconnectCommand`，当前为
 `det shell show_ssh_command <remote-id>`。适配器会移除 `privateKey`；不要把私钥材料写入任务
@@ -476,8 +484,9 @@ Determined 的 HTTP 失败（包括 gRPC-gateway 错误响应体）显示为 `<s
 或管理员可以终止或取消 command、shell 和 experiment。因此，对于其他账户拥有的任务，
 `compute_cancel` 对 command 或 shell 返回 HTTP 403，对 experiment 返回 HTTP 404
 `experiment '<id>' not found`。submitted 记录绑定配置和端点而不是账户，所以把凭据切换到
-另一个账户后可能遇到这些错误。应使用拥有该任务的账户取消，或联系管理员。generic 任务的
-终止、暂停和恢复同样只限任务所有者或管理员，否则返回 HTTP 403。
+另一个账户后可能遇到这些错误。应使用拥有该任务的账户取消，或联系管理员。暂停和恢复
+experiment 需要与取消它相同的权限。generic 任务的终止、暂停和恢复同样只限任务所有者或
+管理员，否则返回 HTTP 403。
 
 <a id="cli-equivalents"></a>
 ## CLI 等价命令

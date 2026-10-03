@@ -638,17 +638,33 @@ class DeterminedAPIClient:
             raise
         return {"id": str(task_id), "acknowledged": True, **response}
 
+    _PAUSABLE_KINDS = ("experiment", "generic")
+
     def pause_task(self, kind: str, task_id: str) -> Dict[str, Any]:
-        """Pause a generic task and its pausable descendants."""
-        if self._kind(kind) != "generic":
-            raise ValueError("only generic tasks can be paused")
+        """Pause an experiment, or a generic task and its pausable descendants."""
+        kind = self._kind(kind)
+        if kind == "experiment":
+            return self._experiment_control(task_id, "pause")
+        if kind != "generic":
+            raise ValueError("only experiments and generic tasks can be paused")
         return self._generic_control(task_id, "pause", {"taskId": str(task_id)})
 
     def unpause_task(self, kind: str, task_id: str) -> Dict[str, Any]:
-        """Resume a paused generic task in a new allocation."""
-        if self._kind(kind) != "generic":
-            raise ValueError("only generic tasks can be resumed")
+        """Resume a paused experiment, or a paused generic task in a new allocation."""
+        kind = self._kind(kind)
+        if kind == "experiment":
+            # Determined calls resuming an experiment activating it.
+            return self._experiment_control(task_id, "activate")
+        if kind != "generic":
+            raise ValueError("only experiments and generic tasks can be resumed")
         return self._generic_control(task_id, "unpause", {"taskId": str(task_id)})
+
+    def _experiment_control(self, experiment_id: str, action: str) -> Dict[str, Any]:
+        response = self._post(
+            f"api/v1/experiments/{quote(str(experiment_id), safe='')}/{action}", data={}
+        )
+        # Like cancel, the response is empty; acknowledge without claiming a remote state.
+        return {"id": str(experiment_id), "acknowledged": True, **response}
 
     def cancel_task(self, kind: str, task_id: str) -> Dict[str, Any]:
         kind = self._kind(kind)

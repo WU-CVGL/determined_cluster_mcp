@@ -1101,11 +1101,39 @@ def test_generic_control_keeps_server_rejection_message(monkeypatch):
     assert message in str(caught.value)
 
 
+def test_generic_control_rejection_is_not_uncertain(monkeypatch):
+    # A master that refuses the change with a client error has not applied it.
+    message = f"cannot pause task {GENERIC_ID} as it is in state 'PAUSED'"
+    monkeypatch.setattr(
+        requests, "post", lambda *a, **k: gateway_error(400, 9, "FailedPrecondition", message)
+    )
+    with pytest.raises(APIError) as caught:
+        client().pause_task("generic", GENERIC_ID)
+    assert not isinstance(caught.value, SubmissionUncertainError)
+    assert message in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("operation", "action"), [("pause_task", "pause"), ("unpause_task", "activate")]
+)
+def test_experiment_pause_and_resume_routes(monkeypatch, operation, action):
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(url)
+        return Response({})
+
+    monkeypatch.setattr(requests, "post", post)
+    result = getattr(client(), operation)("experiment", "17")
+    assert result == {"id": "17", "acknowledged": True}
+    assert calls == [f"http://master:8080/api/v1/experiments/17/{action}"]
+
+
 def test_pause_and_discovery_reject_other_kinds():
-    with pytest.raises(ValueError, match="only generic"):
+    with pytest.raises(ValueError, match="only experiments and generic tasks"):
         client().pause_task("command", "c1")
-    with pytest.raises(ValueError, match="only generic"):
-        client().unpause_task("experiment", "1")
+    with pytest.raises(ValueError, match="only experiments and generic tasks"):
+        client().unpause_task("shell", "s1")
     with pytest.raises(ValueError):
         client().list_remote_tasks("generic", user_id="1")
 

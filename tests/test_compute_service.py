@@ -1109,7 +1109,20 @@ def test_generic_status_logs_cancel_pause_and_resume(tmp_path, profile, generic_
     assert client.cancel_calls == [("generic", remote_id)]
 
 
-def test_pause_and_resume_apply_only_to_owned_bound_generic_tasks(
+def test_experiment_pause_and_resume(tmp_path, profile, command_request):
+    client = GenericClient()
+    service = ComputeService(client, SQLiteTaskStore(tmp_path / "tasks.db"), profile)
+    launched = service.launch(dict(command_request, kind="experiment"), "exp-1", "session-a")
+    task_id, remote_id = launched["task_id"], launched["remote_id"]
+
+    assert service.pause(task_id, "session-a")["pause_acknowledged"] is True
+    assert service.resume(task_id, "session-a")["resume_acknowledged"] is True
+    assert client.controls == [
+        ("pause", "experiment", remote_id), ("unpause", "experiment", remote_id),
+    ]
+
+
+def test_pause_and_resume_apply_only_to_owned_bound_pausable_tasks(
     tmp_path, profile, generic_request, command_request
 ):
     client = GenericClient()

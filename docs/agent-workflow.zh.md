@@ -28,16 +28,19 @@
 
 不要为了确认配置而读取或输出凭据值。MCP 服务通过 secrets 文件或环境接收凭据。除非项目或管理员已经明确选择，否则示例中的镜像和资源池都只是占位符。
 
-根据工作内容选择任务类型：
+根据工作内容选择任务类型。以下四种类型由简到繁排列：
 
-| 类型 | 适用场景 |
-| --- | --- |
-| `command` | 有限的非交互任务，例如评估、转换或构建 |
-| `shell` | 需要可重新连接环境的交互调试 |
-| `experiment` | 训练、搜索、trial，或使用 Determined 实验功能的长时间任务 |
-| `generic` | 长时间、可安全重跑的批处理任务，可能需要暂停以释放资源并在之后恢复，且不需要实验功能 |
+- `command` 在容器中运行一次你的命令，命令退出即结束。用于有限的非交互任务，例如评估、转换或构建。
+- `shell` 提供一个可通过 SSH 连接的容器，而不是运行一个命令。用于交互调试和环境检查。
+- `generic` 像 `command` 一样运行一次你的命令，此外还可以暂停以释放其槽位，之后以同一任务 ID 恢复。恢复时会在新容器中从头再次运行命令，失败后也不会自动重启，所以只用于可安全重跑的长时间批处理任务；见[暂停与恢复](#pause-and-resume)。它要求 Determined master 来自 research-cluster fork 0.40.1 或更高版本，`kind: auto` 从不选择它。
+- `experiment` 将你的命令作为一个或多个 trial 运行，并增加 Determined 的实验功能：
+  - searcher（在 `experiment_config.searcher` 中设置）：运行单个 trial，或在超参数空间上运行多个 trial（网格、随机，或提前停止较差 trial 的自适应搜索）；
+  - 自动重启：失败的 trial（包括其 agent 丢失的情况）会重新启动，最多 `max_restarts` 次（Determined 默认值为 5）；
+  - 检查点：由任务通过 Determined Core API 保存，存放在 `checkpoint_storage` 中并按保留策略（`save_trial_best`、`save_trial_latest`）管理，因此重启的 trial 可以从最新检查点继续，而不是从头开始；
+  - 指标：任务通过 Core API 上报的训练和验证指标，供 searcher 比较，并由 `compute_status` 作为 trial 进度和汇总指标返回；
+  - 暂停与恢复：暂停时每个 trial 会被要求保存检查点并停止，恢复时每个 trial 从其最新检查点继续。
 
-`kind: auto` 从不选择 `generic`，需要显式指定。短时间的有限任务优先使用 `command`；需要 trial、搜索、检查点或自动重启时使用 `experiment`。generic 任务从不自动重启，恢复时会从头再次运行命令，所以只用于可安全重跑的工作；见[暂停与恢复 generic 任务](#pause-and-resume-generic-tasks)。它要求 Determined master 来自 research-cluster fork 0.40.1 或更高版本。
+  不使用 Core API 的任务仍有 searcher、自动重启以及暂停与恢复，但重启或恢复时会从头运行，也不会上报检查点或指标。训练、超参数搜索，以及需要在节点故障后继续的长时间或过夜任务，使用 experiment。
 
 MCP 不接受 `kind: notebook`。
 
@@ -110,16 +113,27 @@ MCP 不接受 `kind: notebook`。
 
 报告本地 task ID、远端 ID、最终状态、存在时的退出结果、输出路径，以及实际观察到的产物或指标。绝不包含 token、密码、私钥、cookie 或 secrets 文件内容。
 
-<a id="pause-and-resume-generic-tasks"></a>
-## 暂停与恢复 generic 任务
+<a id="pause-and-resume"></a>
+## 暂停与恢复
 
-generic 任务的命令应能在任意时刻被停止并从头再次启动：按单元处理工作，每个单元的输出先写入临时名称、完成后再重命名，跳过最终输出已存在的单元，并在启动时删除或重做不完整的单元。除非普通脚本在任务的 `preemption_timeout` 秒（默认 0）内处理 Determined Core API 的抢占信号，否则暂停时会被立即停止。
+暂停会释放任务的槽位但不结束任务：任务保留其 ID，之后可以恢复。experiment 和 generic 任务可以暂停；command 和 shell 不能暂停，会返回 `unsupported_kind`。
 
-1. 调用 `compute_pause(task_id)` 停止运行中的 generic 任务并释放其资源。除非子任务设置了 `no_pause: true`，否则子任务也会被暂停。以 `no_pause: true` 提交的任务不能暂停。
-2. 轮询 `compute_status(task_id)`，直到 `remote_state` 为 `STATE_PAUSED`。已暂停的任务尚未结束；`STATE_STOPPING_PAUSED` 表示它仍在停止。
-3. 需要继续时调用 `compute_resume(task_id)`。Determined 会在同一任务 ID 下启动新容器，并从头再次运行命令；用 `compute_logs` 确认已完成的单元被跳过。
+暂停会通过 Determined Core API 的抢占信号要求工作负载停止，并在任务的 `preemption_timeout` 结束时停止其容器。experiment 的超时默认为一小时，以便每个 trial 保存检查点后退出；generic 任务默认为 0，即立即停止。不使用 Core API 的普通脚本会在超时结束时被停止。
 
-`compute_cancel` 会终止 generic 任务及其所有后代。退出状态 0 使 generic 任务以 `STATE_COMPLETED` 结束；非零退出或 agent 丢失使其以 `STATE_ERROR` 结束，且不会重启。暂停和恢复不适用于其他 kind，会返回 `unsupported_kind`。如果 master 拒绝暂停或恢复（例如任务已经暂停），错误为 `submission_uncertain`，并附带 master 给出的原因；再次尝试前先检查 `compute_status`。
+恢复的方式因类型而异：
+
+- experiment 的每个 trial 从其最新检查点继续；没有检查点的 trial 从头开始。
+- generic 任务在同一任务 ID 下启动新容器，并从头再次运行命令。其命令应能在任意时刻被停止并再次启动：按单元处理工作，每个单元的输出先写入临时名称、完成后再重命名，跳过最终输出已存在的单元，并在启动时删除或重做不完整的单元。除非子任务设置了 `no_pause: true`，否则子任务会随之暂停；以 `no_pause: true` 提交的任务不能暂停。
+
+暂停与恢复的步骤：
+
+1. 调用 `compute_pause(task_id)`。
+2. 轮询 `compute_status(task_id)`，直到 `remote_state` 为 `STATE_PAUSED`。已暂停的任务尚未结束。generic 任务在停止期间报告 `STATE_STOPPING_PAUSED`；experiment 在暂停被接受后立即报告 `STATE_PAUSED`，其 trial 可能要到超时结束才停止。
+3. 需要继续时调用 `compute_resume(task_id)`，并用 `compute_logs` 确认它从检查点继续，或跳过了已完成的单元。
+
+master 拒绝的暂停或恢复（例如暂停已暂停的任务）会以错误返回 master 给出的原因，且没有任何改变。早于 research-cluster fork 中 generic 任务修复的 master 会把被拒绝的 generic 任务请求报告为服务器错误；这些错误以 `submission_uncertain` 返回，再次尝试前先检查 `compute_status`。
+
+`compute_cancel` 会终止 generic 任务及其所有后代。退出状态 0 使 generic 任务以 `STATE_COMPLETED` 结束；非零退出或 agent 丢失使其以 `STATE_ERROR` 结束，且不会重启。
 
 与其他提交一样，为 generic 任务设置有意义的 `name` 和 `description`。不支持 generic 任务名称的旧 master 会拒绝它们；服务随后会去掉这两个字段提交一次，在本地记录中保留它们，并返回 `generic_task_metadata_unsupported` 警告。该警告仅供参考。此时任务在 WebUI 中没有名称，因此应记录本地 ID 和远端 ID。
 

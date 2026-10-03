@@ -25,16 +25,19 @@ Read `AGENTS.md`, the project's own instructions, the configured compute profile
 
 Do not read or print credential values merely to confirm configuration. The MCP server receives credentials through its secrets file or environment. Treat image and pool values in examples as placeholders unless the project or administrator explicitly selected them.
 
-Choose the task kind according to the work:
+Choose the task kind according to the work. The four kinds, from the simplest:
 
-| Kind | Use it for |
-| --- | --- |
-| `command` | A finite, non-interactive run such as evaluation, conversion, or a build |
-| `shell` | Interactive debugging that needs a reconnectable environment |
-| `experiment` | Training, searches, trials, or long-running work that uses Determined experiment features |
-| `generic` | Long, restart-safe batch work that you may need to pause to free its resources and resume later, without experiment features |
+- `command` runs your command once in a container and ends when it exits. Use it for finite, non-interactive work such as an evaluation, a conversion, or a build.
+- `shell` gives you a container to connect to over SSH instead of a command to run. Use it for interactive debugging and environment inspection.
+- `generic` runs your command once like a `command`, and can also be paused to free its slots and resumed later under the same task ID. Resuming starts the command again from the beginning in a new container, and nothing restarts it after a failure, so use it only for long batch work that is safe to rerun; see [Pause and resume](#pause-and-resume). It requires the research-cluster fork 0.40.1 or later of the Determined master, and `kind: auto` never selects it.
+- `experiment` runs your command as one or more trials and adds Determined's experiment features:
+  - a searcher, set in `experiment_config.searcher`, that runs a single trial or many trials over a hyperparameter space (grid, random, or adaptive search that stops weak trials early);
+  - automatic restarts: a failed trial, including one whose agent was lost, starts again up to `max_restarts` times (Determined's default is 5);
+  - checkpoints that the workload saves through Determined's Core API, kept in `checkpoint_storage` under its retention policy (`save_trial_best`, `save_trial_latest`), so a restarted trial can continue from its latest checkpoint instead of from the start;
+  - training and validation metrics that the workload reports through the Core API, which the searcher compares and `compute_status` reports as trial progress and summary metrics;
+  - pause and resume: pausing asks each trial to save a checkpoint and stop, and resuming continues each trial from its latest checkpoint.
 
-`kind: auto` never selects `generic`; request it explicitly. Prefer `command` for a short finite run and `experiment` when you need trials, searches, checkpoints, or automatic restarts. A generic task is never restarted automatically, and resuming it runs the command again from the start, so use it only for work that is safe to rerun; see [Pause and resume generic tasks](#pause-and-resume-generic-tasks). It requires the research-cluster fork 0.40.1 or later of the Determined master.
+  A workload that does not use the Core API still gets the searcher, the restarts, and pause and resume, but a restart or a resume then runs it from the beginning, and it reports no checkpoints or metrics. Use an experiment for training, hyperparameter searches, and long or overnight work that should survive a node failure.
 
 The MCP does not accept `kind: notebook`.
 
@@ -102,15 +105,26 @@ A successful submission or a terminal state alone is not acceptance. Check the p
 
 Report the local task ID, remote ID, final state, exit result when available, output path, and observed artifact or metric. Never include tokens, passwords, private keys, cookies, or secrets-file contents.
 
-## Pause and resume generic tasks
+## Pause and resume
 
-Write a generic task's command so that it can be stopped at any moment and started again from the beginning: process work in units, write each unit's output under a temporary name and rename it when complete, skip units whose final output already exists, and remove or redo partial ones on start. A plain script is stopped immediately on pause unless it handles Determined's Core API preemption signal within the task's `preemption_timeout` seconds (default 0).
+Pausing frees a task's slots without ending it: the task keeps its ID and can be resumed later. Experiments and generic tasks can be paused; commands and shells cannot, and return `unsupported_kind`.
 
-1. Call `compute_pause(task_id)` to stop a running generic task and free its resources. Its child tasks are paused too unless they set `no_pause: true`. A task launched with `no_pause: true` cannot be paused.
-2. Poll `compute_status(task_id)` until `remote_state` is `STATE_PAUSED`. A paused task is not finished; `STATE_STOPPING_PAUSED` means it is still stopping.
-3. Call `compute_resume(task_id)` when the work should continue. Determined starts a new container under the same task ID and runs the command again from the start; check `compute_logs` to confirm that completed units were skipped.
+A pause asks the workload to stop through Determined's Core API preemption signal and stops its containers when the task's `preemption_timeout` ends. For an experiment the timeout defaults to one hour, so that each trial can save a checkpoint and exit; for a generic task it defaults to 0, an immediate stop. A plain script that does not use the Core API is stopped when the timeout ends.
 
-`compute_cancel` kills the generic task and all its descendants. Exit status 0 ends a generic task as `STATE_COMPLETED`; a non-zero exit or a lost agent ends it as `STATE_ERROR`, and it is not restarted. Pause and resume do not apply to other kinds and return `unsupported_kind`. If the master rejects a pause or resume, for example because the task is already paused, the error is `submission_uncertain` with the master's reason; check `compute_status` before trying again.
+Resuming continues differently by kind:
+
+- An experiment continues each trial from its latest checkpoint; a trial without one starts from the beginning.
+- A generic task starts a new container under the same task ID and runs the command again from the beginning. Write its command so that it can be stopped at any moment and started again: process work in units, write each unit's output under a temporary name and rename it when complete, skip units whose final output already exists, and remove or redo partial ones on start. Its child tasks are paused with it unless they set `no_pause: true`, and a task launched with `no_pause: true` cannot be paused.
+
+To pause and resume:
+
+1. Call `compute_pause(task_id)`.
+2. Poll `compute_status(task_id)` until `remote_state` is `STATE_PAUSED`. A paused task is not finished. A generic task reports `STATE_STOPPING_PAUSED` while it stops; an experiment reports `STATE_PAUSED` as soon as the pause is accepted, and its trials can take until their timeout to stop.
+3. Call `compute_resume(task_id)` when the work should continue, and check `compute_logs` that it continued from a checkpoint or skipped completed units.
+
+A pause or resume that the master refuses, for example pausing a paused task, returns the master's reason as an error, and nothing changed. A master that predates the generic-task fixes of the research-cluster fork reports refused generic-task requests as server errors instead; these arrive as `submission_uncertain`, so check `compute_status` before trying again.
+
+`compute_cancel` kills a generic task and all its descendants. Exit status 0 ends a generic task as `STATE_COMPLETED`; a non-zero exit or a lost agent ends it as `STATE_ERROR`, and it is not restarted.
 
 Give a generic task a meaningful `name` and `description` as for any launch. A master that predates generic task names rejects them; the service then submits the task without them once, keeps them in the local record, and returns a `generic_task_metadata_unsupported` warning. Treat that warning as informational. The task then appears without a name in the WebUI, so record the local and remote IDs.
 
