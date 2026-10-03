@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh.md)
 
-Run Determined `command`, `shell`, and `experiment` tasks through a local stdio MCP server. Code, data, checkpoints, and outputs stay on mapped shared storage. Any MCP client that can start a local stdio server can use the service; the client's model is independent of the optional server-side consultation backend.
+Run Determined `command`, `shell`, `experiment`, and pausable `generic` tasks through a local stdio MCP server. Code, data, checkpoints, and outputs stay on mapped shared storage. Any MCP client that can start a local stdio server can use the service; the client's model is independent of the optional server-side consultation backend.
 
 ## Install
 

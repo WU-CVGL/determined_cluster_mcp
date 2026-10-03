@@ -35,6 +35,9 @@
 | `command` | 有限的非交互任务，例如评估、转换或构建 |
 | `shell` | 需要可重新连接环境的交互调试 |
 | `experiment` | 训练、搜索、trial，或使用 Determined 实验功能的长时间任务 |
+| `generic` | 长时间、可安全重跑的批处理任务，可能需要暂停以释放资源并在之后恢复，且不需要实验功能 |
+
+`kind: auto` 从不选择 `generic`，需要显式指定。短时间的有限任务优先使用 `command`；需要 trial、搜索、检查点或自动重启时使用 `experiment`。generic 任务从不自动重启，恢复时会从头再次运行命令，所以只用于可安全重跑的工作；见[暂停与恢复 generic 任务](#pause-and-resume-generic-tasks)。它要求 Determined master 来自 research-cluster fork 0.40.1 或更高版本。
 
 MCP 不接受 `kind: notebook`。
 
@@ -107,12 +110,25 @@ MCP 不接受 `kind: notebook`。
 
 报告本地 task ID、远端 ID、最终状态、存在时的退出结果、输出路径，以及实际观察到的产物或指标。绝不包含 token、密码、私钥、cookie 或 secrets 文件内容。
 
+<a id="pause-and-resume-generic-tasks"></a>
+## 暂停与恢复 generic 任务
+
+generic 任务的命令应能在任意时刻被停止并从头再次启动：按单元处理工作，每个单元的输出先写入临时名称、完成后再重命名，跳过最终输出已存在的单元，并在启动时删除或重做不完整的单元。除非普通脚本在任务的 `preemption_timeout` 秒（默认 0）内处理 Determined Core API 的抢占信号，否则暂停时会被立即停止。
+
+1. 调用 `compute_pause(task_id)` 停止运行中的 generic 任务并释放其资源。除非子任务设置了 `no_pause: true`，否则子任务也会被暂停。以 `no_pause: true` 提交的任务不能暂停。
+2. 轮询 `compute_status(task_id)`，直到 `remote_state` 为 `STATE_PAUSED`。已暂停的任务尚未结束；`STATE_STOPPING_PAUSED` 表示它仍在停止。
+3. 需要继续时调用 `compute_resume(task_id)`。Determined 会在同一任务 ID 下启动新容器，并从头再次运行命令；用 `compute_logs` 确认已完成的单元被跳过。
+
+`compute_cancel` 会终止 generic 任务及其所有后代。退出状态 0 使 generic 任务以 `STATE_COMPLETED` 结束；非零退出或 agent 丢失使其以 `STATE_ERROR` 结束，且不会重启。暂停和恢复不适用于其他 kind，会返回 `unsupported_kind`。如果 master 拒绝暂停或恢复（例如任务已经暂停），错误为 `submission_uncertain`，并附带 master 给出的原因；再次尝试前先检查 `compute_status`。
+
+与其他提交一样，为 generic 任务设置有意义的 `name` 和 `description`。不支持 generic 任务名称的旧 master 会拒绝它们；服务随后会去掉这两个字段提交一次，在本地记录中保留它们，并返回 `generic_task_metadata_unsupported` 警告。该警告仅供参考。此时任务在 WebUI 中没有名称，因此应记录本地 ID 和远端 ID。
+
 <a id="discover-and-adopt-existing-remote-tasks"></a>
 ## 发现并登记已有远端任务
 
 对于通过 Determined WebUI、原生 CLI 或另一台设备独立创建，且属于同一 Determined 账户的任务，使用发现和登记流程：
 
-1. 调用 `compute_discover(kind, limit=50, offset=0)`，其中 kind 为 `command`、`shell` 或 `experiment`。这是只读远端查询，不会创建本地记录，也不会提交任务。
+1. 调用 `compute_discover(kind, limit=50, offset=0)`，其中 kind 为 `command`、`shell` 或 `experiment`。这是只读远端查询，不会创建本地记录，也不会提交任务。generic 任务不能发现或接管，因为 Determined 不报告其所属账户。
 2. 选择目标结果，再调用 `compute_adopt(kind, remote_id)`。
 3. 保存返回的本地 `task_id`，然后用它调用 `compute_status`、`compute_logs`、`compute_usage` 和 `compute_cancel`。
 

@@ -32,6 +32,9 @@ Choose the task kind according to the work:
 | `command` | A finite, non-interactive run such as evaluation, conversion, or a build |
 | `shell` | Interactive debugging that needs a reconnectable environment |
 | `experiment` | Training, searches, trials, or long-running work that uses Determined experiment features |
+| `generic` | Long, restart-safe batch work that you may need to pause to free its resources and resume later, without experiment features |
+
+`kind: auto` never selects `generic`; request it explicitly. Prefer `command` for a short finite run and `experiment` when you need trials, searches, checkpoints, or automatic restarts. A generic task is never restarted automatically, and resuming it runs the command again from the start, so use it only for work that is safe to rerun; see [Pause and resume generic tasks](#pause-and-resume-generic-tasks). It requires the research-cluster fork 0.40.1 or later of the Determined master.
 
 The MCP does not accept `kind: notebook`.
 
@@ -99,11 +102,23 @@ A successful submission or a terminal state alone is not acceptance. Check the p
 
 Report the local task ID, remote ID, final state, exit result when available, output path, and observed artifact or metric. Never include tokens, passwords, private keys, cookies, or secrets-file contents.
 
+## Pause and resume generic tasks
+
+Write a generic task's command so that it can be stopped at any moment and started again from the beginning: process work in units, write each unit's output under a temporary name and rename it when complete, skip units whose final output already exists, and remove or redo partial ones on start. A plain script is stopped immediately on pause unless it handles Determined's Core API preemption signal within the task's `preemption_timeout` seconds (default 0).
+
+1. Call `compute_pause(task_id)` to stop a running generic task and free its resources. Its child tasks are paused too unless they set `no_pause: true`. A task launched with `no_pause: true` cannot be paused.
+2. Poll `compute_status(task_id)` until `remote_state` is `STATE_PAUSED`. A paused task is not finished; `STATE_STOPPING_PAUSED` means it is still stopping.
+3. Call `compute_resume(task_id)` when the work should continue. Determined starts a new container under the same task ID and runs the command again from the start; check `compute_logs` to confirm that completed units were skipped.
+
+`compute_cancel` kills the generic task and all its descendants. Exit status 0 ends a generic task as `STATE_COMPLETED`; a non-zero exit or a lost agent ends it as `STATE_ERROR`, and it is not restarted. Pause and resume do not apply to other kinds and return `unsupported_kind`. If the master rejects a pause or resume, for example because the task is already paused, the error is `submission_uncertain` with the master's reason; check `compute_status` before trying again.
+
+Give a generic task a meaningful `name` and `description` as for any launch. A master that predates generic task names rejects them; the service then submits the task without them once, keeps them in the local record, and returns a `generic_task_metadata_unsupported` warning. Treat that warning as informational. The task then appears without a name in the WebUI, so record the local and remote IDs.
+
 ## Discover and adopt existing remote tasks
 
 Use discovery and adoption for a task created independently through the Determined WebUI, native CLI, or another device under the same Determined account:
 
-1. Call `compute_discover(kind, limit=50, offset=0)` with `command`, `shell`, or `experiment`. This is a read-only remote query; it does not create a local record or submit work.
+1. Call `compute_discover(kind, limit=50, offset=0)` with `command`, `shell`, or `experiment`. This is a read-only remote query; it does not create a local record or submit work. Generic tasks cannot be discovered or adopted, because Determined does not report which account owns them.
 2. Select the intended remote result, then call `compute_adopt(kind, remote_id)`.
 3. Keep the returned local `task_id` and use it with `compute_status`, `compute_logs`, `compute_usage`, and `compute_cancel`.
 

@@ -14,6 +14,7 @@ Let `kind: auto` select from intent when the request is clear:
 - Use `command` for a one-off, non-interactive job expected to finish during an ordinary working session.
 - Use `shell` for interactive debugging, environment inspection, and iterative work. A deployment may advertise an inactivity window such as about two hours; treat it as an advisory, configurable site policy rather than a Determined guarantee.
 - Use `experiment` for overnight or durable work, and whenever experiment features such as search, trial tracking, or checkpoint lifecycle are actually needed. There is no rigid midnight cutoff.
+- Use `generic`, explicitly, for long batch work that must be pausable with `compute_pause` and `compute_resume`. Resuming reruns the command from the start and nothing restarts automatically, so the command must skip completed outputs and resume or clean partial ones.
 
 Set `interactive` or `overnight` explicitly when intent would otherwise be ambiguous. Use the minimum suitable `slots`; heavy CPU work can use zero GPU slots only if the service and target pool support it.
 

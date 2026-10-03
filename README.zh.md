@@ -3,7 +3,7 @@
 
 [English](README.md) | [简体中文](README.zh.md)
 
-通过本地 stdio MCP 服务运行 Determined `command`、`shell` 和 `experiment` 任务。代码、数据、检查点和输出都保存在映射的共享存储中。任何能启动本地 stdio 服务的 MCP 客户端都可以使用本服务；客户端模型与可选的服务端咨询后端彼此独立。
+通过本地 stdio MCP 服务运行 Determined `command`、`shell`、`experiment` 以及可暂停的 `generic` 任务。代码、数据、检查点和输出都保存在映射的共享存储中。任何能启动本地 stdio 服务的 MCP 客户端都可以使用本服务；客户端模型与可选的服务端咨询后端彼此独立。
 
 <a id="install"></a>
 ## 安装

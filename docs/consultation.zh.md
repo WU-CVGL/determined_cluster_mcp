@@ -13,7 +13,7 @@
 <a id="enable-the-codex-backend"></a>
 ## 启用 Codex 后端
 
-MCP server 默认为 `--consultation-backend none`。此模式提供 14 个基础工具，不导入咨询
+MCP server 默认为 `--consultation-backend none`。此模式提供 16 个基础工具，不导入咨询
 worker，也不要求 Codex、`--repo-root` 或 `skills/intensive-compute-runner/SKILL.md`。
 
 要启用后端，先在 server 机器上安装并登录 Codex。所选 repository root 必须存在，并包含
@@ -35,7 +35,7 @@ determined-compute-mcp \
 `--consultation-model` 可省略，当前默认值是 `gpt-5.6-sol`。
 `--consultation-codex-bin` 也可省略，默认使用 `PATH` 中的 `codex`。`--repo-root` 也可通过
 `DETERMINED_COMPUTE_REPO_ROOT` 提供。这些是部署参数，不是 MCP 工具参数。咨询会增加
-`compute_consult` 和 `workflow_status`，使工具总数变为 16。
+`compute_consult` 和 `workflow_status`，使工具总数变为 18。
 
 worker 把自己的表存入 `--db` 指定的同一个本地 SQLite 文件。该文件含有问题、整理后的
 context、生命周期日志和结果，应按服务状态加以保护。分离后的 worker 进程必须能继续访问仓库
