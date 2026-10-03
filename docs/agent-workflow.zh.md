@@ -37,7 +37,7 @@
   - searcher（在 `experiment_config.searcher` 中设置）：运行单个 trial，或在超参数空间上运行多个 trial（网格、随机，或提前停止较差 trial 的自适应搜索）；
   - 自动重启：失败的 trial（包括其 agent 丢失的情况）会重新启动，最多 `max_restarts` 次（Determined 默认值为 5）；
   - 检查点：由任务通过 Determined Core API 保存，存放在 `checkpoint_storage` 中并按保留策略（`save_trial_best`、`save_trial_latest`）管理，因此重启的 trial 可以从最新检查点继续，而不是从头开始；
-  - 指标：任务通过 Core API 上报的训练和验证指标，供 searcher 比较，并由 `compute_status` 作为 trial 进度和汇总指标返回；
+  - 指标：任务通过 Core API 上报的训练和验证指标，供 searcher 比较，并由 `compute_usage` 作为 trial 进度和汇总指标返回；
   - 暂停与恢复：暂停时每个 trial 会被要求保存检查点并停止，恢复时每个 trial 从其最新检查点继续。
 
   不使用 Core API 的任务仍有 searcher、自动重启以及暂停与恢复，但重启或恢复时会从头运行，也不会上报检查点或指标。训练、超参数搜索，以及需要在节点故障后继续的长时间或过夜任务，使用 experiment。

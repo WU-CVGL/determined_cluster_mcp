@@ -34,7 +34,7 @@ Choose the task kind according to the work. The four kinds, from the simplest:
   - a searcher, set in `experiment_config.searcher`, that runs a single trial or many trials over a hyperparameter space (grid, random, or adaptive search that stops weak trials early);
   - automatic restarts: a failed trial, including one whose agent was lost, starts again up to `max_restarts` times (Determined's default is 5);
   - checkpoints that the workload saves through Determined's Core API, kept in `checkpoint_storage` under its retention policy (`save_trial_best`, `save_trial_latest`), so a restarted trial can continue from its latest checkpoint instead of from the start;
-  - training and validation metrics that the workload reports through the Core API, which the searcher compares and `compute_status` reports as trial progress and summary metrics;
+  - training and validation metrics that the workload reports through the Core API, which the searcher compares and `compute_usage` reports as trial progress and summary metrics;
   - pause and resume: pausing asks each trial to save a checkpoint and stop, and resuming continues each trial from its latest checkpoint.
 
   A workload that does not use the Core API still gets the searcher, the restarts, and pause and resume, but a restart or a resume then runs it from the beginning, and it reports no checkpoints or metrics. Use an experiment for training, hyperparameter searches, and long or overnight work that should survive a node failure.
