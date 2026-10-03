@@ -8,7 +8,7 @@ Load this reference when preparing a service request, copying a workspace to sha
 
 | Field | Meaning |
 | --- | --- |
-| `kind` | `auto`, `command`, `shell`, or `experiment` |
+| `kind` | `auto`, `command`, `shell`, `generic`, or `experiment` |
 | `name` | Short task-specific display name; never an internal ID |
 | `description` | Purpose, config, or other useful human context |
 | `interactive` | Selects `shell` when `kind` is `auto` |
@@ -21,8 +21,9 @@ Load this reference when preparing a service request, copying a workspace to sha
 | `pool`, `image` | Optional overrides of profile defaults |
 | `code_revision` | Stable revision or content identifier for reproducibility |
 | `experiment_config` | Experiment-only configuration; selects `experiment` in auto mode |
+| `parent`, `inherit_context`, `pausable`, `preemption_timeout` | Generic-only options; `pausable` defaults to `false`; see the compute reference |
 
-Auto mode otherwise resolves to `command`. Call `plan` before `launch`; planning is read-only.
+Auto mode otherwise resolves to `command` and never selects `generic`. Call `plan` before `launch`; planning is read-only.
 
 Call `compute_resources(slots=1, pool=None)` with the requested values before launch; `slots=0` checks auxiliary capacity. With `allow_queue: false`, launch admits a new request only when capacity is known and currently sufficient; a rejection creates no task or remote submission. `allow_queue: true` explicitly permits scheduler queueing for that request. Capacity is a race-prone snapshot rather than a reservation, and the service never switches pools or execution locations automatically.
 

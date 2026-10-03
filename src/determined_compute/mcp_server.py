@@ -103,6 +103,9 @@ def create_server(
             "Keep code and data on shared mounts; use storage_check/sync/fetch for file access. "
             "Plan before launch, keep request_id stable, and use the returned task_id for control. "
             "Use compute_usage to check a task's measured CPU, memory, and GPU use. "
+            "Experiments and generic tasks can be paused and resumed; a resumed experiment "
+            "continues from its trials' latest checkpoints, a resumed generic task reruns its "
+            "command from the start. "
             "Credentials belong in local configuration, never in tool arguments."
         ),
     )
@@ -180,6 +183,22 @@ def create_server(
         """Cancel a task in the server's owner namespace."""
 
         return await call(service.cancel, task_id, owner)
+
+    @server.tool(annotations=ToolAnnotations(
+        read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=True,
+    ))
+    async def compute_pause(task_id: str) -> dict[str, Any]:
+        """Pause an experiment, or a generic task and its pausable descendants."""
+
+        return await call(service.pause, task_id, owner)
+
+    @server.tool(annotations=ToolAnnotations(
+        read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
+    ))
+    async def compute_resume(task_id: str) -> dict[str, Any]:
+        """Resume a paused experiment or generic task."""
+
+        return await call(service.resume, task_id, owner)
 
     @server.tool(annotations=ToolAnnotations(
         read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True,

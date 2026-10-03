@@ -880,3 +880,317 @@ def test_cpu_only_allocation_has_zero_slots(monkeypatch):
         "allocationId": "c.1", "slots": 0,
     }}))
     assert client().get_allocation("c.1")["slots"] == 0
+
+
+# Generic tasks (Determined fork 0.40.1 and later).
+
+GENERIC_ID = "3f1c2b8e-1111-4c7a-9d55-0123456789ab"
+GENERIC_MARKER = "determined-compute:44444444-4444-4444-4444-444444444444"
+
+
+def generic_config():
+    return {
+        "name": "eval-shard",
+        "description": "Evaluate one shard",
+        "resources": {"slots": 1, "resource_pool": "gpu"},
+        "environment": {
+            "image": "image:tag",
+            "environment_variables": [f"COMPUTE_SUBMISSION_MARKER={GENERIC_MARKER}"],
+        },
+        "bind_mounts": [{"host_path": "/shared", "container_path": "/shared"}],
+        "entrypoint": ["/bin/bash", "-lc", "true"],
+    }
+
+
+def unknown_field(status, field):
+    # The master reports its strict config parse failure through the gateway error body.
+    return gateway_error(
+        status, 13 if status == 500 else 3, "Internal" if status == 500 else "InvalidArgument",
+        "yaml unmarshaling generic task config: error unmarshaling JSON: while decoding "
+        f'JSON: json: unknown field "{field}"',
+    )
+
+
+def test_generic_launch_sends_yaml_config_empty_context_and_options(monkeypatch):
+    import yaml
+
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs["json"]))
+        return Response(
+            {"taskId": GENERIC_ID, "warnings": ["LAUNCH_WARNING_CURRENT_SLOTS_EXCEEDED"]}
+        )
+
+    monkeypatch.setattr(requests, "post", post)
+    result = client().launch_task(
+        "generic", generic_config(), {"parentId": "parent-task", "noPause": True}
+    )
+
+    assert result == {
+        "id": GENERIC_ID,
+        "warnings": [
+            {"code": "launch_warning", "message": "LAUNCH_WARNING_CURRENT_SLOTS_EXCEEDED"}
+        ],
+    }
+    url, payload = calls[0]
+    assert url == "http://master:8080/api/v1/generic-tasks"
+    assert set(payload) == {"config", "contextDirectory", "parentId", "noPause"}
+    assert payload["contextDirectory"] == []
+    assert payload["parentId"] == "parent-task"
+    assert payload["noPause"] is True
+    assert "projectId" not in payload
+    assert yaml.safe_load(payload["config"]) == generic_config()
+
+
+@pytest.mark.parametrize(("status", "field"), [(500, "name"), (400, "name"), (500, "description")])
+def test_generic_launch_retries_once_without_display_fields(monkeypatch, status, field):
+    import yaml
+
+    calls = []
+    responses = [unknown_field(status, field), Response({"taskId": GENERIC_ID})]
+
+    def post(url, **kwargs):
+        calls.append(kwargs["json"])
+        return responses.pop(0)
+
+    monkeypatch.setattr(requests, "post", post)
+    result = client().launch_task("generic", generic_config())
+
+    assert result["id"] == GENERIC_ID
+    assert [item["code"] for item in result["warnings"]] == ["generic_task_metadata_unsupported"]
+    assert len(calls) == 2
+    assert yaml.safe_load(calls[0]["config"]) == generic_config()
+    retried = yaml.safe_load(calls[1]["config"])
+    expected = generic_config()
+    del expected["name"], expected["description"]
+    assert retried == expected
+    assert calls[1]["contextDirectory"] == []
+
+
+@pytest.mark.parametrize(
+    ("response", "error"),
+    [
+        (gateway_error(500, 13, "Internal", "resource pool gpu does not exist"),
+         SubmissionUncertainError),
+        (unknown_field(400, "debugger"), APIError),
+        (unknown_field(403, "name"), APIError),
+        (Response({"message": "bad gateway"}, 502), SubmissionUncertainError),
+    ],
+)
+def test_generic_launch_does_not_retry_other_failures(monkeypatch, response, error):
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(kwargs["json"])
+        return response
+
+    monkeypatch.setattr(requests, "post", post)
+    with pytest.raises(error):
+        client().launch_task("generic", generic_config())
+    assert len(calls) == 1
+
+
+def test_generic_launch_without_display_fields_does_not_retry(monkeypatch):
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(kwargs["json"])
+        return unknown_field(500, "name")
+
+    monkeypatch.setattr(requests, "post", post)
+    config = generic_config()
+    del config["name"], config["description"]
+    with pytest.raises(SubmissionUncertainError):
+        client().launch_task("generic", config)
+    assert len(calls) == 1
+
+
+def test_generic_retry_failure_is_reported_as_the_retry_outcome(monkeypatch):
+    responses = [unknown_field(500, "name"), Response({"message": "bad gateway"}, 502)]
+    monkeypatch.setattr(requests, "post", lambda *a, **k: responses.pop(0))
+    with pytest.raises(SubmissionUncertainError):
+        client().launch_task("generic", generic_config())
+    assert responses == []
+
+
+def test_generic_launch_requires_task_id_and_known_options(monkeypatch):
+    monkeypatch.setattr(requests, "post", lambda *a, **k: Response({"warnings": []}))
+    with pytest.raises(SubmissionUncertainError):
+        client().launch_task("generic", generic_config())
+    with pytest.raises(ValueError, match="projectId"):
+        client().launch_task("generic", generic_config(), {"projectId": 1})
+    with pytest.raises(ValueError, match="only to generic"):
+        client().launch_task("command", generic_config(), {"noPause": True})
+
+
+def test_get_generic_task_maps_state_and_reads_marker_from_config(monkeypatch):
+    requested = []
+    submitted = generic_config()
+    submitted["environment"]["environment_variables"].append("API_TOKEN=do-not-return")
+    responses = {
+        f"/api/v1/tasks/{GENERIC_ID}": Response({
+            "task": {
+                "taskId": GENERIC_ID,
+                "taskType": "TASK_TYPE_GENERIC",
+                "taskState": "GENERIC_TASK_STATE_PAUSED",
+                "startTime": "2026-10-01T00:00:00Z",
+                "allocations": [{"allocationId": f"{GENERIC_ID}.1", "state": "STATE_TERMINATED"}],
+            }
+        }),
+        f"/api/v1/tasks/{GENERIC_ID}/config": Response({"config": json.dumps(submitted)}),
+        "/api/v1/generic-tasks": Response({
+            "tasks": [{
+                "taskId": GENERIC_ID, "userId": 7, "username": "alice", "name": "eval-shard",
+                "state": "GENERIC_TASK_STATE_PAUSED",
+            }],
+            "pagination": {"limit": 0, "offset": 0, "startIndex": 0, "endIndex": 1, "total": 1},
+        }),
+    }
+
+    def get(url, **kwargs):
+        key = url.removeprefix("http://master:8080")
+        requested.append(key)
+        return responses[key]
+
+    monkeypatch.setattr(requests, "get", get)
+    task = client().get_task("generic", GENERIC_ID)
+
+    assert requested == [
+        f"/api/v1/tasks/{GENERIC_ID}", f"/api/v1/tasks/{GENERIC_ID}/config",
+        "/api/v1/generic-tasks",
+    ]
+    assert task["userId"] == 7
+    assert task["username"] == "alice"
+    assert task["id"] == GENERIC_ID
+    assert task["state"] == "STATE_PAUSED"
+    assert task["taskState"] == "GENERIC_TASK_STATE_PAUSED"
+    assert task["submissionMarker"] == GENERIC_MARKER
+    assert task["resourcePool"] == "gpu"
+    assert task["name"] == "eval-shard"
+    assert task["description"] == "Evaluate one shard"
+    assert task["config"]["environment"]["environment_variables"] == "[redacted]"
+    assert "do-not-return" not in json.dumps(task)
+
+
+def test_get_generic_task_rejects_another_task_type(monkeypatch):
+    monkeypatch.setattr(requests, "get", lambda *a, **k: Response({
+        "task": {"taskId": GENERIC_ID, "taskType": "TASK_TYPE_COMMAND", "allocations": []}
+    }))
+    with pytest.raises(APIError) as caught:
+        client().get_task("generic", GENERIC_ID)
+    assert caught.value.code == "kind_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("operation", "action", "body"),
+    [
+        ("cancel_task", "kill", {"taskId": GENERIC_ID, "killFromRoot": False}),
+        ("pause_task", "pause", {"taskId": GENERIC_ID}),
+        ("unpause_task", "unpause", {"taskId": GENERIC_ID}),
+    ],
+)
+def test_generic_control_routes(monkeypatch, operation, action, body):
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append((url, kwargs["json"]))
+        return Response({})
+
+    monkeypatch.setattr(requests, "post", post)
+    result = getattr(client(), operation)("generic", GENERIC_ID)
+    assert result == {"id": GENERIC_ID, "acknowledged": True}
+    assert calls == [(f"http://master:8080/api/v1/tasks/{GENERIC_ID}/{action}", body)]
+
+
+def test_generic_control_keeps_server_rejection_message(monkeypatch):
+    message = f"cannot pause task {GENERIC_ID} as it is in state 'PAUSED'"
+    monkeypatch.setattr(
+        requests, "post", lambda *a, **k: gateway_error(500, 13, "Internal", message)
+    )
+    with pytest.raises(SubmissionUncertainError) as caught:
+        client().pause_task("generic", GENERIC_ID)
+    assert message in str(caught.value)
+
+
+def test_generic_control_rejection_is_not_uncertain(monkeypatch):
+    # A master that refuses the change with a client error has not applied it.
+    message = f"cannot pause task {GENERIC_ID} as it is in state 'PAUSED'"
+    monkeypatch.setattr(
+        requests, "post", lambda *a, **k: gateway_error(400, 9, "FailedPrecondition", message)
+    )
+    with pytest.raises(APIError) as caught:
+        client().pause_task("generic", GENERIC_ID)
+    assert not isinstance(caught.value, SubmissionUncertainError)
+    assert message in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("operation", "action"), [("pause_task", "pause"), ("unpause_task", "activate")]
+)
+def test_experiment_pause_and_resume_routes(monkeypatch, operation, action):
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(url)
+        return Response({})
+
+    monkeypatch.setattr(requests, "post", post)
+    result = getattr(client(), operation)("experiment", "17")
+    assert result == {"id": "17", "acknowledged": True}
+    assert calls == [f"http://master:8080/api/v1/experiments/17/{action}"]
+
+
+def test_pause_rejects_other_kinds():
+    with pytest.raises(ValueError, match="only experiments and generic tasks"):
+        client().pause_task("command", "c1")
+    with pytest.raises(ValueError, match="only experiments and generic tasks"):
+        client().unpause_task("shell", "s1")
+
+
+def test_generic_discovery_lists_owned_tasks_newest_first(monkeypatch):
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs.get("params")))
+        return Response({
+            "tasks": [{
+                "taskId": GENERIC_ID, "userId": 7, "username": "alice", "name": "eval-shard",
+                "description": "", "state": "GENERIC_TASK_STATE_ACTIVE", "resourcePool": "gpu",
+                "startTime": "2026-10-01T00:00:00Z", "noPause": True,
+            }],
+            "pagination": {"limit": 5, "offset": 0, "startIndex": 0, "endIndex": 1, "total": 1},
+        })
+
+    monkeypatch.setattr(requests, "get", get)
+    page = client().list_remote_tasks("generic", user_id="7", limit=5)
+    assert calls == [(
+        "http://master:8080/api/v1/generic-tasks", {"userIds": [7], "limit": 5, "offset": 0},
+    )]
+    assert page["tasks"] == [{
+        "id": GENERIC_ID, "userId": 7, "username": "alice", "name": "eval-shard",
+        "state": "STATE_ACTIVE", "resourcePool": "gpu", "startTime": "2026-10-01T00:00:00Z",
+    }]
+
+
+@pytest.mark.parametrize("status", [404, 405, 501])
+def test_generic_discovery_on_a_master_without_the_list_is_unsupported(monkeypatch, status):
+    monkeypatch.setattr(
+        requests, "get", lambda *a, **k: gateway_error(status, 5, "NotFound", "Not Found")
+    )
+    with pytest.raises(APIError) as caught:
+        client().list_remote_tasks("generic", user_id="7")
+    assert caught.value.code == "unsupported"
+    assert "WU-CVGL/determined#27" in str(caught.value)
+
+
+def test_generic_logs_use_task_log_route(monkeypatch):
+    requested = []
+
+    def get(url, **kwargs):
+        requested.append(url)
+        return Response(lines=[json.dumps({"result": {"message": "done"}})])
+
+    monkeypatch.setattr(requests, "get", get)
+    assert client().task_logs("generic", GENERIC_ID, tail=5) == [{"message": "done"}]
+    assert requested == [f"http://master:8080/api/v1/tasks/{GENERIC_ID}/logs"]
