@@ -175,8 +175,13 @@ URL 和凭据：此时忽略环境中的 `DET_API_TOKEN`、`DET_USERNAME` 和 `D
 
 服务不再接受 `--db` 和 `--owner`，计算配置也不再接受 `cluster_identity`；请从 MCP client
 配置和计算配置中删除它们。服务不读取 `DETERMINED_COMPUTE_DB` 和 `DETERMINED_COMPUTE_OWNER`，
-可以取消设置。旧的任务数据库文件（默认为 `~/.local/state/determined-compute/tasks.sqlite3`）
-不会被读取，可以删除。用 `compute_list` 查找以前的任务。
+可以取消设置。
+
+服务既不读取、迁移，也不删除旧的任务数据库（默认为
+`~/.local/state/determined-compute/tasks.sqlite3`）。自行删除之前，请记下仍需要的工作的
+Determined 任务 ID（即 remote ID）。`compute_list` 能找到 Determined 仍在提供的该账户任务；
+Determined 不再提供的已结束 command 或 shell（结束 24 小时后，或 master 重启后）不会出现在
+其中。
 
 <a id="mcp-api"></a>
 ## MCP API
@@ -195,7 +200,7 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 | `compute_cancel` | `kind`、`id` | 任务摘要、远端取消响应和 `cancellation_acknowledged` |
 | `compute_pause` | `kind`、`id` | experiment 和 generic 任务：任务摘要、远端响应和 `pause_acknowledged` |
 | `compute_resume` | `kind`、`id` | experiment 和 generic 任务：任务摘要、远端响应和 `resume_acknowledged` |
-| `compute_list` | `kind`，可选 `limit=50`、`offset=0`、`marker` | 当前账户的一页任务，最新的在前；指定 `marker` 时只返回该次提交的任务 |
+| `compute_list` | `kind`，可选 `limit=50`、`offset=0`、`marker` | 当前账户的一页任务，最新的在前；指定 `marker` 时返回该页中配置带有该标记的任务 |
 | `compute_resources` | 可选 `slots=1`、`pool` | 当前调度容量和候选资源池 |
 | `storage_check` | `path` | 映射容器路径的访问情况 |
 | `storage_sync` | `local_dir`、`shared_dir`，可选 `dry_run=true` | 预览或把本地目录内容复制到共享存储 |
@@ -215,9 +220,10 @@ Determined 的任务 ID（command、shell 和 generic 任务为 UUID 字符串�
 `advisories`；对于 shell 还有 `reconnect_command`。请保存 kind 和 ID：服务不会记住它们。
 
 每次提交都会在提交的配置中加入一个随机的
-`COMPUTE_SUBMISSION_MARKER=determined-compute:<uuid>` 环境变量。服务不保存它，它只是查找
-依据：`compute_list(kind, marker=...)` 用它与每个任务存储的配置比对，`compute_status` 以
-`submission_marker` 报告它。请求不能设置这个变量。
+`COMPUTE_SUBMISSION_MARKER=determined-compute:<uuid>` 环境变量。服务不保存它。
+`compute_list(kind, marker=...)` 用它与每个任务存储的配置比对，`compute_status` 以
+`submission_marker` 报告它。它是关联标签，而不是身份：在本服务之外复制的配置（例如在 WebUI
+中 fork 的任务）带有同一个标记。请求不能设置这个变量。
 
 适配器把 command 和 shell 配置作为 mapping 发送；experiment 和 generic 任务配置会序列化为
 JSON 文本，master 的 YAML 解析器按字面读取该文本，因此 `y`、`n` 或 `1e-3` 这类字符串仍是
@@ -240,10 +246,14 @@ HTTP 5xx，或响应中没有任务 ID。此时 Determined 可能创建了任务
 {"error":{"code":"submission_uncertain","message":"The command submission is unconfirmed (...); ...","retryable":false,"details":{"kind":"command","submission_marker":"determined-compute:<uuid>"}}}
 ```
 
-再次提交之前，先调用 `compute_list(kind, marker=submission_marker)`。如果它返回一个任务，
-该任务就是这次提交，使用它的 ID；如果没有找到，说明 master 没有创建该任务，可以安全地重新
-提交。如果仍然出现了重复任务，用 `compute_cancel` 取消多余的那个。明确的拒绝（例如 HTTP
-400、401 或 403）是普通错误：没有提交任何任务。
+用 `compute_list(kind, marker=submission_marker)` 查找该任务，使用较小的 `limit`，需要时
+沿 `pagination.next_offset` 继续。它返回的每个任务都带有该标记。只返回一个任务时，它很可能
+就是这次提交；返回多个时，它们共用一份复制的配置，应把它们交给用户判断，而不是自行选择。
+空结果不能证明提交失败：每次搜索只覆盖一页，master 可能在搜索之后才保存任务，而且 Determined
+在已结束的 command 或 shell 结束 24 小时后不再提供它。不要自动再次提交；是否重新提交由用户
+在检查之后决定，例如在 WebUI 中查看，或稍后再次搜索。事后取消的重复任务可能已经产生了取消
+无法撤销的影响，例如已写入的文件。明确的拒绝（例如 HTTP 400、401 或 403）是普通错误：没有
+提交任何任务。
 
 在连接建立之前发生的失败（连接被拒绝、域名解析失败、连接超时或 HTTP 代理不可达）是可重试的
 `transport_error`：请求从未发出，因此没有创建任何任务。连接建立之后的所有失败，包括读取超时、
@@ -464,13 +474,12 @@ master；较旧的 master 返回 `unsupported`。
 
 `marker` 是形如 `determined-compute:<uuid>` 的提交标记，来自 `compute_launch` 的返回值或
 未确认提交的错误。列表条目不含配置，因此服务会从新到旧读取所选页中的每个任务（command、shell
-或 experiment 各一次请求，generic 任务三次），并与其存储配置中的标记比对。由于一个标记只属于
-一次提交，找到第一个匹配后即停止。搜索只覆盖所选的这一页。指定标记时，`tasks` 最多包含匹配
-的那个任务，该任务还带有 `submission_marker`；结果另外包含 `marker` 和 `searched`（读取的
-任务数）；找到匹配后 `pagination.next_offset` 为 `null`，否则指向下一页更早的任务。刚刚提交
-的任务位于最新的任务之中，所以较小的 `limit`（例如 5 或 10）可以让搜索保持简短；只有在此后
-又启动了很多任务时，才需要搜索更早的页。没有标记的任务（例如在 WebUI 中创建的任务）永远不会
-匹配。
+或 experiment 各一次请求，generic 任务三次），并返回存储配置中带有该标记的所有任务，每个任务
+都带有 `submission_marker`。标记是关联标签，所以可能有多个任务匹配，服务从不在其中自行选择。
+搜索只覆盖所选的这一页：结果另外包含 `marker` 和 `searched`（读取的任务数），
+`pagination.next_offset` 与普通列表一样指向下一页更早的任务。`tasks` 为空只表示该页中没有任务
+带有该标记。刚刚提交的任务位于最新的任务之中，所以较小的 `limit`（例如 5 或 10）可以让每次
+搜索保持简短。没有标记的任务（例如在 WebUI 中创建的任务）永远不会匹配。
 
 <a id="errors"></a>
 ### 错误

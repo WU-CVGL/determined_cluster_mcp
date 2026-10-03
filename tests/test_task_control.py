@@ -305,28 +305,61 @@ def test_identity_requires_numeric_user_id_and_does_not_use_fallback_fields(prof
     assert not any(call[1] == "api/v1/commands" for call in client.calls)
 
 
-def test_marker_search_reads_the_page_and_stops_at_the_match(profile):
+def test_marker_search_returns_every_match_on_the_page(profile):
+    # A marker is a correlation label: a config copied outside the service carries it too.
     service, client = service_for(profile)
-    newest = command_entity(OTHER_COMMAND_ID, startTime="2026-09-21T00:00:00Z")
-    match = command_entity()
-    older = command_entity("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
-    client.pages["command"] = page([newest, match, older], limit=10)
-    client.entities[("command", OTHER_COMMAND_ID)] = dict(newest, submissionMarker=OTHER_MARKER)
-    client.entities[("command", COMMAND_ID)] = dict(match, submissionMarker=MARKER)
+    first = command_entity()
+    other = command_entity(OTHER_COMMAND_ID, startTime="2026-09-21T00:00:00Z")
+    copy_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    copied = command_entity(copy_id, startTime="2026-09-22T00:00:00Z")
+    client.pages["command"] = page([copied, other, first], limit=10, total=12)
+    client.entities[("command", copy_id)] = dict(copied, submissionMarker=MARKER)
+    client.entities[("command", OTHER_COMMAND_ID)] = dict(other, submissionMarker=OTHER_MARKER)
+    client.entities[("command", COMMAND_ID)] = dict(first, submissionMarker=MARKER)
 
     result = service.list_tasks("command", limit=10, marker=MARKER)
 
-    assert [task["id"] for task in result["tasks"]] == [COMMAND_ID]
-    assert result["tasks"][0]["submission_marker"] == MARKER
+    assert [task["id"] for task in result["tasks"]] == [copy_id, COMMAND_ID]
+    assert {task["submission_marker"] for task in result["tasks"]} == {MARKER}
     assert result["marker"] == MARKER
-    assert result["searched"] == 2
-    assert result["pagination"]["next_offset"] is None
+    assert result["searched"] == 3
+    # The search does not end at a match: older pages may hold more.
+    assert result["pagination"]["next_offset"] == 3
     assert [call[1] for call in client.calls] == [
         "api/v1/me",
         "api/v1/commands",
+        f"api/v1/commands/{copy_id}",
         f"api/v1/commands/{OTHER_COMMAND_ID}",
         f"api/v1/commands/{COMMAND_ID}",
     ]
+
+
+def test_marker_search_continues_to_the_next_page(profile):
+    service, client = service_for(profile)
+    newer = [
+        command_entity(f"0000000{index}-0000-4000-8000-000000000000") for index in (1, 2)
+    ]
+    original = command_entity()
+    listing = newer + [original]
+    client.list_remote_tasks = lambda kind, *, user_id, limit, offset: copy.deepcopy(
+        page(listing[offset:offset + limit], limit=limit, offset=offset, total=len(listing))
+    )
+    for entity in newer:
+        client.entities[("command", entity["id"])] = dict(entity, submissionMarker=OTHER_MARKER)
+    client.entities[("command", COMMAND_ID)] = dict(original, submissionMarker=MARKER)
+
+    first = service.list_tasks("command", limit=2, marker=MARKER)
+
+    # An empty page is not a verdict: the result only reports where to continue.
+    assert first["tasks"] == []
+    assert first["searched"] == 2
+    assert first["pagination"]["next_offset"] == 2
+    assert set(first) == {"kind", "account", "tasks", "pagination", "marker", "searched"}
+
+    second = service.list_tasks("command", limit=2, offset=2, marker=MARKER)
+
+    assert [task["id"] for task in second["tasks"]] == [COMMAND_ID]
+    assert second["pagination"]["next_offset"] is None
 
 
 def test_marker_search_without_a_match_points_to_older_tasks(profile):

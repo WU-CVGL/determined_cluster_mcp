@@ -195,9 +195,14 @@ storage configuration. See [Shared-storage access](shared-storage-access.md).
 
 The server does not accept `--db` or `--owner`, and the profile does not accept
 `cluster_identity`; remove them from MCP client configurations and profiles.
-`DETERMINED_COMPUTE_DB` and `DETERMINED_COMPUTE_OWNER` are not read and can be unset. Old
-task database files, by default `~/.local/state/determined-compute/tasks.sqlite3`, are
-not read and can be deleted. Find earlier tasks with `compute_list`.
+`DETERMINED_COMPUTE_DB` and `DETERMINED_COMPUTE_OWNER` are not read and can be unset.
+
+The server neither reads, migrates, nor deletes an old task database, by default
+`~/.local/state/determined-compute/tasks.sqlite3`. Before you delete it yourself, note the
+Determined task IDs (the remote IDs) of any work you still need. `compute_list` finds the
+account's tasks that Determined still serves; an ended command or shell that Determined
+no longer serves, 24 hours after it ended or after a master restart, does not appear
+there.
 
 ## MCP API
 
@@ -215,7 +220,7 @@ positive integer for an experiment, which can also be passed as a numeric string
 | `compute_cancel` | `kind`, `id` | Task summary, remote cancellation response, and `cancellation_acknowledged` |
 | `compute_pause` | `kind`, `id` | Experiments and generic tasks: task summary, remote response, and `pause_acknowledged` |
 | `compute_resume` | `kind`, `id` | Experiments and generic tasks: task summary, remote response, and `resume_acknowledged` |
-| `compute_list` | `kind`, optional `limit=50`, `offset=0`, `marker` | One page of the account's tasks, newest first; with `marker`, only the task of that submission |
+| `compute_list` | `kind`, optional `limit=50`, `offset=0`, `marker` | One page of the account's tasks, newest first; with `marker`, the tasks on that page whose config carries it |
 | `compute_resources` | optional `slots=1`, `pool` | Current scheduler capacity and candidate pools |
 | `storage_check` | `path` | Access information for a mapped container path |
 | `storage_sync` | `local_dir`, `shared_dir`, optional `dry_run=true` | Preview or copy local directory contents to shared storage |
@@ -237,10 +242,11 @@ plan's `advisories`; and, for a shell, `reconnect_command`. Keep the kind and ID
 service does not remember them.
 
 Each launch adds a random `COMPUTE_SUBMISSION_MARKER=determined-compute:<uuid>`
-environment variable to the submitted config. The service does not store it. It is a
-lookup key: `compute_list(kind, marker=...)` matches it against each task's stored
-config, and `compute_status` reports it as `submission_marker`. A request cannot set
-this variable.
+environment variable to the submitted config. The service does not store it.
+`compute_list(kind, marker=...)` matches it against each task's stored config, and
+`compute_status` reports it as `submission_marker`. It is a correlation label, not an
+identity: a config copied outside this service, such as a task forked in the WebUI,
+carries the same marker. A request cannot set this variable.
 
 The adapter sends command and shell configs as mappings. It serializes experiment and
 generic task configs as JSON text, which the master's YAML parser reads literally, so a
@@ -265,11 +271,17 @@ message names the next step and whose `details` carry `kind` and `submission_mar
 {"error":{"code":"submission_uncertain","message":"The command submission is unconfirmed (...); ...","retryable":false,"details":{"kind":"command","submission_marker":"determined-compute:<uuid>"}}}
 ```
 
-Before launching again, call `compute_list(kind, marker=submission_marker)`. If it
-returns a task, that task is the submission; use its ID. If it finds none, the master
-did not create the task, and a new launch is safe. If a duplicate starts anyway, cancel
-the extra task with `compute_cancel`. A definite rejection, such as HTTP 400, 401, or
-403, is an ordinary error: nothing was submitted.
+Look for the task with `compute_list(kind, marker=submission_marker)`, with a small
+`limit`, and follow `pagination.next_offset` when needed. Every task it returns carries
+the marker. One returned task is most likely the submission; several share a copied
+config, so show them to the user instead of choosing one. An empty result does not prove
+that the submission failed: each search covers one page, the master may store the task
+after the search, and Determined stops serving an ended command or shell after 24 hours.
+Do not launch again automatically. Whether to submit again is the user's decision after
+checking, for example in the WebUI or with a later search. A duplicate cancelled
+afterwards may already have had effects, such as files it wrote, that cancelling does not
+undo. A definite rejection, such as HTTP 400, 401, or 403, is an ordinary error: nothing
+was submitted.
 
 A failure before any connection was open (a refused connection, a failed name lookup, a
 connect timeout, or an unreachable HTTP proxy) is a retryable `transport_error`: the
@@ -535,15 +547,15 @@ with WU-CVGL/determined#27; an older master returns `unsupported`.
 `marker` is a submission marker of the form `determined-compute:<uuid>`, as returned by
 `compute_launch` or by an unconfirmed launch. List entries do not contain the config, so
 the service reads each task of the selected page, newest first, with one request for a
-command, shell, or experiment and three for a generic task, and compares the marker in
-its stored config. It stops at the first match, because a marker belongs to one
-submission. The search covers only the selected page. With a marker, `tasks` holds at
-most the matching task, which also has `submission_marker`; the result adds `marker` and
-`searched`, the number of tasks read; and `pagination.next_offset` is `null` after a
-match and otherwise points to the next older page. A task launched moments ago is among
-the newest, so a small `limit` such as 5 or 10 keeps the search short; search older
-pages only when many tasks have started since. A task without a marker, such as one
-created in the WebUI, never matches.
+command, shell, or experiment and three for a generic task, and returns every task whose
+stored config carries the marker, each with `submission_marker`. A marker is a
+correlation label, so more than one task can match, and the service never chooses among
+them. The search covers only the selected page: the result adds `marker` and `searched`,
+the number of tasks read, and `pagination.next_offset` points to the next older page as
+for any listing. An empty `tasks` list means only that no task on that page carries the
+marker. A task launched moments ago is among the newest, so a small `limit` such as 5 or
+10 keeps each search short. A task without a marker, such as one created in the WebUI,
+never matches.
 
 ### Errors
 

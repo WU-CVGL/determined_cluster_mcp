@@ -711,9 +711,11 @@ class ComputeService:
     @staticmethod
     def _uncertain(kind: str, marker: str, reason: str) -> SubmissionUncertainError:
         error = SubmissionUncertainError(
-            f"The {kind} submission is unconfirmed ({reason}); Determined may or may not "
-            f"have created it. Do not launch again until compute_list(kind={kind!r}, "
-            f"marker={marker!r}) finds no matching task; if it finds one, use that task."
+            f"The {kind} submission is unconfirmed ({reason}); Determined may or may not have "
+            f"created it, and it may still appear. Look for it with compute_list(kind={kind!r}, "
+            f"marker={marker!r}). An empty result does not prove that the submission failed. "
+            "Do not launch again automatically: whether to resubmit is the user's decision "
+            "after checking."
         )
         error.details = {"kind": kind, "submission_marker": marker}
         return error
@@ -1192,8 +1194,9 @@ class ComputeService:
     ) -> Dict[str, Any]:
         """List one page of the account's tasks of one kind, newest first.
 
-        With a marker, only the tasks of that page are searched, each with one
-        detail read, and the search stops at the first match.
+        With a marker, each task of that page is read once and every task whose stored config
+        carries the marker is returned. A marker is a correlation label, not an identity: a
+        config copied outside this service carries the same one, so several tasks can match.
         """
         kind = self._task_kind(kind)
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
@@ -1226,7 +1229,6 @@ class ComputeService:
         ):
             raise APIError("Remote task pagination is malformed", code="invalid_response")
         tasks: List[Dict[str, Any]] = []
-        searched = 0
         for listed in page["tasks"]:
             self._check_remote_owner(kind, listed, user["id"])
             try:
@@ -1236,7 +1238,6 @@ class ComputeService:
             if marker is None:
                 tasks.append(self._summary(kind, remote_id, listed))
                 continue
-            searched += 1
             entity = self.client.get_task(kind, remote_id)
             self._check_remote_entity(kind, remote_id, entity, user["id"])
             if entity.get("submissionMarker") == marker:
@@ -1244,9 +1245,7 @@ class ComputeService:
                     **self._summary(kind, remote_id, {**listed, **entity}),
                     "submission_marker": marker,
                 })
-                # A marker is unique to one submission, so the search is complete.
-                break
-        next_offset = offset + (searched if marker is not None else len(tasks))
+        next_offset = offset + len(page["tasks"])
         result: Dict[str, Any] = {
             "kind": kind,
             "account": user,
@@ -1264,9 +1263,7 @@ class ComputeService:
         }
         if marker is not None:
             result["marker"] = marker
-            result["searched"] = searched
-            if tasks:
-                result["pagination"]["next_offset"] = None
+            result["searched"] = len(page["tasks"])
         return result
 
     @staticmethod

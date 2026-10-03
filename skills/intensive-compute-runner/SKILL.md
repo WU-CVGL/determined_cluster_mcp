@@ -40,7 +40,7 @@ If the client lacks cluster mounts, read [the shared-storage access guide](../..
 
 Never include credentials in requests, configs, logs, or reports. A launch with `allow_queue: false` performs admission checking and rejects busy or unknown capacity without submitting; `true` explicitly permits scheduler queueing.
 
-If `compute_launch` returns `submission_uncertain`, do not submit again blindly. Call `compute_list(kind, marker=...)` with the `submission_marker` from the error details and a small `limit`: a returned task is the submission; if none is found, the task was not created and a new launch is safe. Cancel any duplicate that starts anyway. If authentication fails, stop and report the configuration problem; do not fall back to local execution.
+If `compute_launch` returns `submission_uncertain`, do not submit again automatically. Look for the task with `compute_list(kind, marker=...)`, using the `submission_marker` from the error details and a small `limit`. One match is most likely the submission; several matches share a copied config, so ask the user. An empty result does not prove that the submission failed; report the unconfirmed launch and let the user decide whether to submit again. If authentication fails, stop and report the configuration problem; do not fall back to local execution.
 
 ## Report
 

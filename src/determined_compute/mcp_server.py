@@ -88,9 +88,10 @@ def create_server(
             "Keep code and data on shared mounts; use storage_check/sync/fetch for file access. "
             "Plan before launch. Every launch is a new submission: the server keeps no task "
             "records, so keep the returned kind and id, which are Determined's own task ID. "
-            "If a launch is unconfirmed, check compute_list(kind, marker=...) before launching "
-            "again. Use compute_list to find the account's tasks and compute_usage to check a "
-            "task's measured CPU, memory, and GPU use. "
+            "If a launch is unconfirmed, look for it with compute_list(kind, marker=...); an "
+            "empty result does not prove it failed, so never launch again automatically: "
+            "resubmitting is the user's decision. Use compute_list to find the account's tasks "
+            "and compute_usage to check a task's measured CPU, memory, and GPU use. "
             "Experiments and generic tasks can be paused and resumed; a resumed experiment "
             "continues from its trials' latest checkpoints, a resumed generic task reruns its "
             "command from the start. "
@@ -126,8 +127,8 @@ def create_server(
     async def compute_launch(request: dict[str, Any]) -> dict[str, Any]:
         """Submit a request once and return its kind and Determined id; checks capacity unless allow_queue=true.
 
-        Every call is a new submission. On an unconfirmed outcome, check compute_list with the
-        returned marker before launching again.
+        Every call is a new submission. On an unconfirmed outcome, look for the task with
+        compute_list and the returned marker, and leave any resubmission to the user.
         """
 
         return await call(service.launch, request)
@@ -201,7 +202,7 @@ def create_server(
     ) -> dict[str, Any]:
         """List one page of the account's tasks of one kind, newest first.
 
-        With marker, search only that page (one read per task) for the task of one submission.
+        With marker, return the tasks on that page (one read each) whose config carries it.
         """
 
         return await call(service.list_tasks, kind, limit, offset, marker)

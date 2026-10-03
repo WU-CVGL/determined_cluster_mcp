@@ -698,11 +698,66 @@ def test_uncertain_launch_returns_the_marker_and_is_not_retried(
     assert error.details == {"kind": kind, "submission_marker": marker}
     assert "unconfirmed" in str(error)
     assert f"compute_list(kind={kind!r}, marker={marker!r})" in str(error)
+    assert "does not prove that the submission failed" in str(error)
 
     # The marker finds the task the master did create, without launching again.
     found = service.list_tasks(kind, marker=marker)
     assert [task["submission_marker"] for task in found["tasks"]] == [marker]
     assert len(client.launches) == 1
+
+
+def test_a_task_that_appears_after_an_empty_search_is_found_and_never_relaunched(
+    profile, command_request
+):
+    class Slow(FakeClient):
+        """The master stores the task only after the client gave up waiting."""
+
+        def launch_task(self, kind, config, options=None):
+            self.pending = (kind, config, options)
+            self.launches.append((kind, copy.deepcopy(config)))
+            raise SubmissionUncertainError("Determined mutation outcome is unknown")
+
+    client = Slow()
+    service = ComputeService(client, profile)
+
+    with pytest.raises(SubmissionUncertainError) as caught:
+        service.launch(dict(command_request, allow_queue=True))
+
+    message = str(caught.value)
+    assert "does not prove that the submission failed" in message
+    assert "Do not launch again automatically" in message
+    assert "safe" not in message and "not created" not in message
+    marker = caught.value.details["submission_marker"]
+    assert service.list_tasks("command", marker=marker)["tasks"] == []
+
+    kind, config, options = client.pending
+    client.launches.pop()
+    remote_id, _entity = client._create(kind, config, options)
+    found = service.list_tasks("command", marker=marker)
+
+    assert [task["id"] for task in found["tasks"]] == [remote_id]
+    # The service never submitted the request a second time.
+    assert len(client.launches) == 1
+
+
+def test_a_fresh_service_continues_by_native_id_without_local_files(
+    tmp_path, monkeypatch, profile, command_request
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    master = FakeClient()
+    launched = ComputeService(master, profile).launch(dict(command_request, allow_queue=True))
+
+    # A new process: a new client and service that share nothing but the master's state.
+    client = FakeClient()
+    client.entities = master.entities
+    fresh = ComputeService(client, profile)
+
+    assert fresh.status("command", launched["id"])["state"] == "QUEUED"
+    assert fresh.logs("command", launched["id"], 3) == [{"message": "ok"}]
+    assert fresh.cancel("command", launched["id"])["cancellation_acknowledged"] is True
+    assert client.cancel_calls == [("command", launched["id"])]
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_definite_rejection_is_not_reported_as_uncertain(profile, command_request):

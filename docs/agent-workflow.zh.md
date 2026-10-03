@@ -100,7 +100,7 @@ MCP 不接受 `kind: notebook`。
 
 调用一次 `compute_launch(request)`。它返回任务的 `kind` 和 `id`，即 Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，experiment 为整数。之后的所有工具都使用这一对值。MCP 不保存这次提交的记录，所以请把 kind、ID、名称和 `submission_marker` 写入自己的工作记录。每次调用都是一次新的提交：用同一请求再次调用 `compute_launch` 会启动第二个任务。
 
-如果提交返回 `submission_uncertain`，说明提交未确认：Determined 可能创建了任务，也可能没有。此时不要再次提交，而是用错误 details 中的 `submission_marker` 调用 `compute_list(kind, marker=...)`。返回的任务就是这次提交，继续使用它的 ID；如果没有找到，说明任务没有创建，可以再次提交。如果仍然出现了重复任务，用 `compute_cancel` 取消多余的那个。参见[故障排查](troubleshooting.zh.md#submission-outcome-is-uncertain)。
+如果提交返回 `submission_uncertain`，说明提交未确认：Determined 可能创建了任务，也可能没有，任务也可能稍后才出现。不要自动再次提交。用错误 details 中的 `submission_marker` 和较小的 `limit` 调用 `compute_list(kind, marker=...)`。只返回一个任务时，它很可能就是这次提交，继续使用它的 ID；返回多个任务时，它们共用一份复制的配置，应交给用户判断，而不是自行选择。空结果不能证明提交失败，因为每次搜索只覆盖一页，master 也可能稍后才保存任务。报告这次未确认的提交，是否重新提交由用户决定。参见[故障排查](troubleshooting.zh.md#submission-outcome-is-uncertain)。
 
 <a id="monitor-and-accept-the-result"></a>
 ## 跟踪并验收结果
@@ -142,7 +142,7 @@ master 拒绝的暂停或恢复（例如暂停已暂停的任务）会以错误�
 
 `compute_list(kind, limit=50, offset=0)` 按从新到旧列出已认证 Determined 账户拥有的任务，无论它们是通过本 MCP、WebUI、原生 CLI 还是另一台设备提交的。每个条目包含 kind、ID、名称、状态、资源池和开始时间，`pagination.next_offset` 指向下一页。把 kind 和 ID 用于 `compute_status`、`compute_logs`、`compute_usage`、`compute_cancel`、`compute_pause` 和 `compute_resume`。列表是只读的。generic 任务需要带有 research-cluster fork generic 任务列表（WU-CVGL/determined#27）的 master；较旧的 master 返回 `unsupported`。
 
-指定 `marker` 时，`compute_list` 只返回某一次提交的任务。它会读取所选页中的每个任务，所以查找刚刚提交的任务时，应使用较小的 `limit`，例如 5 或 10。
+指定 `marker` 时，`compute_list` 返回所选页中配置带有该提交标记的任务。它会读取该页中的每个任务，所以查找刚刚提交的任务时，应使用较小的 `limit`（例如 5 或 10），并沿 `pagination.next_offset` 查看更早的页。标记是关联标签而不是身份：在 MCP 之外复制的配置带有同一个标记，所以可能有多个任务匹配；某一页为空也不能说明任务从未创建。
 
 <a id="ownership-and-records"></a>
 ## 所有权与记录

@@ -93,7 +93,7 @@ Call `compute_plan(request)` and inspect the resolved kind, image, pool, mounts,
 
 Call `compute_launch(request)` once. It returns the task's `kind` and `id`, Determined's own task ID: a UUID for a command, shell, or generic task and an integer for an experiment. Every later tool takes this pair. The MCP keeps no record of the launch, so write the kind, ID, name, and `submission_marker` into your own work record. Every call is a new submission: calling `compute_launch` again with the same request starts a second task.
 
-If the launch returns `submission_uncertain`, the submission is unconfirmed: Determined may or may not have created the task. Do not launch again yet. Call `compute_list(kind, marker=...)` with the `submission_marker` from the error details. A returned task is your submission; continue with its ID. If none is found, the task was not created and you can launch again. If a duplicate is created anyway, cancel the extra task with `compute_cancel`. See [troubleshooting](troubleshooting.md#submission-outcome-is-uncertain).
+If the launch returns `submission_uncertain`, the submission is unconfirmed: Determined may or may not have created the task, and it may still appear. Do not launch again automatically. Call `compute_list(kind, marker=...)` with the `submission_marker` from the error details and a small `limit`. One returned task is most likely your submission; continue with its ID. Several returned tasks share a copied config; show them to the user instead of choosing one. An empty result does not prove that the submission failed, because each search covers one page and the master may store the task later. Report the unconfirmed launch and leave the decision to submit again to the user. See [troubleshooting](troubleshooting.md#submission-outcome-is-uncertain).
 
 ## Monitor and accept the result
 
@@ -132,7 +132,7 @@ Give a generic task a meaningful `name` and `description` as for any launch; Det
 
 `compute_list(kind, limit=50, offset=0)` lists the tasks owned by the authenticated Determined account, newest first, whether they were launched through this MCP, the WebUI, the native CLI, or another device. Each entry has the kind, ID, name, state, resource pool, and start time, and `pagination.next_offset` points to the next page. Use the kind and ID with `compute_status`, `compute_logs`, `compute_usage`, `compute_cancel`, `compute_pause`, and `compute_resume`. Listing is read-only. Generic tasks need a master with the research-cluster fork's generic task list (WU-CVGL/determined#27); an older master returns `unsupported`.
 
-With `marker`, `compute_list` returns only the task of one submission. It reads each task of the selected page, so keep `limit` small, such as 5 or 10, when you look for a launch you just made.
+With `marker`, `compute_list` returns the tasks on the selected page whose config carries that submission marker. It reads each task of the page, so keep `limit` small, such as 5 or 10, when you look for a launch you just made, and follow `pagination.next_offset` to older pages. A marker is a correlation label, not an identity: a config copied outside the MCP carries the same one, so more than one task can match, and an empty page does not show that a task was never created.
 
 ## Ownership and records
 

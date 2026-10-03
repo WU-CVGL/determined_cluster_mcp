@@ -323,3 +323,74 @@ def test_removed_task_store_options_are_rejected(option, capsys):
     with pytest.raises(SystemExit):
         build_parser().parse_args(["--profile", "profile.yaml", option, "value"])
     assert "unrecognized arguments" in capsys.readouterr().err
+
+
+class _Master:
+    """The state of a Determined master, shared by the clients of two MCP processes."""
+
+    def __init__(self):
+        self.entities = {}
+        self.cancelled = []
+
+
+class _MasterClient:
+    api_url = "https://det.example.test"
+
+    def __init__(self, master):
+        self.master = master
+
+    def get_current_user(self):
+        return {"id": "7", "username": "alice"}
+
+    def launch_task(self, kind, config):
+        entity = {"id": COMMAND_ID, "userId": 7, "state": "QUEUED",
+                  "description": config["description"]}
+        self.master.entities[(kind, COMMAND_ID)] = entity
+        return dict(entity)
+
+    def get_task(self, kind, task_id):
+        return dict(self.master.entities[(kind, task_id)])
+
+    def task_logs(self, kind, task_id, tail):
+        return [{"message": f"{kind} {task_id} log"}]
+
+    def cancel_task(self, kind, task_id):
+        self.master.cancelled.append((kind, task_id))
+        return {"id": task_id, "state": "TERMINATING"}
+
+
+def test_a_new_server_process_continues_by_native_id(tmp_path, monkeypatch):
+    from determined_compute.compute import ComputeProfile, ComputeService
+
+    monkeypatch.chdir(tmp_path)
+    profile = ComputeProfile.from_dict({
+        "mounts": [{"host_path": "/shared", "container_path": "/shared"}],
+        "defaults": {"image": "image", "pool": "pool"},
+    })
+    master = _Master()
+    request = {"name": "probe", "command": "true", "workdir": "/shared/work",
+               "output_dir": "/shared/out", "allow_queue": True}
+
+    async def launch():
+        server = create_server(ComputeService(_MasterClient(master), profile))
+        async with Client(server) as client:
+            return _structured(await client.call_tool("compute_launch", {"request": request}))
+
+    async def continue_in_a_new_process(task):
+        server = create_server(ComputeService(_MasterClient(master), profile))
+        async with Client(server) as client:
+            arguments = {"kind": task["kind"], "id": task["id"]}
+            status = _structured(await client.call_tool("compute_status", arguments))
+            logs = _structured(await client.call_tool("compute_logs", {**arguments, "tail": 2}))
+            cancel = _structured(await client.call_tool("compute_cancel", arguments))
+            return status, logs, cancel
+
+    task = asyncio.run(asyncio.wait_for(launch(), timeout=10))
+    status, logs, cancel = asyncio.run(asyncio.wait_for(continue_in_a_new_process(task), 10))
+
+    assert (task["kind"], task["id"]) == ("command", COMMAND_ID)
+    assert status["name"] == "probe" and status["state"] == "QUEUED"
+    assert logs == {"result": [{"message": f"command {COMMAND_ID} log"}]}
+    assert cancel["cancellation_acknowledged"] is True
+    assert master.cancelled == [("command", COMMAND_ID)]
+    assert list(tmp_path.iterdir()) == []
