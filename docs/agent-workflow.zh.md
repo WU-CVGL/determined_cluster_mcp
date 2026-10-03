@@ -32,7 +32,7 @@
 
 - `command` 在容器中运行一次你的命令，命令退出即结束。用于有限的非交互任务，例如评估、转换或构建。
 - `shell` 提供一个可通过 SSH 连接的容器，而不是运行一个命令。用于交互调试和环境检查。
-- `generic` 像 `command` 一样运行一次你的命令，并带有名称和子任务；以 `pausable: true` 提交时，还可以暂停以释放其槽位，之后以同一任务 ID 恢复。恢复时会在新容器中从头再次运行命令，失败后也不会自动重启，所以只在任务可安全重跑时才设为可暂停；见[暂停与恢复](#pause-and-resume)。它要求 Determined master 来自 research-cluster fork 0.40.1 或更高版本，`kind: auto` 从不选择它。
+- `generic` 像 `command` 一样运行一次你的命令，并带有名称和子任务；以 `pausable: true` 提交时，还可以暂停以释放其槽位，之后以同一任务 ID 恢复。恢复时会在新容器中从头再次运行命令，失败后也不会自动重启，所以只在任务可安全重跑时才设为可暂停；见[暂停与恢复](#pause-and-resume)。它要求 Determined master 来自带有 WU-CVGL/determined#27 的 research-cluster fork，该版本能列出 generic 任务及其所有者；在较旧的 master 上，提交会在创建任何内容之前以 `unsupported` 失败。`kind: auto` 从不选择它。
 - `experiment` 将你的命令作为一个或多个 trial 运行，并增加 Determined 的实验功能：
   - searcher（在 `experiment_config.searcher` 中设置）：运行单个 trial，或在超参数空间上运行多个 trial（网格、随机，或提前停止较差 trial 的自适应搜索）；
   - 自动重启：失败的 trial（包括其 agent 丢失的情况）会重新启动，最多 `max_restarts` 次（Determined 默认值为 5）；
@@ -135,7 +135,7 @@ master 拒绝的暂停或恢复（例如暂停已暂停的任务）会以错误�
 
 `compute_cancel` 会终止 generic 任务及其所有后代。退出状态 0 使 generic 任务以 `STATE_COMPLETED` 结束；非零退出或 agent 丢失使其以 `STATE_ERROR` 结束，且不会重启。
 
-与其他提交一样，为 generic 任务设置有意义的 `name` 和 `description`。不支持 generic 任务名称的旧 master 会拒绝它们；服务随后会去掉这两个字段提交一次，并返回 `generic_task_metadata_unsupported` 警告。该警告仅供参考。此时任务在 WebUI 和 `compute_list` 中都没有名称，因此应把它的 ID 与你选定的名称一起记录下来。
+与其他提交一样，为 generic 任务设置有意义的 `name` 和 `description`；Determined 会保存它们，并在 WebUI 和 `compute_list` 中显示。
 
 <a id="find-existing-tasks"></a>
 ## 查找已有任务

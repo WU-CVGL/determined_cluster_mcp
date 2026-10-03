@@ -119,9 +119,13 @@ omitted, Determined applies its cluster default, which offline planning cannot i
 
 A generic task is Determined's lower-level task type: one container that runs an
 entrypoint, with no trials, searcher, or checkpoint lifecycle, which can have child tasks
-and, when launched with `pausable: true`, be paused and resumed. It requires a Determined master from the
-research-cluster fork 0.40.1 or later. Its plan is a command plan with these
-differences:
+and, when launched with `pausable: true`, be paused and resumed. It requires a Determined
+master from the research-cluster fork with WU-CVGL/determined#27, which lists generic
+tasks with their owners; without that list the service could create a generic task but
+never verify its owner, so it could not manage it. Before submitting a generic task, the
+service reads one entry of the list (`GET /api/v1/generic-tasks?limit=1`), and a master
+that answers HTTP 404, 405, or 501 makes the launch fail with `unsupported` before
+anything is created. Its plan is a command plan with these differences:
 
 - The config carries `name`, `description` when set, and `preemption_timeout` when set,
   next to the same `entrypoint`, `resources`, `environment`, and `bind_mounts` as a
@@ -246,15 +250,8 @@ experiment, and sends a generic task config with an empty `contextDirectory`, no
 rejects source upload aliases, never creates a project, removes API envelopes, redacts
 secrets from returned entities, and returns an entity with an `id`.
 
-The generic task `name` and `description` config fields exist only on newer masters;
-an older master rejects them as unknown fields while strictly parsing the config. That
-parse happens before the master stores anything, so when the create request fails with
-HTTP 400 or 500 and the message names the unknown field `name` or `description`, the
-adapter retries once without both fields. The launch result then carries `warnings` with
-a `generic_task_metadata_unsupported` entry; its `name` and `description` are the
-requested values, which Determined does not store. No other failure is retried. Master
-launch warnings, such as a request exceeding current slots, appear in `warnings` with
-code `launch_warning`.
+No launch is retried. Master launch warnings for a generic task, such as a request
+exceeding current slots, appear in `warnings` with code `launch_warning`.
 
 ### Unconfirmed launches
 

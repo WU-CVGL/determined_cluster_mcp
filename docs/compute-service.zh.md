@@ -111,8 +111,12 @@ experiment 必须提供 `command` 或 `experiment_config.entrypoint`，但不能
 ### Generic 任务
 
 generic 任务是 Determined 较底层的任务类型：一个运行入口命令的容器，没有 trial、searcher
-或 checkpoint 生命周期，可以有子任务；以 `pausable: true` 提交时还可以暂停和恢复。它要求 Determined master 来自
-research-cluster fork 0.40.1 或更高版本。它的规划与 command 相同，区别如下：
+或 checkpoint 生命周期，可以有子任务；以 `pausable: true` 提交时还可以暂停和恢复。它要求
+Determined master 来自带有 WU-CVGL/determined#27 的 research-cluster fork，该版本能列出
+generic 任务及其所有者；没有该列表时，服务虽能创建 generic 任务，却无法验证其所有者，因而
+无法管理它。提交 generic 任务之前，服务先读取该列表的一个条目
+（`GET /api/v1/generic-tasks?limit=1`）；master 返回 HTTP 404、405 或 501 时，提交在创建任何
+内容之前以 `unsupported` 失败。它的规划与 command 相同，区别如下：
 
 - 配置除了与 command 相同的 `entrypoint`、`resources`、`environment` 和 `bind_mounts` 外，
   还包含 `name`、已设置时的 `description`，以及已设置时的 `preemption_timeout`。
@@ -221,12 +225,8 @@ JSON 文本，master 的 YAML 解析器按字面读取该文本，因此 `y`、`
 `parentId`、`inheritContext` 和 `noPause` 选项一起发送，不带 `projectId`。适配器拒绝源码上传别名，从不
 自动创建项目，会移除 API envelope、从返回的实体中去除机密，并返回含 `id` 的实体。
 
-generic 任务配置中的 `name` 和 `description` 字段只存在于较新的 master；较旧的 master 在
-严格解析配置时会把它们当作未知字段拒绝。该解析发生在 master 存储任何内容之前，所以当创建
-请求以 HTTP 400 或 500 失败、且消息指出未知字段 `name` 或 `description` 时，适配器会去掉
-这两个字段重试一次。此时提交结果带有 `warnings`，其中包含 `generic_task_metadata_unsupported`
-条目；结果中的 `name` 和 `description` 是请求的值，Determined 不会保存它们。其他失败都不会
-重试。master 的提交警告（例如请求超过当前 slot）以代码 `launch_warning` 出现在 `warnings` 中。
+提交不会重试。generic 任务的 master 提交警告（例如请求超过当前 slot）以代码
+`launch_warning` 出现在 `warnings` 中。
 
 <a id="unconfirmed-launches"></a>
 ### 未确认的提交

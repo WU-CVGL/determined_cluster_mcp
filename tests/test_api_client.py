@@ -1042,42 +1042,19 @@ def test_generic_launch_sends_config_text_empty_context_and_options(monkeypatch)
     assert json.loads(payload["config"]) == generic_config()
 
 
-@pytest.mark.parametrize(("status", "field"), [(500, "name"), (400, "name"), (500, "description")])
-def test_generic_launch_retries_once_without_display_fields(monkeypatch, status, field):
-    import yaml
-
-    calls = []
-    responses = [unknown_field(status, field), Response({"taskId": GENERIC_ID})]
-
-    def post(url, **kwargs):
-        calls.append(kwargs["json"])
-        return responses.pop(0)
-
-    monkeypatch.setattr(requests, "post", post)
-    result = client().launch_task("generic", generic_config())
-
-    assert result["id"] == GENERIC_ID
-    assert [item["code"] for item in result["warnings"]] == ["generic_task_metadata_unsupported"]
-    assert len(calls) == 2
-    assert yaml.safe_load(calls[0]["config"]) == generic_config()
-    retried = yaml.safe_load(calls[1]["config"])
-    expected = generic_config()
-    del expected["name"], expected["description"]
-    assert retried == expected
-    assert calls[1]["contextDirectory"] == []
-
-
 @pytest.mark.parametrize(
     ("response", "error"),
     [
         (gateway_error(500, 13, "Internal", "resource pool gpu does not exist"),
          SubmissionUncertainError),
         (unknown_field(400, "debugger"), APIError),
+        (unknown_field(400, "name"), APIError),
+        (unknown_field(500, "name"), SubmissionUncertainError),
         (unknown_field(403, "name"), APIError),
         (Response({"message": "bad gateway"}, 502), SubmissionUncertainError),
     ],
 )
-def test_generic_launch_does_not_retry_other_failures(monkeypatch, response, error):
+def test_generic_launch_is_sent_once_whatever_the_failure(monkeypatch, response, error):
     calls = []
 
     def post(url, **kwargs):
@@ -1090,27 +1067,25 @@ def test_generic_launch_does_not_retry_other_failures(monkeypatch, response, err
     assert len(calls) == 1
 
 
-def test_generic_launch_without_display_fields_does_not_retry(monkeypatch):
-    calls = []
+def test_generic_task_list_probe(monkeypatch):
+    requested = []
 
-    def post(url, **kwargs):
-        calls.append(kwargs["json"])
-        return unknown_field(500, "name")
+    def get(url, **kwargs):
+        requested.append((url, kwargs.get("params")))
+        return Response({"tasks": [], "pagination": {}})
 
-    monkeypatch.setattr(requests, "post", post)
-    config = generic_config()
-    del config["name"], config["description"]
-    with pytest.raises(SubmissionUncertainError):
-        client().launch_task("generic", config)
-    assert len(calls) == 1
+    monkeypatch.setattr(requests, "get", get)
+    client().require_generic_task_list()
+    assert requested == [("http://master:8080/api/v1/generic-tasks", {"limit": 1})]
 
 
-def test_generic_retry_failure_is_reported_as_the_retry_outcome(monkeypatch):
-    responses = [unknown_field(500, "name"), Response({"message": "bad gateway"}, 502)]
-    monkeypatch.setattr(requests, "post", lambda *a, **k: responses.pop(0))
-    with pytest.raises(SubmissionUncertainError):
-        client().launch_task("generic", generic_config())
-    assert responses == []
+@pytest.mark.parametrize("status", [404, 405, 501])
+def test_generic_task_list_probe_reports_an_older_master_as_unsupported(monkeypatch, status):
+    monkeypatch.setattr(requests, "get", lambda *a, **k: Response({"message": "no"}, status))
+    with pytest.raises(APIError) as caught:
+        client().require_generic_task_list()
+    assert caught.value.code == "unsupported"
+    assert "WU-CVGL/determined#27" in str(caught.value)
 
 
 def test_generic_launch_requires_task_id_and_known_options(monkeypatch):

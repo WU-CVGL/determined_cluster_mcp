@@ -117,7 +117,7 @@ HTTP 503 表示测量后端繁忙或不可用；每个 master 同时最多运行
 <a id="a-task-operation-is-refused"></a>
 ## 任务操作被拒绝
 
-MCP 只操作已认证账户拥有的任务。`ownership_mismatch` 表示任务属于其他账户；即使凭据属于管理员，服务也会在读取任务后、发出任何后续请求之前拒绝。应使用拥有该任务的账户凭据，或请管理员直接通过 Determined 操作。`ownership_unavailable` 表示 master 没有报告 generic 任务的所有者，因为它缺少 research-cluster fork 的 generic 任务列表（WU-CVGL/determined#27）；请管理员升级 master。
+MCP 只操作已认证账户拥有的任务。`ownership_mismatch` 表示任务属于其他账户；即使凭据属于管理员，服务也会在读取任务后、发出任何后续请求之前拒绝。应使用拥有该任务的账户凭据，或请管理员直接通过 Determined 操作。`ownership_unavailable` 表示 master 没有报告 generic 任务的所有者，因为它缺少 research-cluster fork 的 generic 任务列表（WU-CVGL/determined#27）；请管理员升级 master。在这样的 master 上，提交或列出 generic 任务会以 `unsupported` 失败；提交会在创建任何内容之前检查这一点。
 
 Determined 本身也会执行权限检查。在使用 basic authorization 的 fork 0.40.1 或更高版本上，只有任务所有者或管理员可以终止、取消、暂停或恢复任务；其他账户会收到 HTTP 403，experiment 则返回 HTTP 404 `experiment '<id>' not found`。
 

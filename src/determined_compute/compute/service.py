@@ -659,6 +659,10 @@ class ComputeService:
         """
         plan = self.plan(request)
         kind = plan["kind"]
+        if kind == "generic":
+            # Refuse before anything is created when the master could not report the new
+            # task's owner, since such a task could not be managed afterwards.
+            self.client.require_generic_task_list()
         launch_options = (
             self._generic_launch_options(plan["task_options"]) if kind == "generic" else None
         )

@@ -40,10 +40,17 @@ class FakeClient:
         self.controls = []
         self.entities = {}
         self.launch_warnings = []
+        self.generic_list = True
+        self.probes = 0
 
     def get_current_user(self):
         self.me_calls += 1
         return dict(self.user)
+
+    def require_generic_task_list(self):
+        self.probes += 1
+        if not self.generic_list:
+            raise APIError("cannot list generic tasks with their owners", code="unsupported")
 
     def _create(self, kind, config, options=None):
         self.launches.append((kind, copy.deepcopy(config)))
@@ -727,7 +734,7 @@ def generic_launch(command_request):
 
 
 def test_generic_launch_admits_capacity_and_surfaces_warnings(profile, generic_launch):
-    warning = {"code": "generic_task_metadata_unsupported", "message": "submitted without"}
+    warning = {"code": "launch_warning", "message": "LAUNCH_WARNING_CURRENT_SLOTS_EXCEEDED"}
     client = FakeClient()
     client.launch_warnings = [warning]
     inspector = ToggleInspector()
@@ -741,6 +748,22 @@ def test_generic_launch_admits_capacity_and_surfaces_warnings(profile, generic_l
     assert launched["warnings"] == [warning]
     assert client.options == [{"noPause": True}]
     assert [kind for kind, _config in inspector.calls] == ["generic"]
+    assert client.probes == 1
+
+
+def test_generic_launch_needs_a_master_that_lists_generic_tasks(profile, generic_launch):
+    client = FakeClient()
+    client.generic_list = False
+    inspector = ToggleInspector()
+    service = ComputeService(client, profile, inspector=inspector)
+    parent = str(uuid.UUID(int=5))
+
+    with pytest.raises(APIError) as caught:
+        service.launch(dict(generic_launch, parent=parent, allow_queue=False))
+
+    assert caught.value.code == "unsupported"
+    # Refused before the parent, the capacity or the master's create route was touched.
+    assert client.launches == [] and client.gets == [] and inspector.calls == []
 
 
 def test_generic_parent_is_an_owned_remote_generic_task(profile, generic_launch):

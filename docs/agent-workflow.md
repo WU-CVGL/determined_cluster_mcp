@@ -29,7 +29,7 @@ Choose the task kind according to the work. The four kinds, from the simplest:
 
 - `command` runs your command once in a container and ends when it exits. Use it for finite, non-interactive work such as an evaluation, a conversion, or a build.
 - `shell` gives you a container to connect to over SSH instead of a command to run. Use it for interactive debugging and environment inspection.
-- `generic` runs your command once like a `command`, with a name, child tasks, and, if launched with `pausable: true`, pause and resume under the same task ID to free its slots. Resuming starts the command again from the beginning in a new container, and nothing restarts it after a failure, so make a task pausable only when it is safe to rerun; see [Pause and resume](#pause-and-resume). It requires the research-cluster fork 0.40.1 or later of the Determined master, and `kind: auto` never selects it.
+- `generic` runs your command once like a `command`, with a name, child tasks, and, if launched with `pausable: true`, pause and resume under the same task ID to free its slots. Resuming starts the command again from the beginning in a new container, and nothing restarts it after a failure, so make a task pausable only when it is safe to rerun; see [Pause and resume](#pause-and-resume). It requires a Determined master from the research-cluster fork with WU-CVGL/determined#27, which lists generic tasks with their owners; on an older master the launch fails with `unsupported` before anything is created. `kind: auto` never selects it.
 - `experiment` runs your command as one or more trials and adds Determined's experiment features:
   - a searcher, set in `experiment_config.searcher`, that runs a single trial or many trials over a hyperparameter space (grid, random, or adaptive search that stops weak trials early);
   - automatic restarts: a failed trial, including one whose agent was lost, starts again up to `max_restarts` times (Determined's default is 5);
@@ -126,7 +126,7 @@ A pause or resume that the master refuses, for example pausing a paused task, re
 
 `compute_cancel` kills a generic task and all its descendants. Exit status 0 ends a generic task as `STATE_COMPLETED`; a non-zero exit or a lost agent ends it as `STATE_ERROR`, and it is not restarted.
 
-Give a generic task a meaningful `name` and `description` as for any launch. A master that predates generic task names rejects them; the service then submits the task without them once and returns a `generic_task_metadata_unsupported` warning. Treat that warning as informational. The task then appears without a name in the WebUI and in `compute_list`, so record its ID together with the name you chose.
+Give a generic task a meaningful `name` and `description` as for any launch; Determined stores them, and they appear in the WebUI and in `compute_list`.
 
 ## Find existing tasks
 

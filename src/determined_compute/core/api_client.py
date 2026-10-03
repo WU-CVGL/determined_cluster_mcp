@@ -134,10 +134,9 @@ def _login_for_token(api_url: str, username: str, password: str, verify_ssl: boo
     return str(token)
 
 
-# A strict generic-task config parse rejects unknown keys before the master persists
-# anything; older masters do not know the optional display fields.
+# Display fields of a generic task config; every master with the generic task list
+# (WU-CVGL/determined#27) accepts them.
 _GENERIC_METADATA_FIELDS = ("name", "description")
-_UNKNOWN_GENERIC_METADATA = re.compile(r'unknown field \\?"(?:name|description)\\?"')
 _GENERIC_STATE_PREFIX = "GENERIC_TASK_STATE_"
 
 
@@ -564,58 +563,28 @@ class DeterminedAPIClient:
             if expected is None or not isinstance(value, expected):
                 raise ValueError(f"unsupported generic task launch option: {key}")
         # Code and data stay on shared mounts, so the context directory is always empty.
-        body: Dict[str, Any] = {"contextDirectory": [], **options}
-        warnings: List[Dict[str, str]] = []
-        try:
-            response = self._post(
-                "api/v1/generic-tasks",
-                data={**body, "config": _config_text(config)},
-            )
-        except APIError as exc:
-            stripped = {
-                key: value for key, value in config.items() if key not in _GENERIC_METADATA_FIELDS
-            }
-            if stripped == config or not self._rejected_generic_metadata(exc):
-                raise
-            # The rejection happened while parsing the config, before the master stored
-            # anything, so this second request is the only possible submission.
-            response = self._post(
-                "api/v1/generic-tasks",
-                data={**body, "config": _config_text(stripped)},
-            )
-            warnings.append({
-                "code": "generic_task_metadata_unsupported",
-                "message": (
-                    "The Determined master does not accept generic task name and description; "
-                    "the task was submitted without them."
-                ),
-            })
+        body: Dict[str, Any] = {"contextDirectory": [], "config": _config_text(config), **options}
+        response = self._post("api/v1/generic-tasks", data=body)
         task_id = response.get("taskId")
         if not isinstance(task_id, str) or not task_id:
             raise SubmissionUncertainError(
                 "Determined response did not contain a generic task id", details=response
             )
         launch_warnings = response.get("warnings") or []
-        if isinstance(launch_warnings, list):
-            warnings.extend(
-                {"code": "launch_warning", "message": item}
-                for item in launch_warnings
-                if isinstance(item, str) and item
-            )
+        warnings = [
+            {"code": "launch_warning", "message": item}
+            for item in (launch_warnings if isinstance(launch_warnings, list) else [])
+            if isinstance(item, str) and item
+        ]
         return {"id": task_id, "warnings": warnings}
 
-    @staticmethod
-    def _rejected_generic_metadata(exc: APIError) -> bool:
-        """Return whether the master rejected only the optional generic display fields."""
-        # Masters report the strict config parse failure as HTTP 500 (an untyped error)
-        # or, in some builds, HTTP 400; a 500 reaches us as an uncertain mutation.
-        rejection = exc.__cause__ if isinstance(exc, SubmissionUncertainError) else exc
-        return (
-            isinstance(rejection, APIError)
-            and not isinstance(rejection, SubmissionUncertainError)
-            and rejection.code in {400, 500}
-            and _UNKNOWN_GENERIC_METADATA.search(str(rejection)) is not None
-        )
+    def require_generic_task_list(self) -> None:
+        """Fail with ``unsupported`` unless the master lists generic tasks with their owners.
+
+        Without that list (WU-CVGL/determined#27) a generic task could be created but its
+        owner never verified, so it could not be managed afterwards.
+        """
+        self._generic_task_list({"limit": 1})
 
     def _generic_task_list(self, params: Dict[str, Any]) -> Dict[str, Any]:
         try:

@@ -106,7 +106,7 @@ An empty `series` list means no data for the window, not an idle task: the task 
 
 ## A task operation is refused
 
-The MCP acts only on tasks owned by the authenticated account. `ownership_mismatch` means the task belongs to another account; the service reads the task, then refuses before any further request, even when the credentials belong to an administrator. Use the owning account's credentials, or ask an administrator to act through Determined directly. `ownership_unavailable` means the master did not report a generic task's owner, because it lacks the research-cluster fork's generic task list (WU-CVGL/determined#27); ask an administrator to upgrade the master.
+The MCP acts only on tasks owned by the authenticated account. `ownership_mismatch` means the task belongs to another account; the service reads the task, then refuses before any further request, even when the credentials belong to an administrator. Use the owning account's credentials, or ask an administrator to act through Determined directly. `ownership_unavailable` means the master did not report a generic task's owner, because it lacks the research-cluster fork's generic task list (WU-CVGL/determined#27); ask an administrator to upgrade the master. On such a master, launching a generic task or listing generic tasks fails with `unsupported`; a launch checks this before anything is created.
 
 Determined applies its own permissions as well. On the fork 0.40.1 or later with basic authorization, only a task's owner or an administrator can kill, cancel, pause, or resume it; other accounts receive HTTP 403, or HTTP 404 `experiment '<id>' not found` for an experiment.
 
