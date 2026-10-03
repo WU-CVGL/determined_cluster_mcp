@@ -270,7 +270,7 @@ class ResourceInspector:
         """Require current capacity for the config's exact selected pool."""
 
         if kind not in {"command", "shell", "experiment", "generic"}:
-            raise ValueError("kind must be command, shell, experiment, or generic")
+            raise ValueError("kind must be command, shell, generic, or experiment")
         if not isinstance(config, Mapping):
             raise ValueError("config must be an object")
         resources = config.get("resources")

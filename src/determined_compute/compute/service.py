@@ -280,7 +280,7 @@ class ComputeService:
 
         raw_kind = request.get("kind", "auto")
         if raw_kind != "auto" and raw_kind not in _TASK_KINDS:
-            raise ValidationError("kind must be auto, command, shell, experiment, or generic")
+            raise ValidationError("kind must be auto, command, shell, generic, or experiment")
         interactive = request.get("interactive", False)
         overnight = request.get("overnight", False)
         allow_queue = request.get("allow_queue", False)

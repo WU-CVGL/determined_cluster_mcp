@@ -230,7 +230,7 @@ class DeterminedAPIClient:
     def _kind(cls, kind: str) -> str:
         normalized = kind.lower().rstrip("s")
         if normalized not in cls._TASK_KINDS:
-            raise ValueError("kind must be one of: command, shell, experiment, generic")
+            raise ValueError("kind must be one of: command, shell, generic, experiment")
         return normalized
 
     @staticmethod

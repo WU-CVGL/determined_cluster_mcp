@@ -78,7 +78,7 @@ shell_inactivity_seconds: 7200
 | `name` | 字符串 | 可选显示名称，最多 128 个字符 |
 | `description` | 字符串或 null | 可选显示说明，最多 2,048 个字符 |
 | `allow_queue` | 布尔值 | 当前容量不足时允许排队；默认 `false` |
-| `kind` | `auto`、`command`、`shell`、`experiment` 或 `generic` | 执行模式；默认 `auto` |
+| `kind` | `auto`、`command`、`shell`、`generic` 或 `experiment` | 执行模式；默认 `auto` |
 | `interactive` | 布尔值 | 要求 shell 模式；在 auto 模式下选择 `shell` |
 | `overnight` | 布尔值 | 在 auto 模式下选择 `experiment` |
 | `command` | 字符串或字符串数组 | command、generic 任务或 experiment 的入口；shell 模式拒绝此字段 |

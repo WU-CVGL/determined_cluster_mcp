@@ -86,7 +86,7 @@ reconciliation operations on those records.
 | `name` | string | Optional display name, at most 128 characters |
 | `description` | string or null | Optional display description, at most 2,048 characters |
 | `allow_queue` | boolean | Allow submission when current capacity is insufficient; default `false` |
-| `kind` | `auto`, `command`, `shell`, `experiment`, or `generic` | Execution mode; default `auto` |
+| `kind` | `auto`, `command`, `shell`, `generic`, or `experiment` | Execution mode; default `auto` |
 | `interactive` | boolean | Requires shell mode; in auto mode selects `shell` |
 | `overnight` | boolean | In auto mode selects `experiment` |
 | `command` | string or string array | Command, generic task, or experiment entrypoint; shell mode rejects it |

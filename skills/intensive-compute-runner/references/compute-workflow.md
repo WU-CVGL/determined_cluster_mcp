@@ -8,7 +8,7 @@ Load this reference when preparing a service request, copying a workspace to sha
 
 | Field | Meaning |
 | --- | --- |
-| `kind` | `auto`, `command`, `shell`, `experiment`, or `generic` |
+| `kind` | `auto`, `command`, `shell`, `generic`, or `experiment` |
 | `name` | Short task-specific display name; never an internal ID |
 | `description` | Purpose, config, or other useful human context |
 | `interactive` | Selects `shell` when `kind` is `auto` |
