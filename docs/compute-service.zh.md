@@ -215,9 +215,10 @@ Determined 的任务 ID（command、shell 和 generic 任务为 UUID 字符串�
 依据：`compute_list(kind, marker=...)` 用它与每个任务存储的配置比对，`compute_status` 以
 `submission_marker` 报告它。请求不能设置这个变量。
 
-适配器把 command 和 shell 配置作为 mapping 发送；experiment 配置会序列化为 YAML 并请求
-激活；generic 任务配置会序列化为 YAML，并与空的 `contextDirectory`、解析后的 `parentId`、
-`inheritContext` 和 `noPause` 选项一起发送，不带 `projectId`。适配器拒绝源码上传别名，从不
+适配器把 command 和 shell 配置作为 mapping 发送；experiment 和 generic 任务配置会序列化为
+JSON 文本，master 的 YAML 解析器按字面读取该文本，因此 `y`、`n` 或 `1e-3` 这类字符串仍是
+字符串。experiment 提交时请求激活；generic 任务配置与空的 `contextDirectory`、解析后的
+`parentId`、`inheritContext` 和 `noPause` 选项一起发送，不带 `projectId`。适配器拒绝源码上传别名，从不
 自动创建项目，会移除 API envelope、从返回的实体中去除机密，并返回含 `id` 的实体。
 
 generic 任务配置中的 `name` 和 `description` 字段只存在于较新的 master；较旧的 master 在

@@ -238,12 +238,13 @@ lookup key: `compute_list(kind, marker=...)` matches it against each task's stor
 config, and `compute_status` reports it as `submission_marker`. A request cannot set
 this variable.
 
-The adapter sends command and shell configs as mappings. It serializes experiment
-configs as YAML and requests activation. It serializes generic task configs as YAML and
-sends them with an empty `contextDirectory`, no `projectId`, and the resolved `parentId`,
-`inheritContext`, and `noPause` options. It rejects source upload aliases, never
-creates a project, removes API envelopes, redacts secrets from returned entities, and
-returns an entity with an `id`.
+The adapter sends command and shell configs as mappings. It serializes experiment and
+generic task configs as JSON text, which the master's YAML parser reads literally, so a
+string such as `y`, `n`, or `1e-3` stays a string. It requests activation of an
+experiment, and sends a generic task config with an empty `contextDirectory`, no
+`projectId`, and the resolved `parentId`, `inheritContext`, and `noPause` options. It
+rejects source upload aliases, never creates a project, removes API envelopes, redacts
+secrets from returned entities, and returns an entity with an `id`.
 
 The generic task `name` and `description` config fields exist only on newer masters;
 an older master rejects them as unknown fields while strictly parsing the config. That
