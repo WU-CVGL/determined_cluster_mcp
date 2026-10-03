@@ -1,4 +1,4 @@
-"""Persistent, shared-storage-only Determined compute orchestration."""
+"""Stateless, shared-storage-only Determined compute orchestration."""
 
 from .models import (
     APIError,
@@ -6,12 +6,10 @@ from .models import (
     ConflictError,
     NotFoundError,
     SubmissionUncertainError,
-    TaskRecord,
     ValidationError,
 )
 from .profile import ComputeProfile, SharedMount
 from .service import ComputeService
-from .store import SQLiteTaskStore, TaskStore
 
 __all__ = [
     "APIError",
@@ -20,10 +18,7 @@ __all__ = [
     "ComputeService",
     "ConflictError",
     "NotFoundError",
-    "SQLiteTaskStore",
     "SharedMount",
     "SubmissionUncertainError",
-    "TaskRecord",
-    "TaskStore",
     "ValidationError",
 ]

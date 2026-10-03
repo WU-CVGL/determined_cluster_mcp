@@ -263,16 +263,6 @@ class DeterminedAPIClient:
             raise APIError("Current-user response is malformed", code="invalid_response")
         return {"id": user_id, "username": username.strip()}
 
-    def get_cluster_id(self) -> str:
-        response = self._get("info")
-        cluster_id = response.get("cluster_id")
-        if not isinstance(cluster_id, str):
-            raise APIError("Cluster-info response is malformed", code="invalid_response")
-        cluster_id = cluster_id.strip()
-        if not cluster_id or len(cluster_id.encode("utf-8")) > 256:
-            raise APIError("Cluster-info response is malformed", code="invalid_response")
-        return cluster_id
-
     def list_remote_tasks(
         self,
         kind: str,
@@ -536,7 +526,7 @@ class DeterminedAPIClient:
                 "code": "generic_task_metadata_unsupported",
                 "message": (
                     "The Determined master does not accept generic task name and description; "
-                    "the task was submitted without them and they are kept only locally."
+                    "the task was submitted without them."
                 ),
             })
         task_id = response.get("taskId")
@@ -632,7 +622,7 @@ class DeterminedAPIClient:
                 if isinstance(config.get(field), str):
                     entity[field] = config[field]
         # The owner comes from the generic task list; a master without it leaves the entity
-        # ownerless, so ownership checks (adoption) fail instead of guessing.
+        # ownerless, so ownership checks fail instead of guessing.
         try:
             listed = self._generic_task_list({"taskIds": [task_id]}).get("tasks")
         except APIError as exc:

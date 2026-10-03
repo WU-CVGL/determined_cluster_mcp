@@ -98,20 +98,20 @@ MCP 不接受 `kind: notebook`。
 
 调用 `compute_plan(request)`，检查解析后的任务类型、镜像、资源池、挂载、工作目录、输出目录、资源字段和提示信息。规划只在本地验证并渲染配置，不能证明远端文件、权限、凭据或实时容量有效。
 
-生成一个稳定且由调用方控制的 `request_id`，再调用 `compute_launch(request, request_id)`。在工作记录中保留返回的本地 `task_id` 和远端 ID。相同请求使用同一 request ID 重试是幂等的；将该 ID 用于不同内容会被拒绝。
+调用一次 `compute_launch(request)`。它返回任务的 `kind` 和 `id`，即 Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，experiment 为整数。之后的所有工具都使用这一对值。MCP 不保存这次提交的记录，所以请把 kind、ID、名称和 `submission_marker` 写入自己的工作记录。每次调用都是一次新的提交：用同一请求再次调用 `compute_launch` 会启动第二个任务。
 
-如果提交结果不确定，不要生成新的 request ID，也不要再次提交。检查本地任务和远端系统。`compute_reconcile(task_id, remote_id)` 只用于修复这条状态不确定的本地提交，而且必须先找到相符的远端任务。参见[故障排查](troubleshooting.zh.md#submission-outcome-is-uncertain)。
+如果提交返回 `submission_uncertain`，说明提交未确认：Determined 可能创建了任务，也可能没有。此时不要再次提交，而是用错误 details 中的 `submission_marker` 调用 `compute_list(kind, marker=...)`。返回的任务就是这次提交，继续使用它的 ID；如果没有找到，说明任务没有创建，可以再次提交。如果仍然出现了重复任务，用 `compute_cancel` 取消多余的那个。参见[故障排查](troubleshooting.zh.md#submission-outcome-is-uncertain)。
 
 <a id="monitor-and-accept-the-result"></a>
 ## 跟踪并验收结果
 
-调用 `compute_status(task_id)`，直到任务进入终态；使用 `compute_logs(task_id, tail)` 检查进度和最后的消息。用户不再需要运行中的任务时，调用 `compute_cancel(task_id)`。
+调用 `compute_status(kind, id)`，直到任务进入终态；使用 `compute_logs(kind, id, tail)` 检查进度和最后的消息。用户不再需要运行中的任务时，调用 `compute_cancel(kind, id)`。
 
-需要了解运行中的任务实际使用了多少 CPU、内存和 GPU 时，例如在提议调整资源、取消或重新提交之前确认 GPU 利用率是否接近零或 allocation 是否空闲，调用 `compute_usage(task_id)`；对于已结束的任务，它报告任务结束前的窗口。该工具只读，并要求 master 启用任务资源集成；`task_resources_disabled` 或 `task_resources_unsupported` 表示无法取得测量值，而不是任务空闲。先检查 `warnings`。null 或缺失值表示没有测量，绝不表示零；空的 `series` 列表表示该窗口没有数据。数值是每 `step` 秒一次的点采样，GPU 指标覆盖整块分配到的设备，可能包含其他进程。除非指定 `trial_id`，experiment 报告其最新 trial。即使 `metrics` 隐藏了 GPU 序列，`gpus` 仍会比较每个 allocation 的各块 GPU：`utilization_spread_percent` 较大、`least_utilized_gpu_uuid` 的均值很低或 `idle_fraction` 较高，都提示存在空闲或掉队的 GPU；`gpu_count` 小于 `requested_slots` 表示返回了序列的 GPU 少于该 allocation 持有的槽位，并不一定表示其余 GPU 未被使用。对于 experiment，`trial.batches_per_second_lower_bound` 是整个生命周期的下界，因为作为分母的挂钟时间还可能计入镜像拉取、启动、初始化以及因重启损失的 allocation 时间（不含调度排队时间和 allocation 之间的暂停间隔）；工作负载不通过 Determined 的 Core API 报告时，`total_batches_processed` 为 0 属于预期。只报告观察结果；更改槽位数或资源池仍需明确的任务决策。参见[任务用量测量](compute-service.zh.md#task-usage-measurements)。
+需要了解运行中的任务实际使用了多少 CPU、内存和 GPU 时，例如在提议调整资源、取消或重新提交之前确认 GPU 利用率是否接近零或 allocation 是否空闲，调用 `compute_usage(kind, id)`；对于已结束的任务，它报告任务结束前的窗口。该工具只读，并要求 master 启用任务资源集成；`task_resources_disabled` 或 `task_resources_unsupported` 表示无法取得测量值，而不是任务空闲。先检查 `warnings`。null 或缺失值表示没有测量，绝不表示零；空的 `series` 列表表示该窗口没有数据。数值是每 `step` 秒一次的点采样，GPU 指标覆盖整块分配到的设备，可能包含其他进程。除非指定 `trial_id`，experiment 报告其最新 trial。即使 `metrics` 隐藏了 GPU 序列，`gpus` 仍会比较每个 allocation 的各块 GPU：`utilization_spread_percent` 较大、`least_utilized_gpu_uuid` 的均值很低或 `idle_fraction` 较高，都提示存在空闲或掉队的 GPU；`gpu_count` 小于 `requested_slots` 表示返回了序列的 GPU 少于该 allocation 持有的槽位，并不一定表示其余 GPU 未被使用。对于 experiment，`trial.batches_per_second_lower_bound` 是整个生命周期的下界，因为作为分母的挂钟时间还可能计入镜像拉取、启动、初始化以及因重启损失的 allocation 时间（不含调度排队时间和 allocation 之间的暂停间隔）；工作负载不通过 Determined 的 Core API 报告时，`total_batches_processed` 为 0 属于预期。只报告观察结果；更改槽位数或资源池仍需明确的任务决策。参见[任务用量测量](compute-service.zh.md#task-usage-measurements)。
 
 提交成功或进入终态本身不等于验收通过。检查进程退出信息和任务开始时定义的成功判据。已经配置存储访问时，使用 `storage_check` 验证预期共享产物；否则使用任务输出或另一项明确的任务内检查。需要本地副本时，先配置存储访问，再调用 `storage_fetch(shared_dir, local_dir, dry_run=true)` 预览，审核后以 `dry_run=false` 执行，并检查取回的结果。
 
-报告本地 task ID、远端 ID、最终状态、存在时的退出结果、输出路径，以及实际观察到的产物或指标。绝不包含 token、密码、私钥、cookie 或 secrets 文件内容。
+报告任务的 kind 和 ID、最终状态、存在时的退出结果、输出路径，以及实际观察到的产物或指标。绝不包含 token、密码、私钥、cookie 或 secrets 文件内容。
 
 <a id="pause-and-resume"></a>
 ## 暂停与恢复
@@ -127,41 +127,26 @@ MCP 不接受 `kind: notebook`。
 
 暂停与恢复的步骤：
 
-1. 调用 `compute_pause(task_id)`。
-2. 轮询 `compute_status(task_id)`，直到 `remote_state` 为 `STATE_PAUSED`。已暂停的任务尚未结束。generic 任务在停止期间报告 `STATE_STOPPING_PAUSED`；experiment 在暂停被接受后立即报告 `STATE_PAUSED`，其 trial 可能要到超时结束才停止。
-3. 需要继续时调用 `compute_resume(task_id)`，并用 `compute_logs` 确认它从检查点继续，或跳过了已完成的单元。
+1. 调用 `compute_pause(kind, id)`。
+2. 轮询 `compute_status(kind, id)`，直到 `state` 为 `STATE_PAUSED`。已暂停的任务尚未结束。generic 任务在停止期间报告 `STATE_STOPPING_PAUSED`；experiment 在暂停被接受后立即报告 `STATE_PAUSED`，其 trial 可能要到超时结束才停止。
+3. 需要继续时调用 `compute_resume(kind, id)`，并用 `compute_logs` 确认它从检查点继续，或跳过了已完成的单元。
 
 master 拒绝的暂停或恢复（例如暂停已暂停的任务）会以错误返回 master 给出的原因，且没有任何改变。早于 research-cluster fork 中 generic 任务修复的 master 会把被拒绝的 generic 任务请求报告为服务器错误；这些错误以 `submission_uncertain` 返回，再次尝试前先检查 `compute_status`。
 
 `compute_cancel` 会终止 generic 任务及其所有后代。退出状态 0 使 generic 任务以 `STATE_COMPLETED` 结束；非零退出或 agent 丢失使其以 `STATE_ERROR` 结束，且不会重启。
 
-与其他提交一样，为 generic 任务设置有意义的 `name` 和 `description`。不支持 generic 任务名称的旧 master 会拒绝它们；服务随后会去掉这两个字段提交一次，在本地记录中保留它们，并返回 `generic_task_metadata_unsupported` 警告。该警告仅供参考。此时任务在 WebUI 中没有名称，因此应记录本地 ID 和远端 ID。
+与其他提交一样，为 generic 任务设置有意义的 `name` 和 `description`。不支持 generic 任务名称的旧 master 会拒绝它们；服务随后会去掉这两个字段提交一次，并返回 `generic_task_metadata_unsupported` 警告。该警告仅供参考。此时任务在 WebUI 和 `compute_list` 中都没有名称，因此应把它的 ID 与你选定的名称一起记录下来。
 
-<a id="discover-and-adopt-existing-remote-tasks"></a>
-## 发现并登记已有远端任务
+<a id="find-existing-tasks"></a>
+## 查找已有任务
 
-对于通过 Determined WebUI、原生 CLI 或另一台设备独立创建，且属于同一 Determined 账户的任务，使用发现和登记流程：
+`compute_list(kind, limit=50, offset=0)` 按从新到旧列出已认证 Determined 账户拥有的任务，无论它们是通过本 MCP、WebUI、原生 CLI 还是另一台设备提交的。每个条目包含 kind、ID、名称、状态、资源池和开始时间，`pagination.next_offset` 指向下一页。把 kind 和 ID 用于 `compute_status`、`compute_logs`、`compute_usage`、`compute_cancel`、`compute_pause` 和 `compute_resume`。列表是只读的。generic 任务需要带有 research-cluster fork generic 任务列表（WU-CVGL/determined#27）的 master；较旧的 master 返回 `unsupported`。
 
-1. 调用 `compute_discover(kind, limit=50, offset=0)`，其中 kind 为 `command`、`shell`、`generic` 或 `experiment`。这是只读远端查询，不会创建本地记录，也不会提交任务。generic 任务需要带有 research-cluster fork generic 任务列表（WU-CVGL/determined#27）的 master；较旧的 master 返回 `unsupported`。
-2. 选择目标结果，再调用 `compute_adopt(kind, remote_id)`。
-3. 保存返回的本地 `task_id`，然后用它调用 `compute_status`、`compute_logs`、`compute_usage` 和 `compute_cancel`。
+指定 `marker` 时，`compute_list` 只返回某一次提交的任务。它会读取所选页中的每个任务，所以查找刚刚提交的任务时，应使用较小的 `limit`，例如 5 或 10。
 
-登记时会核对实际集群、当前认证账户和远端 owner。它会创建幂等的本地记录，绝不会重新启动远端任务。未知的工作路径、输出路径或版本仍保持未知。登记不会授予存储访问权或新的集群权限。
+<a id="ownership-and-records"></a>
+## 所有权与记录
 
-Reconcile 的用途更窄：`compute_reconcile` 通过核对提交标记，修复远端接受状态不确定的已有本地提交。它不能导入独立创建的任务。如果已经存在状态不确定的本地记录，应对该记录执行 reconcile，不要登记对应的远端任务。
+MCP server 的凭据所选定的 Determined 账户是唯一的身份。每个操作任务的工具都会先检查该账户是否拥有该任务；对其他用户的任务，即使该账户是管理员，也会以 `ownership_mismatch` 拒绝。master 无法报告所有者的 generic 任务会以 `ownership_unavailable` 拒绝。要操作其他账户的任务，请使用该账户的凭据。
 
-<a id="keep-identity-boundaries-separate"></a>
-## 区分各身份边界
-
-任务身份和访问涉及四个彼此独立的值：
-
-| 值 | 含义 |
-| --- | --- |
-| SQLite 数据库 | 本地持久任务记录、幂等和 reconcile 状态 |
-| `owner` | 该数据库中的命名空间；它不是身份认证 |
-| Determined 账户 | 由凭据选择的 API 身份和远端权限 |
-| 集群身份 | 用于避免跨集群任务混淆的实际远端集群 |
-
-只有使用相同数据库和 owner 的会话才共享本地记录。不同数据库可以分别登记同一个远端任务。数据库应放在本地持久磁盘，不要放在共享 NFS 中。共享 owner 不等于共享凭据，更换凭据也不会重命名 owner 命名空间。
-
-在使用 basic authorization 的 Determined fork 0.40.1 或更高版本上，只有任务的 Determined 所有者或管理员可以取消任务。submitted 记录绑定配置和端点而不是账户，因此把凭据切换到另一个账户后，`compute_cancel` 可能对 command 或 shell 返回 HTTP 403，对 experiment 返回 HTTP 404；已登记的记录则返回 `ownership_mismatch`。请使用拥有该任务的账户。
+MCP 不保存任务记录。任务、日志和 experiment 数据保存在 Determined 中；提交了什么以及为什么提交（例如 kind、ID、名称、版本和输出路径）由你自己记录。Determined 只在已结束的 command 或 shell 结束后 24 小时内提供它，因此应在此期间读取其日志和用量。

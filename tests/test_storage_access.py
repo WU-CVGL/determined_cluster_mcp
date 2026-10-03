@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import shutil
 import sys
 import time
@@ -457,8 +458,8 @@ def test_subprocess_reader_cleanup_is_bounded_when_grandchild_keeps_pipe_open():
     assert "parent complete" in result["output"]
 
 
-def test_config_is_separate_from_compute_profile_fingerprint(tmp_path):
+def test_config_is_separate_from_compute_profile(tmp_path):
     compute_profile = profile()
-    before = compute_profile.fingerprint
+    before = copy.deepcopy(compute_profile)
     StorageService(compute_profile, local_config(tmp_path))
-    assert compute_profile.fingerprint == before
+    assert compute_profile == before

@@ -5,7 +5,7 @@
 Follow the caller's requested scope. Read only the route needed for the task:
 
 - Cluster workload or storage operation: [agent workflow](docs/agent-workflow.md)
-- Request fields, tools, identity, or recovery: [compute reference](docs/compute-service.md)
+- Request fields, tools, task identity and ownership, or unconfirmed launches: [compute reference](docs/compute-service.md)
 - Local mount, SSH, or file transfer: [shared storage access](docs/shared-storage-access.md)
 - Startup or runtime failure: [troubleshooting](docs/troubleshooting.md)
 

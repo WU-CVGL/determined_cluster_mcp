@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "determined-compute"
 version = "0.6.0"
-description = "Persistent shared-storage compute service and MCP tools for Determined"
+description = "Stateless shared-storage compute service and MCP tools for Determined"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

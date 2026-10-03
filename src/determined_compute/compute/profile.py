@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import posixpath
 from dataclasses import dataclass
@@ -72,7 +71,6 @@ class ComputeProfile:
     default_pool: str
     default_slots: int = 1
     shell_inactivity_seconds: Optional[int] = None
-    cluster_identity: Optional[str] = None
 
     @classmethod
     def from_file(cls, path: Any) -> "ComputeProfile":
@@ -99,7 +97,6 @@ class ComputeProfile:
             "shared_mounts",
             "defaults",
             "shell_inactivity_seconds",
-            "cluster_identity",
         }
         unknown = set(value) - allowed
         if unknown:
@@ -134,18 +131,12 @@ class ComputeProfile:
             isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0
         ):
             raise ValidationError("shell_inactivity_seconds must be a positive integer or null")
-        cluster_identity = value.get("cluster_identity")
-        if cluster_identity is not None and (
-            not isinstance(cluster_identity, str) or not cluster_identity
-        ):
-            raise ValidationError("cluster_identity must be a non-empty string or null")
         return cls(
             mounts=mounts,
             default_image=image,
             default_pool=pool,
             default_slots=slots,
             shell_inactivity_seconds=timeout,
-            cluster_identity=cluster_identity,
         )
 
     @staticmethod
@@ -195,21 +186,6 @@ class ComputeProfile:
         if any(mount.read_only for mount in matches if len(mount.host_path) == specificity):
             raise ValidationError(f"{field} is under a read-only shared mount")
         return path
-
-    @property
-    def fingerprint(self) -> str:
-        value = {
-            "mounts": [mount.as_config() for mount in self.mounts],
-            "defaults": {
-                "image": self.default_image,
-                "pool": self.default_pool,
-                "slots": self.default_slots,
-            },
-            "shell_inactivity_seconds": self.shell_inactivity_seconds,
-            "cluster_identity": self.cluster_identity,
-        }
-        encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        return hashlib.sha256(encoded).hexdigest()
 
 
 __all__ = ["ComputeProfile", "SharedMount"]

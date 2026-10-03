@@ -10,7 +10,7 @@ Determined 任务使用计算配置中的共享主机路径与容器路径映射
 <a id="configure-access-separately"></a>
 ## 单独配置存储访问
 
-把访问方式放在独立 YAML 文件中，通过 `--storage-config PATH` 或 `DETERMINED_COMPUTE_STORAGE` 指定。该文件不会改变计算配置指纹或任务身份。
+把访问方式放在独立 YAML 文件中，通过 `--storage-config PATH` 或 `DETERMINED_COMPUTE_STORAGE` 指定。该文件不会改变计算配置，也不影响任务的提交方式。
 
 ```yaml
 mode: auto                 # auto、local 或 ssh

@@ -399,35 +399,6 @@ def test_get_current_user_rejects_malformed_response_without_echo(monkeypatch, p
     assert caught.value.details is None
 
 
-def test_get_cluster_id_uses_root_info_cluster_id(monkeypatch):
-    calls = []
-
-    def get(url, **kwargs):
-        calls.append(url)
-        return Response({"cluster_id": " cluster-123 ", "master_id": "wrong-value"})
-
-    monkeypatch.setattr(requests, "get", get)
-    assert client().get_cluster_id() == "cluster-123"
-    assert calls == ["http://master:8080/info"]
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {"master_id": "not-the-cluster-id"},
-        {"cluster_id": ""},
-        {"cluster_id": 123},
-        {"cluster_id": "x" * 257},
-    ],
-)
-def test_get_cluster_id_rejects_malformed_response(monkeypatch, payload):
-    monkeypatch.setattr(requests, "get", lambda *a, **k: Response(payload))
-    with pytest.raises(APIError) as caught:
-        client().get_cluster_id()
-    assert caught.value.code == "invalid_response"
-    assert caught.value.details is None
-
-
 @pytest.mark.parametrize("kind", ["command", "shell", "experiment"])
 def test_list_remote_tasks_filters_pages_and_redacts(kind, monkeypatch):
     calls = []
@@ -575,7 +546,7 @@ def test_list_remote_tasks_rejects_malformed_pages_without_echo(monkeypatch, pay
     assert caught.value.details is None
 
 
-def test_remote_discovery_does_not_swallow_authentication_error(monkeypatch):
+def test_remote_listing_does_not_swallow_authentication_error(monkeypatch):
     monkeypatch.setattr(
         requests,
         "get",
@@ -1148,7 +1119,7 @@ def test_pause_rejects_other_kinds():
         client().unpause_task("shell", "s1")
 
 
-def test_generic_discovery_lists_owned_tasks_newest_first(monkeypatch):
+def test_generic_listing_returns_owned_tasks_newest_first(monkeypatch):
     calls = []
 
     def get(url, **kwargs):
@@ -1174,7 +1145,7 @@ def test_generic_discovery_lists_owned_tasks_newest_first(monkeypatch):
 
 
 @pytest.mark.parametrize("status", [404, 405, 501])
-def test_generic_discovery_on_a_master_without_the_list_is_unsupported(monkeypatch, status):
+def test_generic_listing_on_a_master_without_the_list_is_unsupported(monkeypatch, status):
     monkeypatch.setattr(
         requests, "get", lambda *a, **k: gateway_error(status, 5, "NotFound", "Not Found")
     )
