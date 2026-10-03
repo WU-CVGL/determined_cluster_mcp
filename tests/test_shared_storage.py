@@ -2,16 +2,14 @@ from pathlib import Path
 
 import pytest
 
-from determined_compute.compute import ComputeProfile, ComputeService, SQLiteTaskStore, ValidationError
+from determined_compute.compute import ComputeProfile, ComputeService, ValidationError
 
 ROOTS = ['/SSD', '/SSD_home', '/SSD_datasets', '/SSD3', '/SSD3_home', '/SSD3_datasets', '/UNSAFE_SSD4']
 
 @pytest.fixture
 def service():
     profile = ComputeProfile.from_file(Path(__file__).resolve().parents[1] / 'cfg/compute-profile.example.yaml')
-    store = SQLiteTaskStore(':memory:')
-    yield ComputeService(None, store, profile)
-    store.close()
+    return ComputeService(None, profile)
 
 @pytest.mark.parametrize('root', ROOTS)
 def test_shared_root_accepts_command_paths_without_local_or_cluster_access(service, root):

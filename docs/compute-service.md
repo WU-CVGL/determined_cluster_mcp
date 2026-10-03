@@ -10,9 +10,8 @@ and checking work, see [Agent workflow](agent-workflow.md).
 
 ```mermaid
 flowchart LR
-    U[Any local stdio MCP client] --> M[16 MCP tools]
+    U[Any local stdio MCP client] --> M[13 MCP tools]
     M --> C[ComputeService]
-    C --> D[(local SQLite database)]
     C --> A[Determined API]
     A --> K[Determined cluster]
     P[compute profile] --> C
@@ -20,25 +19,23 @@ flowchart LR
     S --> H[mapped shared storage]
 ```
 
-The MCP server is a local stdio service for one trusted user. It binds `owner` at
-startup; no tool accepts an owner argument. Separate processes can use separate owner
-names with one database, while collaborators can deliberately share a name. This is a
-namespace boundary, not multi-user authentication. A remotely exposed service needs
-its own authenticated transport.
+The MCP server is a local stdio service for one trusted user. It acts as the Determined
+account selected by its credentials, and only on tasks that account owns. A remotely
+exposed service needs its own authenticated transport.
 
-`ComputeService` owns planning, idempotent submission, status, logs, usage measurements,
-cancellation, pause and resume, discovery, adoption, and conservative
-reconciliation. Its local `task_id`
-remains stable across restarts and is distinct from the Determined `remote_id`. Keep the
-SQLite database on durable local storage. Keep source, data, packages, checkpoints,
-logs, and outputs on mapped shared storage.
+`ComputeService` plans and submits requests and reads and controls the account's tasks:
+status, logs, usage measurements, cancellation, pause and resume, and listing. It keeps
+no task records. Determined holds the tasks, their logs, and their experiment data, and
+every tool addresses a task by its kind and Determined's own ID. Keeping a record of
+submitted work, such as the IDs that `compute_launch` returns, is the caller's
+responsibility. Keep source, data, packages, checkpoints, logs, and outputs on mapped
+shared storage.
 
 ## Compute profile
 
 Pass the profile with `--profile PATH` or `DETERMINED_COMPUTE_PROFILE`. Its schema is:
 
 ```yaml
-cluster_identity: optional-deployment-label
 mounts:
   - host_path: /shared/projects
     container_path: /workspace
@@ -65,11 +62,6 @@ The image, resource pool, and slot count are defaults that a request can overrid
 the pool supports it. `shell_inactivity_seconds` is optional and advisory. The service
 does not enforce an idle timeout.
 
-`cluster_identity` is an optional operator-facing label. Submitted local records bind
-to the profile fingerprint and the resolved Determined endpoint, including this label.
-Changing that binding prevents later status, log, usage, cancellation, and
-reconciliation operations on those records.
-
 ## Request object and planning
 
 `compute_plan` and `compute_launch` accept the same request object:
@@ -89,7 +81,7 @@ reconciliation operations on those records.
 | `pool`, `image` | string | Optional overrides of profile defaults |
 | `code_revision` | string or null | Caller-provided revision or content identifier |
 | `experiment_config` | object | Extra experiment configuration; requires experiment mode |
-| `parent` | string or null | Generic only: local `task_id` of a generic parent task in the same owner namespace |
+| `parent` | string or null | Generic only: Determined task ID (a UUID) of a generic parent task owned by the same account |
 | `inherit_context` | boolean | Generic only: inherit the parent's context directory; requires `parent`; default `false` |
 | `pausable` | boolean | Generic only: the task can be paused, and resuming reruns it from the start; default `false` |
 | `preemption_timeout` | non-negative integer | Generic only: seconds a task gets to stop after a pause request; Determined's default is 0. An experiment sets it in `experiment_config` |
@@ -108,9 +100,11 @@ adds an advisory. Commands and shells place the name on the first description li
 experiments and generic tasks use their native name and description fields. Top-level
 display metadata overrides matching experiment fields.
 
-Command, generic, and experiment entrypoints create `output_dir`, change to `workdir`,
-and then run the command through `/bin/bash -lc`. Command, generic, and shell configs
-use `resources.slots`; experiments use `resources.slots_per_trial`. The service supplies
+Command, generic, and experiment entrypoints render as
+`mkdir -p <output_dir> && cd <workdir> || exit $?`, a newline, and then the command, so a
+failed setup step exits with its status before any statement of the command runs.
+Commands and generic tasks run this text through `/bin/bash -lc`. Command, generic, and
+shell configs use `resources.slots`; experiments use `resources.slots_per_trial`. The service supplies
 profile bind mounts and manages `COMPUTE_WORKDIR`, `COMPUTE_OUTPUT_DIR`,
 `COMPUTE_CODE_REVISION`, and the private submission marker. A request cannot override
 those variables or bind mounts.
@@ -125,9 +119,13 @@ omitted, Determined applies its cluster default, which offline planning cannot i
 
 A generic task is Determined's lower-level task type: one container that runs an
 entrypoint, with no trials, searcher, or checkpoint lifecycle, which can have child tasks
-and, when launched with `pausable: true`, be paused and resumed. It requires a Determined master from the
-research-cluster fork 0.40.1 or later. Its plan is a command plan with these
-differences:
+and, when launched with `pausable: true`, be paused and resumed. It requires a Determined
+master from the research-cluster fork with WU-CVGL/determined#27, which lists generic
+tasks with their owners; without that list the service could create a generic task but
+never verify its owner, so it could not manage it. Before submitting a generic task, the
+service reads one entry of the list (`GET /api/v1/generic-tasks?limit=1`), and a master
+that answers HTTP 404, 405, or 501 makes the launch fail with `unsupported` before
+anything is created. Its plan is a command plan with these differences:
 
 - The config carries `name`, `description` when set, and `preemption_timeout` when set,
   next to the same `entrypoint`, `resources`, `environment`, and `bind_mounts` as a
@@ -136,9 +134,10 @@ differences:
   `pausable`. Plans of other kinds have no such key.
 - A pausable plan has the `generic_restart_safety` advisory.
 
-At launch, `parent` must name a generic task in the same owner namespace that is bound
-to a remote ID and to the current profile and endpoint; it is sent as that remote ID.
-Otherwise the launch fails before a local record is created. The task is submitted with
+At launch, the service reads `parent` from Determined, verifies that it is a generic task
+owned by the authenticated account (see
+[Task identity and ownership](#task-identity-and-ownership)), and sends it as
+`parentId`; otherwise the launch fails before anything is submitted. The task is submitted with
 an empty context directory, because code and data stay on shared mounts, so
 `inherit_context` inherits nothing from a parent launched through this service. No
 project is sent, so Determined places the task in its default project, as it does for
@@ -166,52 +165,62 @@ Generic task lifecycle:
 
 ## Start the MCP server
 
-Start one persistent stdio process per configured client:
+Start one stdio process per configured client:
 
 ```bash
 determined-compute-mcp \
   --profile /absolute/path/to/compute-profile.yaml \
-  --db /absolute/local/path/to/tasks.sqlite3 \
-  --owner your-owner \
   --secrets-file /absolute/path/to/credentials.env \
   --verify-ssl
 ```
 
-`--profile`, `--db`, and `--owner` correspond to
-`DETERMINED_COMPUTE_PROFILE`, `DETERMINED_COMPUTE_DB`, and
-`DETERMINED_COMPUTE_OWNER`. `--storage-config` corresponds to
+`--profile` corresponds to `DETERMINED_COMPUTE_PROFILE` and `--storage-config` to
 `DETERMINED_COMPUTE_STORAGE`; `--secrets-file` can instead be supplied through
-`DETERMINED_COMPUTE_SECRETS`. The API URL, token, and TLS verification default to
-`DET_MASTER`, `DET_API_TOKEN`, and `DET_VERIFY_SSL`; keep credentials in the existing
-provider or secrets file rather than the profile, database, tool arguments, or reports.
+`DETERMINED_COMPUTE_SECRETS`. TLS verification defaults to `DET_VERIFY_SSL`. A secrets
+file that sets `DET_MASTER` supplies the API URL and the credentials together: the
+environment's `DET_API_TOKEN`, `DET_USERNAME`, and `DET_PASSWORD` are then ignored, and an
+`--api-url` or environment `DET_MASTER` that names a different master is rejected before
+any request. A secrets file without `DET_MASTER` uses `--api-url` or else `DET_MASTER`,
+and `DET_API_TOKEN` from the environment before the file. `--api-token` replaces any
+other token or login and is sent only to the selected master. Keep credentials in the
+existing provider or secrets file rather than the profile, tool arguments, or reports.
 
-The default database path is `~/.local/state/determined-compute/tasks.sqlite3`, but
-MCP deployments should specify an absolute local path. MCP rejects `:memory:`. After an upgrade, restart every MCP
-process that shares the database so all processes load the same tool set and additive
-schema.
+The server writes no files of its own. After an upgrade, restart every MCP process so
+that it loads the current tool set.
 
 Optional client-side access to mapped storage uses the same profile and a separate
 storage configuration. See [Shared-storage access](shared-storage-access.md).
 
+### Upgrading from a version with a task database
+
+The server does not accept `--db` or `--owner`, and the profile does not accept
+`cluster_identity`; remove them from MCP client configurations and profiles.
+`DETERMINED_COMPUTE_DB` and `DETERMINED_COMPUTE_OWNER` are not read and can be unset.
+
+The server neither reads, migrates, nor deletes an old task database, by default
+`~/.local/state/determined-compute/tasks.sqlite3`. Before you delete it yourself, note the
+Determined task IDs (the remote IDs) of any work you still need. `compute_list` finds the
+account's tasks that Determined still serves; an ended command or shell that Determined
+no longer serves, 24 hours after it ended or after a master restart, does not appear
+there.
+
 ## MCP API
 
-The server exposes 16 tools. The `owner` below is always the startup-bound
-namespace and never a tool argument.
+The server exposes 13 tools. `kind` is `command`, `shell`, `generic`, or `experiment`.
+`id` is Determined's own task ID: a UUID for a command, shell, or generic task, and a
+positive integer for an experiment, which can also be passed as a numeric string.
 
 | Tool | Arguments | Return value and effect |
 | --- | --- | --- |
-| `compute_plan` | `request` | Offline normalized plan; no cluster or database mutation |
-| `compute_launch` | `request`, `request_id` | Persisted task record; may submit once |
-| `compute_status` | `task_id` | Local task record, refreshed remote state, and remote entity when bound |
-| `compute_logs` | `task_id`, optional `tail=200` | Chronological list of the newest remote log records |
-| `compute_usage` | `task_id`, optional `window_seconds=3600`, `allocation_id`, `trial_id`, `metrics`, `include_samples=false` | Read-only summary of one task's measured CPU, memory, and GPU use |
-| `compute_cancel` | `task_id` | Updated record, remote cancellation response, and acknowledgement |
-| `compute_pause` | `task_id` | Experiments and generic tasks: record, remote response, and `pause_acknowledged` |
-| `compute_resume` | `task_id` | Experiments and generic tasks: record, remote response, and `resume_acknowledged` |
-| `compute_reconcile` | `task_id`, `remote_id` | Record bound only after marker verification |
-| `compute_list_tasks` | none | Local records in the bound owner namespace |
-| `compute_discover` | `kind`, optional `limit=50`, `offset=0` | One current-account remote page; no local mutation |
-| `compute_adopt` | `kind`, `remote_id` | Idempotently registered local record; no remote submission |
+| `compute_plan` | `request` | Offline normalized plan; no cluster access |
+| `compute_launch` | `request` | Submits once; returns `kind`, `id`, `name`, `description`, `state`, `submission_marker`, `advisories`, and any `warnings` |
+| `compute_status` | `kind`, `id` | Task summary, submission marker, and sanitized remote entity |
+| `compute_logs` | `kind`, `id`, optional `tail=200` | Chronological list of the newest remote log records |
+| `compute_usage` | `kind`, `id`, optional `window_seconds=3600`, `allocation_id`, `trial_id`, `metrics`, `include_samples=false` | Read-only summary of one task's measured CPU, memory, and GPU use |
+| `compute_cancel` | `kind`, `id` | Task summary, remote cancellation response, and `cancellation_acknowledged` |
+| `compute_pause` | `kind`, `id` | Experiments and generic tasks: task summary, remote response, and `pause_acknowledged` |
+| `compute_resume` | `kind`, `id` | Experiments and generic tasks: task summary, remote response, and `resume_acknowledged` |
+| `compute_list` | `kind`, optional `limit=50`, `offset=0`, `marker` | One page of the account's tasks, newest first; with `marker`, the tasks on that page whose config carries it |
 | `compute_resources` | optional `slots=1`, `pool` | Current scheduler capacity and candidate pools |
 | `storage_check` | `path` | Access information for a mapped container path |
 | `storage_sync` | `local_dir`, `shared_dir`, optional `dry_run=true` | Preview or copy local directory contents to shared storage |
@@ -224,47 +233,111 @@ advisories. `compute_resources` is a live snapshot, not a reservation. Positive 
 requests inspect schedulable agent slots; zero checks auxiliary-container capacity.
 Candidate pools are suggestions and are never substituted automatically.
 
-`compute_launch` checks capacity unless `allow_queue` is explicitly true. Its
-`request_id` is an idempotency key within the bound owner. Repeating the same ID and
-equivalent request returns the established record. Reusing it with different content
-returns `idempotency_conflict`. Once a local row has claimed an ID, a retry cannot
-submit a second remote task, even after restart.
+`compute_launch` checks capacity unless `allow_queue` is explicitly true, then submits
+the request once. Every call is a new submission: launching the same request twice
+starts two tasks. On success it returns `kind`; `id`, Determined's task ID (a UUID
+string for a command, shell, or generic task, an integer for an experiment); `name` and
+`description`; the `state` reported at creation, or `null`; `submission_marker`; the
+plan's `advisories`; and, for a shell, `reconnect_command`. Keep the kind and ID: the
+service does not remember them.
 
-The adapter sends command and shell configs as mappings. It serializes experiment
-configs as YAML and requests activation. It serializes generic task configs as YAML and
-sends them with an empty `contextDirectory`, no `projectId`, and the resolved `parentId`,
-`inheritContext`, and `noPause` options. It rejects source upload aliases, never
-creates a project, removes API envelopes, sanitizes retained identity material, and
-returns an entity with an `id`.
+Each launch adds a random `COMPUTE_SUBMISSION_MARKER=determined-compute:<uuid>`
+environment variable to the submitted config. The service does not store it.
+`compute_list(kind, marker=...)` matches it against each task's stored config, and
+`compute_status` reports it as `submission_marker`. It is a correlation label, not an
+identity: a config copied outside this service, such as a task forked in the WebUI,
+carries the same marker. A request cannot set this variable.
 
-The generic task `name` and `description` config fields exist only on newer masters;
-an older master rejects them as unknown fields while strictly parsing the config. That
-parse happens before the master stores anything, so when the create request fails with
-HTTP 400 or 500 and the message names the unknown field `name` or `description`, the
-adapter retries once without both fields. The launch result then carries `warnings` with
-a `generic_task_metadata_unsupported` entry, and the local record keeps both values. No
-other failure is retried. Master launch warnings, such as a request exceeding current
-slots, appear in `warnings` with code `launch_warning`. An idempotent repeat of the
-launch returns the stored record without `warnings`.
+The adapter sends command and shell configs as mappings. It serializes experiment and
+generic task configs as JSON text, which the master's YAML parser reads literally, so a
+string such as `y`, `n`, or `1e-3` stays a string. It requests activation of an
+experiment, and sends a generic task config with an empty `contextDirectory`, no
+`projectId`, and the resolved `parentId`, `inheritContext`, and `noPause` options. It
+rejects source upload aliases, never creates a project, removes API envelopes, redacts
+secrets from returned entities, and returns an entity with an `id`.
 
-### Task records, status, logs, and cancellation
+No launch is retried. Master launch warnings for a generic task, such as a request
+exceeding current slots, appear in `warnings` with code `launch_warning`.
 
-A public task record includes `task_id`, `request_id`, `owner`, `origin`, `kind`, local
-`state`, `remote_id`, `remote_state`, display metadata, paths, revision, cluster/account
-binding fields, an optional fixed `error_code`, and timestamps. Internal request hashes,
-profile hashes, and submission markers are never public. The service stores no full
-request body, generated config, API response, logs, or raw exception text in a task
-record.
+### Unconfirmed launches
 
-`compute_status` returns local state without contacting Determined when no remote ID is
-bound. Otherwise it fetches the entity, updates `remote_state`, and includes the
-sanitized entity as `remote`. For a generic task, the entity combines the task record
-(`GET /api/v1/tasks/{id}`) with its submitted config (`GET /api/v1/tasks/{id}/config`),
-whose environment variables are redacted, and adds `resourcePool`, `name`, and
-`description` from that config. Its `taskState` is reported in `remote_state` with the
-`GENERIC_TASK_STATE_` prefix replaced by `STATE_`, the experiment vocabulary:
+A launch request can reach the master without a confirmed answer: a transport failure
+or timeout after the request was sent, an HTTP 5xx response, or a response without a
+task ID. Determined may or may not have created the task. The service never retries
+such a launch. It returns a `submission_uncertain` error that is not retryable, whose
+message names the next step and whose `details` carry `kind` and `submission_marker`:
 
-| `remote_state` | Meaning |
+```json
+{"error":{"code":"submission_uncertain","message":"The command submission is unconfirmed (...); ...","retryable":false,"details":{"kind":"command","submission_marker":"determined-compute:<uuid>"}}}
+```
+
+Look for the task with `compute_list(kind, marker=submission_marker)`, with a small
+`limit`, and follow `pagination.next_offset` when needed. Every task it returns carries
+the marker. One returned task is most likely the submission; several share a copied
+config, so show them to the user instead of choosing one. An empty result does not prove
+that the submission failed: each search covers one page, the master may store the task
+after the search, and Determined stops serving an ended command or shell after 24 hours.
+Do not launch again automatically. Whether to submit again is the user's decision after
+checking, for example in the WebUI or with a later search. A duplicate cancelled
+afterwards may already have had effects, such as files it wrote, that cancelling does not
+undo. A definite rejection, such as HTTP 400, 401, or 403, is an ordinary error: nothing
+was submitted.
+
+A failure before any connection was open (a refused connection, a failed name lookup, a
+connect timeout, or an unreachable HTTP proxy) is a retryable `transport_error`: the
+request was never sent, so nothing was created. So is an answer from an HTTP proxy whose
+RFC 9209 `Proxy-Status` header reports that it never connected to the next hop, with the
+error type `dns_error`, `dns_timeout`, `destination_not_found`,
+`destination_unavailable`, `connection_refused`, `connection_timeout`,
+`destination_ip_prohibited`, or `destination_ip_unroutable`; its `details` carry
+`source: "proxy"`, `status_code`, and `proxy_error`. The service parses the header as an
+RFC 8941 structured-field list, reads the `error` parameter of every member, and ignores
+a header that does not parse.
+
+Everything after the connection opened, including a read timeout, a dropped connection,
+a TLS error, or any other HTTP 5xx, is unconfirmed. A 5xx counts as an HTTP proxy's
+answer rather than Determined's when its body is empty or not JSON, so it is no Determined
+error, and it carries a `Proxy-Connection`, `Via`, or `Proxy-Status` header. The error
+then says that a proxy, not Determined, answered and that the master was probably
+unreachable, and its `details` add `source: "proxy"`, `status_code`, and, when
+`Proxy-Status` names one, `proxy_error`. It stays unconfirmed, because a proxy can also
+fail after forwarding the request. A 5xx with a Determined JSON error body is never
+attributed to a proxy. A read answered this way fails with the same label and is
+retryable. Cancel, pause, and resume follow the same rules; check `compute_status` after
+an unconfirmed one.
+
+### Task identity and ownership
+
+Status, logs, usage, cancel, pause, and resume, and a generic task's `parent`, first
+read the authenticated account (`GET /api/v1/me`) and the task from Determined. They
+proceed only when the task's `userId` equals the account's ID and the returned ID
+matches the requested one. Otherwise they fail with `ownership_mismatch` before any
+further request, so an administrator account cannot act on other users' tasks through
+this service. The service reads the account once per process, because the credentials
+are fixed when it starts.
+
+A generic task's owner comes from Determined's generic task list
+(`GET /api/v1/generic-tasks?taskIds=`), which the research-cluster fork has from
+WU-CVGL/determined#27 on. When the master cannot report the owner, the call fails with
+`ownership_unavailable` instead of guessing.
+
+Determined serves an ended command or shell for only 24 hours after it ends, and not
+after a master restart. After that its owner cannot be verified, so every call on it,
+including `compute_usage`, returns Determined's HTTP 404.
+
+### Status, logs, and cancellation
+
+`compute_status` returns the task summary: `kind`, `id`, `name`, `description`, `state`,
+`username`, `resource_pool`, `start_time`, and `end_time`. Commands and shells carry
+the name on the first line of their description. It adds `submission_marker` when the
+task's config carries one and the sanitized entity as `remote`. For a generic task, the
+entity combines the task record (`GET /api/v1/tasks/{id}`) with its submitted config
+(`GET /api/v1/tasks/{id}/config`), whose environment variables are redacted, and adds
+`resourcePool`, `name`, and `description` from that config. Its `taskState` is reported
+in `state` with the `GENERIC_TASK_STATE_` prefix replaced by `STATE_`, the experiment
+vocabulary:
+
+| `state` | Meaning |
 | --- | --- |
 | `STATE_ACTIVE` | Queued or running |
 | `STATE_STOPPING_PAUSED` | Pause requested; the container is stopping |
@@ -275,29 +348,29 @@ whose environment variables are redacted, and adds `resourcePool`, `name`, and
 | `STATE_CANCELED` | Terminal: killed |
 
 The entity's `allocations` list each run of the task; a resumed task has one allocation
-per run. A stale `pending` or `submitting` row becomes
-`submission_uncertain`; this never causes automatic resubmission.
+per run.
 
 `compute_logs` requires a positive `tail`. Command, shell, and generic task logs come
-from their task log API; a resumed generic task's logs include every run. Experiment logs come from the highest numeric trial ID, which a server-side
-sort selects even when an experiment has more than 100 trials; an experiment with no
-trials returns an empty list. Results are ordered oldest to newest. A task with no
-remote ID also returns an empty list.
+from their task log API; a resumed generic task's logs include every run. Experiment
+logs come from the highest numeric trial ID, which a server-side sort selects even when
+an experiment has more than 100 trials; an experiment with no trials returns an empty
+list. Results are ordered oldest to newest.
 
 `compute_cancel` uses the task kill endpoint for commands and shells, the experiment
 cancel endpoint for experiments, and the generic task kill endpoint, which also kills
-the task's descendants but never its ancestors, for generic tasks. It requires a bound remote ID and returns
-`cancellation_acknowledged: true` when the API call completes. Remote termination alone
-does not prove success; inspect exit information and expected shared-storage artifacts.
+the task's descendants but never its ancestors, for generic tasks. It returns the task
+summary with `cancellation_acknowledged: true` and the remote response as `remote`; a
+command or shell response also updates `state`. Remote termination alone does not prove
+success; inspect exit information and expected shared-storage artifacts.
 
 ### Pause and resume
 
-`compute_pause(task_id)` and `compute_resume(task_id)` apply to experiments and generic
-tasks; a command or shell returns `unsupported_kind`. They apply the same owner,
-binding, and adoption checks as `compute_cancel`, and a record without a remote ID
-returns `remote_id_unknown`. Each returns the local record, the remote acknowledgement
-as `remote`, and `pause_acknowledged` or `resume_acknowledged`; poll `compute_status`
-for the resulting state.
+`compute_pause(kind, id)` and `compute_resume(kind, id)` apply to experiments and
+generic tasks; a command or shell returns `unsupported_kind` without contacting
+Determined. They apply the ownership check of
+[Task identity and ownership](#task-identity-and-ownership). Each returns the task
+summary, the remote acknowledgement as `remote`, and `pause_acknowledged` or
+`resume_acknowledged`; poll `compute_status` for the resulting state.
 
 For an experiment, pause and resume call Determined's experiment pause and activate
 endpoints. The experiment reports `STATE_PAUSED` as soon as the pause is accepted, while
@@ -319,31 +392,31 @@ server errors, which arrive as `submission_uncertain` errors whose message inclu
 master's reason; check `compute_status` before repeating the call.
 
 For a running shell, use the sanitized `reconnectCommand`, currently
-`det shell show_ssh_command <remote-id>`. The adapter removes `privateKey`; never put
-private key material in task records or reports.
+`det shell show_ssh_command <id>`, which `compute_launch` also returns as
+`reconnect_command`. The adapter removes `privateKey`; never put private key material in
+reports.
 
 ### Task usage measurements
 
 `compute_usage` is read-only and summarizes the measured CPU, memory, and GPU use of one
-owned task; `compute_resources` describes scheduler capacity instead. It requires a
-Determined master from the research-cluster fork 0.40.1 or later on which an
+task owned by the account; `compute_resources` describes scheduler capacity instead. It
+requires a Determined master from the research-cluster fork 0.40.1 or later on which an
 administrator has configured `integrations.task_resources` (`prometheus_url` and
 `det_cluster`).
 
-The service validates arguments first and then applies the same owner and binding
-checks as `compute_status`. A record without a remote ID returns `remote_id_unknown`;
-reconcile it first. An adopted task's remote owner is verified again. The service then
-asks the master whether task resources are available: a disabled integration returns
-`task_resources_disabled`, and a master without the API returns
-`task_resources_unsupported`. Neither is retryable.
+The service validates arguments first and then applies the ownership check of [Task
+identity and ownership](#task-identity-and-ownership). It then asks the master whether
+task resources are available: a disabled integration returns `task_resources_disabled`,
+and a master without the API returns `task_resources_unsupported`. Neither is retryable.
 
-For a command, shell, or generic task, `determined_task_id` is the remote ID. An experiment reports one
-trial: the highest-ID trial by default, or `trial_id` when given. A requested trial that
-belongs to another experiment returns `trial_not_found`; a nonexistent or inaccessible
-trial ID returns Determined's HTTP 404. Other kinds reject `trial_id`. The service
-measures the selected trial's newest Determined task. An experiment with no trial, or a
-trial with no task, returns `task_not_started`. `allocation_id` restricts results to one
-allocation listed for that task; any other value returns `allocation_not_found`.
+For a command, shell, or generic task, `determined_task_id` is the task's ID. An
+experiment reports one trial: the highest-ID trial by default, or `trial_id` when given.
+A requested trial that belongs to another experiment returns `trial_not_found`; a
+nonexistent or inaccessible trial ID returns Determined's HTTP 404. Other kinds reject
+`trial_id`. The service measures the selected trial's newest Determined task. An
+experiment with no trial, or a trial with no task, returns `task_not_started`.
+`allocation_id` restricts results to one allocation listed for that task; any other
+value returns `allocation_not_found`.
 
 `window_seconds` must be 60 through 604,800 (seven days); the default is 3,600. The
 window ends at the task end time for an ended task, capped at the current time, and
@@ -363,7 +436,7 @@ The result contains:
 
 | Field | Meaning |
 | --- | --- |
-| `task_id`, `kind`, `remote_id` | Local task identity |
+| `kind`, `id` | The task, as identified in the call |
 | `determined_task_id` | Determined task whose measurements were read |
 | `trial` | `null` for commands, shells, and generic tasks; otherwise `id`, `state`, `selection` (`latest` or `requested`), `experiment_trial_count` (`null` when `trial_id` was given), `task_count`, and the trial progress and summary-metric fields described below |
 | `resource_pool` | The task's pool as `name` and the operator-written `description` from Determined, trimmed and truncated to 4,096 characters. `description` is `null` when the pool has none or is not in the pool list returned to this account. The whole field is `null` when the pool name is unknown |
@@ -447,21 +520,17 @@ Pool, allocation-detail, and GPU-model context is best-effort and read after the
 measurements. A Determined API error in one of these lookups, including a transport
 failure or malformed response, adds `resource_pool`, `allocation_details`, or
 `gpu_models` to `context_unavailable` and leaves the affected fields empty or `null`;
-the measurements are still returned. After a transport failure, the remaining lookups are
-skipped and reported the same way, so an unresponsive master delays the result by one
-timeout rather than one per lookup. A submitted task needs one extra entity read, which
-`compute_logs` does not make, to learn its pool name, and a failure there reports
-`resource_pool`; an adopted task reuses the entity read for its ownership check.
-Determined serves an ended command or shell for only 24 hours after it ends and not
-after a master restart; for such a task, `resource_pool` is then `null` without a
-`context_unavailable` entry. The
-pool list is read only when the pool name is known. Allocation details are read for the
-first eight allocations in Determined's order (allocations without an end time, such as
-queued or running ones, first, then most recently ended) plus a requested
-`allocation_id`; other allocations keep `null` details, and `allocation_details_limit`
-reports the limit. The agent list, which supplies GPU model names, is read only when a
-GPU series exists. When RBAC hides device UUIDs from the current account, `gpu_model` is
-`null` and `gpu_models` is empty without any `context_unavailable` entry.
+the measurements are still returned. After a transport failure, the remaining lookups
+are skipped and reported the same way, so an unresponsive master delays the result by
+one timeout rather than one per lookup. The pool name comes from the task entity read
+for the ownership check, and the pool list is read only when that name is known.
+Allocation details are read for the first eight allocations in Determined's order
+(allocations without an end time, such as queued or running ones, first, then most
+recently ended) plus a requested `allocation_id`; other allocations keep `null` details,
+and `allocation_details_limit` reports the limit. The agent list, which supplies GPU
+model names, is read only when a GPU series exists. When RBAC hides device UUIDs from
+the current account, `gpu_model` is `null` and `gpu_models` is empty without any
+`context_unavailable` entry.
 
 `include_samples=true` adds `samples_omitted`. When `samples_omitted` is false, each
 series also has `samples` as `[unix_seconds, value_or_null]` pairs. When the selected
@@ -476,57 +545,33 @@ client clock far ahead of the master can cause that error. HTTP 404 means the De
 task, or a requested trial ID, is missing or inaccessible. See
 [troubleshooting](troubleshooting.md#usage-measurements-are-unavailable-or-empty).
 
-### Discover and adopt
+### List tasks and find a submission
 
-`compute_discover` accepts `kind` equal to `command`, `shell`, `generic`, or `experiment`. `limit`
-must be 1 through 100 and `offset` must be non-negative. It queries only tasks owned by
-the currently authenticated Determined account and returns the actual cluster ID,
-account identity, sanitized metadata, any matching `local_task_id`, and consistent
-pagination including `next_offset`. It neither writes a local record nor submits work.
-Command, shell, and generic task remote IDs are UUIDs; experiment remote IDs are positive
-integers.
+`compute_list(kind, limit=50, offset=0, marker=None)` lists the tasks owned by the
+authenticated account, newest first by start time. `limit` must be 1 through 100 and
+`offset` must be non-negative. The result has `kind`, `account` (`id` and `username`),
+`tasks`, and `pagination` with `offset`, `limit`, `total`, and `next_offset`, which is
+`null` on the last page. Each task has the summary fields of `compute_status` without
+the remote entity. Determined filters the list by owner, and the service checks the
+owner of every returned task again; a mismatch is an `ownership_mismatch` error, not a
+silently shortened page. Use it for work created by this service, the WebUI, the native
+CLI, or another device under the same account.
 
-Generic tasks are listed and their owner verified through Determined's generic task list,
-which the research-cluster fork has from WU-CVGL/determined#27 on. Against an older master,
-discovering generic tasks fails with `unsupported`, and adopting one fails with
-`ownership_unavailable`, because nothing else reports a generic task's owner.
+Generic tasks are listed through Determined's generic task list, which needs a master
+with WU-CVGL/determined#27; an older master returns `unsupported`.
 
-`compute_adopt` fetches one remote task and verifies both its normalized ID and
-`userId` against `/me` before writing. Administrative visibility cannot be used to
-adopt another user's task. Registration identity is the local owner, actual cluster ID,
-kind, and remote ID; the record also binds and verifies the authenticated user ID. A
-previously submitted record in the same database is returned unchanged rather than
-replaced.
-
-New adopted records have `origin: "adopted"`, local `state: "adopted"`, and an internal
-adoption request ID. They retain only whitelisted identity, state, name, and description
-metadata. Unknown `workdir`, `output_dir`, and `code_revision` are exposed as `null`;
-the store does not infer them or retain raw remote configuration. Later status, logs,
-usage, and cancellation re-check the actual cluster and account binding. Adopted tasks
-do not use the submitting profile as their authority and gain no storage permissions.
-
-Use discovery and adoption for work created by the WebUI, native CLI, or another device
-under the same account. Use reconciliation for a local submission whose acceptance was
-uncertain. An adopted task cannot be reconciled or used as a launch retry.
-
-### Reconciliation and recovery
-
-A transport timeout can leave remote acceptance unknown. The service preserves the
-local task and returns its `task_id` in error details. It does not resubmit that request
-automatically. `compute_reconcile(task_id, remote_id)` fetches the proposed entity and
-binds it only if its reserved `COMPUTE_SUBMISSION_MARKER` equals the local unguessable
-marker. For a generic task the marker is read from the submitted config; find the task
-ID in the WebUI or with `det task list`. A mismatch returns `identity_mismatch`. First-line description markers are
-considered only for migrated legacy records without stored display metadata.
-
-This marker separates reconciliation from adoption: an uncertain local submission with
-a matching marker must be reconciled, while an independently created remote task can be
-adopted. If evidence is unavailable, investigate rather than launching the same work
-again.
-
-Submitted local tasks remain bound to the original profile fingerprint and endpoint.
-Adopted tasks remain bound to the actual cluster ID and authenticated user ID. These
-checks prevent a changed profile or account from operating on an unrelated task.
+`marker` is a submission marker of the form `determined-compute:<uuid>`, as returned by
+`compute_launch` or by an unconfirmed launch. List entries do not contain the config, so
+the service reads each task of the selected page, newest first, with one request for a
+command, shell, or experiment and three for a generic task, and returns every task whose
+stored config carries the marker, each with `submission_marker`. A marker is a
+correlation label, so more than one task can match, and the service never chooses among
+them. The search covers only the selected page: the result adds `marker` and `searched`,
+the number of tasks read, and `pagination.next_offset` points to the next older page as
+for any listing. An empty `tasks` list means only that no task on that page carries the
+marker. A task launched moments ago is among the newest, so a small `limit` such as 5 or
+10 keeps each search short. A task without a marker, such as one created in the WebUI,
+never matches.
 
 ### Errors
 
@@ -537,22 +582,22 @@ MCP failures use `isError: true`; their text content is compact JSON of this for
 ```
 
 `retryable` and `details` appear only when available, and structured content is null.
-Safe details can include the local task ID and capacity information. Authentication,
-permission, transport, and response-shape failures are errors rather than empty
-results. Error messages and reports may contain sanitized commands, paths, IDs, states,
-and error classes, but must not include credentials or secret-file contents.
+Safe details can include the kind and submission marker of an unconfirmed launch;
+`source: "proxy"`, `status_code`, and `proxy_error` when an HTTP proxy answered instead
+of Determined; and capacity information. Authentication, permission, transport, and response-shape failures
+are errors rather than empty results. Error messages and reports may contain sanitized
+commands, paths, IDs, states, and error classes, but must not include credentials or
+secret-file contents.
 
 A Determined HTTP failure, including a gRPC-gateway error body, appears as
 `<status> <message>`. HTTP 429 and 5xx responses other than 501 are retryable; 501 means
 the master lacks the route. Usage-specific codes are described in
 [Task usage measurements](#task-usage-measurements).
 
-On the Determined fork 0.40.1 or later with basic authorization, only the task's
-Determined owner or an administrator can kill or cancel commands, shells, and
-experiments. For a task owned by another account, `compute_cancel` therefore returns
-HTTP 403 for a command or shell and HTTP 404 `experiment '<id>' not found` for an
-experiment. Submitted records bind to the profile and endpoint rather than the account,
-so switching credentials to another account can produce these errors. Cancel with the
-owning account or ask an administrator. Experiment pause and resume need the same
-permission as cancelling the experiment. Generic task kill, pause, and resume are likewise
-limited to the task's owner or an administrator and return HTTP 403 otherwise.
+The service acts only on tasks owned by the authenticated account and checks this
+before acting on a task, so another account's task returns `ownership_mismatch` even when the
+credentials belong to an administrator. Use the owning account's credentials, or ask an
+administrator to act through Determined directly. Determined applies its own permissions
+as well: on the fork 0.40.1 or later with basic authorization, only a task's owner or an
+administrator can kill, cancel, pause, or resume it, and other accounts receive HTTP 403,
+or HTTP 404 for an experiment.

@@ -1,4 +1,4 @@
-"""Persistent shared-storage compute services for Determined clusters."""
+"""Stateless, shared-storage compute services for Determined clusters."""
 
 from determined_compute.core.api_client import APIError, DeterminedAPIClient, SubmissionUncertainError
 

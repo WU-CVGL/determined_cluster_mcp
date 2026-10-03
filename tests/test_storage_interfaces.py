@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from determined_compute.compute import ComputeProfile, ComputeService, SQLiteTaskStore
+from determined_compute.compute import ComputeProfile, ComputeService
 from determined_compute.storage import StorageAccessConfig, StorageService
 
 
@@ -24,11 +24,10 @@ def test_real_mcp_storage_preview_and_copy_round_trip(tmp_path):
     (source / 'code.py').write_text('print(1)\n')
     (source / '.env.production').write_text('fixture-secret')
     fetched = tmp_path / 'fetched'
-    store = SQLiteTaskStore(':memory:')
-    service = ComputeService(None, store, profile)
+    service = ComputeService(None, profile)
     storage = StorageService(profile, StorageAccessConfig())
     async def exercise():
-        async with Client(create_server(service, 'fixture', storage_service=storage)) as client:
+        async with Client(create_server(service, storage_service=storage)) as client:
             tools = {tool.name: tool for tool in (await client.list_tools()).tools}
             assert tools['storage_check'].annotations.read_only_hint is True
             assert tools['storage_sync'].annotations.destructive_hint is True
@@ -43,10 +42,7 @@ def test_real_mcp_storage_preview_and_copy_round_trip(tmp_path):
             downloaded = await client.call_tool('storage_fetch', {'shared_dir': '/shared/job/code', 'local_dir': str(fetched), 'dry_run': False})
             assert not downloaded.is_error, downloaded
             assert (fetched / 'code.py').read_text() == 'print(1)\n'
-    try:
-        asyncio.run(asyncio.wait_for(exercise(), 20))
-    finally:
-        store.close()
+    asyncio.run(asyncio.wait_for(exercise(), 20))
 
 
 def test_real_mcp_lazy_client_blocks_busy_pool_before_submission(tmp_path):
@@ -67,22 +63,17 @@ def test_real_mcp_lazy_client_blocks_busy_pool_before_submission(tmp_path):
             return {'agents': []}
         def launch_task(self, *args):
             pytest.fail('busy pool must not receive a launch request')
-    store = SQLiteTaskStore(':memory:')
     lazy = _LazyClient(API)
-    service = ComputeService(lazy, store, profile)
+    service = ComputeService(lazy, profile)
     async def exercise():
-        async with Client(create_server(service, 'fixture', resource_inspector=ResourceInspector(lazy))) as c:
+        async with Client(create_server(service, resource_inspector=ResourceInspector(lazy))) as c:
             capacity = await c.call_tool('compute_resources', {'pool': 'example', 'slots': 1})
             assert not capacity.is_error
             assert capacity.structured_content['available'] is False
-            denied = await c.call_tool('compute_launch', {'request_id': 'busy', 'request': {
+            denied = await c.call_tool('compute_launch', {'request': {
                 'name': 'busy-check', 'command': ['true'], 'workdir': '/shared/project',
                 'output_dir': '/shared/output', 'slots': 1,
             }})
             assert denied.is_error
             assert 'capacity_unavailable' in denied.content[0].text
-            assert service.list_tasks('fixture') == []
-    try:
-        asyncio.run(asyncio.wait_for(exercise(), 10))
-    finally:
-        store.close()
+    asyncio.run(asyncio.wait_for(exercise(), 10))

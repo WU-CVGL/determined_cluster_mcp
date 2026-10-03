@@ -6,13 +6,13 @@
 
 ## The MCP server does not start
 
-Check that the client uses the virtual environment's absolute executable path and that every file path in its configuration is absolute. The MCP process requires a readable compute profile, a persistent local database path, and a non-empty owner. The database parent is created automatically, but the process must be able to write there.
+Check that the client uses the virtual environment's absolute executable path and that every file path in its configuration is absolute. The MCP process requires a readable compute profile. It rejects `--db` and `--owner`, and the profile loader rejects `cluster_identity`; remove them from configurations written for a version with a task database (see [upgrading](compute-service.md#upgrading-from-a-version-with-a-task-database)).
 
 ```bash
 /absolute/path/to/determined_cluster_mcp/.venv/bin/determined-compute-mcp --help
 ```
 
-Once the client lists the tools, call `compute_plan` with a request to check the profile and paths; it needs no cluster access. The server uses stdout for MCP protocol frames and writes startup errors to stderr. Inspect the MCP client's server log for the exact error. After changing the installation or upgrading the service, restart every MCP process that shares the database so all processes load the same tools and schema.
+Once the client lists the tools, call `compute_plan` with a request to check the profile and paths; it needs no cluster access. The server uses stdout for MCP protocol frames and writes startup errors to stderr. Inspect the MCP client's server log for the exact error. After changing the installation or upgrading the service, restart every MCP process so that it loads the current tools.
 
 Compute tasks do not need `--storage-config`. Storage tools automatically use a local shared path when it matches the configured `host_path`. For a custom local mapping or login-node SSH, copy `cfg/storage-access.example.yaml` to `.local/storage.yaml`, edit it, and add `--storage-config /absolute/path/to/.local/storage.yaml`.
 
@@ -25,9 +25,11 @@ DET_MASTER=https://determined.example.org
 DET_API_TOKEN=replace-with-your-token
 ```
 
-Do not put credentials in the compute profile, request, owner, task name, or description. Restrict access to the secrets file and inspect only whether required variable names are present, not their values.
+When the secrets file sets `DET_MASTER`, its credentials go only to that master. An error that `--api-url` or `DET_MASTER` names a different master than the secrets file means an override points elsewhere: unset the override, or use a secrets file for that master.
 
-The configured `owner` does not select a Determined user. It is only a namespace in the local SQLite database. Remote authorization comes from the API credentials. Therefore changing owner cannot fix an API permission error, and sharing an owner does not share remote permissions.
+Do not put credentials in the compute profile, request, task name, or description. Restrict access to the secrets file and inspect only whether required variable names are present, not their values.
+
+The credentials select the Determined account, and the MCP acts only on tasks that account owns. Switching credentials therefore changes which tasks `compute_list` shows and which tasks the other tools accept.
 
 ## TLS certificate verification fails
 
@@ -43,7 +45,7 @@ For MCP, keep `--verify-ssl` in the server arguments and pass the CA variable th
 ```json
 {
   "command": "/absolute/path/to/determined_cluster_mcp/.venv/bin/determined-compute-mcp",
-  "args": ["--profile", "/absolute/path/to/profile.yaml", "--db", "/absolute/local/path/to/tasks.sqlite3", "--owner", "your-owner", "--secrets-file", "/absolute/path/to/credentials.env", "--verify-ssl"],
+  "args": ["--profile", "/absolute/path/to/profile.yaml", "--secrets-file", "/absolute/path/to/credentials.env", "--verify-ssl"],
   "env": {
     "REQUESTS_CA_BUNDLE": "/absolute/path/to/organization-ca-bundle.pem"
   }
@@ -80,15 +82,15 @@ A resource pool that an administrator created dynamically appears in `compute_re
 
 ## Submission outcome is uncertain
 
-A connection failure after a mutation was sent may mean the remote task was accepted even though the client did not receive its ID. The service records `submission_uncertain` and does not automatically retry.
+A connection that drops or times out after a launch request was sent, an HTTP 5xx response, or a response without a task ID may mean that Determined created the task even though the client did not receive its ID. `compute_launch` then returns `submission_uncertain` with `kind` and `submission_marker` in the error details, and does not retry. A failure before any connection opened, such as a refused connection or a failed name lookup, is a retryable `transport_error` instead: nothing was sent.
 
-Keep the original local `task_id`, request, and `request_id`. Do not launch again with a new request ID. Inspect the Determined account for the corresponding remote task, then call `compute_reconcile(task_id, remote_id)` only for the same uncertain local submission. Reconciliation verifies the reserved submission marker before binding the record; a mismatch is rejected.
+When the error details carry `source: "proxy"`, an HTTP proxy between this machine and the master answered, not Determined. The master was probably unreachable: check the API URL, whether the master is up, and whether its address belongs in `NO_PROXY`. A launch or other change answered this way is still unconfirmed, because the proxy may have failed after forwarding the request. A proxy that reports in its `Proxy-Status` header that it never connected to the master (for example `error=dns_error` or `error=connection_refused`) gives a retryable `transport_error` with `proxy_error` instead, since nothing reached the master. See [unconfirmed launches](compute-service.md#unconfirmed-launches) for how a proxy's answer is recognized.
 
-Use `compute_adopt` for a remote task that was created independently. Adoption is not a workaround for an uncertain local submission. See [discover and adopt](agent-workflow.md#discover-and-adopt-existing-remote-tasks) for the boundary.
+Do not launch again automatically. Call `compute_list(kind, marker=submission_marker)` with a small `limit`: it reads the newest tasks of the account and returns every one whose stored config carries that marker. One returned task is most likely the submission; continue with its ID. Several returned tasks share a copied config; let the user decide which one, if any, is the submission. An empty result does not prove that the submission failed: follow `pagination.next_offset` to older pages, search again later, since the master may store the task after the search, or check the WebUI. An ended command or shell that Determined no longer serves does not appear at all. Whether to submit again is the user's decision after checking; a duplicate cancelled afterwards may already have written files or had other effects that cancelling does not undo. See [unconfirmed launches](compute-service.md#unconfirmed-launches).
 
 ## A task is terminal but the result is unclear
 
-Use `compute_status` and `compute_logs` with the local task ID. A successful API submission, remote ID, or terminal state does not by itself prove workload success. Check exit information and the success criteria defined before launch. With storage access configured, verify the expected shared artifact with `storage_check`; if a local copy is required, preview and then execute `storage_fetch`. Without storage access, use task output or another explicit workload-level check. To see whether the task actually used its CPU, memory, or GPUs before it ended, call `compute_usage(task_id)`; for an ended task or a paused trial, the window ends when the task or its last allocation ended.
+Use `compute_status` and `compute_logs` with the task's kind and ID. A successful API submission, task ID, or terminal state does not by itself prove workload success. Check exit information and the success criteria defined before launch. With storage access configured, verify the expected shared artifact with `storage_check`; if a local copy is required, preview and then execute `storage_fetch`. Without storage access, use task output or another explicit workload-level check. To see whether the task actually used its CPU, memory, or GPUs before it ended, call `compute_usage(kind, id)`; for an ended task or a paused trial, the window ends when the task or its last allocation ended.
 
 An experiment may have no trial logs before a trial starts. For a shell, the sanitized reconnect command can be used while the shell remains available. Reports may include task IDs, states, sanitized commands, paths, and errors, but must omit credential values and secret-file contents.
 
@@ -96,17 +98,19 @@ An experiment may have no trial logs before a trial starts. For a shell, the san
 
 `compute_usage` depends on the master's task-resources API. `task_resources_disabled` means the master has the API but an administrator has not enabled `integrations.task_resources`. `task_resources_unsupported` means the master lacks the API; it needs a Determined master from the research-cluster fork 0.40.1 or later. Neither is retryable, so ask an administrator. Unavailable measurements are not evidence that a task is idle.
 
-HTTP 503 means the measurement backend is busy or unavailable; each master runs at most four resource queries at once, so wait and retry. HTTP 400 can mean clock skew: the master rejects a window end more than 60 seconds ahead of its own clock, so correct the clock of the machine running the MCP server. HTTP 404 means the Determined task, or a requested trial ID, is missing or inaccessible to the current account.
+HTTP 503 means the measurement backend is busy or unavailable; each master runs at most four resource queries at once, so wait and retry. HTTP 400 can mean clock skew: the master rejects a window end more than 60 seconds ahead of its own clock, so correct the clock of the machine running the MCP server. HTTP 404 means the Determined task, or a requested trial ID, is missing or inaccessible to the current account. Determined serves an ended command or shell for only 24 hours after it ends and not after a master restart; after that its owner cannot be verified, so its usage, status, and logs return HTTP 404 and retrying will not help.
 
-`task_not_started` means the experiment has no trial yet or its trial has no Determined task; wait until it starts. `trial_not_found` means the requested trial does not belong to this experiment. `allocation_not_found` means the allocation is not listed for the selected task; choose one from the returned `allocations`. `remote_id_unknown` means the local submission is not bound and must be reconciled first.
+`task_not_started` means the experiment has no trial yet or its trial has no Determined task; wait until it starts. `trial_not_found` means the requested trial does not belong to this experiment. `allocation_not_found` means the allocation is not listed for the selected task; choose one from the returned `allocations`.
 
-A non-empty `context_unavailable` is not fatal. It lists context lookups (`resource_pool`, `allocation_details`, or `gpu_models`) that failed with a Determined API error; the related fields are empty or `null`, and the returned measurements remain valid. Retry later if you need that context. After a transport failure the remaining lookups are skipped, so several names can appear at once. A `null` `resource_pool` without a `context_unavailable` entry for an ended command or shell means Determined no longer serves that task's entity, so retrying will not help. A `null` `gpu_model` without a `gpu_models` entry in `context_unavailable` can mean that RBAC hides device UUIDs from the current account, so model names cannot be matched. A trial's `total_batches_processed` of 0 is expected when the workload does not report progress through Determined's Core API, as with a plain bash entrypoint, or has not reported yet; it does not show that the workload made no progress, so judge progress from logs, measured use, and expected artifacts instead.
+A non-empty `context_unavailable` is not fatal. It lists context lookups (`resource_pool`, `allocation_details`, or `gpu_models`) that failed with a Determined API error; the related fields are empty or `null`, and the returned measurements remain valid. Retry later if you need that context. After a transport failure the remaining lookups are skipped, so several names can appear at once. A `null` `gpu_model` without a `gpu_models` entry in `context_unavailable` can mean that RBAC hides device UUIDs from the current account, so model names cannot be matched. A trial's `total_batches_processed` of 0 is expected when the workload does not report progress through Determined's Core API, as with a plain bash entrypoint, or has not reported yet; it does not show that the workload made no progress, so judge progress from logs, measured use, and expected artifacts instead.
 
 An empty `series` list means no data for the window, not an idle task: the task may not have run in that window, or monitoring retained no data for it. Compare the window and its `anchor` with `task_start_time` and `allocations`, or use a longer `window_seconds`. If `samples_omitted` is true, narrow the window, select fewer metrics, or choose one allocation. A task can stay `RUNNING` for up to about 150 seconds while its agent is disconnected, because by default the fork waits that long (`agent_reconnect_wait`) for the agent to reconnect; a `RUNNING` state alone therefore does not prove progress. Field meanings and limits are in [task usage measurements](compute-service.md#task-usage-measurements).
 
-## Cancellation is rejected
+## A task operation is refused
 
-On the Determined fork 0.40.1 or later with basic authorization, only a task's Determined owner or an administrator can kill or cancel it. For a task owned by another account, `compute_cancel` returns HTTP 403 for a command or shell and HTTP 404 `experiment '<id>' not found` for an experiment. This usually follows a credential change: submitted records bind to the profile and endpoint, not the account, so the service still sends the request. Restore the owning account's credentials or ask an administrator to cancel the task. An adopted record reports `ownership_mismatch` before any cancellation request is sent.
+The MCP acts only on tasks owned by the authenticated account. `ownership_mismatch` means the task belongs to another account; the service reads the task, then refuses before any further request, even when the credentials belong to an administrator. Use the owning account's credentials, or ask an administrator to act through Determined directly. `ownership_unavailable` means the master did not report a generic task's owner, because it lacks the research-cluster fork's generic task list (WU-CVGL/determined#27); ask an administrator to upgrade the master. On such a master, launching a generic task or listing generic tasks fails with `unsupported`; a launch checks this before anything is created.
+
+Determined applies its own permissions as well. On the fork 0.40.1 or later with basic authorization, only a task's owner or an administrator can kill, cancel, pause, or resume it; other accounts receive HTTP 403, or HTTP 404 `experiment '<id>' not found` for an experiment.
 
 ## A transfer is partial or different from the preview
 

@@ -1,21 +1,19 @@
-"""Transport-independent planning and persistent compute task orchestration."""
+"""Transport-independent planning and stateless control of Determined tasks."""
 
 from __future__ import annotations
 
 import copy
-import hashlib
-import json
 import math
 import posixpath
 import re
 import shlex
+import threading
 import time
 import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any, Dict, List, Mapping, Optional, Sequence
-from urllib.parse import urlsplit
 
 from determined_compute.core.api_client import DeterminedAPIClient
 
@@ -24,11 +22,9 @@ from .models import (
     ConflictError,
     NotFoundError,
     SubmissionUncertainError,
-    TaskRecord,
     ValidationError,
 )
 from .profile import ComputeProfile
-from .store import SQLiteTaskStore
 
 
 _REQUEST_FIELDS = {
@@ -171,15 +167,6 @@ def _display_description(value: Any, field: str = "description") -> Optional[str
     return result
 
 
-def _remote_id(entity: Any) -> str:
-    if not isinstance(entity, Mapping):
-        raise SubmissionUncertainError("launch response was not an object")
-    value = entity.get("id")
-    if value is None:
-        raise SubmissionUncertainError("launch response did not contain a remote task id")
-    return str(value)
-
-
 def _unix_seconds(value: Optional[str]) -> Optional[int]:
     """Floor an RFC 3339 timestamp to Unix seconds; a missing offset means UTC."""
     if value is None:
@@ -246,27 +233,22 @@ def _remote_state(entity: Any) -> Optional[str]:
 
 
 class ComputeService:
-    """Plan and launch tasks while preserving local ownership and idempotency."""
+    """Plan and launch tasks, and act on Determined tasks owned by the account.
+
+    The service keeps no task records: Determined's own task IDs address every task.
+    """
 
     def __init__(
         self,
         client: Any,
-        store: SQLiteTaskStore,
         profile: ComputeProfile,
-        submission_stale_seconds: int = 300,
         inspector: Any = None,
     ) -> None:
-        if (
-            isinstance(submission_stale_seconds, bool)
-            or not isinstance(submission_stale_seconds, int)
-            or submission_stale_seconds < 0
-        ):
-            raise ValueError("submission_stale_seconds must be a non-negative integer")
         self.client = client
-        self.store = store
         self.profile = profile
-        self.submission_stale_seconds = submission_stale_seconds
         self.inspector = inspector
+        self._user: Optional[Dict[str, str]] = None
+        self._user_lock = threading.Lock()
 
     def plan(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Validate and normalize a request without contacting Determined."""
@@ -438,7 +420,7 @@ class ComputeService:
             "code_revision": code_revision,
             "advisories": advisories,
         }
-        # Only generic plans carry this key, so the payload hash of other kinds is unchanged.
+        # Only generic plans carry this key.
         if task_options is not None:
             result["task_options"] = {
                 key: task_options[key] for key in ("parent", "inherit_context", "pausable")
@@ -448,8 +430,15 @@ class ComputeService:
     @staticmethod
     def _generic_options(request: Mapping[str, Any]) -> Dict[str, Any]:
         parent = request.get("parent")
-        if parent is not None and (not isinstance(parent, str) or not parent):
-            raise ValidationError("parent must be a local task_id or null")
+        if parent is not None:
+            if not isinstance(parent, str):
+                raise ValidationError("parent must be a generic task ID (a UUID) or null")
+            try:
+                parent = str(uuid.UUID(parent))
+            except ValueError as exc:
+                raise ValidationError(
+                    "parent must be a generic task ID (a UUID) or null"
+                ) from exc
         inherit_context = request.get("inherit_context", False)
         pausable = request.get("pausable", False)
         if not isinstance(inherit_context, bool) or not isinstance(pausable, bool):
@@ -657,103 +646,97 @@ class ComputeService:
             rendered = " ".join(shlex.quote(part) for part in command)
         else:
             raise ValidationError("command must be a string or string-list")
-        return (
-            f"mkdir -p {shlex.quote(output_dir)} && "
-            f"cd {shlex.quote(workdir)} && {rendered}"
-        )
+        # The prelude ends in "|| exit $?" on its own line, so a failed mkdir or cd exits with
+        # its status before the shell reads any statement of the command, whatever its form.
+        prelude = f"mkdir -p {shlex.quote(output_dir)} && cd {shlex.quote(workdir)}"
+        return f"{prelude} || exit $?\n{rendered}"
 
-    def launch(self, request: Dict[str, Any], request_id: str, owner: str) -> Dict[str, Any]:
-        request_id = _required_text(request_id, "request_id")
-        owner = _required_text(owner, "owner")
+    def launch(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Submit a request once and return Determined's own task ID.
+
+        Nothing is recorded locally. A launch whose outcome is unknown is never
+        retried; the error carries the submission marker for compute_list.
+        """
         plan = self.plan(request)
-        payload_hash = self._payload_hash(plan)
-        existing = self.store.lookup_request(request_id, owner)
-        if existing is not None:
-            self._validate_idempotent_payload(existing, payload_hash, request, plan)
-            return self._public(existing)
-
-        if not plan["allow_queue"]:
-            try:
-                self._inspector().require_capacity(plan["kind"], plan["config"])
-            except APIError:
-                # A concurrent process may have claimed this id after our lookup.
-                existing = self.store.lookup_request(request_id, owner)
-                if existing is not None:
-                    self._validate_idempotent_payload(
-                        existing, payload_hash, request, plan
-                    )
-                    return self._public(existing)
-                raise
+        kind = plan["kind"]
+        if kind == "generic":
+            # Refuse before anything is created when the master could not report the new
+            # task's owner, since such a task could not be managed afterwards.
+            self.client.require_generic_task_list()
         launch_options = (
-            self._generic_launch_options(plan["task_options"], owner)
-            if plan["kind"] == "generic"
-            else None
+            self._generic_launch_options(plan["task_options"]) if kind == "generic" else None
         )
-        workdir = self.profile.validate_container_path(request.get("workdir"), "workdir")
-        output_dir = self.profile.validate_container_path(request.get("output_dir"), "output_dir")
-        record, created = self.store.claim(
-            request_id=request_id,
-            owner=owner,
-            payload_hash=payload_hash,
-            profile_hash=self.profile.fingerprint,
-            kind=plan["kind"],
-            code_revision=plan["code_revision"],
-            name=plan["name"],
-            description=plan["description"],
-            workdir=workdir,
-            output_dir=output_dir,
-            cluster_identity=self._cluster_identity(),
-        )
-        if not created:
-            return self._public(record)
-
-        self.store.mark_submitting(record.task_id)
-        launch_config = self._with_submission_marker(plan["config"], record.submission_marker)
+        if not plan["allow_queue"]:
+            self._inspector().require_capacity(kind, plan["config"])
+        marker = f"determined-compute:{uuid.uuid4()}"
+        launch_config = self._with_submission_marker(plan["config"], marker)
         try:
             if launch_options is None:
-                entity = self.client.launch_task(plan["kind"], launch_config)
+                entity = self.client.launch_task(kind, launch_config)
             else:
-                entity = self.client.launch_task(plan["kind"], launch_config, launch_options)
-            remote_id = _remote_id(entity)
-            result = self._public(self.store.mark_submitted(record.task_id, remote_id))
-            warnings = entity.get("warnings") if launch_options is not None else None
-            if isinstance(warnings, list) and warnings:
-                result["warnings"] = warnings
-            return result
+                entity = self.client.launch_task(kind, launch_config, launch_options)
+            remote_id = self._launched_id(kind, entity)
         except SubmissionUncertainError as exc:
-            self._best_effort_submission_state(record.task_id, "uncertain")
-            self._attach_task_details(exc, record)
-            raise
-        except APIError as exc:
-            # API-provided strings can echo request data; persist only a fixed class.
-            self._best_effort_submission_state(record.task_id, "failed")
-            self._attach_task_details(exc, record)
+            raise self._uncertain(kind, marker, str(exc), exc.details) from exc
+        except APIError:
+            # The master answered with a definite rejection, so nothing was submitted.
             raise
         except Exception as exc:
-            self._best_effort_submission_state(record.task_id, "uncertain")
-            error = SubmissionUncertainError("remote submission outcome is uncertain")
-            self._attach_task_details(error, record)
-            raise error from exc
+            raise self._uncertain(kind, marker, "the launch failed unexpectedly") from exc
+        result: Dict[str, Any] = {
+            "kind": kind,
+            "id": self._public_id(kind, remote_id),
+            "name": plan["name"],
+            "description": plan["description"],
+            "state": _remote_state(entity),
+            "submission_marker": marker,
+            "advisories": plan["advisories"],
+        }
+        if kind == "shell" and isinstance(entity.get("reconnectCommand"), str):
+            result["reconnect_command"] = entity["reconnectCommand"]
+        warnings = entity.get("warnings") if launch_options is not None else None
+        if isinstance(warnings, list) and warnings:
+            result["warnings"] = warnings
+        return result
 
-    def _generic_launch_options(
-        self, options: Mapping[str, Any], owner: str
-    ) -> Dict[str, Any]:
-        """Resolve a generic task's local parent to its remote task id."""
+    @classmethod
+    def _launched_id(cls, kind: str, entity: Any) -> str:
+        if not isinstance(entity, Mapping) or entity.get("id") is None:
+            raise SubmissionUncertainError("launch response did not contain a task id")
+        try:
+            return cls._canonical_id(kind, entity["id"])
+        except ValidationError as exc:
+            raise SubmissionUncertainError("launch response contained a malformed task id") from exc
+
+    @staticmethod
+    def _uncertain(
+        kind: str, marker: str, reason: str, cause: Any = None
+    ) -> SubmissionUncertainError:
+        error = SubmissionUncertainError(
+            f"The {kind} submission is unconfirmed ({reason}); Determined may or may not have "
+            f"created it, and it may still appear. Look for it with compute_list(kind={kind!r}, "
+            f"marker={marker!r}). An empty result does not prove that the submission failed. "
+            "Do not launch again automatically: whether to resubmit is the user's decision "
+            "after checking."
+        )
+        details: Dict[str, Any] = {"kind": kind, "submission_marker": marker}
+        if isinstance(cause, Mapping) and cause.get("source") == "proxy":
+            # An HTTP proxy, not Determined, answered; keep that label for the caller.
+            details.update(
+                (key, cause[key]) for key in ("source", "status_code", "proxy_error") if key in cause
+            )
+        error.details = details
+        return error
+
+    def _generic_launch_options(self, options: Mapping[str, Any]) -> Dict[str, Any]:
+        """Verify a generic task's parent before launching under it."""
         # Resuming a paused generic task reruns it from the start, so a task is pausable only
         # when the request asks for it. Always send the value: masters differ in how they treat
         # an unset noPause.
         result: Dict[str, Any] = {"noPause": not options["pausable"]}
         if options["parent"] is not None:
-            parent = self.store.get_owned(options["parent"], owner)
-            if parent.kind != "generic":
-                raise ValidationError("parent must be a generic task")
-            self._validate_binding(parent)
-            if parent.remote_id is None:
-                raise ConflictError(
-                    "parent remote task id is unknown; reconcile the parent first",
-                    code="remote_id_unknown",
-                )
-            result["parentId"] = parent.remote_id
+            _kind, parent_id, _entity = self._owned("generic", options["parent"])
+            result["parentId"] = parent_id
             if options["inherit_context"]:
                 result["inheritContext"] = True
         return result
@@ -765,113 +748,29 @@ class ComputeService:
             self.inspector = ResourceInspector(self.client)
         return self.inspector
 
-    def _validate_idempotent_payload(
-        self,
-        record: TaskRecord,
-        payload_hash: str,
-        request: Mapping[str, Any],
-        plan: Mapping[str, Any],
-    ) -> None:
-        if record.origin == "adopted":
-            raise ConflictError(
-                "an adopted task cannot be used as a launch retry",
-                code="idempotency_conflict",
-            )
-        if record.payload_hash == payload_hash:
-            return
-        new_fields = {"name", "description", "allow_queue"}
-        legacy_record = record.name is None and record.description is None
-        legacy_request = not new_fields.intersection(request)
-        if (
-            legacy_record
-            and legacy_request
-            and record.payload_hash == self._legacy_payload_hash(plan, request)
-        ):
-            return
-        raise ConflictError(
-            "request_id was already used with a different request",
-            code="idempotency_conflict",
-        )
-
-    def _legacy_payload_hash(
-        self, plan: Mapping[str, Any], request: Mapping[str, Any]
-    ) -> str:
-        """Reconstruct the 0.4 plan hash for migrated task rows only."""
-
-        config = copy.deepcopy(dict(plan["config"]))
-        if plan["kind"] == "experiment":
-            original = request.get("experiment_config")
-            original = original if isinstance(original, Mapping) else {}
-            for field in ("name", "description"):
-                if field in original:
-                    config[field] = copy.deepcopy(original[field])
-                else:
-                    config.pop(field, None)
-        else:
-            config.pop("description", None)
-        legacy_plan = {
-            "kind": plan["kind"],
-            "config": config,
-            "code_revision": plan["code_revision"],
-            "advisories": [
-                copy.deepcopy(item)
-                for item in plan["advisories"]
-                if item.get("code") != "generated_task_name"
-            ],
-        }
-        return self._payload_hash(legacy_plan)
-
-    def _best_effort_submission_state(self, task_id: str, state: str) -> None:
-        try:
-            if state == "failed":
-                self.store.mark_failed(task_id, "api_error")
-            else:
-                self.store.mark_uncertain(task_id)
-        except Exception:
-            # A durable pending/submitting record is already safe: retrying it cannot
-            # launch again. Preserve the original API/outcome error for the caller.
-            pass
-
-    def status(self, task_id: str, owner: str) -> Dict[str, Any]:
-        record = self.store.get_owned(task_id, owner)
-        self._validate_binding(record)
-        if record.remote_id is None and record.state in {"pending", "submitting"}:
-            record = self.store.mark_stale_submission_uncertain(
-                task_id, owner, self.submission_stale_seconds
-            )
-        result = self._public(record)
-        if record.remote_id is None:
-            return result
-        entity = self.client.get_task(record.kind, record.remote_id)
-        if record.origin == "adopted":
-            self._check_adopted_entity(record, entity)
-        state = _remote_state(entity)
-        if state != record.remote_state:
-            record = self.store.update_remote_state(record.task_id, state)
-            result = self._public(record)
+    def status(self, kind: str, task_id: Any) -> Dict[str, Any]:
+        """Return the current remote state of one task owned by the account."""
+        kind, remote_id, entity = self._owned(kind, task_id)
+        result = self._summary(kind, remote_id, entity)
+        marker = entity.get("submissionMarker")
+        if isinstance(marker, str):
+            result["submission_marker"] = marker
         result["remote"] = entity
         return result
 
-    def logs(self, task_id: str, owner: str, tail: int = 100) -> List[Any]:
+    def logs(self, kind: str, task_id: Any, tail: int = 100) -> List[Any]:
         if isinstance(tail, bool) or not isinstance(tail, int) or tail <= 0:
             raise ValidationError("tail must be a positive integer")
-        record = self.store.get_owned(task_id, owner)
-        self._validate_binding(record)
-        if record.remote_id is None:
-            return []
-        if record.origin == "adopted":
-            self._check_adopted_entity(
-                record, self.client.get_task(record.kind, record.remote_id)
-            )
-        result = self.client.task_logs(record.kind, record.remote_id, tail)
+        kind, remote_id, _entity = self._owned(kind, task_id)
+        result = self.client.task_logs(kind, remote_id, tail)
         if not isinstance(result, list):
             raise APIError("task log response was not a list", code="invalid_api_response")
         return result
 
     def usage(
         self,
-        task_id: str,
-        owner: str,
+        kind: str,
+        task_id: Any,
         window_seconds: int = 3600,
         allocation_id: Optional[str] = None,
         trial_id: Optional[int] = None,
@@ -879,6 +778,7 @@ class ComputeService:
         include_samples: bool = False,
     ) -> Dict[str, Any]:
         """Summarize measured CPU, memory, and GPU use of one owned task."""
+        kind = self._task_kind(kind)
         if (
             isinstance(window_seconds, bool)
             or not isinstance(window_seconds, int)
@@ -913,31 +813,17 @@ class ComputeService:
             metrics = list(dict.fromkeys(metrics))
         if not isinstance(include_samples, bool):
             raise ValidationError("include_samples must be a boolean")
-
-        record = self.store.get_owned(task_id, owner)
-        if trial_id is not None and record.kind != "experiment":
+        if trial_id is not None and kind != "experiment":
             raise ValidationError("trial_id applies only to experiment tasks")
-        self._validate_binding(record)
-        if record.remote_id is None:
-            raise ConflictError(
-                "remote task id is unknown; reconcile the submission before reading usage",
-                code="remote_id_unknown",
-            )
-        entity: Any = None
-        if record.origin == "adopted":
-            entity = self.client.get_task(record.kind, record.remote_id)
-            self._check_adopted_entity(record, entity)
+
+        kind, remote_id, entity = self._owned(kind, task_id)
         if not self.client.task_resources_enabled():
             raise APIError(
                 "task resource monitoring is not enabled on this Determined master",
                 code="task_resources_disabled",
             )
-        trial = (
-            self._usage_trial(record.remote_id, trial_id)
-            if record.kind == "experiment"
-            else None
-        )
-        determined_task_id = trial["task_id"] if trial is not None else record.remote_id
+        trial = self._usage_trial(remote_id, trial_id) if kind == "experiment" else None
+        determined_task_id = trial["task_id"] if trial is not None else remote_id
         info = self.client.get_task_info(determined_task_id)
         allocations = [
             {
@@ -1002,20 +888,7 @@ class ComputeService:
                 unavailable.append(name)
             return None
 
-        if entity is None:
-            try:
-                entity = self.client.get_task(record.kind, record.remote_id)
-            except APIError as exc:
-                unreachable = exc.code == "transport_error"
-                # Determined keeps an ended command or shell for only 24 hours and drops it
-                # on a master restart, so its absence then leaves the pool unknown.
-                if not (exc.code == 404 and task_end is not None):
-                    unavailable.append("resource_pool")
-        pool_name = (
-            self._remote_text(entity.get("resourcePool"), 256)
-            if isinstance(entity, Mapping)
-            else None
-        )
+        pool_name = self._remote_text(entity.get("resourcePool"), 256)
         resource_pool = None
         if pool_name is not None:
             pools = context("resource_pool", self.client.list_resource_pools) or []
@@ -1071,9 +944,8 @@ class ComputeService:
                 "reported yet"
             )
         result: Dict[str, Any] = {
-            "task_id": record.task_id,
-            "kind": record.kind,
-            "remote_id": record.remote_id,
+            "kind": kind,
+            "id": self._public_id(kind, remote_id),
             "determined_task_id": determined_task_id,
             "trial": (
                 {key: value for key, value in trial.items() if key != "task_id"}
@@ -1287,154 +1159,65 @@ class ComputeService:
             })
         return result
 
-    def cancel(self, task_id: str, owner: str) -> Dict[str, Any]:
-        record = self.store.get_owned(task_id, owner)
-        self._validate_binding(record)
-        if record.remote_id is None:
-            raise ConflictError(
-                "remote task id is unknown; reconcile the submission before cancelling",
-                code="remote_id_unknown",
-            )
-        if record.origin == "adopted":
-            self._check_adopted_entity(
-                record, self.client.get_task(record.kind, record.remote_id)
-            )
-        entity = self.client.cancel_task(record.kind, record.remote_id)
-        state = _remote_state(entity)
+    def cancel(self, kind: str, task_id: Any) -> Dict[str, Any]:
+        kind, remote_id, entity = self._owned(kind, task_id)
+        response = self.client.cancel_task(kind, remote_id)
+        result = self._summary(kind, remote_id, entity)
+        state = _remote_state(response)
         if state is not None:
-            record = self.store.update_remote_state(record.task_id, state)
-        updated = self._public(record)
-        updated["cancellation_acknowledged"] = True
-        updated["remote"] = entity
-        return updated
-
-    def pause(self, task_id: str, owner: str) -> Dict[str, Any]:
-        """Pause an experiment or a generic task; its containers stop and it keeps its id."""
-        return self._pause_control(task_id, owner, "pause")
-
-    def resume(self, task_id: str, owner: str) -> Dict[str, Any]:
-        """Resume a paused experiment or generic task."""
-        return self._pause_control(task_id, owner, "resume")
-
-    def _pause_control(self, task_id: str, owner: str, action: str) -> Dict[str, Any]:
-        record = self.store.get_owned(task_id, owner)
-        if record.kind not in {"experiment", "generic"}:
-            raise ValidationError(
-                f"{action} applies only to experiments and generic tasks; "
-                f"this task is a {record.kind}",
-                code="unsupported_kind",
-            )
-        self._validate_binding(record)
-        if record.remote_id is None:
-            raise ConflictError(
-                f"remote task id is unknown; reconcile the submission before {action}",
-                code="remote_id_unknown",
-            )
-        if record.origin == "adopted":
-            self._check_adopted_entity(
-                record, self.client.get_task(record.kind, record.remote_id)
-            )
-        operation = self.client.pause_task if action == "pause" else self.client.unpause_task
-        entity = operation(record.kind, record.remote_id)
-        result = self._public(record)
-        result[f"{action}_acknowledged"] = True
-        result["remote"] = entity
+            result["state"] = state
+        result["cancellation_acknowledged"] = True
+        result["remote"] = response
         return result
 
-    def list_tasks(self, owner: str) -> List[Dict[str, Any]]:
-        owner = _required_text(owner, "owner")
-        return [self._public(record) for record in self.store.list_owned(owner)]
+    def pause(self, kind: str, task_id: Any) -> Dict[str, Any]:
+        """Pause an experiment or a generic task; its containers stop and it keeps its ID."""
+        return self._pause_control(kind, task_id, "pause")
 
-    @staticmethod
-    def _management_kind(kind: Any) -> str:
-        if not isinstance(kind, str) or kind not in {"command", "shell", "generic", "experiment"}:
-            raise ValidationError("kind must be command, shell, generic, or experiment")
-        return kind
+    def resume(self, kind: str, task_id: Any) -> Dict[str, Any]:
+        """Resume a paused experiment or generic task."""
+        return self._pause_control(kind, task_id, "resume")
 
-    @staticmethod
-    def _management_remote_id(kind: str, value: Any) -> str:
-        if kind == "experiment":
-            try:
-                return DeterminedAPIClient.normalize_user_id(value)
-            except ValueError as exc:
-                raise ValidationError("experiment remote_id must be a positive integer") from exc
-        if not isinstance(value, str):
-            raise ValidationError("command, shell, and generic task remote_id must be a UUID")
-        try:
-            return str(uuid.UUID(value))
-        except ValueError as exc:
+    def _pause_control(self, kind: str, task_id: Any, action: str) -> Dict[str, Any]:
+        kind = self._task_kind(kind)
+        if kind not in {"experiment", "generic"}:
             raise ValidationError(
-                "command, shell, and generic task remote_id must be a UUID"
-            ) from exc
-
-    def _remote_account(self) -> tuple[str, Dict[str, str]]:
-        cluster_id = self.client.get_cluster_id()
-        user = self.client.get_current_user()
-        if (
-            not isinstance(cluster_id, str)
-            or not cluster_id.strip()
-            or len(cluster_id.encode("utf-8")) > 256
-            or not isinstance(user, Mapping)
-            or not isinstance(user.get("username"), str)
-            or not user["username"].strip()
-        ):
-            raise APIError("Remote cluster or account identity is unavailable", code="invalid_response")
-        try:
-            user_id = DeterminedAPIClient.normalize_user_id(user.get("id"))
-        except ValueError as exc:
-            raise APIError("Remote account identity is unavailable", code="invalid_response") from exc
-        return cluster_id.strip(), {"id": user_id, "username": user["username"].strip()}
-
-    @staticmethod
-    def _check_remote_owner(entity: Any, user_id: str) -> None:
-        if not isinstance(entity, Mapping):
-            raise APIError("Remote task response is malformed", code="invalid_response")
-        try:
-            task_user_id = DeterminedAPIClient.normalize_user_id(entity.get("userId"))
-        except ValueError as exc:
-            raise APIError("Remote task ownership cannot be established", code="ownership_unavailable") from exc
-        if task_user_id != user_id:
-            raise ConflictError(
-                "remote task is not owned by the authenticated account",
-                code="ownership_mismatch",
+                f"{action} applies only to experiments and generic tasks; this task is a {kind}",
+                code="unsupported_kind",
             )
+        kind, remote_id, entity = self._owned(kind, task_id)
+        operation = self.client.pause_task if action == "pause" else self.client.unpause_task
+        response = operation(kind, remote_id)
+        result = self._summary(kind, remote_id, entity)
+        result[f"{action}_acknowledged"] = True
+        result["remote"] = response
+        return result
 
-    def _check_remote_entity(self, kind: str, remote_id: str, entity: Any, user_id: str) -> None:
-        self._check_remote_owner(entity, user_id)
-        try:
-            actual_id = self._management_remote_id(kind, entity.get("id"))
-        except ValidationError as exc:
-            raise APIError("Remote task identity is malformed", code="invalid_response") from exc
-        if actual_id != remote_id:
-            raise ConflictError("remote task identity does not match", code="identity_mismatch")
+    def list_tasks(
+        self,
+        kind: str,
+        limit: int = 50,
+        offset: int = 0,
+        marker: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """List one page of the account's tasks of one kind, newest first.
 
-    def _check_adopted_entity(self, record: TaskRecord, entity: Any) -> None:
-        self._check_remote_entity(record.kind, record.remote_id, entity, record.remote_user_id)
-
-    @staticmethod
-    def _remote_text(value: Any, limit: int = 4096) -> Optional[str]:
-        if not isinstance(value, str):
-            return None
-        text = value.strip()
-        return text[:limit] if text else None
-
-    @classmethod
-    def _remote_metadata(cls, entity: Mapping[str, Any]) -> Dict[str, Optional[str]]:
-        description = cls._remote_text(entity.get("description"))
-        name = cls._remote_text(entity.get("name"), 256) or cls._remote_text(entity.get("displayName"), 256)
-        if name is None and description:
-            name = description.splitlines()[0][:256]
-        return {"name": name, "description": description}
-
-    def discover(self, kind: str, owner: str, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
-        """Read one remote page for the authenticated account without registering tasks."""
-        kind = self._management_kind(kind)
-        owner = _required_text(owner, "owner")
+        With a marker, each task of that page is read once and every task whose stored config
+        carries the marker is returned. A marker is a correlation label, not an identity: a
+        config copied outside this service carries the same one, so several tasks can match.
+        """
+        kind = self._task_kind(kind)
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValidationError("limit must be an integer between 1 and 100")
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise ValidationError("offset must be a non-negative integer")
-        cluster_id, user = self._remote_account()
+        if marker is not None:
+            marker = DeterminedAPIClient._valid_submission_marker(marker)
+            if marker is None:
+                raise ValidationError(
+                    "marker must be a submission marker of the form determined-compute:<uuid>"
+                )
+        user = self._account()
         page = self.client.list_remote_tasks(kind, user_id=user["id"], limit=limit, offset=offset)
         if not isinstance(page, Mapping) or not isinstance(page.get("tasks"), list):
             raise APIError("Remote task page is malformed", code="invalid_response")
@@ -1453,209 +1236,159 @@ class ComputeService:
             or len(page["tasks"]) > limit
         ):
             raise APIError("Remote task pagination is malformed", code="invalid_response")
-        tasks = []
-        binding = self._cluster_identity()
-        for entity in page["tasks"]:
-            self._check_remote_owner(entity, user["id"])
+        tasks: List[Dict[str, Any]] = []
+        for listed in page["tasks"]:
+            self._check_remote_owner(kind, listed, user["id"])
             try:
-                remote_id = self._management_remote_id(kind, entity.get("id"))
+                remote_id = self._canonical_id(kind, listed.get("id"))
             except ValidationError as exc:
                 raise APIError("Remote task identity is malformed", code="invalid_response") from exc
-            local = self.store.lookup_remote(
-                owner=owner, kind=kind, remote_id=remote_id,
-                cluster_identity=binding, remote_cluster_id=cluster_id,
-            )
-            if (
-                local is not None
-                and local.origin == "adopted"
-                and local.remote_user_id != user["id"]
-            ):
-                local = None
-            tasks.append({
-                "kind": kind,
-                "remote_id": remote_id,
-                **self._remote_metadata(entity),
-                "remote_state": _remote_state(entity),
-                "remote_user_id": user["id"],
-                "remote_username": self._remote_text(entity.get("username"), 256),
-                "resource_pool": self._remote_text(entity.get("resourcePool"), 256),
-                "start_time": self._remote_text(entity.get("startTime"), 128),
-                "local_task_id": local.task_id if local is not None else None,
-            })
-        next_offset = offset + len(tasks)
-        return {
+            if marker is None:
+                tasks.append(self._summary(kind, remote_id, listed))
+                continue
+            entity = self.client.get_task(kind, remote_id)
+            self._check_remote_entity(kind, remote_id, entity, user["id"])
+            if entity.get("submissionMarker") == marker:
+                tasks.append({
+                    **self._summary(kind, remote_id, {**listed, **entity}),
+                    "submission_marker": marker,
+                })
+        next_offset = offset + len(page["tasks"])
+        result: Dict[str, Any] = {
             "kind": kind,
-            "remote_cluster_id": cluster_id,
             "account": user,
             "tasks": tasks,
             "pagination": {
-                "offset": offset, "limit": limit, "total": pagination["total"],
-                "next_offset": next_offset if tasks and next_offset < pagination["total"] else None,
+                "offset": offset,
+                "limit": limit,
+                "total": pagination["total"],
+                "next_offset": (
+                    next_offset
+                    if next_offset > offset and next_offset < pagination["total"]
+                    else None
+                ),
             },
         }
-
-    def adopt(self, kind: str, remote_id: str, owner: str) -> Dict[str, Any]:
-        """Register an existing owned task locally; never submit or edit a remote task."""
-        kind = self._management_kind(kind)
-        remote_id = self._management_remote_id(kind, remote_id)
-        owner = _required_text(owner, "owner")
-        cluster_id, user = self._remote_account()
-        entity = self.client.get_task(kind, remote_id)
-        self._check_remote_entity(kind, remote_id, entity, user["id"])
-        record, _created = self.store.adopt(
-            owner=owner, kind=kind, remote_id=remote_id,
-            remote_state=_remote_state(entity),
-            cluster_identity=self._cluster_identity(),
-            remote_cluster_id=cluster_id, remote_user_id=user["id"],
-            profile_hash=self.profile.fingerprint,
-            submission_marker=(
-                entity.get("submissionMarker")
-                if isinstance(entity.get("submissionMarker"), str)
-                else None
-            ),
-            legacy_submission_markers=tuple(
-                marker
-                for description in self._entity_descriptions(entity)
-                if (
-                    marker := DeterminedAPIClient._valid_submission_marker(
-                        description.splitlines()[0] if description else None
-                    )
-                ) is not None
-            ),
-            **self._remote_metadata(entity),
-        )
-        # A task launched through this owner/database retains its original binding.
-        if record.origin == "submitted":
-            self._validate_binding(record)
-        if record.remote_state != _remote_state(entity):
-            record = self.store.update_remote_state(record.task_id, _remote_state(entity))
-        return self._public(record)
-
-    def reconcile(self, task_id: str, owner: str, remote_id: str) -> Dict[str, Any]:
-        """Bind an uncertain record only after verifying its unguessable remote marker."""
-
-        remote_id = _required_text(remote_id, "remote_id")
-        record = self.store.get_owned(task_id, owner)
-        if record.origin == "adopted":
-            raise ConflictError("an adopted task is not a submission to reconcile", code="invalid_operation")
-        self._validate_binding(record)
-        if record.remote_id is not None:
-            if record.remote_id != remote_id:
-                raise ConflictError("task is already bound to a different remote id")
-            return self._public(record)
-        if record.state not in {"pending", "submitting", "submission_uncertain"}:
-            raise ConflictError("task is not eligible for reconciliation")
-        entity = self.client.get_task(record.kind, remote_id)
-        marker = entity.get("submissionMarker") if isinstance(entity, Mapping) else None
-        legacy_match = (
-            record.name is None
-            and record.description is None
-            and any(
-                self._legacy_description_marker(
-                    description, record.submission_marker
-                )
-                for description in self._entity_descriptions(entity)
-            )
-        )
-        if marker != record.submission_marker and not legacy_match:
-            raise ConflictError(
-                "remote task identity marker does not match; refusing unsafe binding",
-                code="identity_mismatch",
-            )
-        return self._public(
-            self.store.bind_reconciled(record.task_id, remote_id, _remote_state(entity))
-        )
-
-    def _payload_hash(self, plan: Mapping[str, Any]) -> str:
-        value = {
-            "plan": plan,
-            "profile_hash": self.profile.fingerprint,
-            "cluster_identity": self._cluster_identity(),
-        }
-        try:
-            encoded = json.dumps(
-                value,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
-            ).encode("utf-8")
-        except (TypeError, ValueError) as exc:
-            raise ValidationError("request must contain JSON-compatible values") from exc
-        return hashlib.sha256(encoded).hexdigest()
-
-    def _cluster_identity(self) -> Optional[str]:
-        label = self.profile.cluster_identity
-        api_url = getattr(self.client, "api_url", None)
-        if api_url is not None:
-            parsed = urlsplit(str(api_url))
-            if not parsed.hostname:
-                raise ValidationError("client api_url has no host for cluster binding")
-            try:
-                port = f":{parsed.port}" if parsed.port is not None else ""
-            except ValueError as exc:
-                raise ValidationError("client api_url has an invalid port") from exc
-            hostname = parsed.hostname.lower()
-            if ":" in hostname:
-                hostname = f"[{hostname}]"
-            path = parsed.path.rstrip("/")
-            endpoint = f"{parsed.scheme.lower()}://{hostname}{port}{path}"
-        else:
-            client_identity = getattr(self.client, "cluster_identity", None)
-            endpoint = str(client_identity) if client_identity is not None else None
-        if label is None and endpoint is None:
-            return None
-        # Keep the operator-facing label and the resolved endpoint in the binding.
-        # A reused label must never authorize operations against a different master.
-        return json.dumps(
-            {"endpoint": endpoint, "label": label},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-
-    def _validate_binding(self, record: TaskRecord) -> None:
-        if record.origin == "adopted":
-            cluster_id, user = self._remote_account()
-            if cluster_id != record.remote_cluster_id:
-                raise ConflictError("task belongs to a different remote cluster", code="binding_mismatch")
-            if user["id"] != record.remote_user_id:
-                raise ConflictError("task belongs to a different authenticated account", code="ownership_mismatch")
-            return
-        if (
-            record.profile_hash != self.profile.fingerprint
-            or record.cluster_identity != self._cluster_identity()
-        ):
-            raise ConflictError(
-                "task belongs to a different compute profile or cluster",
-                code="binding_mismatch",
-            )
-
-    @staticmethod
-    def _public(record: TaskRecord) -> Dict[str, Any]:
-        result = record.public_dict()
-        if record.remote_id is None and record.state in {
-            "pending",
-            "submitting",
-            "submission_uncertain",
-        }:
-            result["recovery"] = {
-                "action": "reconcile",
-                "safe_to_resubmit": False,
-                "message": (
-                    "The remote outcome is not bound. Inspect Determined and reconcile "
-                    "a matching remote id; do not relaunch this request_id."
-                ),
-            }
+        if marker is not None:
+            result["marker"] = marker
+            result["searched"] = len(page["tasks"])
         return result
 
     @staticmethod
-    def _attach_task_details(exc: BaseException, record: TaskRecord) -> None:
-        safe_details = {"task_id": record.task_id, "request_id": record.request_id}
+    def _task_kind(kind: Any) -> str:
+        if not isinstance(kind, str) or kind not in _TASK_KINDS:
+            raise ValidationError("kind must be command, shell, generic, or experiment")
+        return kind
+
+    @staticmethod
+    def _canonical_id(kind: str, value: Any) -> str:
+        if kind == "experiment":
+            try:
+                return DeterminedAPIClient.normalize_user_id(value)
+            except ValueError as exc:
+                raise ValidationError("experiment id must be a positive integer") from exc
+        if not isinstance(value, str):
+            raise ValidationError("command, shell, and generic task id must be a UUID")
         try:
-            setattr(exc, "details", safe_details)
-            setattr(exc, "task_id", record.task_id)
-        except Exception:
-            pass
+            return str(uuid.UUID(value))
+        except ValueError as exc:
+            raise ValidationError("command, shell, and generic task id must be a UUID") from exc
+
+    @staticmethod
+    def _public_id(kind: str, remote_id: str) -> Any:
+        return int(remote_id) if kind == "experiment" else remote_id
+
+    def _account(self) -> Dict[str, str]:
+        """Return the authenticated account; credentials are fixed for the process."""
+        if self._user is None:
+            with self._user_lock:
+                if self._user is None:
+                    user = self.client.get_current_user()
+                    if (
+                        not isinstance(user, Mapping)
+                        or not isinstance(user.get("username"), str)
+                        or not user["username"].strip()
+                    ):
+                        raise APIError("Remote account identity is unavailable", code="invalid_response")
+                    try:
+                        user_id = DeterminedAPIClient.normalize_user_id(user.get("id"))
+                    except ValueError as exc:
+                        raise APIError(
+                            "Remote account identity is unavailable", code="invalid_response"
+                        ) from exc
+                    self._user = {"id": user_id, "username": user["username"].strip()}
+        return dict(self._user)
+
+    def _owned(self, kind: Any, task_id: Any) -> tuple[str, str, Dict[str, Any]]:
+        """Fetch one remote task and verify that the authenticated account owns it."""
+        kind = self._task_kind(kind)
+        remote_id = self._canonical_id(kind, task_id)
+        user = self._account()
+        entity = self.client.get_task(kind, remote_id)
+        self._check_remote_entity(kind, remote_id, entity, user["id"])
+        return kind, remote_id, entity
+
+    @staticmethod
+    def _check_remote_owner(kind: str, entity: Any, user_id: str) -> None:
+        if not isinstance(entity, Mapping):
+            raise APIError("Remote task response is malformed", code="invalid_response")
+        try:
+            task_user_id = DeterminedAPIClient.normalize_user_id(entity.get("userId"))
+        except ValueError as exc:
+            hint = (
+                "; a generic task's owner needs a master with the generic task list "
+                "(WU-CVGL/determined#27)"
+                if kind == "generic"
+                else ""
+            )
+            raise APIError(
+                "Determined did not report the owner of this task, so it cannot be checked "
+                "against the authenticated account" + hint,
+                code="ownership_unavailable",
+            ) from exc
+        if task_user_id != user_id:
+            raise ConflictError(
+                "task is not owned by the authenticated account",
+                code="ownership_mismatch",
+            )
+
+    def _check_remote_entity(self, kind: str, remote_id: str, entity: Any, user_id: str) -> None:
+        self._check_remote_owner(kind, entity, user_id)
+        try:
+            actual_id = self._canonical_id(kind, entity.get("id"))
+        except ValidationError as exc:
+            raise APIError("Remote task identity is malformed", code="invalid_response") from exc
+        if actual_id != remote_id:
+            raise APIError("Remote task identity does not match the request", code="invalid_response")
+
+    @staticmethod
+    def _remote_text(value: Any, limit: int = 4096) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        return text[:limit] if text else None
+
+    @classmethod
+    def _summary(cls, kind: str, remote_id: str, entity: Mapping[str, Any]) -> Dict[str, Any]:
+        """Whitelisted, display-oriented fields of one remote task."""
+        description = cls._remote_text(entity.get("description"))
+        name = cls._remote_text(entity.get("name"), 256) or cls._remote_text(
+            entity.get("displayName"), 256
+        )
+        if name is None and description:
+            # Commands and shells carry the name on the first description line.
+            name = description.splitlines()[0][:256]
+        return {
+            "kind": kind,
+            "id": cls._public_id(kind, remote_id),
+            "name": name,
+            "description": description,
+            "state": _remote_state(entity),
+            "username": cls._remote_text(entity.get("username"), 256),
+            "resource_pool": cls._remote_text(entity.get("resourcePool"), 256),
+            "start_time": cls._remote_text(entity.get("startTime"), 128),
+            "end_time": cls._remote_text(entity.get("endTime"), 128),
+        }
 
     @staticmethod
     def _with_submission_marker(config: Mapping[str, Any], marker: str) -> Dict[str, Any]:
@@ -1674,34 +1407,13 @@ class ComputeService:
         for item in variables:
             if item.split("=", 1)[0] == _SUBMISSION_MARKER_VARIABLE:
                 raise ValidationError(
-                    f"{_SUBMISSION_MARKER_VARIABLE} is reserved for task identity"
+                    f"{_SUBMISSION_MARKER_VARIABLE} is reserved for the submission marker"
                 )
         environment["environment_variables"] = list(variables) + [
             f"{_SUBMISSION_MARKER_VARIABLE}={marker}"
         ]
         result["environment"] = environment
         return result
-
-    @staticmethod
-    def _legacy_description_marker(
-        description: Optional[str], marker: str
-    ) -> bool:
-        if not description:
-            return False
-        # Backward compatibility only: pre-metadata jobs used the first line.
-        return description.splitlines()[0] == marker
-
-    @staticmethod
-    def _entity_descriptions(entity: Any) -> Sequence[str]:
-        if not isinstance(entity, Mapping):
-            return ()
-        candidates: Sequence[Any] = (
-            entity.get("description"),
-            entity.get("config", {}).get("description")
-            if isinstance(entity.get("config"), Mapping)
-            else None,
-        )
-        return tuple(candidate for candidate in candidates if isinstance(candidate, str))
 
 
 __all__ = ["ComputeService"]

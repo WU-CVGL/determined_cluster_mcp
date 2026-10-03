@@ -1,7 +1,5 @@
 # Copy this file outside version control and replace every placeholder.
 # Values describe one deployment; old image and pool examples are not defaults.
-cluster_identity: "REPLACE_WITH_CLUSTER_NAME"
-
 mounts:
   - host_path: "/workspace/REPLACE_WITH_USER"
     container_path: "/run/determined/workdir/home"
