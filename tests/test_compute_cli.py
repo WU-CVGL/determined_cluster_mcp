@@ -135,6 +135,23 @@ def test_usage_binds_owner_and_forwards_options(monkeypatch, capsys):
     ]
 
 
+def test_pause_and_resume_bind_owner(monkeypatch, capsys):
+    service = FakeService()
+    service.pause = lambda task_id, owner: service.calls.append(("pause", task_id, owner)) or {
+        "task_id": task_id, "pause_acknowledged": True,
+    }
+    service.resume = lambda task_id, owner: service.calls.append(("resume", task_id, owner)) or {
+        "task_id": task_id, "resume_acknowledged": True,
+    }
+    monkeypatch.setattr(compute_cli, "_resolve_runtime", lambda args: (service, "alice"))
+
+    assert compute_cli.main(["pause", "task-1"]) == 0
+    assert json.loads(capsys.readouterr().out)["result"]["pause_acknowledged"] is True
+    assert compute_cli.main(["resume", "task-1"]) == 0
+    assert json.loads(capsys.readouterr().out)["result"]["resume_acknowledged"] is True
+    assert service.calls == [("pause", "task-1", "alice"), ("resume", "task-1", "alice")]
+
+
 def test_plan_accepts_yaml_request_file(tmp_path, monkeypatch, capsys):
     service = FakeService()
     request = tmp_path / "request.yaml"

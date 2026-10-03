@@ -215,6 +215,14 @@ def build_parser() -> argparse.ArgumentParser:
     cancel = commands.add_parser("cancel", help="Cancel one task")
     cancel.add_argument("task_id")
 
+    pause = commands.add_parser("pause", help="Pause one generic task")
+    pause.add_argument("task_id")
+
+    resume = commands.add_parser(
+        "resume", help="Resume one paused generic task; its command runs again from the start"
+    )
+    resume.add_argument("task_id")
+
     reconcile = commands.add_parser(
         "reconcile", help="Bind an uncertain task to a verified remote task id"
     )
@@ -272,6 +280,10 @@ def _dispatch(args: argparse.Namespace, service: ComputeService, owner: str) -> 
         )
     if args.command == "cancel":
         return service.cancel(args.task_id, owner)
+    if args.command == "pause":
+        return service.pause(args.task_id, owner)
+    if args.command == "resume":
+        return service.resume(args.task_id, owner)
     if args.command == "reconcile":
         return service.reconcile(args.task_id, owner, args.remote_id)
     if args.command == "discover":

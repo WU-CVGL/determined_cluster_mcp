@@ -921,3 +921,256 @@ def test_store_additively_migrates_legacy_task_schema(tmp_path):
         for row in sqlite3.connect(db_path).execute("PRAGMA table_info(compute_tasks)")
     }
     assert {"name", "description"}.issubset(columns)
+
+
+class GenericClient(FakeClient):
+    """Fake client that also serves generic-task launch options and control routes."""
+
+    def __init__(self, warnings=None):
+        super().__init__()
+        self.options = []
+        self.controls = []
+        self.warnings = warnings or []
+
+    def launch_task(self, kind, config, options=None):
+        self.options.append(options)
+        entity = super().launch_task(kind, config)
+        marker = next(
+            item.partition("=")[2]
+            for item in config["environment"]["environment_variables"]
+            if item.startswith("COMPUTE_SUBMISSION_MARKER=")
+        )
+        self.entities[(kind, entity["id"])] = {
+            "id": entity["id"], "state": "STATE_ACTIVE", "submissionMarker": marker,
+        }
+        return {"id": entity["id"], "warnings": list(self.warnings)}
+
+    def pause_task(self, kind, remote_id):
+        self.controls.append(("pause", kind, remote_id))
+        return {"id": remote_id, "acknowledged": True}
+
+    def unpause_task(self, kind, remote_id):
+        self.controls.append(("unpause", kind, remote_id))
+        return {"id": remote_id, "acknowledged": True}
+
+    def cancel_task(self, kind, remote_id):
+        self.cancel_calls.append((kind, remote_id))
+        return {"id": remote_id, "acknowledged": True}
+
+
+@pytest.fixture
+def generic_request(command_request):
+    return dict(
+        command_request,
+        kind="generic",
+        name="eval-shards",
+        description="Evaluate every shard; skips finished shards on resume.",
+    )
+
+
+def test_generic_plan_uses_native_metadata_and_command_entrypoint(
+    tmp_path, profile, generic_request
+):
+    service = ComputeService(FakeClient(), SQLiteTaskStore(tmp_path / "tasks.db"), profile)
+    command = service.plan(dict(generic_request, kind="command"))
+
+    plan = service.plan(dict(generic_request, preemption_timeout=120, no_pause=True))
+
+    config = plan["config"]
+    assert plan["kind"] == "generic"
+    assert config["name"] == "eval-shards"
+    assert config["description"] == "Evaluate every shard; skips finished shards on resume."
+    assert config["entrypoint"] == command["config"]["entrypoint"]
+    assert config["resources"] == {"slots": 1, "resource_pool": "gpu"}
+    assert config["environment"] == command["config"]["environment"]
+    assert config["bind_mounts"] == command["config"]["bind_mounts"]
+    assert config["preemption_timeout"] == 120
+    assert plan["task_options"] == {"parent": None, "inherit_context": False, "no_pause": True}
+    assert "generic_restart_safety" in {item["code"] for item in plan["advisories"]}
+    # Other kinds keep their plan shape, so their idempotency hashes are unchanged.
+    assert "task_options" not in command
+    assert "preemption_timeout" not in command["config"]
+
+
+def test_generic_plan_without_description_omits_it(tmp_path, profile, generic_request):
+    service = ComputeService(FakeClient(), SQLiteTaskStore(tmp_path / "tasks.db"), profile)
+    request = dict(generic_request)
+    del request["description"]
+    assert "description" not in service.plan(request)["config"]
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"kind": "command", "no_pause": True}, "require generic kind"),
+        ({"kind": "experiment", "preemption_timeout": 5}, "require generic kind"),
+        ({"kind": "auto", "parent": "task"}, "require generic kind"),
+        ({"inherit_context": True}, "inherit_context requires parent"),
+        ({"preemption_timeout": -1}, "preemption_timeout"),
+        ({"preemption_timeout": True}, "preemption_timeout"),
+        ({"no_pause": "yes"}, "booleans"),
+        ({"parent": ""}, "parent"),
+        ({"command": None}, "command"),
+        ({"interactive": True}, "shell"),
+        ({"experiment_config": {"entrypoint": "true"}}, "experiment kind"),
+    ],
+)
+def test_generic_plan_validation(tmp_path, profile, generic_request, change, message):
+    service = ComputeService(FakeClient(), SQLiteTaskStore(tmp_path / "tasks.db"), profile)
+    with pytest.raises(ValidationError, match=message):
+        service.plan(dict(generic_request, **change))
+
+
+def test_generic_launch_admits_capacity_and_surfaces_warnings(
+    tmp_path, profile, generic_request
+):
+    warning = {"code": "generic_task_metadata_unsupported", "message": "kept locally"}
+    client = GenericClient(warnings=[warning])
+    service = ComputeService(client, SQLiteTaskStore(tmp_path / "tasks.db"), profile)
+
+    launched = service.launch(generic_request, "generic-1", "session-a")
+
+    assert launched["kind"] == "generic"
+    assert launched["state"] == "submitted"
+    assert launched["name"] == "eval-shards"
+    assert launched["description"].startswith("Evaluate every shard")
+    assert launched["warnings"] == [warning]
+    assert client.options == [{}]
+    kind, config = client.launches[0]
+    assert kind == "generic"
+    assert config["name"] == "eval-shards"
+    assert any(
+        item.startswith("COMPUTE_SUBMISSION_MARKER=")
+        for item in config["environment"]["environment_variables"]
+    )
+    # An idempotent retry returns the stored record without submitting again.
+    again = service.launch(generic_request, "generic-1", "session-a")
+    assert again["task_id"] == launched["task_id"]
+    assert len(client.launches) == 1
+
+
+def test_generic_parent_resolves_to_owned_remote_task(tmp_path, profile, generic_request):
+    client = GenericClient()
+    service = ComputeService(client, SQLiteTaskStore(tmp_path / "tasks.db"), profile)
+    parent = service.launch(generic_request, "parent", "session-a")
+    child_request = dict(
+        generic_request, name="child", parent=parent["task_id"], inherit_context=True,
+        no_pause=True,
+    )
+
+    service.launch(child_request, "child", "session-a")
+
+    assert client.options[-1] == {
+        "parentId": parent["remote_id"], "inheritContext": True, "noPause": True,
+    }
+
+
+def test_generic_parent_must_be_an_owned_bound_generic_task(
+    tmp_path, profile, generic_request, command_request
+):
+    client = GenericClient()
+    service = ComputeService(client, SQLiteTaskStore(tmp_path / "tasks.db"), profile)
+    parent = service.launch(generic_request, "parent", "session-a")
+    command = service.launch(command_request, "command", "session-a")
+
+    with pytest.raises(NotFoundError):
+        service.launch(dict(generic_request, parent=parent["task_id"]), "x", "session-b")
+    with pytest.raises(ValidationError, match="generic"):
+        service.launch(dict(generic_request, parent=command["task_id"]), "y", "session-a")
+
+    assert {item["request_id"] for item in service.list_tasks("session-a")} == {
+        "command", "parent",
+    }
+    assert service.list_tasks("session-b") == []
+    assert len(client.launches) == 2
+
+
+def test_generic_status_logs_cancel_pause_and_resume(tmp_path, profile, generic_request):
+    client = GenericClient()
+    service = ComputeService(client, SQLiteTaskStore(tmp_path / "tasks.db"), profile)
+    launched = service.launch(generic_request, "generic-1", "session-a")
+    task_id, remote_id = launched["task_id"], launched["remote_id"]
+
+    paused = service.pause(task_id, "session-a")
+    assert paused["pause_acknowledged"] is True
+    client.entities[("generic", remote_id)]["state"] = "STATE_PAUSED"
+    status = service.status(task_id, "session-a")
+    assert status["remote_state"] == "STATE_PAUSED"
+
+    resumed = service.resume(task_id, "session-a")
+    assert resumed["resume_acknowledged"] is True
+    assert client.controls == [("pause", "generic", remote_id), ("unpause", "generic", remote_id)]
+
+    assert service.logs(task_id, "session-a", 5) == [{"message": "ok"}]
+    assert client.log_calls == [("generic", remote_id, 5)]
+    cancelled = service.cancel(task_id, "session-a")
+    assert cancelled["cancellation_acknowledged"] is True
+    assert cancelled["remote_state"] == "STATE_PAUSED"
+    assert client.cancel_calls == [("generic", remote_id)]
+
+
+def test_pause_and_resume_apply_only_to_owned_bound_generic_tasks(
+    tmp_path, profile, generic_request, command_request
+):
+    client = GenericClient()
+    store = SQLiteTaskStore(tmp_path / "tasks.db")
+    service = ComputeService(client, store, profile)
+    command = service.launch(command_request, "command", "session-a")
+    generic = service.launch(generic_request, "generic", "session-a")
+
+    for action in (service.pause, service.resume):
+        with pytest.raises(ValidationError) as caught:
+            action(command["task_id"], "session-a")
+        assert caught.value.code == "unsupported_kind"
+        with pytest.raises(NotFoundError):
+            action(generic["task_id"], "session-b")
+
+    record, _ = store.claim(
+        request_id="unbound", owner="session-a", payload_hash="hash",
+        profile_hash=profile.fingerprint, kind="generic", code_revision=None,
+        workdir="/shared/container/jobs/code", output_dir="/shared/container/jobs/out",
+        cluster_identity=service._cluster_identity(),
+    )
+    with pytest.raises(ConflictError) as caught:
+        service.pause(record.task_id, "session-a")
+    assert caught.value.code == "remote_id_unknown"
+    assert client.controls == []
+
+
+def test_uncertain_generic_submission_reconciles_by_marker(
+    tmp_path, profile, generic_request
+):
+    class UncertainGeneric(GenericClient):
+        def launch_task(self, kind, config, options=None):
+            super().launch_task(kind, config, options)
+            raise SubmissionUncertainError("connection closed after request")
+
+    client = UncertainGeneric()
+    service = ComputeService(client, SQLiteTaskStore(tmp_path / "tasks.db"), profile)
+    with pytest.raises(SubmissionUncertainError) as caught:
+        service.launch(generic_request, "generic-1", "session-a")
+    task_id = caught.value.details["task_id"]
+    remote = client.entities[("generic", "1")]
+
+    reconciled = service.reconcile(task_id, "session-a", "1")
+
+    assert reconciled["remote_id"] == "1"
+    assert reconciled["remote_state"] == remote["state"]
+    with pytest.raises(SubmissionUncertainError) as caught:
+        service.launch(dict(generic_request, name="other"), "generic-2", "session-a")
+    other = caught.value.details["task_id"]
+    # Another task's marker never binds this submission.
+    client.entities[("generic", "2")]["submissionMarker"] = remote["submissionMarker"]
+    with pytest.raises(ConflictError) as caught:
+        service.reconcile(other, "session-a", "2")
+    assert caught.value.code == "identity_mismatch"
+
+
+def test_generic_tasks_cannot_be_discovered_or_adopted(tmp_path, profile):
+    client = FakeClient()
+    service = ComputeService(client, SQLiteTaskStore(tmp_path / "tasks.db"), profile)
+    with pytest.raises(ValidationError, match="cannot be discovered or adopted"):
+        service.discover("generic", "session-a")
+    with pytest.raises(ValidationError, match="cannot be discovered or adopted"):
+        service.adopt("generic", "3f1c2b8e-1111-4c7a-9d55-0123456789ab", "session-a")
+    assert client.gets == []

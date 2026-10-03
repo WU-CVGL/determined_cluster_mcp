@@ -269,8 +269,8 @@ class ResourceInspector:
     def require_capacity(self, kind: str, config: Mapping[str, Any]) -> Dict[str, Any]:
         """Require current capacity for the config's exact selected pool."""
 
-        if kind not in {"command", "shell", "experiment"}:
-            raise ValueError("kind must be command, shell, or experiment")
+        if kind not in {"command", "shell", "experiment", "generic"}:
+            raise ValueError("kind must be command, shell, experiment, or generic")
         if not isinstance(config, Mapping):
             raise ValueError("config must be an object")
         resources = config.get("resources")

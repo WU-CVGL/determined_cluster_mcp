@@ -46,7 +46,14 @@ _REQUEST_FIELDS = {
     "image",
     "code_revision",
     "experiment_config",
+    "parent",
+    "inherit_context",
+    "no_pause",
+    "preemption_timeout",
 }
+# Request fields that only a generic task accepts.
+_GENERIC_FIELDS = ("parent", "inherit_context", "no_pause", "preemption_timeout")
+_TASK_KINDS = {"command", "shell", "experiment", "generic"}
 _NAME_MAX_LENGTH = 128
 _DESCRIPTION_MAX_LENGTH = 2048
 _SUBMISSION_MARKER_VARIABLE = "COMPUTE_SUBMISSION_MARKER"
@@ -272,8 +279,8 @@ class ComputeService:
         _reject_upload_fields(request)
 
         raw_kind = request.get("kind", "auto")
-        if raw_kind not in {"auto", "command", "shell", "experiment"}:
-            raise ValidationError("kind must be auto, command, shell, or experiment")
+        if raw_kind != "auto" and raw_kind not in _TASK_KINDS:
+            raise ValidationError("kind must be auto, command, shell, experiment, or generic")
         interactive = request.get("interactive", False)
         overnight = request.get("overnight", False)
         allow_queue = request.get("allow_queue", False)
@@ -302,6 +309,11 @@ class ComputeService:
             raise ValidationError("interactive work must use a shell")
         if experiment_config is not None and kind != "experiment":
             raise ValidationError("experiment_config requires experiment kind")
+        task_options = self._generic_options(request) if kind == "generic" else None
+        if kind != "generic":
+            present = [field for field in _GENERIC_FIELDS if field in request]
+            if present:
+                raise ValidationError(f"{', '.join(present)} require generic kind")
 
         workdir = self.profile.validate_writable_container_path(
             request.get("workdir"), "workdir"
@@ -373,6 +385,8 @@ class ComputeService:
                 image,
                 code_revision,
             )
+            if task_options is not None and task_options["preemption_timeout"] is not None:
+                config["preemption_timeout"] = task_options["preemption_timeout"]
 
         advisories: List[Dict[str, Any]] = []
         if generated_name:
@@ -392,6 +406,18 @@ class ComputeService:
                     "message": "Long or overnight work is more robust as an experiment.",
                 }
             )
+        if kind == "generic":
+            advisories.append(
+                {
+                    "code": "generic_restart_safety",
+                    "message": (
+                        "A generic task is never restarted automatically, and resuming a "
+                        "paused one runs the command again from the start in a new "
+                        "container. Make the command skip completed outputs and resume or "
+                        "clean up partial ones."
+                    ),
+                }
+            )
         if kind == "shell" and self.profile.shell_inactivity_seconds is not None:
             advisories.append(
                 {
@@ -403,7 +429,7 @@ class ComputeService:
                     ),
                 }
             )
-        return {
+        result = {
             "kind": kind,
             "name": name,
             "description": description,
@@ -411,6 +437,35 @@ class ComputeService:
             "config": config,
             "code_revision": code_revision,
             "advisories": advisories,
+        }
+        # Only generic plans carry this key, so the payload hash of other kinds is unchanged.
+        if task_options is not None:
+            result["task_options"] = {
+                key: task_options[key] for key in ("parent", "inherit_context", "no_pause")
+            }
+        return result
+
+    @staticmethod
+    def _generic_options(request: Mapping[str, Any]) -> Dict[str, Any]:
+        parent = request.get("parent")
+        if parent is not None and (not isinstance(parent, str) or not parent):
+            raise ValidationError("parent must be a local task_id or null")
+        inherit_context = request.get("inherit_context", False)
+        no_pause = request.get("no_pause", False)
+        if not isinstance(inherit_context, bool) or not isinstance(no_pause, bool):
+            raise ValidationError("inherit_context and no_pause must be booleans")
+        if inherit_context and parent is None:
+            raise ValidationError("inherit_context requires parent")
+        timeout = request.get("preemption_timeout")
+        if timeout is not None and (
+            isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 0
+        ):
+            raise ValidationError("preemption_timeout must be a non-negative integer of seconds")
+        return {
+            "parent": parent,
+            "inherit_context": inherit_context,
+            "no_pause": no_pause,
+            "preemption_timeout": timeout,
         }
 
     def _base_config(
@@ -457,11 +512,20 @@ class ComputeService:
         config = self._base_config(
             kind, workdir, output_dir, slots, pool, image, code_revision
         )
-        config["description"] = name + (
-            ("\n" + description) if description is not None else ""
-        )
+        if kind == "generic":
+            # Generic tasks have native display fields; masters without them are
+            # handled when the task is submitted.
+            config = {
+                "name": name,
+                **({"description": description} if description is not None else {}),
+                **config,
+            }
+        else:
+            config["description"] = name + (
+                ("\n" + description) if description is not None else ""
+            )
         command = request.get("command")
-        if kind == "command":
+        if kind in {"command", "generic"}:
             config["entrypoint"] = [
                 "/bin/bash",
                 "-lc",
@@ -620,6 +684,11 @@ class ComputeService:
                     )
                     return self._public(existing)
                 raise
+        launch_options = (
+            self._generic_launch_options(plan["task_options"], owner)
+            if plan["kind"] == "generic"
+            else None
+        )
         workdir = self.profile.validate_container_path(request.get("workdir"), "workdir")
         output_dir = self.profile.validate_container_path(request.get("output_dir"), "output_dir")
         record, created = self.store.claim(
@@ -641,9 +710,16 @@ class ComputeService:
         self.store.mark_submitting(record.task_id)
         launch_config = self._with_submission_marker(plan["config"], record.submission_marker)
         try:
-            entity = self.client.launch_task(plan["kind"], launch_config)
+            if launch_options is None:
+                entity = self.client.launch_task(plan["kind"], launch_config)
+            else:
+                entity = self.client.launch_task(plan["kind"], launch_config, launch_options)
             remote_id = _remote_id(entity)
-            return self._public(self.store.mark_submitted(record.task_id, remote_id))
+            result = self._public(self.store.mark_submitted(record.task_id, remote_id))
+            warnings = entity.get("warnings") if launch_options is not None else None
+            if isinstance(warnings, list) and warnings:
+                result["warnings"] = warnings
+            return result
         except SubmissionUncertainError as exc:
             self._best_effort_submission_state(record.task_id, "uncertain")
             self._attach_task_details(exc, record)
@@ -658,6 +734,28 @@ class ComputeService:
             error = SubmissionUncertainError("remote submission outcome is uncertain")
             self._attach_task_details(error, record)
             raise error from exc
+
+    def _generic_launch_options(
+        self, options: Mapping[str, Any], owner: str
+    ) -> Dict[str, Any]:
+        """Resolve a generic task's local parent to its remote task id."""
+        result: Dict[str, Any] = {}
+        if options["parent"] is not None:
+            parent = self.store.get_owned(options["parent"], owner)
+            if parent.kind != "generic":
+                raise ValidationError("parent must be a generic task")
+            self._validate_binding(parent)
+            if parent.remote_id is None:
+                raise ConflictError(
+                    "parent remote task id is unknown; reconcile the parent first",
+                    code="remote_id_unknown",
+                )
+            result["parentId"] = parent.remote_id
+            if options["inherit_context"]:
+                result["inheritContext"] = True
+        if options["no_pause"]:
+            result["noPause"] = True
+        return result
 
     def _inspector(self) -> Any:
         if self.inspector is None:
@@ -1209,12 +1307,43 @@ class ComputeService:
         updated["remote"] = entity
         return updated
 
+    def pause(self, task_id: str, owner: str) -> Dict[str, Any]:
+        """Pause a generic task: its containers stop and the task keeps its id."""
+        return self._generic_control(task_id, owner, "pause")
+
+    def resume(self, task_id: str, owner: str) -> Dict[str, Any]:
+        """Resume a paused generic task, which runs its command again from the start."""
+        return self._generic_control(task_id, owner, "resume")
+
+    def _generic_control(self, task_id: str, owner: str, action: str) -> Dict[str, Any]:
+        record = self.store.get_owned(task_id, owner)
+        if record.kind != "generic":
+            raise ValidationError(
+                f"{action} applies only to generic tasks; this task is a {record.kind}",
+                code="unsupported_kind",
+            )
+        self._validate_binding(record)
+        if record.remote_id is None:
+            raise ConflictError(
+                f"remote task id is unknown; reconcile the submission before {action}",
+                code="remote_id_unknown",
+            )
+        operation = self.client.pause_task if action == "pause" else self.client.unpause_task
+        entity = operation(record.kind, record.remote_id)
+        result = self._public(record)
+        result[f"{action}_acknowledged"] = True
+        result["remote"] = entity
+        return result
+
     def list_tasks(self, owner: str) -> List[Dict[str, Any]]:
         owner = _required_text(owner, "owner")
         return [self._public(record) for record in self.store.list_owned(owner)]
 
     @staticmethod
     def _management_kind(kind: Any) -> str:
+        if kind == "generic":
+            # Determined exposes no owner of a generic task, so ownership cannot be verified.
+            raise ValidationError("generic tasks cannot be discovered or adopted")
         if not isinstance(kind, str) or kind not in {"command", "shell", "experiment"}:
             raise ValidationError("kind must be command, shell, or experiment")
         return kind
