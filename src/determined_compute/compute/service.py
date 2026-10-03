@@ -739,7 +739,9 @@ class ComputeService:
         self, options: Mapping[str, Any], owner: str
     ) -> Dict[str, Any]:
         """Resolve a generic task's local parent to its remote task id."""
-        result: Dict[str, Any] = {}
+        # Determined pauses a child task with its parent only when the child's noPause is
+        # explicitly false, so always send the value.
+        result: Dict[str, Any] = {"noPause": options["no_pause"]}
         if options["parent"] is not None:
             parent = self.store.get_owned(options["parent"], owner)
             if parent.kind != "generic":
@@ -753,8 +755,6 @@ class ComputeService:
             result["parentId"] = parent.remote_id
             if options["inherit_context"]:
                 result["inheritContext"] = True
-        if options["no_pause"]:
-            result["noPause"] = True
         return result
 
     def _inspector(self) -> Any:

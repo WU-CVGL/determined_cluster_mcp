@@ -1035,7 +1035,7 @@ def test_generic_launch_admits_capacity_and_surfaces_warnings(
     assert launched["name"] == "eval-shards"
     assert launched["description"].startswith("Evaluate every shard")
     assert launched["warnings"] == [warning]
-    assert client.options == [{}]
+    assert client.options == [{"noPause": False}]
     kind, config = client.launches[0]
     assert kind == "generic"
     assert config["name"] == "eval-shards"
