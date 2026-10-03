@@ -10,10 +10,9 @@ Check that the client uses the virtual environment's absolute executable path an
 
 ```bash
 /absolute/path/to/determined_cluster_mcp/.venv/bin/determined-compute-mcp --help
-/absolute/path/to/determined_cluster_mcp/.venv/bin/determined-compute --profile /absolute/path/to/profile.yaml plan --request-file /absolute/path/to/request.json
 ```
 
-The server uses stdout for MCP protocol frames and writes startup errors to stderr. Inspect the MCP client's server log for the exact error. After changing the installation or upgrading the service, restart every MCP process that shares the database so all processes load the same tools and schema.
+Once the client lists the tools, call `compute_plan` with a request to check the profile and paths; it needs no cluster access. The server uses stdout for MCP protocol frames and writes startup errors to stderr. Inspect the MCP client's server log for the exact error. After changing the installation or upgrading the service, restart every MCP process that shares the database so all processes load the same tools and schema.
 
 Compute tasks do not need `--storage-config`. Storage tools automatically use a local shared path when it matches the configured `host_path`. For a custom local mapping or login-node SSH, copy `cfg/storage-access.example.yaml` to `.local/storage.yaml`, edit it, and add `--storage-config /absolute/path/to/.local/storage.yaml`.
 

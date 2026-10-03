@@ -12,12 +12,55 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 from determined_compute.compute import ComputeError, ComputeProfile, ComputeService, SQLiteTaskStore
-from determined_compute.compute_cli import DEFAULT_DB_PATH, _LazyClient, normalize_owner, safe_error_details
 from determined_compute.core.api_client import APIError as ClientAPIError
 from determined_compute.core.api_client import DeterminedAPIClient
+
+
+DEFAULT_DB_PATH = Path("~/.local/state/determined-compute/tasks.sqlite3").expanduser()
+
+
+def normalize_owner(value: str) -> str:
+    """Validate the owner namespace bound at startup."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("owner must be a non-empty string")
+    value = value.strip()
+    if len(value.encode("utf-8")) > 256:
+        raise ValueError("owner is too long")
+    return value
+
+
+class _LazyClient:
+    """Construct the API client only when a service operation needs it."""
+
+    def __init__(self, factory: Callable[[], DeterminedAPIClient]) -> None:
+        import threading
+
+        self._factory = factory
+        self._client: Optional[DeterminedAPIClient] = None
+        self._lock = threading.Lock()
+
+    def _resolve_client(self) -> DeterminedAPIClient:
+        if self._client is None:
+            with self._lock:
+                if self._client is None:
+                    client = self._factory()
+                    self._client = client
+        return self._client
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._resolve_client(), name)
+
+
+def safe_error_details(exc: BaseException) -> dict[str, Any]:
+    details = getattr(exc, "details", None)
+    allowed = {"task_id", "resource_pool", "requested_slots", "available", "candidate_pools"}
+    result = {key: value for key, value in details.items() if key in allowed} if isinstance(details, dict) else {}
+    if "task_id" not in result and getattr(exc, "task_id", None):
+        result["task_id"] = str(exc.task_id)
+    return result
 
 
 def _tool_error(exc: BaseException) -> dict[str, Any]:
@@ -37,7 +80,6 @@ def _tool_error(exc: BaseException) -> dict[str, Any]:
 def create_server(
     service: ComputeService,
     owner: str,
-    workflow_manager: Any = None,
     storage_service: Any = None,
     resource_inspector: Any = None,
 ) -> Any:
@@ -224,44 +266,6 @@ def create_server(
             """Copy shared directory contents to a local directory; preview by default, no deletions."""
             return await call(storage_service.fetch, shared_dir, local_dir, dry_run)
 
-    if workflow_manager is not None:
-
-        @server.tool(annotations=ToolAnnotations(
-            read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
-        ))
-        async def compute_consult(
-            question: str,
-            request_id: str,
-            context: Optional[dict[str, Any]] = None,
-        ) -> dict[str, Any]:
-            """Queue a read-only consultation for this repository."""
-
-            try:
-                return await asyncio.to_thread(
-                    workflow_manager.submit, question, owner, request_id, context
-                )
-            except (OSError, ValueError) as exc:
-                fail(exc)
-            except Exception as exc:
-                if getattr(exc, "code", None) == "workflow_conflict":
-                    fail(exc)
-                raise
-
-        @server.tool(annotations=ToolAnnotations(
-            read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False,
-        ))
-        async def workflow_status(workflow_id: str) -> dict[str, Any]:
-            """Return persisted status and logs for one consultation workflow."""
-
-            try:
-                return await asyncio.to_thread(workflow_manager.status, workflow_id, owner)
-            except (OSError, ValueError) as exc:
-                fail(exc)
-            except Exception as exc:
-                if getattr(exc, "code", None) == "workflow_not_found":
-                    fail(exc)
-                raise
-
     return server
 
 
@@ -277,24 +281,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--owner",
         help="Bound owner namespace (or DETERMINED_COMPUTE_OWNER)",
     )
-    parser.add_argument(
-        "--repo-root",
-        help="Optional repository root for the configured consultation backend",
-    )
-    parser.add_argument(
-        "--consultation-backend",
-        choices=("none", "codex"),
-        default="none",
-        help="Optional repository consultation backend (default: none)",
-    )
-    parser.add_argument(
-        "--consultation-model",
-        help="Model for the optional Codex consultation backend",
-    )
-    parser.add_argument(
-        "--consultation-codex-bin",
-        help="Codex executable for the consultation backend (default: codex)",
-    )
     parser.add_argument("--api-url", help="Determined master URL (defaults to DET_MASTER)")
     parser.add_argument("--api-token", help="Determined API token (defaults to DET_API_TOKEN)")
     parser.add_argument("--secrets-file", help="Path to a KEY=VALUE secrets file")
@@ -306,22 +292,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _runtime(args: argparse.Namespace) -> tuple[Any, str]:
-    if args.consultation_backend == "none":
-        consultation_options = [
-            name
-            for name, value in (
-                ("--consultation-model", args.consultation_model),
-                ("--consultation-codex-bin", args.consultation_codex_bin),
-            )
-            if value is not None
-        ]
-    else:
-        consultation_options = []
-    if consultation_options:
-        raise ValueError(
-            f"{', '.join(consultation_options)} require --consultation-backend codex"
-        )
-
     profile_path = args.profile or os.environ.get("DETERMINED_COMPUTE_PROFILE")
     if not profile_path:
         raise ValueError("--profile or DETERMINED_COMPUTE_PROFILE is required")
@@ -354,21 +324,8 @@ def _runtime(args: argparse.Namespace) -> tuple[Any, str]:
     access = StorageAccessConfig.from_file(access_path) if access_path else StorageAccessConfig()
     storage = StorageService(profile, access, Path(args.secrets_file).expanduser() if args.secrets_file else None)
 
-    workflow_manager = None
-    if args.consultation_backend == "codex":
-        from determined_compute.agent_worker import WorkflowManager
-
-        repo_root = Path(
-            args.repo_root or os.environ.get("DETERMINED_COMPUTE_REPO_ROOT") or os.getcwd()
-        ).resolve()
-        workflow_options: dict[str, Any] = {}
-        if args.consultation_model is not None:
-            workflow_options["model"] = args.consultation_model
-        if args.consultation_codex_bin is not None:
-            workflow_options["codex_bin"] = args.consultation_codex_bin
-        workflow_manager = WorkflowManager(db_path, repo_root, **workflow_options)
     from determined_compute.compute.admission import ResourceInspector
-    return create_server(service, owner, workflow_manager, storage, ResourceInspector(service.client)), owner
+    return create_server(service, owner, storage, ResourceInspector(service.client)), owner
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

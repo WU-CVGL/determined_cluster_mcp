@@ -3,7 +3,7 @@
 
 [English](README.md) | [简体中文](README.zh.md)
 
-通过本地 stdio MCP 服务运行 Determined command、shell、generic 任务和 experiment，并可暂停和恢复 experiment 与 generic 任务。代码、数据、检查点和输出都保存在映射的共享存储中。任何能启动本地 stdio 服务的 MCP 客户端都可以使用本服务；客户端模型与可选的服务端咨询后端彼此独立。
+通过本地 stdio MCP 服务运行 Determined command、shell、generic 任务和 experiment，并可暂停和恢复 experiment 与 generic 任务。代码、数据、检查点和输出都保存在映射的共享存储中。任何能启动本地 stdio 服务的 MCP 客户端都可以使用本服务，并使用自己的模型。
 
 <a id="install"></a>
 ## 安装
@@ -58,13 +58,27 @@ DET_API_TOKEN=replace-with-your-token
 
 `owner` 是本地任务命名空间，不用于身份认证；凭据决定所使用的 Determined 账户。需要 SSH 或私有 CA 时，将相应环境传给 stdio 进程，具体见下方故障排查文档。
 
+<a id="install-the-agent-skill-optional"></a>
+## 安装 agent skill（可选）
+
+MCP 工具不依赖该 skill 即可使用。`intensive-compute-runner` skill 为 Codex、Claude Code 等支持 skill 的 agent 提供任务指引。在仓库根目录下，将 skill 目录链接到 agent 的 skill 目录：
+
+```bash
+# Codex
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+ln -s "$PWD/skills/intensive-compute-runner" "${CODEX_HOME:-$HOME/.codex}/skills/"
+
+# Claude Code
+mkdir -p "$HOME/.claude/skills"
+ln -s "$PWD/skills/intensive-compute-runner" "$HOME/.claude/skills/"
+```
+
+启动新的 agent 会话即可加载。使用链接时，`git pull` 后 skill 会自动保持最新，skill 中的相对链接也会经由该链接指向本仓库的 `docs/`；因此应使用链接而不是复制，并保持仓库目录不动。若只想在某个 Claude Code 项目中使用，改为链接到该项目的 `.claude/skills/`。skill 要求上述 MCP 服务已接入。删除该链接即可卸载。
+
 <a id="documentation"></a>
 ## 文档
 
 - [Agent 工作流](docs/agent-workflow.zh.md)：准备、规划、提交、跟踪和验收任务
 - [计算服务参考](docs/compute-service.zh.md)：配置、请求、工具、用量测量、任务身份与恢复
 - [共享存储访问](docs/shared-storage-access.zh.md)：本地挂载、SSH、预览和传输
-- [可选咨询](docs/consultation.zh.md)：服务端 Codex 后端与模型配置
 - [故障排查](docs/troubleshooting.zh.md)：启动、认证、TLS、路径、容量、提交状态不确定、用量测量和取消
-
-JSON CLI 用法可运行 `determined-compute --help` 查看。

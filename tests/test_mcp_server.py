@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import builtins
 import json
 import sys
 import threading
@@ -85,19 +84,6 @@ class FakeService:
         }
 
 
-class FakeWorkflowManager:
-    def __init__(self) -> None:
-        self.calls = []
-
-    def submit(self, question, owner, request_id, context=None):
-        self.calls.append(("submit", question, owner, request_id, context))
-        return {"workflow_id": "workflow-1", "status": "queued"}
-
-    def status(self, workflow_id, owner):
-        self.calls.append(("status", workflow_id, owner))
-        return {"workflow_id": workflow_id, "owner": owner, "status": "succeeded"}
-
-
 def _structured(result):
     return result.structured_content
 
@@ -105,8 +91,7 @@ def _structured(result):
 def test_real_sdk_client_lists_tools_and_invokes_bound_owner():
     async def exercise():
         service = FakeService()
-        workflows = FakeWorkflowManager()
-        server = create_server(service, "alice", workflows)
+        server = create_server(service, "alice")
         async with Client(server) as client:
             listed = await client.list_tools()
             tools = {tool.name: tool for tool in listed.tools}
@@ -123,8 +108,6 @@ def test_real_sdk_client_lists_tools_and_invokes_bound_owner():
                 "compute_list_tasks",
                 "compute_discover",
                 "compute_adopt",
-                "compute_consult",
-                "workflow_status",
             }
             for tool in tools.values():
                 assert "owner" not in tool.input_schema.get("properties", {})
@@ -194,17 +177,6 @@ def test_real_sdk_client_lists_tools_and_invokes_bound_owner():
                 "compute_adopt", {"kind": "command", "remote_id": "remote-1"}
             )
             assert _structured(adopted)["task_id"] == "adopted-1"
-
-            consulted = await client.call_tool(
-                "compute_consult",
-                {
-                    "question": "How should this run?",
-                    "request_id": "consult-1",
-                    "context": {"kind": "command"},
-                },
-            )
-            assert _structured(consulted)["workflow_id"] == "workflow-1"
-
         assert ("launch", {"command": "true"}, "req-1", "alice") in service.calls
         assert ("discover", "command", "alice", 7, 2) in service.calls
         assert (
@@ -213,15 +185,6 @@ def test_real_sdk_client_lists_tools_and_invokes_bound_owner():
         assert ("adopt", "command", "remote-1", "alice") in service.calls
         assert ("pause", "task-1", "alice") in service.calls
         assert ("resume", "task-1", "alice") in service.calls
-        assert workflows.calls == [
-            (
-                "submit",
-                "How should this run?",
-                "alice",
-                "consult-1",
-                {"kind": "command"},
-            )
-        ]
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=10))
 
@@ -288,7 +251,6 @@ def test_stdio_subprocess_initializes_and_calls_offline_plan(tmp_path):
         "defaults:\n  image: image\n  pool: pool\n",
         encoding="utf-8",
     )
-    # Default runtime must not require a repository skill or consultation backend.
     repo_root = Path(__file__).resolve().parents[1]
     source_root = str(repo_root / "src")
     params = StdioServerParameters(
@@ -302,8 +264,6 @@ def test_stdio_subprocess_initializes_and_calls_offline_plan(tmp_path):
             str(tmp_path / "tasks.db"),
             "--owner",
             "alice",
-            "--repo-root",
-            str(tmp_path),
         ],
         env={"PYTHONPATH": source_root},
         cwd=str(tmp_path),
@@ -316,8 +276,6 @@ def test_stdio_subprocess_initializes_and_calls_offline_plan(tmp_path):
             assert "compute_plan" in tools
             assert "compute_discover" in tools
             assert "compute_adopt" in tools
-            assert "compute_consult" not in tools
-            assert "workflow_status" not in tools
             result = await client.call_tool(
                 "compute_plan",
                 {
@@ -334,21 +292,13 @@ def test_stdio_subprocess_initializes_and_calls_offline_plan(tmp_path):
     asyncio.run(asyncio.wait_for(exercise(), timeout=10))
 
 
-def test_default_runtime_does_not_import_consultation_worker(tmp_path, monkeypatch):
+def test_default_runtime_registers_all_tools(tmp_path):
     profile = tmp_path / "profile.yaml"
     profile.write_text(
         "mounts:\n  - host_path: /shared\n    container_path: /shared\n"
         "defaults:\n  image: image\n  pool: pool\n",
         encoding="utf-8",
     )
-    original_import = builtins.__import__
-
-    def guarded_import(name, *args, **kwargs):
-        if name == "determined_compute.agent_worker":
-            raise AssertionError("default MCP runtime imported consultation worker")
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", guarded_import)
     args = build_parser().parse_args(
         [
             "--profile",
@@ -357,8 +307,6 @@ def test_default_runtime_does_not_import_consultation_worker(tmp_path, monkeypat
             str(tmp_path / "tasks.db"),
             "--owner",
             "alice",
-            "--repo-root",
-            str(tmp_path),
         ]
     )
     server, owner = _runtime(args)
@@ -373,8 +321,6 @@ def test_default_runtime_does_not_import_consultation_worker(tmp_path, monkeypat
             assert "storage_check" in tools
             assert "compute_resources" in tools
             assert "compute_usage" in tools
-            assert "compute_consult" not in tools
-            assert "workflow_status" not in tools
             result = await client.call_tool(
                 "compute_plan",
                 {
@@ -389,69 +335,3 @@ def test_default_runtime_does_not_import_consultation_worker(tmp_path, monkeypat
 
     assert owner == "alice"
     asyncio.run(asyncio.wait_for(exercise(), timeout=10))
-
-
-def test_codex_backend_passes_deployment_options_and_registers_tools(tmp_path, monkeypatch):
-    profile = tmp_path / "profile.yaml"
-    profile.write_text(
-        "mounts:\n  - host_path: /shared\n    container_path: /shared\n"
-        "defaults:\n  image: image\n  pool: pool\n",
-        encoding="utf-8",
-    )
-    captured = {}
-
-    class Manager(FakeWorkflowManager):
-        def __init__(self, db_path, repo_root, **kwargs):
-            super().__init__()
-            captured.update(db_path=db_path, repo_root=repo_root, kwargs=kwargs)
-
-    monkeypatch.setattr("determined_compute.agent_worker.WorkflowManager", Manager)
-    args = build_parser().parse_args(
-        [
-            "--profile",
-            str(profile),
-            "--db",
-            str(tmp_path / "tasks.db"),
-            "--owner",
-            "alice",
-            "--repo-root",
-            str(tmp_path),
-            "--consultation-backend",
-            "codex",
-            "--consultation-model",
-            "configured-model",
-            "--consultation-codex-bin",
-            "/opt/codex/bin/codex",
-        ]
-    )
-    server, _owner = _runtime(args)
-
-    async def exercise():
-        async with Client(server) as client:
-            tools = {tool.name: tool for tool in (await client.list_tools()).tools}
-            assert len(tools) == 18
-            assert "compute_consult" in tools
-            assert "workflow_status" in tools
-
-    asyncio.run(asyncio.wait_for(exercise(), timeout=10))
-    assert captured == {
-        "db_path": tmp_path / "tasks.db",
-        "repo_root": tmp_path.resolve(),
-        "kwargs": {
-            "model": "configured-model",
-            "codex_bin": "/opt/codex/bin/codex",
-        },
-    }
-
-
-@pytest.mark.parametrize(
-    "option",
-    [
-        ["--consultation-model", "configured-model"],
-        ["--consultation-codex-bin", "/opt/codex/bin/codex"],
-    ],
-)
-def test_consultation_options_require_codex_backend(option):
-    args = build_parser().parse_args(option)
-    with pytest.raises(ValueError, match="require --consultation-backend codex"):
-        _runtime(args)

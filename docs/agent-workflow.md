@@ -4,7 +4,7 @@
 
 [Home](../README.md) · [Compute reference](compute-service.md) · [Storage access](shared-storage-access.md) · [Troubleshooting](troubleshooting.md)
 
-This workflow is for any agent or client that can call the local stdio MCP tools. The client selects its own model. Normal storage and compute work does not require Codex, a repository skill, or server-side consultation.
+This workflow is for any agent or client that can call the local stdio MCP tools. The client selects its own model. Normal storage and compute work does not require a repository skill.
 
 ## Describe the goal and success criteria
 
@@ -154,7 +154,3 @@ Four values participate in task identity and access:
 Sessions share local records only when they use the same database and owner. Separate databases can adopt the same remote task independently. Keep the database on local durable disk rather than shared NFS. Sharing an owner does not share credentials, and changing credentials does not rename the owner namespace.
 
 On the Determined fork 0.40.1 or later with basic authorization, only a task's Determined owner or an administrator can cancel it. A submitted record binds to the profile and endpoint rather than the account, so after credentials switch to another account, `compute_cancel` can return HTTP 403 for a command or shell and HTTP 404 for an experiment; an adopted record reports `ownership_mismatch` instead. Use the account that owns the task.
-
-## Optional consultation
-
-The client agent can perform this workflow directly. Server-side consultation defaults to `none` and is not needed for any deterministic tool. A deployment may enable the separate read-only Codex backend and configure its model; that model is independent of the MCP client's model. Consultation can return advice but cannot launch, cancel, transfer files, or use the caller's MCP tools. See [optional consultation](consultation.md).

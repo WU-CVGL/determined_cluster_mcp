@@ -5,7 +5,7 @@
 
 [首页](../README.zh.md) · [计算服务参考](compute-service.zh.md) · [共享存储访问](shared-storage-access.zh.md) · [故障排查](troubleshooting.zh.md)
 
-任何能够调用本地 stdio MCP 工具的 agent 或客户端都可以遵循本工作流。模型由客户端自行选择。常规存储和计算操作不依赖 Codex、仓库 skill 或服务端咨询。
+任何能够调用本地 stdio MCP 工具的 agent 或客户端都可以遵循本工作流。模型由客户端自行选择。常规存储和计算操作不依赖仓库 skill。
 
 <a id="describe-the-goal-and-success-criteria"></a>
 ## 描述目标与成功判据
@@ -165,8 +165,3 @@ Reconcile 的用途更窄：`compute_reconcile` 通过核对提交标记，修�
 只有使用相同数据库和 owner 的会话才共享本地记录。不同数据库可以分别登记同一个远端任务。数据库应放在本地持久磁盘，不要放在共享 NFS 中。共享 owner 不等于共享凭据，更换凭据也不会重命名 owner 命名空间。
 
 在使用 basic authorization 的 Determined fork 0.40.1 或更高版本上，只有任务的 Determined 所有者或管理员可以取消任务。submitted 记录绑定配置和端点而不是账户，因此把凭据切换到另一个账户后，`compute_cancel` 可能对 command 或 shell 返回 HTTP 403，对 experiment 返回 HTTP 404；已登记的记录则返回 `ownership_mismatch`。请使用拥有该任务的账户。
-
-<a id="optional-consultation"></a>
-## 可选咨询
-
-客户端 agent 可以直接完成本工作流。服务端咨询默认设置为 `none`，任何确定性工具都不依赖它。部署方可以启用独立的只读 Codex 后端并指定其模型；该模型与 MCP 客户端模型彼此独立。咨询只能返回建议，不能提交或取消任务、传输文件，也不能使用调用方的 MCP 工具。参见[可选咨询](consultation.zh.md)。

@@ -120,24 +120,9 @@ python -m keyring set determined-compute alice
 <a id="check-preview-and-transfer"></a>
 ## 检查、预览和传输
 
-Python 接口为 `StorageService.check(path)`、`sync(local_dir, shared_dir, dry_run=True)` 和 `fetch(shared_dir, local_dir, dry_run=True)`。CLI 与 MCP 使用相同的路径规则。`check` 返回所选后端、容器路径、转换后的主机路径、可选本地路径、存在性、类型以及读写权限。同步/取回复制目录内容，并返回操作、后端、解析后的两端路径、主机路径、排除项、实际 `preserve_permissions`、dry-run/完成状态，以及带 `truncated` 标志的长度受限输出。本地结果包含映射路径；SSH 结果只暴露配置的主机别名，不返回用户名、密钥路径或凭据。
+Python 接口为 `StorageService.check(path)`、`sync(local_dir, shared_dir, dry_run=True)` 和 `fetch(shared_dir, local_dir, dry_run=True)`。MCP 存储工具调用这些方法。`check` 返回所选后端、容器路径、转换后的主机路径、可选本地路径、存在性、类型以及读写权限。同步/取回复制目录内容，并返回操作、后端、解析后的两端路径、主机路径、排除项、实际 `preserve_permissions`、dry-run/完成状态，以及带 `truncated` 标志的长度受限输出。本地结果包含映射路径；SSH 结果只暴露配置的主机别名，不返回用户名、密钥路径或凭据。
 
-```bash
-export DETERMINED_COMPUTE_PROFILE=/path/to/compute-profile.yaml
-export DETERMINED_COMPUTE_STORAGE=/path/to/storage-access.yaml
-
-determined-compute storage-check /SSD/project/run
-
-# 默认为预览，不修改文件。
-determined-compute storage-sync "$PWD/repo" /SSD/project/run/repo
-determined-compute storage-fetch /SSD/project/run/results "$PWD/results"
-
-# 检查预览后才执行传输。
-determined-compute storage-sync "$PWD/repo" /SSD/project/run/repo --execute
-determined-compute storage-fetch /SSD/project/run/results "$PWD/results" --execute
-```
-
-MCP 提供 `storage_check(path)`、`storage_sync(local_dir, shared_dir, dry_run=True)` 和 `storage_fetch(shared_dir, local_dir, dry_run=True)`。默认为预览；检查解析后的源路径、目标路径、传输方式和排除规则之后，才传入 `dry_run=false`。CLI 使用 `--execute` 表达同一授权。只读咨询 worker 没有 SSH/存储凭据或工具，也不应让它测试凭据。
+MCP 提供 `storage_check(path)`、`storage_sync(local_dir, shared_dir, dry_run=True)` 和 `storage_fetch(shared_dir, local_dir, dry_run=True)`。默认为预览；检查解析后的源路径、目标路径、传输方式和排除规则之后，才传入 `dry_run=false`。
 
 客户端的 `local_dir` 必须是绝对路径。传输使用 `rsync -a --safe-links --mkpath --itemize-changes`；SSH 传输还使用隔离参数选项（`-s`）。默认的 `preserve_permissions: true` 会让归档模式保留权限、所有者、用户组和目录时间。只有确认某个挂载拒绝这些操作时才设为 `false`；此时本地和 SSH 传输都会加入 `--no-owner --no-group --no-perms --omit-dir-times`。不要全局关闭保留行为，不要根据存储名称猜测，也不要在失败后自动改参数重试。
 
