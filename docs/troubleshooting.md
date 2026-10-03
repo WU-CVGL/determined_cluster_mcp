@@ -25,6 +25,8 @@ DET_MASTER=https://determined.example.org
 DET_API_TOKEN=replace-with-your-token
 ```
 
+When the secrets file sets `DET_MASTER`, its credentials go only to that master. An error that `--api-url` or `DET_MASTER` names a different master than the secrets file means an override points elsewhere: unset the override, or use a secrets file for that master.
+
 Do not put credentials in the compute profile, request, task name, or description. Restrict access to the secrets file and inspect only whether required variable names are present, not their values.
 
 The credentials select the Determined account, and the MCP acts only on tasks that account owns. Switching credentials therefore changes which tasks `compute_list` shows and which tasks the other tools accept.

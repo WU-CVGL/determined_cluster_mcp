@@ -48,6 +48,10 @@ def _normalize_api_url(api_url: Optional[str]) -> str:
     return url.rstrip("/")
 
 
+def _master_from(values: Mapping[str, str]) -> Optional[str]:
+    return next((values[name] for name in ("DET_MASTER", "DET_MASTER_ADDR", "DET_MASTER_HOST") if values.get(name)), None)
+
+
 def _bool_env(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     return default if raw is None else raw.lower() in {"1", "true", "yes", "y", "on"}
@@ -141,15 +145,24 @@ class DeterminedAPIClient:
 
     def __init__(self, api_url: Optional[str] = None, api_token: Optional[str] = None, secrets_path: Optional[Path] = None, verify_ssl: Optional[bool] = None) -> None:
         secrets = load_secrets(secrets_path)
-        secret_master = secrets.get("DET_MASTER") or secrets.get("DET_MASTER_ADDR") or secrets.get("DET_MASTER_HOST")
-        environment_master = (
-            os.environ.get("DET_MASTER")
-            or os.environ.get("DET_MASTER_ADDR")
-            or os.environ.get("DET_MASTER_HOST")
-        )
-        self.api_url = _normalize_api_url(api_url or environment_master or secret_master)
+        file_master, ambient_master = _master_from(secrets), _master_from(os.environ)
+        if file_master:
+            # A secrets file that names its master supplies the URL and the credentials
+            # together, so its credentials reach only that master and no ambient credential
+            # does. An explicit api_url, or else the environment's master, that names another
+            # master is refused here, before a login or any other request.
+            override, source = (api_url, "--api-url") if api_url else (ambient_master, "DET_MASTER")
+            if override and _normalize_api_url(override) != _normalize_api_url(file_master):
+                raise ValueError(
+                    f"{source} names a different master than the secrets file, whose credentials "
+                    "belong to its own master; unset the override or use a secrets file for that master"
+                )
+            ambient: Mapping[str, str] = {}
+        else:
+            ambient = os.environ
+        self.api_url = _normalize_api_url(api_url or file_master or ambient_master)
         self.verify_ssl = _bool_env("DET_VERIFY_SSL", False) if verify_ssl is None else verify_ssl
-        self.api_token = self._resolve_token(api_token, secrets)
+        self.api_token = self._resolve_token(api_token, secrets, ambient)
         self.headers: Dict[str, str] = {}
         if self.api_token:
             self.headers["Authorization"] = f"Bearer {self.api_token}"
@@ -246,15 +259,17 @@ class DeterminedAPIClient:
                 close()
         return logs
 
-    def _resolve_token(self, api_token: Optional[str], secrets: Dict[str, str]) -> Optional[str]:
+    def _resolve_token(
+        self, api_token: Optional[str], secrets: Dict[str, str], ambient: Mapping[str, str]
+    ) -> Optional[str]:
         if api_token:
             return api_token
-        if os.environ.get("DET_API_TOKEN"):
-            return os.environ["DET_API_TOKEN"]
+        if ambient.get("DET_API_TOKEN"):
+            return ambient["DET_API_TOKEN"]
         if secrets.get("DET_API_TOKEN"):
             return secrets["DET_API_TOKEN"]
-        username = secrets.get("DET_USERNAME") or os.environ.get("DET_USERNAME")
-        password = secrets.get("DET_PASSWORD") or os.environ.get("DET_PASSWORD")
+        username = secrets.get("DET_USERNAME") or ambient.get("DET_USERNAME")
+        password = secrets.get("DET_PASSWORD") or ambient.get("DET_PASSWORD")
         return _login_for_token(self.api_url, username, password, self.verify_ssl) if username and password else None
 
     @classmethod

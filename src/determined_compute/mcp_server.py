@@ -248,8 +248,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--profile", help="Compute profile YAML (or DETERMINED_COMPUTE_PROFILE)")
     parser.add_argument("--storage-config", help="Client storage access YAML (or DETERMINED_COMPUTE_STORAGE)")
-    parser.add_argument("--api-url", help="Determined master URL (defaults to DET_MASTER)")
-    parser.add_argument("--api-token", help="Determined API token (defaults to DET_API_TOKEN)")
+    parser.add_argument(
+        "--api-url",
+        help="Determined master URL (defaults to the secrets file's DET_MASTER, else DET_MASTER); "
+        "must match a master the secrets file names",
+    )
+    parser.add_argument(
+        "--api-token",
+        help="Determined API token for the selected master; replaces any other token or login",
+    )
     parser.add_argument("--secrets-file", help="Path to a KEY=VALUE secrets file")
     verify = parser.add_mutually_exclusive_group()
     verify.add_argument("--verify-ssl", action="store_true", dest="verify_ssl")

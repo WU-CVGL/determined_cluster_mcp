@@ -172,9 +172,14 @@ determined-compute-mcp \
 
 `--profile` corresponds to `DETERMINED_COMPUTE_PROFILE` and `--storage-config` to
 `DETERMINED_COMPUTE_STORAGE`; `--secrets-file` can instead be supplied through
-`DETERMINED_COMPUTE_SECRETS`. The API URL, token, and TLS verification default to
-`DET_MASTER`, `DET_API_TOKEN`, and `DET_VERIFY_SSL`; keep credentials in the existing
-provider or secrets file rather than the profile, tool arguments, or reports.
+`DETERMINED_COMPUTE_SECRETS`. TLS verification defaults to `DET_VERIFY_SSL`. A secrets
+file that sets `DET_MASTER` supplies the API URL and the credentials together: the
+environment's `DET_API_TOKEN`, `DET_USERNAME`, and `DET_PASSWORD` are then ignored, and an
+`--api-url` or environment `DET_MASTER` that names a different master is rejected before
+any request. A secrets file without `DET_MASTER` uses `--api-url` or else `DET_MASTER`,
+and `DET_API_TOKEN` from the environment before the file. `--api-token` replaces any
+other token or login and is sent only to the selected master. Keep credentials in the
+existing provider or secrets file rather than the profile, tool arguments, or reports.
 
 The server writes no files of its own. After an upgrade, restart every MCP process so
 that it loads the current tool set.
