@@ -113,24 +113,9 @@ The selected keyring backend must already be unlocked and available to the servi
 
 ## Check, preview, and transfer
 
-The Python boundary is `StorageService.check(path)`, `sync(local_dir, shared_dir, dry_run=True)`, and `fetch(shared_dir, local_dir, dry_run=True)`. CLI and MCP operations use the same path rules. `check` reports the selected backend, container path, translated host path, optional local path, existence, type, and read/write access. Sync/fetch copy directory contents and report the operation, backend, resolved endpoints, host path, exclusions, effective `preserve_permissions`, dry-run/completion state, and bounded output with a `truncated` flag. Local results include the mapped path; SSH results expose only the configured host alias, never the user, identity path, or credential.
+The Python boundary is `StorageService.check(path)`, `sync(local_dir, shared_dir, dry_run=True)`, and `fetch(shared_dir, local_dir, dry_run=True)`. The MCP storage tools call these methods. `check` reports the selected backend, container path, translated host path, optional local path, existence, type, and read/write access. Sync/fetch copy directory contents and report the operation, backend, resolved endpoints, host path, exclusions, effective `preserve_permissions`, dry-run/completion state, and bounded output with a `truncated` flag. Local results include the mapped path; SSH results expose only the configured host alias, never the user, identity path, or credential.
 
-```bash
-export DETERMINED_COMPUTE_PROFILE=/path/to/compute-profile.yaml
-export DETERMINED_COMPUTE_STORAGE=/path/to/storage-access.yaml
-
-determined-compute storage-check /SSD/project/run
-
-# Preview by default; no files change.
-determined-compute storage-sync "$PWD/repo" /SSD/project/run/repo
-determined-compute storage-fetch /SSD/project/run/results "$PWD/results"
-
-# Transfer only after reviewing the preview.
-determined-compute storage-sync "$PWD/repo" /SSD/project/run/repo --execute
-determined-compute storage-fetch /SSD/project/run/results "$PWD/results" --execute
-```
-
-MCP exposes `storage_check(path)`, `storage_sync(local_dir, shared_dir, dry_run=True)`, and `storage_fetch(shared_dir, local_dir, dry_run=True)`. Preview is the default; pass `dry_run=false` only after reviewing resolved source, destination, transport, and exclusions. The CLI uses `--execute` for the same authorization. The read-only consultation worker has no SSH/storage credentials or tools and must never be asked to test them.
+MCP exposes `storage_check(path)`, `storage_sync(local_dir, shared_dir, dry_run=True)`, and `storage_fetch(shared_dir, local_dir, dry_run=True)`. Preview is the default; pass `dry_run=false` only after reviewing resolved source, destination, transport, and exclusions.
 
 Client-side `local_dir` values must be absolute paths. Transfer uses `rsync -a --safe-links --mkpath --itemize-changes`; SSH transfers also use secluded arguments (`-s`). With the default `preserve_permissions: true`, archive mode preserves permissions, owner, group, and directory times. Set it to `false` only for a verified mount that rejects those operations; the backend then adds `--no-owner --no-group --no-perms --omit-dir-times` for local and SSH transfers. Do not disable preservation globally, infer it from a storage name, or retry automatically with different flags.
 

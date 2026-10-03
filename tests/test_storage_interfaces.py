@@ -1,10 +1,7 @@
 import asyncio
-import json
-from pathlib import Path
 
 import pytest
 
-from determined_compute import compute_cli
 from determined_compute.compute import ComputeProfile, ComputeService, SQLiteTaskStore
 from determined_compute.storage import StorageAccessConfig, StorageService
 
@@ -16,30 +13,6 @@ def make_profile(tmp_path):
         'mounts': [{'host_path': str(shared), 'container_path': '/shared'}],
         'defaults': {'image': 'example', 'pool': 'example'},
     }), shared
-
-
-def test_storage_cli_does_not_construct_cluster_client_or_task_store(tmp_path, monkeypatch, capsys):
-    profile, shared = make_profile(tmp_path)
-    storage = StorageService(profile, StorageAccessConfig())
-    monkeypatch.setattr(compute_cli, '_resolve_storage', lambda args: storage)
-    monkeypatch.setattr(compute_cli, '_resolve_runtime', lambda args: pytest.fail('compute runtime used'))
-    assert compute_cli.main(['storage-check', '/shared']) == 0
-    result = json.loads(capsys.readouterr().out)['result']
-    assert result['exists'] is True
-    assert result['backend'] == 'local'
-    assert not list(tmp_path.glob('*.sqlite3'))
-
-
-def test_storage_cli_previews_unless_execute_is_explicit(monkeypatch, capsys):
-    calls = []
-    class Storage:
-        def sync(self, local_dir, shared_dir, dry_run=True):
-            calls.append((local_dir, shared_dir, dry_run))
-            return {'dry_run': dry_run}
-    monkeypatch.setattr(compute_cli, '_resolve_storage', lambda args: Storage())
-    assert compute_cli.main(['storage-sync', '/src', '/shared/job']) == 0
-    assert compute_cli.main(['storage-sync', '/src', '/shared/job', '--execute']) == 0
-    assert calls == [('/src', '/shared/job', True), ('/src', '/shared/job', False)]
 
 
 def test_real_mcp_storage_preview_and_copy_round_trip(tmp_path):
@@ -79,7 +52,7 @@ def test_real_mcp_storage_preview_and_copy_round_trip(tmp_path):
 def test_real_mcp_lazy_client_blocks_busy_pool_before_submission(tmp_path):
     pytest.importorskip('mcp')
     from mcp import Client
-    from determined_compute.compute_cli import _LazyClient
+    from determined_compute.mcp_server import _LazyClient
     from determined_compute.compute.admission import ResourceInspector
     from determined_compute.mcp_server import create_server
     profile, _ = make_profile(tmp_path)

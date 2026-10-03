@@ -1,11 +1,11 @@
 ---
 name: intensive-compute-runner
-description: Plan, launch, inspect, and stop resource-intensive GPU or CPU work through this repository's Determined compute service. Use for heavy compute or managed cluster tasks; small local checks and hardware inspection alone are outside scope.
+description: Plan, launch, inspect, and stop resource-intensive GPU or CPU work on a Determined cluster through the determined-compute MCP tools (compute_* and storage_*). Use for heavy compute or managed cluster tasks; small local checks and hardware inspection alone are outside scope.
 ---
 
 # Intensive Compute Runner
 
-Use this repository's `ComputeService` for heavy-compute planning, idempotent launch, task state, logs, measured usage, and cancellation. Any MCP-capable agent can use the tools with its own model. An optional consultation worker can also load this repository skill; do not install it globally.
+Use this repository's `ComputeService` for heavy-compute planning, idempotent launch, task state, logs, measured usage, and cancellation. Any MCP-capable agent can use the tools with its own model. Install the skill by linking this directory into the agent's skills directory, as the repository README describes; relative links such as `../../docs/` then resolve through that link to the repository checkout.
 
 ## Choose a mode
 
@@ -27,7 +27,7 @@ For durable jobs, use a stable revision in its own shared directory and record `
 
 If files must be copied into shared storage, read [references/compute-workflow.md](references/compute-workflow.md). Preserve its secret exclusions and safe sync rules.
 
-If the client lacks cluster mounts, read [the shared-storage access guide](../../docs/shared-storage-access.md). Use `storage_check`, preview `storage_sync` or `storage_fetch`, and execute only after review. Storage credentials stay service-side; the consultation worker cannot test them.
+If the client lacks cluster mounts, read [the shared-storage access guide](../../docs/shared-storage-access.md). Use `storage_check`, preview `storage_sync` or `storage_fetch`, and execute only after review. Storage credentials stay service-side.
 
 ## Plan, then execute
 
@@ -40,8 +40,6 @@ If the client lacks cluster mounts, read [the shared-storage access guide](../..
 Never include credentials in requests, configs, logs, or reports. A launch with `allow_queue: false` performs admission checking and rejects busy or unknown capacity without submitting; `true` explicitly permits scheduler queueing.
 
 If launch outcome is unknown after a timeout or connection loss, do not submit again blindly. Use `compute_reconcile` only with a verified remote ID for the known task; the service checks its submission marker before binding. If authentication fails, stop and report the configuration problem; do not fall back to local execution.
-
-If the server exposes `compute_consult`, it can request a read-only plan or diagnosis from the deployment's configured consultation backend and model. Consultation is optional; the caller can plan directly with its own model. Consultation state persists, but the worker cannot launch or cancel work; deterministic service tools perform mutations.
 
 ## Report
 
