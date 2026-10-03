@@ -646,10 +646,10 @@ class ComputeService:
             rendered = " ".join(shlex.quote(part) for part in command)
         else:
             raise ValidationError("command must be a string or string-list")
-        return (
-            f"mkdir -p {shlex.quote(output_dir)} && "
-            f"cd {shlex.quote(workdir)} && {rendered}"
-        )
+        # The prelude ends in "|| exit $?" on its own line, so a failed mkdir or cd exits with
+        # its status before the shell reads any statement of the command, whatever its form.
+        prelude = f"mkdir -p {shlex.quote(output_dir)} && cd {shlex.quote(workdir)}"
+        return f"{prelude} || exit $?\n{rendered}"
 
     def launch(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Submit a request once and return Determined's own task ID.

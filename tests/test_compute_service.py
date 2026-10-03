@@ -200,7 +200,7 @@ def test_plan_is_offline_and_builds_shared_storage_command(tmp_path, profile, co
     assert plan["config"]["entrypoint"] == [
         "/bin/bash",
         "-lc",
-        "mkdir -p /shared/container/jobs/out && cd /shared/container/jobs/code && "
+        "mkdir -p /shared/container/jobs/out && cd /shared/container/jobs/code || exit $?\n"
         "python train.py --name 'space value'",
     ]
 

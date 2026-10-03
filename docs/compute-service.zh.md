@@ -94,9 +94,10 @@ auto 模式从不选择 `generic`。显式 `kind` 会保留，所以 overnight c
 experiment 和 generic 任务使用原生 name 与 description 字段。顶层显示元数据会覆盖同名的
 experiment 字段。
 
-command、generic 和 experiment 的入口先创建 `output_dir`，再切换到 `workdir`，最后通过
-`/bin/bash -lc` 运行命令。command、generic 和 shell 配置使用 `resources.slots`，experiment
-使用 `resources.slots_per_trial`。服务提供配置中的 bind mount，并管理 `COMPUTE_WORKDIR`、
+command、generic 和 experiment 的入口渲染为 `mkdir -p <output_dir> && cd <workdir> || exit $?`，
+换行后再接命令，因此准备步骤失败时会以其退出码退出，命令中的任何语句都不会运行。command 和
+generic 任务通过 `/bin/bash -lc` 运行这段文本。command、generic 和 shell 配置使用
+`resources.slots`，experiment 使用 `resources.slots_per_trial`。服务提供配置中的 bind mount，并管理 `COMPUTE_WORKDIR`、
 `COMPUTE_OUTPUT_DIR`、`COMPUTE_CODE_REVISION` 和私有提交标记；请求不能覆盖这些环境变量或
 bind mount。
 
