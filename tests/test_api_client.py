@@ -1165,3 +1165,81 @@ def test_generic_logs_use_task_log_route(monkeypatch):
     monkeypatch.setattr(requests, "get", get)
     assert client().task_logs("generic", GENERIC_ID, tail=5) == [{"message": "done"}]
     assert requested == [f"http://master:8080/api/v1/tasks/{GENERIC_ID}/logs"]
+
+
+def _closed_local_port():
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def test_refused_connection_is_not_an_uncertain_submission():
+    # A real refused connection: nothing reached a server, so the launch certainly did not happen.
+    unreachable = DeterminedAPIClient(f"http://127.0.0.1:{_closed_local_port()}", api_token="token")
+    with pytest.raises(APIError) as caught:
+        unreachable.launch_task("command", {"entrypoint": ["true"]})
+    assert not isinstance(caught.value, SubmissionUncertainError)
+    assert caught.value.code == "transport_error"
+    assert caught.value.retryable is True
+
+
+def _new_connection_error():
+    from urllib3.exceptions import NewConnectionError
+
+    return NewConnectionError(None, "Failed to establish a new connection: refused")
+
+
+def _max_retry(reason):
+    from urllib3.exceptions import MaxRetryError
+
+    return MaxRetryError(None, "/api/v1/commands", reason)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        requests.exceptions.ConnectTimeout("connect timed out"),
+        requests.exceptions.ConnectionError(_max_retry(_new_connection_error())),
+        requests.exceptions.ProxyError(
+            _max_retry(
+                __import__("urllib3").exceptions.ProxyError(
+                    "Unable to connect to proxy", _new_connection_error()
+                )
+            )
+        ),
+    ],
+    ids=["connect-timeout", "refused-or-dns", "proxy-unreachable"],
+)
+def test_failures_before_a_connection_opened_are_not_uncertain(monkeypatch, error):
+    def post(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(requests, "post", post)
+    with pytest.raises(APIError) as caught:
+        client().launch_task("command", {"entrypoint": ["true"]})
+    assert not isinstance(caught.value, SubmissionUncertainError)
+    assert caught.value.code == "transport_error"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        requests.exceptions.ReadTimeout("read timed out"),
+        requests.exceptions.ConnectionError(
+            __import__("urllib3").exceptions.ProtocolError(
+                "Connection aborted.", ConnectionResetError()
+            )
+        ),
+        requests.exceptions.SSLError("TLS failure"),
+    ],
+    ids=["read-timeout", "connection-dropped", "tls"],
+)
+def test_failures_after_a_connection_opened_stay_uncertain(monkeypatch, error):
+    def post(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(requests, "post", post)
+    with pytest.raises(SubmissionUncertainError):
+        client().launch_task("command", {"entrypoint": ["true"]})

@@ -266,6 +266,13 @@ did not create the task, and a new launch is safe. If a duplicate starts anyway,
 the extra task with `compute_cancel`. A definite rejection, such as HTTP 400, 401, or
 403, is an ordinary error: nothing was submitted.
 
+A failure before any connection was open (a refused connection, a failed name lookup, a
+connect timeout, or an unreachable HTTP proxy) is a retryable `transport_error`: the
+request was never sent, so nothing was created. Everything after the connection opened,
+including a read timeout, a dropped connection, a TLS error, or an HTTP 5xx from a proxy
+in front of the master, is unconfirmed. Cancel, pause, and resume follow the same rule;
+check `compute_status` after an unconfirmed one.
+
 ### Task identity and ownership
 
 Status, logs, usage, cancel, pause, and resume, and a generic task's `parent`, first

@@ -80,7 +80,7 @@ A resource pool that an administrator created dynamically appears in `compute_re
 
 ## Submission outcome is uncertain
 
-A connection failure or timeout after a launch request was sent, an HTTP 5xx response, or a response without a task ID may mean that Determined created the task even though the client did not receive its ID. `compute_launch` then returns `submission_uncertain` with `kind` and `submission_marker` in the error details, and does not retry.
+A connection that drops or times out after a launch request was sent, an HTTP 5xx response, or a response without a task ID may mean that Determined created the task even though the client did not receive its ID. `compute_launch` then returns `submission_uncertain` with `kind` and `submission_marker` in the error details, and does not retry. A failure before any connection opened, such as a refused connection or a failed name lookup, is a retryable `transport_error` instead: nothing was sent.
 
 Do not launch again yet. Call `compute_list(kind, marker=submission_marker)`: it reads the newest tasks of the account and returns the one whose stored config carries that marker. If it returns a task, that is the submission; continue with its ID. If it finds none, nothing was created and a new launch is safe; if many tasks have started since, search older pages with `offset` first. If a duplicate is created anyway, cancel the extra task with `compute_cancel`. See [unconfirmed launches](compute-service.md#unconfirmed-launches).
 

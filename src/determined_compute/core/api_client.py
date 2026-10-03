@@ -13,6 +13,7 @@ from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import requests
 import yaml
+from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
 
 from determined_compute.utils.secrets import load_secrets
 
@@ -70,6 +71,29 @@ def _error_from_response(response: requests.Response) -> APIError:
         # 501 means the master lacks the route; repeating the request cannot help.
         retryable=status == 429 or (status >= 500 and status != 501),
     )
+
+
+def _connection_never_opened(exc: requests.RequestException) -> bool:
+    """Return whether a request failed before a connection to the server (or proxy) was open.
+
+    Refused connections, failed name resolution and connect timeouts happen before any byte of
+    the request is sent. Everything later (read timeouts, dropped connections, TLS errors,
+    responses from a proxy) may follow a request the server received.
+    """
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return True
+    if not isinstance(exc, requests.exceptions.ConnectionError) or isinstance(
+        exc, requests.exceptions.SSLError
+    ):
+        return False
+    reason: Any = exc.args[0] if exc.args else None
+    # requests wraps urllib3's MaxRetryError, whose reason may be a ProxyError that wraps the
+    # failure to reach the proxy.
+    for _ in range(3):
+        reason = getattr(reason, "reason", None) or getattr(reason, "original_error", None) or reason
+        if isinstance(reason, (NewConnectionError, ConnectTimeoutError)):
+            return True
+    return False
 
 
 def _login_for_token(api_url: str, username: str, password: str, verify_ssl: bool) -> str:
@@ -172,6 +196,12 @@ class DeterminedAPIClient:
         try:
             response = requests.post(self._url(endpoint), headers={**self.headers, "Content-Type": "application/json"}, json=data, timeout=60, verify=self.verify_ssl)
         except requests.RequestException as exc:
+            if _connection_never_opened(exc):
+                # Nothing reached the master, so the mutation certainly did not happen.
+                raise APIError(
+                    "Could not connect to Determined; the request was not sent",
+                    code="transport_error", details={"endpoint": endpoint}, retryable=True,
+                ) from exc
             raise SubmissionUncertainError("Determined mutation outcome is unknown", details={"endpoint": endpoint}) from exc
         return self._json_response(response, mutation=True)
 

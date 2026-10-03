@@ -88,7 +88,7 @@ GUI 应用可能不会继承终端中导出的变量。应在客户端的 MCP �
 <a id="submission-outcome-is-uncertain"></a>
 ## 提交结果不确定
 
-提交请求发出后出现连接故障或超时、返回 HTTP 5xx，或响应中没有任务 ID，都可能表示 Determined 已经创建了任务，只是客户端没有收到 ID。此时 `compute_launch` 返回 `submission_uncertain`，错误 details 中包含 `kind` 和 `submission_marker`，且不会重试。
+提交请求发出后连接中断或超时、返回 HTTP 5xx，或响应中没有任务 ID，都可能表示 Determined 已经创建了任务，只是客户端没有收到 ID。此时 `compute_launch` 返回 `submission_uncertain`，错误 details 中包含 `kind` 和 `submission_marker`，且不会重试。在任何连接建立之前发生的失败（例如连接被拒绝或域名解析失败）则是可重试的 `transport_error`：请求没有发出。
 
 此时不要再次提交。调用 `compute_list(kind, marker=submission_marker)`：它读取该账户最新的任务，并返回存储配置中带有该标记的任务。如果返回了任务，它就是这次提交，继续使用它的 ID；如果没有找到，说明没有创建任何任务，可以安全地重新提交；如果此后又启动了很多任务，先用 `offset` 搜索更早的页。如果仍然出现了重复任务，用 `compute_cancel` 取消多余的那个。参见[未确认的提交](compute-service.zh.md#unconfirmed-launches)。
 
