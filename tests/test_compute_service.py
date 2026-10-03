@@ -974,7 +974,7 @@ def test_generic_plan_uses_native_metadata_and_command_entrypoint(
     service = ComputeService(FakeClient(), SQLiteTaskStore(tmp_path / "tasks.db"), profile)
     command = service.plan(dict(generic_request, kind="command"))
 
-    plan = service.plan(dict(generic_request, preemption_timeout=120, no_pause=True))
+    plan = service.plan(dict(generic_request, preemption_timeout=120, pausable=True))
 
     config = plan["config"]
     assert plan["kind"] == "generic"
@@ -985,8 +985,12 @@ def test_generic_plan_uses_native_metadata_and_command_entrypoint(
     assert config["environment"] == command["config"]["environment"]
     assert config["bind_mounts"] == command["config"]["bind_mounts"]
     assert config["preemption_timeout"] == 120
-    assert plan["task_options"] == {"parent": None, "inherit_context": False, "no_pause": True}
+    assert plan["task_options"] == {"parent": None, "inherit_context": False, "pausable": True}
     assert "generic_restart_safety" in {item["code"] for item in plan["advisories"]}
+    # A task that cannot be paused is never rerun, so it needs no restart-safety advisory.
+    default = service.plan(generic_request)
+    assert default["task_options"]["pausable"] is False
+    assert "generic_restart_safety" not in {item["code"] for item in default["advisories"]}
     # Other kinds keep their plan shape, so their idempotency hashes are unchanged.
     assert "task_options" not in command
     assert "preemption_timeout" not in command["config"]
@@ -1002,13 +1006,13 @@ def test_generic_plan_without_description_omits_it(tmp_path, profile, generic_re
 @pytest.mark.parametrize(
     ("change", "message"),
     [
-        ({"kind": "command", "no_pause": True}, "require generic kind"),
+        ({"kind": "command", "pausable": True}, "require generic kind"),
         ({"kind": "experiment", "preemption_timeout": 5}, "require generic kind"),
         ({"kind": "auto", "parent": "task"}, "require generic kind"),
         ({"inherit_context": True}, "inherit_context requires parent"),
         ({"preemption_timeout": -1}, "preemption_timeout"),
         ({"preemption_timeout": True}, "preemption_timeout"),
-        ({"no_pause": "yes"}, "booleans"),
+        ({"pausable": "yes"}, "booleans"),
         ({"parent": ""}, "parent"),
         ({"command": None}, "command"),
         ({"interactive": True}, "shell"),
@@ -1035,7 +1039,7 @@ def test_generic_launch_admits_capacity_and_surfaces_warnings(
     assert launched["name"] == "eval-shards"
     assert launched["description"].startswith("Evaluate every shard")
     assert launched["warnings"] == [warning]
-    assert client.options == [{"noPause": False}]
+    assert client.options == [{"noPause": True}]
     kind, config = client.launches[0]
     assert kind == "generic"
     assert config["name"] == "eval-shards"
@@ -1055,13 +1059,13 @@ def test_generic_parent_resolves_to_owned_remote_task(tmp_path, profile, generic
     parent = service.launch(generic_request, "parent", "session-a")
     child_request = dict(
         generic_request, name="child", parent=parent["task_id"], inherit_context=True,
-        no_pause=True,
+        pausable=True,
     )
 
     service.launch(child_request, "child", "session-a")
 
     assert client.options[-1] == {
-        "parentId": parent["remote_id"], "inheritContext": True, "noPause": True,
+        "parentId": parent["remote_id"], "inheritContext": True, "noPause": False,
     }
 
 
@@ -1179,11 +1183,9 @@ def test_uncertain_generic_submission_reconciles_by_marker(
     assert caught.value.code == "identity_mismatch"
 
 
-def test_generic_tasks_cannot_be_discovered_or_adopted(tmp_path, profile):
+def test_generic_adoption_rejects_invalid_ids_before_network(tmp_path, profile):
     client = FakeClient()
     service = ComputeService(client, SQLiteTaskStore(tmp_path / "tasks.db"), profile)
-    with pytest.raises(ValidationError, match="cannot be discovered or adopted"):
-        service.discover("generic", "session-a")
-    with pytest.raises(ValidationError, match="cannot be discovered or adopted"):
-        service.adopt("generic", "3f1c2b8e-1111-4c7a-9d55-0123456789ab", "session-a")
+    with pytest.raises(ValidationError, match="must be a UUID"):
+        service.adopt("generic", "not-a-uuid", "session-a")
     assert client.gets == []

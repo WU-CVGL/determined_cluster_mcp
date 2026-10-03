@@ -32,7 +32,7 @@
 
 - `command` 在容器中运行一次你的命令，命令退出即结束。用于有限的非交互任务，例如评估、转换或构建。
 - `shell` 提供一个可通过 SSH 连接的容器，而不是运行一个命令。用于交互调试和环境检查。
-- `generic` 像 `command` 一样运行一次你的命令，此外还可以暂停以释放其槽位，之后以同一任务 ID 恢复。恢复时会在新容器中从头再次运行命令，失败后也不会自动重启，所以只用于可安全重跑的长时间批处理任务；见[暂停与恢复](#pause-and-resume)。它要求 Determined master 来自 research-cluster fork 0.40.1 或更高版本，`kind: auto` 从不选择它。
+- `generic` 像 `command` 一样运行一次你的命令，并带有名称和子任务；以 `pausable: true` 提交时，还可以暂停以释放其槽位，之后以同一任务 ID 恢复。恢复时会在新容器中从头再次运行命令，失败后也不会自动重启，所以只在任务可安全重跑时才设为可暂停；见[暂停与恢复](#pause-and-resume)。它要求 Determined master 来自 research-cluster fork 0.40.1 或更高版本，`kind: auto` 从不选择它。
 - `experiment` 将你的命令作为一个或多个 trial 运行，并增加 Determined 的实验功能：
   - searcher（在 `experiment_config.searcher` 中设置）：运行单个 trial，或在超参数空间上运行多个 trial（网格、随机，或提前停止较差 trial 的自适应搜索）；
   - 自动重启：失败的 trial（包括其 agent 丢失的情况）会重新启动，最多 `max_restarts` 次（Determined 默认值为 5）；
@@ -116,14 +116,14 @@ MCP 不接受 `kind: notebook`。
 <a id="pause-and-resume"></a>
 ## 暂停与恢复
 
-暂停会释放任务的槽位但不结束任务：任务保留其 ID，之后可以恢复。experiment 和 generic 任务可以暂停；command 和 shell 不能暂停，会返回 `unsupported_kind`。
+暂停会释放任务的槽位但不结束任务：任务保留其 ID，之后可以恢复。experiment 以及以 `pausable: true` 提交的 generic 任务可以暂停；command 和 shell 返回 `unsupported_kind`，暂停不可暂停的 generic 任务会失败，任务继续运行。
 
 暂停会通过 Determined Core API 的抢占信号要求工作负载停止，并在任务的 `preemption_timeout` 结束时停止其容器。experiment 的超时默认为一小时，以便每个 trial 保存检查点后退出；generic 任务默认为 0，即立即停止。不使用 Core API 的普通脚本会在超时结束时被停止。
 
 恢复的方式因类型而异：
 
 - experiment 的每个 trial 从其最新检查点继续；没有检查点的 trial 从头开始。
-- generic 任务在同一任务 ID 下启动新容器，并从头再次运行命令。其命令应能在任意时刻被停止并再次启动：按单元处理工作，每个单元的输出先写入临时名称、完成后再重命名，跳过最终输出已存在的单元，并在启动时删除或重做不完整的单元。除非子任务设置了 `no_pause: true`，否则子任务会随之暂停；以 `no_pause: true` 提交的任务不能暂停。
+- generic 任务在同一任务 ID 下启动新容器，并从头再次运行命令。其命令应能在任意时刻被停止并再次启动：按单元处理工作，每个单元的输出先写入临时名称、完成后再重命名，跳过最终输出已存在的单元，并在启动时删除或重做不完整的单元。可暂停的子任务会随之暂停；不可暂停的子任务继续运行。
 
 暂停与恢复的步骤：
 
@@ -142,7 +142,7 @@ master 拒绝的暂停或恢复（例如暂停已暂停的任务）会以错误�
 
 对于通过 Determined WebUI、原生 CLI 或另一台设备独立创建，且属于同一 Determined 账户的任务，使用发现和登记流程：
 
-1. 调用 `compute_discover(kind, limit=50, offset=0)`，其中 kind 为 `command`、`shell` 或 `experiment`。这是只读远端查询，不会创建本地记录，也不会提交任务。generic 任务不能发现或接管，因为 Determined 不报告其所属账户。
+1. 调用 `compute_discover(kind, limit=50, offset=0)`，其中 kind 为 `command`、`shell`、`generic` 或 `experiment`。这是只读远端查询，不会创建本地记录，也不会提交任务。generic 任务需要带有 research-cluster fork generic 任务列表（WU-CVGL/determined#27）的 master；较旧的 master 返回 `unsupported`。
 2. 选择目标结果，再调用 `compute_adopt(kind, remote_id)`。
 3. 保存返回的本地 `task_id`，然后用它调用 `compute_status`、`compute_logs`、`compute_usage` 和 `compute_cancel`。
 

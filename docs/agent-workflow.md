@@ -29,7 +29,7 @@ Choose the task kind according to the work. The four kinds, from the simplest:
 
 - `command` runs your command once in a container and ends when it exits. Use it for finite, non-interactive work such as an evaluation, a conversion, or a build.
 - `shell` gives you a container to connect to over SSH instead of a command to run. Use it for interactive debugging and environment inspection.
-- `generic` runs your command once like a `command`, and can also be paused to free its slots and resumed later under the same task ID. Resuming starts the command again from the beginning in a new container, and nothing restarts it after a failure, so use it only for long batch work that is safe to rerun; see [Pause and resume](#pause-and-resume). It requires the research-cluster fork 0.40.1 or later of the Determined master, and `kind: auto` never selects it.
+- `generic` runs your command once like a `command`, with a name, child tasks, and, if launched with `pausable: true`, pause and resume under the same task ID to free its slots. Resuming starts the command again from the beginning in a new container, and nothing restarts it after a failure, so make a task pausable only when it is safe to rerun; see [Pause and resume](#pause-and-resume). It requires the research-cluster fork 0.40.1 or later of the Determined master, and `kind: auto` never selects it.
 - `experiment` runs your command as one or more trials and adds Determined's experiment features:
   - a searcher, set in `experiment_config.searcher`, that runs a single trial or many trials over a hyperparameter space (grid, random, or adaptive search that stops weak trials early);
   - automatic restarts: a failed trial, including one whose agent was lost, starts again up to `max_restarts` times (Determined's default is 5);
@@ -107,14 +107,14 @@ Report the local task ID, remote ID, final state, exit result when available, ou
 
 ## Pause and resume
 
-Pausing frees a task's slots without ending it: the task keeps its ID and can be resumed later. Experiments and generic tasks can be paused; commands and shells cannot, and return `unsupported_kind`.
+Pausing frees a task's slots without ending it: the task keeps its ID and can be resumed later. Experiments and generic tasks launched with `pausable: true` can be paused; commands and shells return `unsupported_kind`, and pausing a generic task that is not pausable fails and leaves it running.
 
 A pause asks the workload to stop through Determined's Core API preemption signal and stops its containers when the task's `preemption_timeout` ends. For an experiment the timeout defaults to one hour, so that each trial can save a checkpoint and exit; for a generic task it defaults to 0, an immediate stop. A plain script that does not use the Core API is stopped when the timeout ends.
 
 Resuming continues differently by kind:
 
 - An experiment continues each trial from its latest checkpoint; a trial without one starts from the beginning.
-- A generic task starts a new container under the same task ID and runs the command again from the beginning. Write its command so that it can be stopped at any moment and started again: process work in units, write each unit's output under a temporary name and rename it when complete, skip units whose final output already exists, and remove or redo partial ones on start. Its child tasks are paused with it unless they set `no_pause: true`, and a task launched with `no_pause: true` cannot be paused.
+- A generic task starts a new container under the same task ID and runs the command again from the beginning. Write its command so that it can be stopped at any moment and started again: process work in units, write each unit's output under a temporary name and rename it when complete, skip units whose final output already exists, and remove or redo partial ones on start. Its pausable child tasks are paused with it; children that are not pausable keep running.
 
 To pause and resume:
 
@@ -132,7 +132,7 @@ Give a generic task a meaningful `name` and `description` as for any launch. A m
 
 Use discovery and adoption for a task created independently through the Determined WebUI, native CLI, or another device under the same Determined account:
 
-1. Call `compute_discover(kind, limit=50, offset=0)` with `command`, `shell`, or `experiment`. This is a read-only remote query; it does not create a local record or submit work. Generic tasks cannot be discovered or adopted, because Determined does not report which account owns them.
+1. Call `compute_discover(kind, limit=50, offset=0)` with `command`, `shell`, `generic`, or `experiment`. This is a read-only remote query; it does not create a local record or submit work. Generic tasks need a master with the research-cluster fork's generic task list (WU-CVGL/determined#27); an older master returns `unsupported`.
 2. Select the intended remote result, then call `compute_adopt(kind, remote_id)`.
 3. Keep the returned local `task_id` and use it with `compute_status`, `compute_logs`, `compute_usage`, and `compute_cancel`.
 

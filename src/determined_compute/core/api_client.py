@@ -99,8 +99,9 @@ _GENERIC_STATE_PREFIX = "GENERIC_TASK_STATE_"
 
 class DeterminedAPIClient:
     _TASK_KINDS = {"command", "shell", "experiment", "generic"}
-    # Kinds whose remote listing can be filtered by the owning account.
-    _LISTABLE_KINDS = {"command", "shell", "experiment"}
+    # Kinds whose remote listing can be filtered by the owning account. Generic tasks need a
+    # master with the generic task list (WU-CVGL/determined#27).
+    _LISTABLE_KINDS = {"command", "shell", "generic", "experiment"}
     _REMOTE_TASK_FIELDS = (
         "id",
         "userId",
@@ -281,23 +282,35 @@ class DeterminedAPIClient:
         offset: int = 0,
     ) -> Dict[str, Any]:
         if kind not in self._LISTABLE_KINDS:
-            raise ValueError("kind must be one of: command, shell, experiment")
+            raise ValueError("kind must be one of: command, shell, generic, experiment")
         normalized_user_id = self.normalize_user_id(user_id)
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValueError("limit must be an integer between 1 and 100")
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise ValueError("offset must be a non-negative integer")
-        response = self._get(
-            f"api/v1/{kind}s",
-            params={
-                "userIds": [int(normalized_user_id)],
-                "limit": limit,
-                "offset": offset,
-                "orderBy": "ORDER_BY_DESC",
-                "sortBy": "SORT_BY_START_TIME",
-            },
-        )
-        collection = response.get(f"{kind}s")
+        if kind == "generic":
+            # The generic task list is always newest first.
+            response = self._generic_task_list(
+                {"userIds": [int(normalized_user_id)], "limit": limit, "offset": offset}
+            )
+            collection = response.get("tasks")
+            if isinstance(collection, list):
+                collection = [
+                    self._generic_summary(item) if isinstance(item, Mapping) else item
+                    for item in collection
+                ]
+        else:
+            response = self._get(
+                f"api/v1/{kind}s",
+                params={
+                    "userIds": [int(normalized_user_id)],
+                    "limit": limit,
+                    "offset": offset,
+                    "orderBy": "ORDER_BY_DESC",
+                    "sortBy": "SORT_BY_START_TIME",
+                },
+            )
+            collection = response.get(f"{kind}s")
         if not isinstance(collection, list):
             raise APIError("Remote-task response is malformed", code="invalid_response")
         tasks: List[Dict[str, Any]] = []
@@ -553,6 +566,37 @@ class DeterminedAPIClient:
             and _UNKNOWN_GENERIC_METADATA.search(str(rejection)) is not None
         )
 
+    def _generic_task_list(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return self._get("api/v1/generic-tasks", params=params)
+        except APIError as exc:
+            # A master without the list answers the GET of the create route with 404/405/501.
+            if exc.code in {404, 405, 501}:
+                raise APIError(
+                    "This Determined master cannot list generic tasks with their owners; "
+                    "it needs the research-cluster fork with WU-CVGL/determined#27",
+                    code="unsupported",
+                ) from exc
+            raise
+
+    @staticmethod
+    def _generic_summary(item: Mapping[str, Any]) -> Dict[str, Any]:
+        """Map a listed generic task to the fields of other kinds' remote entities."""
+        summary: Dict[str, Any] = {
+            "id": item.get("taskId"),
+            "userId": item.get("userId"),
+            "username": item.get("username"),
+            "name": item.get("name"),
+            "description": item.get("description") or None,
+            "resourcePool": item.get("resourcePool"),
+            "startTime": item.get("startTime"),
+            "endTime": item.get("endTime"),
+        }
+        raw_state = item.get("state")
+        if isinstance(raw_state, str) and raw_state.startswith(_GENERIC_STATE_PREFIX):
+            summary["state"] = "STATE_" + raw_state[len(_GENERIC_STATE_PREFIX):]
+        return {key: value for key, value in summary.items() if value is not None}
+
     def _get_generic_task(self, task_id: str) -> Dict[str, Any]:
         path = f"api/v1/tasks/{quote(str(task_id), safe='')}"
         task = self._get(path).get("task")
@@ -587,6 +631,21 @@ class DeterminedAPIClient:
             for field in _GENERIC_METADATA_FIELDS:
                 if isinstance(config.get(field), str):
                     entity[field] = config[field]
+        # The owner comes from the generic task list; a master without it leaves the entity
+        # ownerless, so ownership checks (adoption) fail instead of guessing.
+        try:
+            listed = self._generic_task_list({"taskIds": [task_id]}).get("tasks")
+        except APIError as exc:
+            if exc.code != "unsupported":
+                raise
+            listed = None
+        if isinstance(listed, list):
+            for item in listed:
+                if isinstance(item, Mapping) and item.get("taskId") == task_id:
+                    summary = self._generic_summary(item)
+                    for field in ("userId", "username", "name"):
+                        if field in summary:
+                            entity[field] = summary[field]
         return entity
 
     def get_task(self, kind: str, task_id: str) -> Dict[str, Any]:

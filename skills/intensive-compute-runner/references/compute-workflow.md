@@ -21,7 +21,7 @@ Load this reference when preparing a service request, copying a workspace to sha
 | `pool`, `image` | Optional overrides of profile defaults |
 | `code_revision` | Stable revision or content identifier for reproducibility |
 | `experiment_config` | Experiment-only configuration; selects `experiment` in auto mode |
-| `parent`, `inherit_context`, `no_pause`, `preemption_timeout` | Generic-only options; see the compute reference |
+| `parent`, `inherit_context`, `pausable`, `preemption_timeout` | Generic-only options; `pausable` defaults to `false`; see the compute reference |
 
 Auto mode otherwise resolves to `command` and never selects `generic`. Call `plan` before `launch`; planning is read-only.
 

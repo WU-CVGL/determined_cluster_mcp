@@ -48,11 +48,11 @@ _REQUEST_FIELDS = {
     "experiment_config",
     "parent",
     "inherit_context",
-    "no_pause",
+    "pausable",
     "preemption_timeout",
 }
 # Request fields that only a generic task accepts.
-_GENERIC_FIELDS = ("parent", "inherit_context", "no_pause", "preemption_timeout")
+_GENERIC_FIELDS = ("parent", "inherit_context", "pausable", "preemption_timeout")
 _TASK_KINDS = {"command", "shell", "experiment", "generic"}
 _NAME_MAX_LENGTH = 128
 _DESCRIPTION_MAX_LENGTH = 2048
@@ -406,7 +406,7 @@ class ComputeService:
                     "message": "Long or overnight work is more robust as an experiment.",
                 }
             )
-        if kind == "generic":
+        if task_options is not None and task_options["pausable"]:
             advisories.append(
                 {
                     "code": "generic_restart_safety",
@@ -441,7 +441,7 @@ class ComputeService:
         # Only generic plans carry this key, so the payload hash of other kinds is unchanged.
         if task_options is not None:
             result["task_options"] = {
-                key: task_options[key] for key in ("parent", "inherit_context", "no_pause")
+                key: task_options[key] for key in ("parent", "inherit_context", "pausable")
             }
         return result
 
@@ -451,9 +451,9 @@ class ComputeService:
         if parent is not None and (not isinstance(parent, str) or not parent):
             raise ValidationError("parent must be a local task_id or null")
         inherit_context = request.get("inherit_context", False)
-        no_pause = request.get("no_pause", False)
-        if not isinstance(inherit_context, bool) or not isinstance(no_pause, bool):
-            raise ValidationError("inherit_context and no_pause must be booleans")
+        pausable = request.get("pausable", False)
+        if not isinstance(inherit_context, bool) or not isinstance(pausable, bool):
+            raise ValidationError("inherit_context and pausable must be booleans")
         if inherit_context and parent is None:
             raise ValidationError("inherit_context requires parent")
         timeout = request.get("preemption_timeout")
@@ -464,7 +464,7 @@ class ComputeService:
         return {
             "parent": parent,
             "inherit_context": inherit_context,
-            "no_pause": no_pause,
+            "pausable": pausable,
             "preemption_timeout": timeout,
         }
 
@@ -739,9 +739,10 @@ class ComputeService:
         self, options: Mapping[str, Any], owner: str
     ) -> Dict[str, Any]:
         """Resolve a generic task's local parent to its remote task id."""
-        # Determined pauses a child task with its parent only when the child's noPause is
-        # explicitly false, so always send the value.
-        result: Dict[str, Any] = {"noPause": options["no_pause"]}
+        # Resuming a paused generic task reruns it from the start, so a task is pausable only
+        # when the request asks for it. Always send the value: masters differ in how they treat
+        # an unset noPause.
+        result: Dict[str, Any] = {"noPause": not options["pausable"]}
         if options["parent"] is not None:
             parent = self.store.get_owned(options["parent"], owner)
             if parent.kind != "generic":
@@ -1346,11 +1347,8 @@ class ComputeService:
 
     @staticmethod
     def _management_kind(kind: Any) -> str:
-        if kind == "generic":
-            # Determined exposes no owner of a generic task, so ownership cannot be verified.
-            raise ValidationError("generic tasks cannot be discovered or adopted")
-        if not isinstance(kind, str) or kind not in {"command", "shell", "experiment"}:
-            raise ValidationError("kind must be command, shell, or experiment")
+        if not isinstance(kind, str) or kind not in {"command", "shell", "generic", "experiment"}:
+            raise ValidationError("kind must be command, shell, generic, or experiment")
         return kind
 
     @staticmethod
@@ -1361,11 +1359,13 @@ class ComputeService:
             except ValueError as exc:
                 raise ValidationError("experiment remote_id must be a positive integer") from exc
         if not isinstance(value, str):
-            raise ValidationError("command and shell remote_id must be a UUID")
+            raise ValidationError("command, shell, and generic task remote_id must be a UUID")
         try:
             return str(uuid.UUID(value))
         except ValueError as exc:
-            raise ValidationError("command and shell remote_id must be a UUID") from exc
+            raise ValidationError(
+                "command, shell, and generic task remote_id must be a UUID"
+            ) from exc
 
     def _remote_account(self) -> tuple[str, Dict[str, str]]:
         cluster_id = self.client.get_cluster_id()

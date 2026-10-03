@@ -98,7 +98,7 @@ reconciliation operations on those records.
 | `experiment_config` | object | Extra experiment configuration; requires experiment mode |
 | `parent` | string or null | Generic only: local `task_id` of a generic parent task in the same owner namespace |
 | `inherit_context` | boolean | Generic only: inherit the parent's context directory; requires `parent`; default `false` |
-| `no_pause` | boolean | Generic only: the task cannot be paused; default `false` |
+| `pausable` | boolean | Generic only: the task can be paused, and resuming reruns it from the start; default `false` |
 | `preemption_timeout` | non-negative integer | Generic only: seconds a task gets to stop after a pause request; Determined's default is 0. An experiment sets it in `experiment_config` |
 
 Unknown request fields and upload/context fields are rejected. In auto mode,
@@ -131,8 +131,8 @@ omitted, Determined applies its cluster default, which offline planning cannot i
 ### Generic tasks
 
 A generic task is Determined's lower-level task type: one container that runs an
-entrypoint, with no trials, searcher, or checkpoint lifecycle, which can be paused and
-resumed and can have child tasks. It requires a Determined master from the
+entrypoint, with no trials, searcher, or checkpoint lifecycle, which can have child tasks
+and, when launched with `pausable: true`, be paused and resumed. It requires a Determined master from the
 research-cluster fork 0.40.1 or later. Its plan is a command plan with these
 differences:
 
@@ -140,8 +140,8 @@ differences:
   next to the same `entrypoint`, `resources`, `environment`, and `bind_mounts` as a
   command.
 - The plan has a `task_options` object with `parent`, `inherit_context`, and
-  `no_pause`. Plans of other kinds have no such key.
-- Every generic plan has the `generic_restart_safety` advisory.
+  `pausable`. Plans of other kinds have no such key.
+- A pausable plan has the `generic_restart_safety` advisory.
 
 At launch, `parent` must name a generic task in the same owner namespace that is bound
 to a remote ID and to the current profile and endpoint; it is sent as that remote ID.
@@ -156,18 +156,20 @@ Generic task lifecycle:
 
 - Exit status 0 ends the task as `COMPLETED`. A non-zero exit or a lost agent ends it as
   `ERROR`. Determined never restarts a generic task automatically.
-- Pausing stops the task's container. The workload is notified through Determined's
+- Only a task launched with `pausable: true` can be paused; pausing any other generic
+  task fails and leaves it running, so it runs once. Pausing stops the task's container.
+  The workload is notified through Determined's
   Core API preemption signal and gets `preemption_timeout` seconds (default 0, an
   immediate stop) to exit. A plain script that does not use the Core API is simply
   stopped.
 - Resuming starts a new container under the same task ID and runs the entrypoint again
   from the beginning. The workload must be restart-safe: skip outputs that are already
   complete, and resume or clean up partial ones.
-- Killing (`compute_cancel`) and pausing also act on the task's descendants, and
-  resuming resumes the paused ones. A child with `no_pause: true` keeps running when its
-  parent is paused, and pausing a task with `no_pause: true` itself fails. The service
-  always sends `no_pause`; a child task created by other means without the setting is
-  not paused with its parent.
+- Killing (`compute_cancel`) acts on the task and all its descendants. Pausing acts on
+  the task and its pausable descendants, and resuming resumes the paused ones; a child
+  that is not pausable keeps running when its parent is paused. The service always sends
+  Determined's `noPause` as the opposite of `pausable`, because masters differ in how they
+  treat an unset value.
 
 ## Start the MCP server
 
@@ -322,7 +324,7 @@ reports `STATE_STOPPING_PAUSED`, then `STATE_PAUSED`. Resume is accepted only fo
 in `STATE_PAUSED` whose descendants have finished stopping, and it runs the entrypoint
 again from the start. A master with the research-cluster fork's generic-task fixes
 refuses a pause, resume, or kill with HTTP 404 for a missing task, HTTP 400 for a state
-that does not allow it (such as pausing a paused task or a task with `no_pause: true`),
+that does not allow it (such as pausing a paused task or one that is not pausable),
 and HTTP 409 while another pause, resume, or kill is in progress; these are ordinary
 errors that carry the master's reason. An older master reports the same refusals as
 server errors, which arrive as `submission_uncertain` errors whose message includes the
@@ -488,17 +490,18 @@ task, or a requested trial ID, is missing or inaccessible. See
 
 ### Discover and adopt
 
-`compute_discover` accepts `kind` equal to `command`, `shell`, or `experiment`. `limit`
+`compute_discover` accepts `kind` equal to `command`, `shell`, `generic`, or `experiment`. `limit`
 must be 1 through 100 and `offset` must be non-negative. It queries only tasks owned by
 the currently authenticated Determined account and returns the actual cluster ID,
 account identity, sanitized metadata, any matching `local_task_id`, and consistent
 pagination including `next_offset`. It neither writes a local record nor submits work.
-Command and shell remote IDs are UUIDs; experiment remote IDs are positive integers.
+Command, shell, and generic task remote IDs are UUIDs; experiment remote IDs are positive
+integers.
 
-Generic tasks cannot be discovered or adopted, and `generic` returns `invalid_request`
-for both tools. Determined's task record does not name a generic task's owner, and its
-task list covers only running allocations, so the service cannot verify that a remote
-generic task belongs to the current account.
+Generic tasks are listed and their owner verified through Determined's generic task list,
+which the research-cluster fork has from WU-CVGL/determined#27 on. Against an older master,
+discovering generic tasks fails with `unsupported`, and adopting one fails with
+`ownership_unavailable`, because nothing else reports a generic task's owner.
 
 `compute_adopt` fetches one remote task and verifies both its normalized ID and
 `userId` against `/me` before writing. Administrative visibility cannot be used to

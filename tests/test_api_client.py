@@ -1039,6 +1039,13 @@ def test_get_generic_task_maps_state_and_reads_marker_from_config(monkeypatch):
             }
         }),
         f"/api/v1/tasks/{GENERIC_ID}/config": Response({"config": json.dumps(submitted)}),
+        "/api/v1/generic-tasks": Response({
+            "tasks": [{
+                "taskId": GENERIC_ID, "userId": 7, "username": "alice", "name": "eval-shard",
+                "state": "GENERIC_TASK_STATE_PAUSED",
+            }],
+            "pagination": {"limit": 0, "offset": 0, "startIndex": 0, "endIndex": 1, "total": 1},
+        }),
     }
 
     def get(url, **kwargs):
@@ -1049,7 +1056,12 @@ def test_get_generic_task_maps_state_and_reads_marker_from_config(monkeypatch):
     monkeypatch.setattr(requests, "get", get)
     task = client().get_task("generic", GENERIC_ID)
 
-    assert requested == [f"/api/v1/tasks/{GENERIC_ID}", f"/api/v1/tasks/{GENERIC_ID}/config"]
+    assert requested == [
+        f"/api/v1/tasks/{GENERIC_ID}", f"/api/v1/tasks/{GENERIC_ID}/config",
+        "/api/v1/generic-tasks",
+    ]
+    assert task["userId"] == 7
+    assert task["username"] == "alice"
     assert task["id"] == GENERIC_ID
     assert task["state"] == "STATE_PAUSED"
     assert task["taskState"] == "GENERIC_TASK_STATE_PAUSED"
@@ -1129,13 +1141,47 @@ def test_experiment_pause_and_resume_routes(monkeypatch, operation, action):
     assert calls == [f"http://master:8080/api/v1/experiments/17/{action}"]
 
 
-def test_pause_and_discovery_reject_other_kinds():
+def test_pause_rejects_other_kinds():
     with pytest.raises(ValueError, match="only experiments and generic tasks"):
         client().pause_task("command", "c1")
     with pytest.raises(ValueError, match="only experiments and generic tasks"):
         client().unpause_task("shell", "s1")
-    with pytest.raises(ValueError):
-        client().list_remote_tasks("generic", user_id="1")
+
+
+def test_generic_discovery_lists_owned_tasks_newest_first(monkeypatch):
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs.get("params")))
+        return Response({
+            "tasks": [{
+                "taskId": GENERIC_ID, "userId": 7, "username": "alice", "name": "eval-shard",
+                "description": "", "state": "GENERIC_TASK_STATE_ACTIVE", "resourcePool": "gpu",
+                "startTime": "2026-10-01T00:00:00Z", "noPause": True,
+            }],
+            "pagination": {"limit": 5, "offset": 0, "startIndex": 0, "endIndex": 1, "total": 1},
+        })
+
+    monkeypatch.setattr(requests, "get", get)
+    page = client().list_remote_tasks("generic", user_id="7", limit=5)
+    assert calls == [(
+        "http://master:8080/api/v1/generic-tasks", {"userIds": [7], "limit": 5, "offset": 0},
+    )]
+    assert page["tasks"] == [{
+        "id": GENERIC_ID, "userId": 7, "username": "alice", "name": "eval-shard",
+        "state": "STATE_ACTIVE", "resourcePool": "gpu", "startTime": "2026-10-01T00:00:00Z",
+    }]
+
+
+@pytest.mark.parametrize("status", [404, 405, 501])
+def test_generic_discovery_on_a_master_without_the_list_is_unsupported(monkeypatch, status):
+    monkeypatch.setattr(
+        requests, "get", lambda *a, **k: gateway_error(status, 5, "NotFound", "Not Found")
+    )
+    with pytest.raises(APIError) as caught:
+        client().list_remote_tasks("generic", user_id="7")
+    assert caught.value.code == "unsupported"
+    assert "WU-CVGL/determined#27" in str(caught.value)
 
 
 def test_generic_logs_use_task_log_route(monkeypatch):

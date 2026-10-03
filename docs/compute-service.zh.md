@@ -90,7 +90,7 @@ shell_inactivity_seconds: 7200
 | `experiment_config` | 对象 | 额外的实验配置；要求 experiment 模式 |
 | `parent` | 字符串或 null | 仅 generic：同一 owner 命名空间中某个 generic 父任务的本地 `task_id` |
 | `inherit_context` | 布尔值 | 仅 generic：继承父任务的 context 目录；要求 `parent`；默认 `false` |
-| `no_pause` | 布尔值 | 仅 generic：该任务不能暂停；默认 `false` |
+| `pausable` | 布尔值 | 仅 generic：该任务可以暂停，恢复时从头重新运行；默认 `false` |
 | `preemption_timeout` | 非负整数 | 仅 generic：收到暂停请求后任务可用于停止的秒数；Determined 默认为 0。experiment 在 `experiment_config` 中设置 |
 
 服务拒绝未知字段以及上传/context 字段。在 auto 模式中，`interactive` 优先选择 `shell`，
@@ -120,14 +120,14 @@ experiment 必须提供 `command` 或 `experiment_config.entrypoint`，但不能
 ### Generic 任务
 
 generic 任务是 Determined 较底层的任务类型：一个运行入口命令的容器，没有 trial、searcher
-或 checkpoint 生命周期，可以暂停和恢复，也可以有子任务。它要求 Determined master 来自
+或 checkpoint 生命周期，可以有子任务；以 `pausable: true` 提交时还可以暂停和恢复。它要求 Determined master 来自
 research-cluster fork 0.40.1 或更高版本。它的规划与 command 相同，区别如下：
 
 - 配置除了与 command 相同的 `entrypoint`、`resources`、`environment` 和 `bind_mounts` 外，
   还包含 `name`、已设置时的 `description`，以及已设置时的 `preemption_timeout`。
-- 规划包含 `task_options` 对象，其中有 `parent`、`inherit_context` 和 `no_pause`。其他
+- 规划包含 `task_options` 对象，其中有 `parent`、`inherit_context` 和 `pausable`。其他
   kind 的规划没有该键。
-- 每个 generic 规划都带有 `generic_restart_safety` 提示。
+- 可暂停的规划带有 `generic_restart_safety` 提示。
 
 提交时，`parent` 必须指向同一 owner 命名空间中、已绑定 remote ID 且绑定当前配置和端点的
 generic 任务；服务以该 remote ID 发送。否则提交会在创建本地记录之前失败。代码和数据都在
@@ -139,15 +139,15 @@ generic 任务的生命周期：
 
 - 退出状态 0 使任务以 `COMPLETED` 结束；非零退出或 agent 丢失使其以 `ERROR` 结束。
   Determined 从不自动重启 generic 任务。
-- 暂停会停止任务的容器。工作负载通过 Determined Core API 的抢占信号收到通知，并有
+- 只有以 `pausable: true` 提交的任务可以暂停；暂停其他 generic 任务会失败，任务继续运行，
+  因此只运行一次。暂停会停止任务的容器。工作负载通过 Determined Core API 的抢占信号收到通知，并有
   `preemption_timeout` 秒（默认 0，即立即停止）可用于退出。不使用 Core API 的普通脚本会被
   直接停止。
 - 恢复会在同一任务 ID 下启动新容器，并从头再次运行入口命令。工作负载必须可安全重跑：
   跳过已完成的输出，并续做或清理不完整的输出。
-- 终止（`compute_cancel`）和暂停也作用于任务的后代，恢复则会恢复已暂停的后代。设置了
-  `no_pause: true` 的子任务在父任务暂停时继续运行，暂停一个自身设置了 `no_pause: true` 的
-  任务会失败。服务总是发送 `no_pause`；通过其他方式创建且未设置该值的子任务不会随父任务
-  暂停。
+- 终止（`compute_cancel`）作用于任务及其所有后代。暂停作用于任务及其可暂停的后代，恢复则
+  会恢复已暂停的后代；不可暂停的子任务在父任务暂停时继续运行。由于不同 master 对未设置的值
+  处理不同，服务总是把 Determined 的 `noPause` 作为 `pausable` 的相反值发送。
 
 <a id="start-the-mcp-server"></a>
 ## 启动 MCP server
@@ -287,7 +287,7 @@ experiment 立即报告 `STATE_PAUSED`，而其 trial 收到抢占信号，并�
 [Generic 任务](#generic-tasks)。任务先报告 `STATE_STOPPING_PAUSED`，再报告 `STATE_PAUSED`。
 只有处于 `STATE_PAUSED` 且后代都已停止的任务才能恢复，恢复会从头再次运行入口命令。包含
 research-cluster fork 中 generic 任务修复的 master 拒绝暂停、恢复或终止时，对不存在的任务返回
-HTTP 404，对不允许该操作的状态（例如暂停已暂停的任务或设置了 `no_pause: true` 的任务）返回
+HTTP 404，对不允许该操作的状态（例如暂停已暂停的任务或不可暂停的任务）返回
 HTTP 400，在另一个暂停、恢复或终止进行中时返回 HTTP 409；这些都是带有 master 原因的普通错误。
 较旧的 master 把同样的拒绝报告为服务器错误，因此会以 `submission_uncertain` 错误返回，消息中
 包含 master 给出的原因；重复调用前先检查 `compute_status`。
@@ -424,15 +424,15 @@ task 或指定的 trial ID 不存在或无权访问时返回 HTTP 404。参见
 <a id="discover-and-adopt"></a>
 ### 发现与接管
 
-`compute_discover` 的 `kind` 可以是 `command`、`shell` 或 `experiment`。`limit` 必须在
+`compute_discover` 的 `kind` 可以是 `command`、`shell`、`generic` 或 `experiment`。`limit` 必须在
 1 到 100 之间，`offset` 必须是非负数。它只查询当前已认证 Determined 账户拥有的任务，返回
 实际集群 ID、账户身份、清理后的元数据、匹配的 `local_task_id`（若有）以及包含
 `next_offset` 的一致分页信息。它既不写入本地记录，也不提交任务。
-command 和 shell 的 remote ID 是 UUID，experiment 的 remote ID 是正整数。
+command、shell 和 generic 任务的 remote ID 是 UUID，experiment 的 remote ID 是正整数。
 
-generic 任务不能发现或接管；两个工具对 `generic` 都返回 `invalid_request`。Determined 的任务
-记录不包含 generic 任务的所有者，其任务列表也只覆盖正在运行的 allocation，所以服务无法验证
-某个远端 generic 任务属于当前账户。
+generic 任务通过 Determined 的 generic 任务列表列出并验证所有者；research-cluster fork 从
+WU-CVGL/determined#27 起提供该列表。对较旧的 master，发现 generic 任务会以 `unsupported` 失败，
+接管则以 `ownership_unavailable` 失败，因为没有其他接口报告 generic 任务的所有者。
 
 `compute_adopt` 先取得一个远端任务，再把其规范化 ID 和 `userId` 与 `/me` 对照，验证通过后
 才写入。即使管理员可以看到其他任务，也不能接管其他用户的任务。注册身份由本地 owner、实际
