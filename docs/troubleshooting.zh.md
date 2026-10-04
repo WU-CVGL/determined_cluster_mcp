@@ -105,7 +105,7 @@ Requests 从 MCP 进程环境读取 `HTTPS_PROXY`、`HTTP_PROXY` 和 `NO_PROXY` 
 
 提交请求发出后连接中断或超时、返回 HTTP 5xx、返回重定向（HTTP 3xx，任何变更请求都不会跟随），或响应中没有任务 ID，都可能表示 Determined 已经创建了任务，只是客户端没有收到 ID。此时 `compute_launch` 返回 `submission_uncertain`，错误 details 中包含 `kind` 和 `submission_marker`，且不会重试。在任何连接建立之前发生的失败（例如连接被拒绝或域名解析失败）则是可重试的 `transport_error`：请求没有发出。
 
-错误 details 带有 `source: "proxy"` 时，作出应答的是本机与 master 之间的 HTTP 代理，而不是 Determined。master 很可能无法访问：检查 API 地址、master 是否在运行，以及其地址是否应加入 `NO_PROXY`。以这种方式得到应答的提交或其他修改仍属于未确认，因为代理可能在转发请求之后才失败。如果代理在 `Proxy-Status` 头中表明它从未连上 master（例如 `error=dns_error` 或 `error=connection_refused`），则返回带有 `proxy_error` 的可重试 `transport_error`，因为请求没有到达 master。代理应答的识别方式见[未确认的提交](compute-service.zh.md#unconfirmed-launches)。
+错误 details 带有 `source: "proxy"` 时，作出应答的是本机与 master 之间的 HTTP 代理，而不是 Determined。master 很可能无法访问：检查 API 地址、master 是否在运行，以及其地址是否应加入 `NO_PROXY` 和 `no_proxy`。以这种方式得到应答的提交或其他修改仍属于未确认，因为代理可能在转发请求之后才失败。如果代理在 `Proxy-Status` 头中表明它从未连上 master（例如 `error=dns_error` 或 `error=connection_refused`），则返回带有 `proxy_error` 的可重试 `transport_error`，因为请求没有到达 master。代理应答的识别方式见[未确认的提交](compute-service.zh.md#unconfirmed-launches)。
 
 不要自动再次提交。使用较小的 `limit` 调用 `compute_list(kind, marker=submission_marker)`：它读取该账户最新的任务，并返回存储配置中带有该标记的所有任务。只返回一个任务时，它很可能就是这次提交，继续使用它的 ID；返回多个任务时，它们共用一份复制的配置，应由用户判断哪一个（如果有的话）是这次提交。空结果不能证明提交失败：可以沿 `pagination.next_offset` 查看更早的页，稍后再次搜索（master 可能在搜索之后才保存任务），或在 WebUI 中查看。Determined 不再提供的已结束 command 或 shell 根本不会出现。是否重新提交由用户在检查之后决定；事后取消的重复任务可能已经写入文件或产生了取消无法撤销的其他影响。参见[未确认的提交](compute-service.zh.md#unconfirmed-launches)。
 
