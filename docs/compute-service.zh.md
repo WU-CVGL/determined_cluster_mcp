@@ -278,9 +278,10 @@ Determined 可能创建了任务，也可能没有。服务从不重试这样的
 
 状态、日志、用量、取消、暂停和恢复，以及 generic 任务的 `parent`，都会先读取已认证账户
 （`GET /api/v1/me`）和 Determined 中的任务。只有当任务的 `userId` 等于该账户 ID、且返回的
-ID 与请求的 ID 一致时才继续；否则在发出任何后续请求之前以 `ownership_mismatch` 失败，因此
-管理员账户也不能通过本服务操作其他用户的任务。由于凭据在进程启动时就已确定，服务在每个进程
-中只读取一次账户。
+ID 与请求的 ID 一致时才继续，否则在发出任何后续请求之前失败。所有者是其他账户时以
+`ownership_mismatch` 失败，因此管理员账户也不能通过本服务操作其他用户的任务。返回的 ID
+格式错误或与请求的 ID 不一致时以 `invalid_response` 失败。由于凭据在进程启动时就已确定，
+服务在每个进程中只读取一次账户。
 
 generic 任务的所有者来自 Determined 的 generic 任务列表
 （`GET /api/v1/generic-tasks?taskIds=`）；research-cluster fork 从 WU-CVGL/determined#27 起

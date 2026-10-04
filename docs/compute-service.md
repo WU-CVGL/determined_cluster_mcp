@@ -312,10 +312,11 @@ an unconfirmed one.
 Status, logs, usage, cancel, pause, and resume, and a generic task's `parent`, first
 read the authenticated account (`GET /api/v1/me`) and the task from Determined. They
 proceed only when the task's `userId` equals the account's ID and the returned ID
-matches the requested one. Otherwise they fail with `ownership_mismatch` before any
-further request, so an administrator account cannot act on other users' tasks through
-this service. The service reads the account once per process, because the credentials
-are fixed when it starts.
+matches the requested one, and fail before any further request otherwise. Another
+owner fails with `ownership_mismatch`, so an administrator account cannot act on other
+users' tasks through this service. A returned ID that is malformed or differs from the
+requested one fails with `invalid_response`. The service reads the account once per
+process, because the credentials are fixed when it starts.
 
 A generic task's owner comes from Determined's generic task list
 (`GET /api/v1/generic-tasks?taskIds=`), which the research-cluster fork has from
