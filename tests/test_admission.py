@@ -187,3 +187,12 @@ def test_slot_bounds_and_bool_are_rejected(slots):
     inspector = ResourceInspector(Client([], []))
     with pytest.raises(ValueError, match="non-negative integer"):
         inspector.resources(slots=slots)
+
+
+def test_generic_task_uses_slots_for_admission():
+    inspector = ResourceInspector(Client([pool(total=1, used=0)], [agent(slots=1)]))
+    assert inspector.require_capacity("generic", command_config())["admitted"] is True
+    busy = ResourceInspector(Client([pool(total=1, used=1)], [agent(slots=1, occupied=1)]))
+    with pytest.raises(APIError) as caught:
+        busy.require_capacity("generic", command_config())
+    assert caught.value.code == "capacity_unavailable"

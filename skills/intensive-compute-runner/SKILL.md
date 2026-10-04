@@ -13,7 +13,8 @@ Let `kind: auto` select from intent when the request is clear:
 
 - Use `command` for a one-off, non-interactive job expected to finish during an ordinary working session.
 - Use `shell` for interactive debugging, environment inspection, and iterative work. A deployment may advertise an inactivity window such as about two hours; treat it as an advisory, configurable site policy rather than a Determined guarantee.
-- Use `experiment` for overnight or durable work, and whenever experiment features such as search, trial tracking, or checkpoint lifecycle are actually needed. There is no rigid midnight cutoff.
+- Use `generic`, explicitly, for batch work that needs a name or child tasks, and with `pausable: true` when it must be pausable with `compute_pause` and `compute_resume` without becoming an experiment. Resuming reruns the command from the start and nothing restarts automatically, so a pausable command must skip completed outputs and resume or clean partial ones.
+- Use `experiment` for overnight or durable work, and whenever its features are needed: a searcher over one or many trials, automatic restarts of a failed trial up to `max_restarts`, checkpoints and metrics that the workload reports through Determined's Core API, and pause and resume, so a restarted or resumed trial continues from its latest checkpoint. There is no rigid midnight cutoff.
 
 Set `interactive` or `overnight` explicitly when intent would otherwise be ambiguous. Use the minimum suitable `slots`; heavy CPU work can use zero GPU slots only if the service and target pool support it.
 

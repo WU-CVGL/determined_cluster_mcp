@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Union
@@ -89,8 +90,18 @@ def _login_for_token(api_url: str, username: str, password: str, verify_ssl: boo
     return str(token)
 
 
+# A strict generic-task config parse rejects unknown keys before the master persists
+# anything; older masters do not know the optional display fields.
+_GENERIC_METADATA_FIELDS = ("name", "description")
+_UNKNOWN_GENERIC_METADATA = re.compile(r'unknown field \\?"(?:name|description)\\?"')
+_GENERIC_STATE_PREFIX = "GENERIC_TASK_STATE_"
+
+
 class DeterminedAPIClient:
-    _TASK_KINDS = {"command", "shell", "experiment"}
+    _TASK_KINDS = {"command", "shell", "experiment", "generic"}
+    # Kinds whose remote listing can be filtered by the owning account. Generic tasks need a
+    # master with the generic task list (WU-CVGL/determined#27).
+    _LISTABLE_KINDS = {"command", "shell", "generic", "experiment"}
     _REMOTE_TASK_FIELDS = (
         "id",
         "userId",
@@ -220,7 +231,7 @@ class DeterminedAPIClient:
     def _kind(cls, kind: str) -> str:
         normalized = kind.lower().rstrip("s")
         if normalized not in cls._TASK_KINDS:
-            raise ValueError("kind must be one of: command, shell, experiment")
+            raise ValueError("kind must be one of: command, shell, generic, experiment")
         return normalized
 
     @staticmethod
@@ -270,24 +281,36 @@ class DeterminedAPIClient:
         limit: int = 50,
         offset: int = 0,
     ) -> Dict[str, Any]:
-        if kind not in self._TASK_KINDS:
-            raise ValueError("kind must be one of: command, shell, experiment")
+        if kind not in self._LISTABLE_KINDS:
+            raise ValueError("kind must be one of: command, shell, generic, experiment")
         normalized_user_id = self.normalize_user_id(user_id)
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValueError("limit must be an integer between 1 and 100")
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise ValueError("offset must be a non-negative integer")
-        response = self._get(
-            f"api/v1/{kind}s",
-            params={
-                "userIds": [int(normalized_user_id)],
-                "limit": limit,
-                "offset": offset,
-                "orderBy": "ORDER_BY_DESC",
-                "sortBy": "SORT_BY_START_TIME",
-            },
-        )
-        collection = response.get(f"{kind}s")
+        if kind == "generic":
+            # The generic task list is always newest first.
+            response = self._generic_task_list(
+                {"userIds": [int(normalized_user_id)], "limit": limit, "offset": offset}
+            )
+            collection = response.get("tasks")
+            if isinstance(collection, list):
+                collection = [
+                    self._generic_summary(item) if isinstance(item, Mapping) else item
+                    for item in collection
+                ]
+        else:
+            response = self._get(
+                f"api/v1/{kind}s",
+                params={
+                    "userIds": [int(normalized_user_id)],
+                    "limit": limit,
+                    "offset": offset,
+                    "orderBy": "ORDER_BY_DESC",
+                    "sortBy": "SORT_BY_START_TIME",
+                },
+            )
+            collection = response.get(f"{kind}s")
         if not isinstance(collection, list):
             raise APIError("Remote-task response is malformed", code="invalid_response")
         tasks: List[Dict[str, Any]] = []
@@ -463,19 +486,172 @@ class DeterminedAPIClient:
                 found.extend(DeterminedAPIClient._upload_fields(item, f"{path}[{index}]"))
         return found
 
-    def launch_task(self, kind: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    def launch_task(
+        self, kind: str, config: Dict[str, Any], options: Optional[Mapping[str, Any]] = None
+    ) -> Dict[str, Any]:
         kind = self._kind(kind)
         if not isinstance(config, dict):
             raise TypeError("config must be a dictionary")
         present = self._upload_fields(config)
         if present:
             raise ValueError("Code/data uploads are not supported; remove: " + ", ".join(present))
+        if kind == "generic":
+            return self._launch_generic_task(config, options or {})
+        if options:
+            raise ValueError("launch options apply only to generic tasks")
         body = {"config": yaml.safe_dump(config, sort_keys=False), "activate": True} if kind == "experiment" else {"config": config}
         entity = self._entity(self._post(f"api/v1/{kind}s", data=body), kind, mutation=True)
         return self._safe_shell(entity) if kind == "shell" else entity
 
+    _GENERIC_OPTIONS = {"parentId": str, "inheritContext": bool, "noPause": bool}
+
+    def _launch_generic_task(
+        self, config: Dict[str, Any], options: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        for key, value in options.items():
+            expected = self._GENERIC_OPTIONS.get(key)
+            if expected is None or not isinstance(value, expected):
+                raise ValueError(f"unsupported generic task launch option: {key}")
+        # Code and data stay on shared mounts, so the context directory is always empty.
+        body: Dict[str, Any] = {"contextDirectory": [], **options}
+        warnings: List[Dict[str, str]] = []
+        try:
+            response = self._post(
+                "api/v1/generic-tasks",
+                data={**body, "config": yaml.safe_dump(config, sort_keys=False)},
+            )
+        except APIError as exc:
+            stripped = {
+                key: value for key, value in config.items() if key not in _GENERIC_METADATA_FIELDS
+            }
+            if stripped == config or not self._rejected_generic_metadata(exc):
+                raise
+            # The rejection happened while parsing the config, before the master stored
+            # anything, so this second request is the only possible submission.
+            response = self._post(
+                "api/v1/generic-tasks",
+                data={**body, "config": yaml.safe_dump(stripped, sort_keys=False)},
+            )
+            warnings.append({
+                "code": "generic_task_metadata_unsupported",
+                "message": (
+                    "The Determined master does not accept generic task name and description; "
+                    "the task was submitted without them and they are kept only locally."
+                ),
+            })
+        task_id = response.get("taskId")
+        if not isinstance(task_id, str) or not task_id:
+            raise SubmissionUncertainError(
+                "Determined response did not contain a generic task id", details=response
+            )
+        launch_warnings = response.get("warnings") or []
+        if isinstance(launch_warnings, list):
+            warnings.extend(
+                {"code": "launch_warning", "message": item}
+                for item in launch_warnings
+                if isinstance(item, str) and item
+            )
+        return {"id": task_id, "warnings": warnings}
+
+    @staticmethod
+    def _rejected_generic_metadata(exc: APIError) -> bool:
+        """Return whether the master rejected only the optional generic display fields."""
+        # Masters report the strict config parse failure as HTTP 500 (an untyped error)
+        # or, in some builds, HTTP 400; a 500 reaches us as an uncertain mutation.
+        rejection = exc.__cause__ if isinstance(exc, SubmissionUncertainError) else exc
+        return (
+            isinstance(rejection, APIError)
+            and not isinstance(rejection, SubmissionUncertainError)
+            and rejection.code in {400, 500}
+            and _UNKNOWN_GENERIC_METADATA.search(str(rejection)) is not None
+        )
+
+    def _generic_task_list(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            return self._get("api/v1/generic-tasks", params=params)
+        except APIError as exc:
+            # A master without the list answers the GET of the create route with 404/405/501.
+            if exc.code in {404, 405, 501}:
+                raise APIError(
+                    "This Determined master cannot list generic tasks with their owners; "
+                    "it needs the research-cluster fork with WU-CVGL/determined#27",
+                    code="unsupported",
+                ) from exc
+            raise
+
+    @staticmethod
+    def _generic_summary(item: Mapping[str, Any]) -> Dict[str, Any]:
+        """Map a listed generic task to the fields of other kinds' remote entities."""
+        summary: Dict[str, Any] = {
+            "id": item.get("taskId"),
+            "userId": item.get("userId"),
+            "username": item.get("username"),
+            "name": item.get("name"),
+            "description": item.get("description") or None,
+            "resourcePool": item.get("resourcePool"),
+            "startTime": item.get("startTime"),
+            "endTime": item.get("endTime"),
+        }
+        raw_state = item.get("state")
+        if isinstance(raw_state, str) and raw_state.startswith(_GENERIC_STATE_PREFIX):
+            summary["state"] = "STATE_" + raw_state[len(_GENERIC_STATE_PREFIX):]
+        return {key: value for key, value in summary.items() if value is not None}
+
+    def _get_generic_task(self, task_id: str) -> Dict[str, Any]:
+        path = f"api/v1/tasks/{quote(str(task_id), safe='')}"
+        task = self._get(path).get("task")
+        if not isinstance(task, Mapping) or task.get("taskId") != task_id:
+            raise APIError("Determined response did not contain the task", code="invalid_response")
+        if task.get("taskType") != "TASK_TYPE_GENERIC":
+            raise APIError("Determined task is not a generic task", code="kind_mismatch")
+        entity = self._redact_secrets(dict(task))
+        entity.pop("submissionMarker", None)
+        entity["id"] = task_id
+        raw_state = task.get("taskState")
+        entity["state"] = (
+            "STATE_" + raw_state[len(_GENERIC_STATE_PREFIX):]
+            if isinstance(raw_state, str) and raw_state.startswith(_GENERIC_STATE_PREFIX)
+            else None
+        )
+        config: Any = self._get(f"{path}/config").get("config")
+        if isinstance(config, str):
+            try:
+                config = yaml.safe_load(config) if config else None
+            except yaml.YAMLError:
+                config = None
+        if isinstance(config, Mapping):
+            marker = self._submission_marker_from_config(config)
+            if marker is not None:
+                entity["submissionMarker"] = marker
+            entity["config"] = self._redact_secrets(dict(config))
+            resources = config.get("resources")
+            pool = resources.get("resource_pool") if isinstance(resources, Mapping) else None
+            if isinstance(pool, str) and pool:
+                entity["resourcePool"] = pool
+            for field in _GENERIC_METADATA_FIELDS:
+                if isinstance(config.get(field), str):
+                    entity[field] = config[field]
+        # The owner comes from the generic task list; a master without it leaves the entity
+        # ownerless, so ownership checks (adoption) fail instead of guessing.
+        try:
+            listed = self._generic_task_list({"taskIds": [task_id]}).get("tasks")
+        except APIError as exc:
+            if exc.code != "unsupported":
+                raise
+            listed = None
+        if isinstance(listed, list):
+            for item in listed:
+                if isinstance(item, Mapping) and item.get("taskId") == task_id:
+                    summary = self._generic_summary(item)
+                    for field in ("userId", "username", "name"):
+                        if field in summary:
+                            entity[field] = summary[field]
+        return entity
+
     def get_task(self, kind: str, task_id: str) -> Dict[str, Any]:
         kind = self._kind(kind)
+        if kind == "generic":
+            return self._get_generic_task(task_id)
         response = self._get(f"api/v1/{kind}s/{task_id}")
         entity = self._redact_secrets(dict(self._entity(response, kind)))
         entity.pop("submissionMarker", None)
@@ -505,8 +681,57 @@ class DeterminedAPIClient:
         entries.reverse()
         return entries
 
+    def _generic_control(self, task_id: str, action: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            response = self._post(
+                f"api/v1/tasks/{quote(str(task_id), safe='')}/{action}", data=body
+            )
+        except SubmissionUncertainError as exc:
+            # The master reports rejected preconditions, such as a task that is already
+            # paused, as untyped server errors; keep that message visible to the caller.
+            if isinstance(exc.__cause__, APIError):
+                raise SubmissionUncertainError(
+                    f"Determined {action} outcome is unknown after a server error: {exc.__cause__}",
+                    details=exc.details,
+                ) from exc.__cause__
+            raise
+        return {"id": str(task_id), "acknowledged": True, **response}
+
+    _PAUSABLE_KINDS = ("experiment", "generic")
+
+    def pause_task(self, kind: str, task_id: str) -> Dict[str, Any]:
+        """Pause an experiment, or a generic task and its pausable descendants."""
+        kind = self._kind(kind)
+        if kind == "experiment":
+            return self._experiment_control(task_id, "pause")
+        if kind != "generic":
+            raise ValueError("only experiments and generic tasks can be paused")
+        return self._generic_control(task_id, "pause", {"taskId": str(task_id)})
+
+    def unpause_task(self, kind: str, task_id: str) -> Dict[str, Any]:
+        """Resume a paused experiment, or a paused generic task in a new allocation."""
+        kind = self._kind(kind)
+        if kind == "experiment":
+            # Determined calls resuming an experiment activating it.
+            return self._experiment_control(task_id, "activate")
+        if kind != "generic":
+            raise ValueError("only experiments and generic tasks can be resumed")
+        return self._generic_control(task_id, "unpause", {"taskId": str(task_id)})
+
+    def _experiment_control(self, experiment_id: str, action: str) -> Dict[str, Any]:
+        response = self._post(
+            f"api/v1/experiments/{quote(str(experiment_id), safe='')}/{action}", data={}
+        )
+        # Like cancel, the response is empty; acknowledge without claiming a remote state.
+        return {"id": str(experiment_id), "acknowledged": True, **response}
+
     def cancel_task(self, kind: str, task_id: str) -> Dict[str, Any]:
         kind = self._kind(kind)
+        if kind == "generic":
+            # Killing a generic task also kills its descendants, never its ancestors.
+            return self._generic_control(
+                task_id, "kill", {"taskId": str(task_id), "killFromRoot": False}
+            )
         action = "cancel" if kind == "experiment" else "kill"
         response = self._post(f"api/v1/{kind}s/{task_id}/{action}", data={})
         if kind == "experiment":

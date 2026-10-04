@@ -48,6 +48,14 @@ class FakeService:
         self.calls.append(("cancel", task_id, owner))
         return {"task_id": task_id, "state": "cancelling"}
 
+    def pause(self, task_id, owner):
+        self.calls.append(("pause", task_id, owner))
+        return {"task_id": task_id, "owner": owner, "pause_acknowledged": True}
+
+    def resume(self, task_id, owner):
+        self.calls.append(("resume", task_id, owner))
+        return {"task_id": task_id, "owner": owner, "resume_acknowledged": True}
+
     def reconcile(self, task_id, owner, remote_id):
         self.calls.append(("reconcile", task_id, owner, remote_id))
         return {"task_id": task_id, "remote_id": remote_id, "owner": owner}
@@ -94,6 +102,8 @@ def test_real_sdk_client_lists_tools_and_invokes_bound_owner():
                 "compute_logs",
                 "compute_usage",
                 "compute_cancel",
+                "compute_pause",
+                "compute_resume",
                 "compute_reconcile",
                 "compute_list_tasks",
                 "compute_discover",
@@ -122,6 +132,18 @@ def test_real_sdk_client_lists_tools_and_invokes_bound_owner():
             assert tools["compute_usage"].annotations.destructive_hint is False
             assert tools["compute_usage"].annotations.open_world_hint is True
             assert "compute_resources" in tools["compute_usage"].description
+            for name in ("compute_pause", "compute_resume"):
+                assert tools[name].input_schema["required"] == ["task_id"]
+                assert tools[name].annotations.read_only_hint is False
+                assert tools[name].annotations.open_world_hint is True
+            assert tools["compute_pause"].annotations.destructive_hint is True
+            assert tools["compute_resume"].annotations.destructive_hint is False
+            assert "generic" in tools["compute_pause"].description
+
+            paused = await client.call_tool("compute_pause", {"task_id": "task-1"})
+            assert _structured(paused)["pause_acknowledged"] is True
+            resumed = await client.call_tool("compute_resume", {"task_id": "task-1"})
+            assert _structured(resumed)["resume_acknowledged"] is True
 
             launched = await client.call_tool(
                 "compute_launch",
@@ -161,6 +183,8 @@ def test_real_sdk_client_lists_tools_and_invokes_bound_owner():
             "usage", "task-1", "alice", 900, "a.1", 4, ["cpu_cores", "gpu_power_watts"], True
         ) in service.calls
         assert ("adopt", "command", "remote-1", "alice") in service.calls
+        assert ("pause", "task-1", "alice") in service.calls
+        assert ("resume", "task-1", "alice") in service.calls
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=10))
 
@@ -248,7 +272,7 @@ def test_stdio_subprocess_initializes_and_calls_offline_plan(tmp_path):
     async def exercise():
         async with Client(params) as client:
             tools = {tool.name for tool in (await client.list_tools()).tools}
-            assert len(tools) == 14
+            assert len(tools) == 16
             assert "compute_plan" in tools
             assert "compute_discover" in tools
             assert "compute_adopt" in tools
@@ -290,7 +314,7 @@ def test_default_runtime_registers_all_tools(tmp_path):
     async def exercise():
         async with Client(server) as client:
             tools = {tool.name for tool in (await client.list_tools()).tools}
-            assert len(tools) == 14
+            assert len(tools) == 16
             assert "compute_plan" in tools
             assert "compute_discover" in tools
             assert "compute_adopt" in tools

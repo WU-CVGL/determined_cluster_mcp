@@ -720,3 +720,54 @@ def test_adopted_usage_reuses_verified_entity_for_pool_context(tmp_path, profile
         ("GET", "api/v1/task-resources/capability")
     )
     assert usage["resource_pool"]["name"] == "gpu"
+
+
+GENERIC_REMOTE_ID = "3f1c2b8e-1111-4c7a-9d55-0123456789ab"
+
+
+def generic_entity(**overrides):
+    entity = {
+        "id": GENERIC_REMOTE_ID, "userId": 7, "username": "alice", "name": "eval-shards",
+        "state": "STATE_ACTIVE", "resourcePool": "gpu", "startTime": "2026-10-01T00:00:00Z",
+    }
+    entity.update(overrides)
+    return entity
+
+
+def test_generic_tasks_are_discovered_and_adopted_by_owner(tmp_path, profile):
+    service, client, _store = service_for(tmp_path, profile)
+    client.pages["generic"] = {
+        "tasks": [generic_entity()],
+        "pagination": {"limit": 50, "offset": 0, "total": 1},
+    }
+    result = service.discover("generic", "session-a")
+    assert [(t["kind"], t["remote_id"], t["name"]) for t in result["tasks"]] == [
+        ("generic", GENERIC_REMOTE_ID, "eval-shards"),
+    ]
+
+    client.entities[("generic", GENERIC_REMOTE_ID)] = generic_entity()
+    adopted = service.adopt("generic", GENERIC_REMOTE_ID, "session-a")
+    assert adopted["kind"] == "generic"
+    assert adopted["remote_id"] == GENERIC_REMOTE_ID
+    assert adopted["origin"] == "adopted"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "error", "code"),
+    [
+        ({"userId": 8}, ConflictError, "ownership_mismatch"),
+        ({"userId": None}, APIError, "ownership_unavailable"),
+    ],
+)
+def test_generic_adoption_requires_a_known_matching_owner(
+    tmp_path, profile, overrides, error, code
+):
+    service, client, _store = service_for(tmp_path, profile)
+    entity = generic_entity(**overrides)
+    if entity["userId"] is None:
+        del entity["userId"]  # a master without the generic task list reports no owner
+    client.entities[("generic", GENERIC_REMOTE_ID)] = entity
+    with pytest.raises(error) as caught:
+        service.adopt("generic", GENERIC_REMOTE_ID, "session-a")
+    assert caught.value.code == code
+    assert service.list_tasks("session-a") == []
