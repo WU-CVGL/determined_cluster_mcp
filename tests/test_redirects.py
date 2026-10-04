@@ -112,6 +112,27 @@ def test_an_empty_3xx_without_a_location_is_no_acknowledgement(transport, path, 
     assert "HTTP 300" in str(caught.value) and caught.value.details["status_code"] == 300
 
 
+# A bad IPv6 host, a non-numeric port and a header byte that is not UTF-8.
+@pytest.mark.parametrize(
+    "location", ["http://[::1/landing", "http://master:80x/landing", "http://master/caf\xe9"]
+)
+@pytest.mark.parametrize("status", [300, 303])
+@pytest.mark.parametrize(("path", "call"), [mutation[1:] for mutation in MUTATIONS], ids=MUTATION_IDS)
+def test_an_unparseable_redirect_target_is_unconfirmed(transport, status, location, path, call):
+    # requests parses a 303's Location although it does not follow it; a 300's is parsed only
+    # for the message.
+    transport.answer("POST", path, status, headers={"Location": location})
+
+    with pytest.raises(SubmissionUncertainError) as caught:
+        call(client())
+
+    assert transport.sent == [("POST", MASTER + path)]
+    error = caught.value
+    assert error.code == "submission_uncertain" and error.retryable is False
+    message = str(error)
+    assert "server error" not in message and "80x" not in message and "[::1" not in message
+
+
 @pytest.mark.parametrize(("path", "call"), [mutation[1:] for mutation in MUTATIONS], ids=MUTATION_IDS)
 def test_a_refused_connection_is_still_a_transport_error(transport, path, call):
     with pytest.raises(APIError) as caught:

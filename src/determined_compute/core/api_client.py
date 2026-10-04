@@ -398,10 +398,19 @@ class DeterminedAPIClient:
                     code="transport_error", details={"endpoint": endpoint}, retryable=True,
                 ) from exc
             raise SubmissionUncertainError("Determined mutation outcome is unknown", details={"endpoint": endpoint}) from exc
+        except ValueError as exc:
+            # requests parses a 3xx's Location even when it does not follow it, after this
+            # request was sent; an unparseable one fails there.
+            raise SubmissionUncertainError(
+                "Determined mutation outcome is unknown", details={"endpoint": endpoint}
+            ) from exc
         if 300 <= response.status_code < 400:
             location = _header(response, "Location")
             # Only the target's path: its host, credentials and query stay out of the error.
-            target = f" to {urlsplit(location).path or '/'}" if location else ""
+            try:
+                target = f" to {urlsplit(location).path or '/'}" if location else ""
+            except ValueError:
+                target = ""
             raise SubmissionUncertainError(
                 f"Determined mutation outcome is unknown after HTTP {response.status_code}, "
                 f"a redirect{target} that was not followed",
