@@ -1346,3 +1346,121 @@ def test_failures_after_a_connection_opened_stay_uncertain(monkeypatch, error):
     monkeypatch.setattr(requests, "post", post)
     with pytest.raises(SubmissionUncertainError):
         client().launch_task("command", {"entrypoint": ["true"]})
+
+
+def _tls_failure(verify_message=None, reason=None):
+    """A TLS failure shaped as requests raises it, with a query string in the wrapped URL."""
+    import ssl
+
+    from urllib3.exceptions import SSLError as Urllib3SSLError
+
+    if verify_message is not None:
+        cause = ssl.SSLCertVerificationError(1, f"certificate verify failed: {verify_message}")
+        cause.verify_message = verify_message
+    else:
+        cause = ssl.SSLError(1, f"[SSL: {reason}] handshake failed")
+        cause.reason = reason
+    return requests.exceptions.SSLError(_max_retry_at("/api/v1/x?token=query-secret", Urllib3SSLError(cause)))
+
+
+def _max_retry_at(url, reason):
+    from urllib3.exceptions import MaxRetryError
+
+    return MaxRetryError(None, url, reason)
+
+
+def _proxy_failure(reason):
+    from urllib3.exceptions import ProxyError as Urllib3ProxyError
+
+    return requests.exceptions.ProxyError(
+        _max_retry_at("/api/v1/x?token=query-secret", Urllib3ProxyError("Unable to connect to proxy", reason))
+    )
+
+
+AKI = "Missing Authority Key Identifier"
+TLS_VERIFY = (
+    f"TLS verification of the master failed ({AKI}); "
+    "see docs/troubleshooting.md#tls-certificate-verification-fails"
+)
+TLS_EOF = "the TLS connection to the master failed (UNEXPECTED_EOF_WHILE_READING)"
+PROXY = (
+    "the proxy refused or could not reach the master; "
+    "see docs/troubleshooting.md#the-master-is-unreachable-through-a-proxy"
+)
+
+
+def _login(tmp_path):
+    secrets = tmp_path / "credentials.env"
+    secrets.write_text("DET_MASTER=https://master.example\nDET_USERNAME=alice\nDET_PASSWORD=pw-value\n")
+    DeterminedAPIClient(secrets_path=secrets)
+
+
+@pytest.mark.parametrize(
+    ("error", "phrase"),
+    [
+        (_tls_failure(verify_message=AKI), TLS_VERIFY),
+        (_proxy_failure(OSError("Tunnel connection failed: 503 Service Unavailable")), PROXY),
+    ],
+    ids=["tls", "proxy"],
+)
+def test_a_login_names_a_tls_or_proxy_failure(monkeypatch, tmp_path, error, phrase):
+    def post(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(requests, "post", post)
+    with pytest.raises(APIError) as caught:
+        _login(tmp_path)
+    assert str(caught.value) == f"Could not authenticate with Determined: {phrase}"
+    assert caught.value.code == "transport_error" and caught.value.retryable is True
+    assert caught.value.details == {"endpoint": "api/v1/auth/login"}
+
+
+@pytest.mark.parametrize(
+    ("error", "phrase"),
+    [
+        (_tls_failure(verify_message=AKI), TLS_VERIFY),
+        (_tls_failure(reason="UNEXPECTED_EOF_WHILE_READING"), TLS_EOF),
+        (_proxy_failure(_new_connection_error()), PROXY),
+    ],
+    ids=["tls-verify", "tls-eof", "proxy"],
+)
+def test_a_read_names_a_tls_or_proxy_failure(monkeypatch, error, phrase):
+    def get(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(requests, "get", get)
+    with pytest.raises(APIError) as caught:
+        client().get_task_info("task-1")
+    message = str(caught.value)
+    assert message.startswith(f"Determined request failed: {phrase}")
+    assert "query-secret" not in message
+    assert caught.value.code == "transport_error" and caught.value.retryable is True
+
+
+@pytest.mark.parametrize(
+    ("error", "uncertain", "phrase"),
+    [
+        # A TLS failure stays unconfirmed, as before; only the message names it.
+        (_tls_failure(verify_message=AKI), True, TLS_VERIFY),
+        (_proxy_failure(OSError("Tunnel connection failed: 503 Service Unavailable")), True, PROXY),
+        # A proxy that could not be reached was never sent the request.
+        (_proxy_failure(_new_connection_error()), False, PROXY),
+    ],
+    ids=["tls", "proxy-answered", "proxy-unreachable"],
+)
+def test_a_mutation_names_a_tls_or_proxy_failure_and_keeps_its_classification(monkeypatch, error, uncertain, phrase):
+    def post(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(requests, "post", post)
+    with pytest.raises(APIError) as caught:
+        client().launch_task("command", {"entrypoint": ["true"]})
+    error = caught.value
+    assert isinstance(error, SubmissionUncertainError) is uncertain
+    if uncertain:
+        assert str(error) == f"Determined mutation outcome is unknown: {phrase}"
+        assert (error.code, error.retryable) == ("submission_uncertain", False)
+    else:
+        assert str(error) == f"Could not connect to Determined; the request was not sent: {phrase}"
+        assert (error.code, error.retryable) == ("transport_error", True)
+    assert error.details == {"endpoint": "api/v1/commands"}
