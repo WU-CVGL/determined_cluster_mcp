@@ -405,15 +405,10 @@ class DeterminedAPIClient:
                 "Determined mutation outcome is unknown", details={"endpoint": endpoint}
             ) from exc
         if 300 <= response.status_code < 400:
-            location = _header(response, "Location")
-            # Only the target's path: its host, credentials and query stay out of the error.
-            try:
-                target = f" to {urlsplit(location).path or '/'}" if location else ""
-            except ValueError:
-                target = ""
+            # The target is left out of the error: its path or query can carry a session.
             raise SubmissionUncertainError(
                 f"Determined mutation outcome is unknown after HTTP {response.status_code}, "
-                f"a redirect{target} that was not followed",
+                "a redirect that was not followed",
                 details={"endpoint": endpoint, "status_code": response.status_code},
             )
         return self._json_response(response, mutation=True)

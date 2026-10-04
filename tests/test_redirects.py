@@ -96,8 +96,8 @@ def test_no_mutation_follows_a_redirect(transport, status, path, call):
     assert error.code == "submission_uncertain" and error.retryable is False
     assert error.details["status_code"] == status
     message = str(error)
-    assert f"HTTP {status}" in message and "/landing" in message and "not followed" in message
-    assert "token" not in message and "login.example" not in message
+    assert f"HTTP {status}" in message and "not followed" in message
+    assert "landing" not in message and "token" not in message and "login.example" not in message
     assert "server error" not in message
 
 
@@ -164,7 +164,7 @@ def test_a_redirected_launch_whose_follow_up_fails_keeps_its_marker(transport):
     assert caught.value.details == {"kind": "command", "submission_marker": marker}
     assert f"COMPUTE_SUBMISSION_MARKER={marker}".encode() in transport.bodies[0]
     message = str(caught.value)
-    assert "HTTP 303" in message and "/landing" in message and "not followed" in message
+    assert "HTTP 303" in message and "not followed" in message and "landing" not in message
     assert "does not prove that the submission failed" in message and "token" not in message
 
 
