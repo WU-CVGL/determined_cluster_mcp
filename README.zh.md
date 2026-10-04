@@ -36,7 +36,7 @@ DET_API_TOKEN=replace-with-your-token
 
 也支持 `DET_USERNAME` 和 `DET_PASSWORD`。不要提交凭据文件。使用管理员提供的镜像、资源池、计算节点宿主机路径和容器挂载路径填写 `profile.yaml`。任务请求使用容器路径。
 
-HTTPS 为可选项：设置 `DET_MASTER=https://determined.example.org`，在 MCP 参数中加入 `--verify-ssl`，并在客户端的 `env` 中为私有 CA 传入 `REQUESTS_CA_BUNDLE`，代理无法访问 master 时传入 `NO_PROXY`。参见[可选 HTTPS](docs/compute-service.zh.md#optional-https)。
+HTTPS 为可选项：设置 `DET_MASTER=https://determined.example.org`，在 MCP 参数中加入 `--verify-ssl`，并在客户端的 `env` 中为私有 CA 传入 `REQUESTS_CA_BUNDLE`，代理无法访问 master 时传入 `NO_PROXY` 和 `no_proxy`。参见[可选 HTTPS](docs/compute-service.zh.md#optional-https)。
 
 计算任务不需要客户端存储配置。共享路径与已配置的 `host_path` 在本机一致时，存储工具会自动使用该本地路径。需要自定义本地映射或登录节点 SSH 时，将 `cfg/storage-access.example.yaml` 复制为 `.local/storage.yaml`，编辑后再把 `--storage-config /absolute/path/to/.local/storage.yaml` 加入 MCP 参数。
 

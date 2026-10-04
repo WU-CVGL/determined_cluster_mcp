@@ -33,7 +33,7 @@ DET_API_TOKEN=replace-with-your-token
 
 `DET_USERNAME` and `DET_PASSWORD` are also supported. Do not commit the credentials file. Fill `profile.yaml` with the administrator-provided image, resource pool, cluster-agent host paths, and container mount paths. Use container paths in task requests.
 
-HTTPS is optional: set `DET_MASTER=https://determined.example.org`, add `--verify-ssl` to the MCP arguments, and in the client's `env` pass `REQUESTS_CA_BUNDLE` for a private CA and `NO_PROXY` when a proxy cannot reach the master. See [optional HTTPS](docs/compute-service.md#optional-https).
+HTTPS is optional: set `DET_MASTER=https://determined.example.org`, add `--verify-ssl` to the MCP arguments, and in the client's `env` pass `REQUESTS_CA_BUNDLE` for a private CA and both `NO_PROXY` and `no_proxy` when a proxy cannot reach the master. See [optional HTTPS](docs/compute-service.md#optional-https).
 
 Compute tasks do not need a client storage configuration. Storage tools automatically use a local shared path when it matches the configured `host_path`. For a custom local mapping or login-node SSH, copy `cfg/storage-access.example.yaml` to `.local/storage.yaml`, edit it, and add `--storage-config /absolute/path/to/.local/storage.yaml` to the MCP arguments.
 

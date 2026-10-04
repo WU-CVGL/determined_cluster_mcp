@@ -279,8 +279,12 @@ def _transport_message(message: str, exc: requests.RequestException) -> str:
     the wrapping exceptions carries the URL, with its query string, and the proxy's address.
     """
     if isinstance(exc, requests.exceptions.ProxyError):
+        failure = (
+            "the proxy could not be reached" if _connection_never_opened(exc)
+            else "the proxy refused or could not reach the master"
+        )
         return (
-            f"{message}: the proxy refused or could not reach the master; "
+            f"{message}: {failure}; "
             "see docs/troubleshooting.md#the-master-is-unreachable-through-a-proxy"
         )
     if not isinstance(exc, requests.exceptions.SSLError):

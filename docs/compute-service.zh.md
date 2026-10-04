@@ -152,13 +152,12 @@ generic 任务的生命周期：
 ```bash
 determined-compute-mcp \
   --profile /absolute/path/to/compute-profile.yaml \
-  --secrets-file /absolute/path/to/credentials.env \
-  --verify-ssl
+  --secrets-file /absolute/path/to/credentials.env
 ```
 
 `--profile` 对应 `DETERMINED_COMPUTE_PROFILE`，`--storage-config` 对应
 `DETERMINED_COMPUTE_STORAGE`；`--secrets-file` 也可通过 `DETERMINED_COMPUTE_SECRETS`
-提供。TLS 验证默认来自 `DET_VERIFY_SSL`。设置了 `DET_MASTER` 的 secrets 文件同时提供 API
+提供。设置了 `DET_MASTER` 的 secrets 文件同时提供 API
 URL 和凭据：此时忽略环境中的 `DET_API_TOKEN`、`DET_USERNAME` 和 `DET_PASSWORD`；若
 `--api-url` 或环境中的 `DET_MASTER` 指向另一个 master，会在发出任何请求前被拒绝。没有
 `DET_MASTER` 的 secrets 文件使用 `--api-url`，否则使用 `DET_MASTER`；环境中的
@@ -175,11 +174,12 @@ URL 和凭据：此时忽略环境中的 `DET_API_TOKEN`、`DET_USERNAME` 和 `D
 
 纯 HTTP 无需任何 TLS 设置。要通过 HTTPS 访问 master，在 secrets 文件中设置
 `DET_MASTER=https://determined.example.org`；带协议的 URL 按原样使用，只有裸主机名才会补上
-`:8080`。用 `--verify-ssl` 或 `DET_VERIFY_SSL=true` 开启验证。不开启时连接虽然加密，但不校验
-master 的身份，Requests 会输出 `InsecureRequestWarning`。Requests 从 MCP 进程环境读取用于
-私有 CA 的 `REQUESTS_CA_BUNDLE`，以及 `HTTPS_PROXY`、`HTTP_PROXY` 和 `NO_PROXY`，该环境来自
-客户端及其 `env` 设置；secrets 文件中的代理变量不会生效。代理无法访问 master 时，把 master 的
-主机名或域名后缀加入 `NO_PROXY`：
+`:8080`。用 `--verify-ssl` 或 MCP 进程环境中的 `DET_VERIFY_SSL=true` 开启验证。不开启时连接
+虽然加密，但不校验 master 的身份，Requests 会输出 `InsecureRequestWarning`。Requests 从 MCP
+进程环境读取用于私有 CA 的 `REQUESTS_CA_BUNDLE`，以及 `HTTPS_PROXY`、`HTTP_PROXY` 和
+`NO_PROXY` 或其优先生效的小写形式，该环境来自客户端及其 `env` 设置；secrets 文件只提供 master
+和凭据，其中的 TLS 和代理变量不会生效。代理无法访问 master 时，把 master 的主机名或域名后缀同时
+加入 `NO_PROXY` 和 `no_proxy`：
 
 ```json
 {
@@ -191,7 +191,8 @@ master 的身份，Requests 会输出 `InsecureRequestWarning`。Requests 从 MC
   ],
   "env": {
     "REQUESTS_CA_BUNDLE": "/absolute/path/to/organization-ca-bundle.pem",
-    "NO_PROXY": "determined.example.org"
+    "NO_PROXY": "determined.example.org",
+    "no_proxy": "determined.example.org"
   }
 }
 ```

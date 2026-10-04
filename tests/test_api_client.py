@@ -173,10 +173,12 @@ def test_transport_read_is_retryable_but_mutation_is_uncertain(monkeypatch):
     with pytest.raises(APIError) as caught:
         client().get_task("command", "c1")
     assert caught.value.retryable is True
+    assert str(caught.value) == "Determined request failed"
 
     monkeypatch.setattr(requests, "post", fail)
-    with pytest.raises(SubmissionUncertainError):
+    with pytest.raises(SubmissionUncertainError) as caught:
         client().launch_task("command", {"entrypoint": ["true"]})
+    assert str(caught.value) == "Determined mutation outcome is unknown"
 
 
 def test_launch_payloads_and_shell_secret_removal(monkeypatch):
@@ -1286,6 +1288,7 @@ def test_refused_connection_is_not_an_uncertain_submission():
     assert not isinstance(caught.value, SubmissionUncertainError)
     assert caught.value.code == "transport_error"
     assert caught.value.retryable is True
+    assert str(caught.value) == "Could not connect to Determined; the request was not sent"
 
 
 def _new_connection_error():
@@ -1387,6 +1390,10 @@ PROXY = (
     "the proxy refused or could not reach the master; "
     "see docs/troubleshooting.md#the-master-is-unreachable-through-a-proxy"
 )
+PROXY_UNREACHABLE = (
+    "the proxy could not be reached; "
+    "see docs/troubleshooting.md#the-master-is-unreachable-through-a-proxy"
+)
 
 
 def _login(tmp_path):
@@ -1420,9 +1427,9 @@ def test_a_login_names_a_tls_or_proxy_failure(monkeypatch, tmp_path, error, phra
     [
         (_tls_failure(verify_message=AKI), TLS_VERIFY),
         (_tls_failure(reason="UNEXPECTED_EOF_WHILE_READING"), TLS_EOF),
-        (_proxy_failure(_new_connection_error()), PROXY),
+        (_proxy_failure(_new_connection_error()), PROXY_UNREACHABLE),
     ],
-    ids=["tls-verify", "tls-eof", "proxy"],
+    ids=["tls-verify", "tls-eof", "proxy-unreachable"],
 )
 def test_a_read_names_a_tls_or_proxy_failure(monkeypatch, error, phrase):
     def get(*args, **kwargs):
@@ -1438,13 +1445,32 @@ def test_a_read_names_a_tls_or_proxy_failure(monkeypatch, error, phrase):
 
 
 @pytest.mark.parametrize(
+    ("error", "phrase"),
+    [
+        (_tls_failure(verify_message=AKI), TLS_VERIFY),
+        (_proxy_failure(_new_connection_error()), PROXY_UNREACHABLE),
+    ],
+    ids=["tls", "proxy-unreachable"],
+)
+def test_a_log_read_names_a_tls_or_proxy_failure(monkeypatch, error, phrase):
+    def get(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(requests, "get", get)
+    with pytest.raises(APIError) as caught:
+        client().get_trial_logs("1")
+    assert str(caught.value) == f"Determined log request failed: {phrase}"
+    assert caught.value.code == "transport_error" and caught.value.retryable is True
+
+
+@pytest.mark.parametrize(
     ("error", "uncertain", "phrase"),
     [
         # A TLS failure stays unconfirmed, as before; only the message names it.
         (_tls_failure(verify_message=AKI), True, TLS_VERIFY),
         (_proxy_failure(OSError("Tunnel connection failed: 503 Service Unavailable")), True, PROXY),
         # A proxy that could not be reached was never sent the request.
-        (_proxy_failure(_new_connection_error()), False, PROXY),
+        (_proxy_failure(_new_connection_error()), False, PROXY_UNREACHABLE),
     ],
     ids=["tls", "proxy-answered", "proxy-unreachable"],
 )
