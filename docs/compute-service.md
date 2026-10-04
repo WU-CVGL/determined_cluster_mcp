@@ -262,10 +262,11 @@ exceeding current slots, appear in `warnings` with code `launch_warning`.
 ### Unconfirmed launches
 
 A launch request can reach the master without a confirmed answer: a transport failure
-or timeout after the request was sent, an HTTP 5xx response, or a response without a
-task ID. Determined may or may not have created the task. The service never retries
-such a launch. It returns a `submission_uncertain` error that is not retryable, whose
-message names the next step and whose `details` carry `kind` and `submission_marker`:
+or timeout after the request was sent, an HTTP 5xx response, a redirect (HTTP 3xx,
+which no mutation follows), or a response without a task ID. Determined may or may not
+have created the task. The service never retries such a launch. It returns a
+`submission_uncertain` error that is not retryable, whose message names the next step
+and whose `details` carry `kind` and `submission_marker`:
 
 ```json
 {"error":{"code":"submission_uncertain","message":"The command submission is unconfirmed (...); ...","retryable":false,"details":{"kind":"command","submission_marker":"determined-compute:<uuid>"}}}

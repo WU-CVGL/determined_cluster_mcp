@@ -238,9 +238,10 @@ JSON 文本，master 的 YAML 解析器按字面读取该文本，因此 `y`、`
 ### 未确认的提交
 
 提交请求可能已到达 master，却没有得到确认的答复：请求发出后出现传输失败或超时、返回
-HTTP 5xx，或响应中没有任务 ID。此时 Determined 可能创建了任务，也可能没有。服务从不重试
-这样的提交，而是返回不可重试的 `submission_uncertain` 错误；其消息说明下一步操作，
-`details` 包含 `kind` 和 `submission_marker`：
+HTTP 5xx、返回重定向（HTTP 3xx，任何变更请求都不会跟随），或响应中没有任务 ID。此时
+Determined 可能创建了任务，也可能没有。服务从不重试这样的提交，而是返回不可重试的
+`submission_uncertain` 错误；其消息说明下一步操作，`details` 包含 `kind` 和
+`submission_marker`：
 
 ```json
 {"error":{"code":"submission_uncertain","message":"The command submission is unconfirmed (...); ...","retryable":false,"details":{"kind":"command","submission_marker":"determined-compute:<uuid>"}}}

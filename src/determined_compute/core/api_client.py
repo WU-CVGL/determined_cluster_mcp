@@ -384,7 +384,12 @@ class DeterminedAPIClient:
         data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         try:
-            response = requests.post(self._url(endpoint), headers={**self.headers, "Content-Type": "application/json"}, json=data, timeout=60, verify=self.verify_ssl)
+            # A redirect is never followed: a failure on the way to its target would look like
+            # a request that was never sent, although this one was.
+            response = requests.post(
+                self._url(endpoint), headers={**self.headers, "Content-Type": "application/json"},
+                json=data, timeout=60, verify=self.verify_ssl, allow_redirects=False,
+            )
         except requests.RequestException as exc:
             if _connection_never_opened(exc):
                 # Nothing reached the master, so the mutation certainly did not happen.
@@ -393,6 +398,15 @@ class DeterminedAPIClient:
                     code="transport_error", details={"endpoint": endpoint}, retryable=True,
                 ) from exc
             raise SubmissionUncertainError("Determined mutation outcome is unknown", details={"endpoint": endpoint}) from exc
+        if 300 <= response.status_code < 400:
+            location = _header(response, "Location")
+            # Only the target's path: its host, credentials and query stay out of the error.
+            target = f" to {urlsplit(location).path or '/'}" if location else ""
+            raise SubmissionUncertainError(
+                f"Determined mutation outcome is unknown after HTTP {response.status_code}, "
+                f"a redirect{target} that was not followed",
+                details={"endpoint": endpoint, "status_code": response.status_code},
+            )
         return self._json_response(response, mutation=True)
 
 
