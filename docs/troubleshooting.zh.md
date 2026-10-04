@@ -44,7 +44,7 @@ export REQUESTS_CA_BUNDLE=/absolute/path/to/organization-ca-bundle.pem
 export DET_VERIFY_SSL=true
 ```
 
-使用 MCP 时，在服务参数中保留 `--verify-ssl`，并通过 stdio 客户端的环境配置传入 CA 变量。外围字段需按客户端的 MCP 语法调整：
+使用 MCP 时，在服务参数中加入 `--verify-ssl`，并通过 stdio 客户端的环境配置传入 CA 变量。外围字段需按客户端的 MCP 语法调整：
 
 ```json
 {
@@ -59,6 +59,19 @@ export DET_VERIFY_SSL=true
 GUI 应用可能不会继承终端中导出的变量。应在客户端的 MCP 环境设置中配置该变量，或从包含该变量的环境启动客户端，然后重启 MCP 服务。MCP 进程必须能够读取 CA bundle。
 
 正确的 CA 链可以解决未知签发者问题。证书过期或主机名不匹配必须由部署运维方修正；关闭验证不能修复证书身份。
+
+Python 3.13 及以上版本以 OpenSSL 的严格 X.509 模式验证。此时私有 CA 证书需要包含 `keyCertSign`（以及 `cRLSign`）的 `keyUsage` 和 Subject Key Identifier，服务端证书需要 Authority Key Identifier。否则验证失败，错误消息会给出原因，例如 `Missing Authority Key Identifier` 或 `CA cert does not include key usage extension`，即使 curl 和较旧的 Python 版本接受该证书链。以严格模式检查证书链：
+
+```bash
+openssl verify -x509_strict -CAfile ca.pem server.pem
+```
+
+解决方法是重新签发带有这些扩展的证书；MCP 始终保持严格验证。经代理访问 HTTPS master 时，不带验证原因的 TLS 连接失败（例如 `UNEXPECTED_EOF_WHILE_READING`）通常表示代理无法访问 master；见[通过代理无法访问 master](#the-master-is-unreachable-through-a-proxy)。
+
+<a id="the-master-is-unreachable-through-a-proxy"></a>
+## 通过代理无法访问 master
+
+Requests 从 MCP 进程环境读取 `HTTPS_PROXY`、`HTTP_PROXY` 和 `NO_PROXY`，该环境来自 MCP 客户端；secrets 文件中的代理变量不会生效。代理无法访问 master 时，请求失败，错误消息提示代理拒绝或无法访问 master；对 HTTPS master 则提示与 master 的 TLS 连接失败，其他工具可能报告 TLS connect error。如果不经代理即可访问 master，把其主机名或域名后缀（例如 `.example.org`）加入客户端 `env` 中的 `NO_PROXY`，然后重启 MCP 服务；示例见[可选 HTTPS](compute-service.zh.md#optional-https)。代理代替 master 应答的情况见[提交结果不确定](#submission-outcome-is-uncertain)。
 
 <a id="a-shared-path-is-rejected-or-missing"></a>
 ## 共享路径被拒绝或不存在

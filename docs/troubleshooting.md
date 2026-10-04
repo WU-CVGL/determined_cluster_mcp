@@ -40,7 +40,7 @@ export REQUESTS_CA_BUNDLE=/absolute/path/to/organization-ca-bundle.pem
 export DET_VERIFY_SSL=true
 ```
 
-For MCP, keep `--verify-ssl` in the server arguments and pass the CA variable through the stdio client's environment configuration. Adapt the surrounding keys to the client's MCP syntax:
+For MCP, add `--verify-ssl` to the server arguments and pass the CA variable through the stdio client's environment configuration. Adapt the surrounding keys to the client's MCP syntax:
 
 ```json
 {
@@ -55,6 +55,18 @@ For MCP, keep `--verify-ssl` in the server arguments and pass the CA variable th
 A GUI application may not inherit variables exported in a terminal. Configure the variable in the client's MCP environment settings or start the client from an environment that contains it, then restart the MCP server. The CA bundle must be readable by the MCP process.
 
 An unknown issuer is addressed by the correct CA chain. An expired certificate or hostname mismatch must be corrected by the deployment operator; disabling verification does not repair the certificate identity.
+
+Python 3.13 and later verify in OpenSSL's strict X.509 mode. A private CA certificate then needs `keyUsage` with `keyCertSign` (and `cRLSign`) and a Subject Key Identifier, and the server certificate needs an Authority Key Identifier. Otherwise verification fails, and the error message names the reason, such as `Missing Authority Key Identifier` or `CA cert does not include key usage extension`, although curl and older Python versions accept the chain. Check the chain in strict mode:
+
+```bash
+openssl verify -x509_strict -CAfile ca.pem server.pem
+```
+
+The fix is to reissue the certificates with these extensions; the MCP keeps strict verification on. When an HTTPS master is reached through a proxy, a TLS connection failure without a verification reason, such as `UNEXPECTED_EOF_WHILE_READING`, usually means that the proxy could not reach the master; see [the master is unreachable through a proxy](#the-master-is-unreachable-through-a-proxy).
+
+## The master is unreachable through a proxy
+
+Requests reads `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY` from the MCP process environment, which comes from the MCP client; proxy variables in the secrets file are not applied. When the proxy cannot reach the master, requests fail with an error saying that the proxy refused or could not reach the master or, for an HTTPS master, that the TLS connection to the master failed; other tools may report a TLS connect error. If the master is reachable without the proxy, add its host, or its domain suffix such as `.example.org`, to `NO_PROXY` in the client's `env` and restart the MCP server; [optional HTTPS](compute-service.md#optional-https) shows an example. An HTTP proxy that answers in place of the master is covered in [submission outcome is uncertain](#submission-outcome-is-uncertain).
 
 ## A shared path is rejected or missing
 

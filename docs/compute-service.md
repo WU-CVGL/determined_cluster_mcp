@@ -191,6 +191,40 @@ that it loads the current tool set.
 Optional client-side access to mapped storage uses the same profile and a separate
 storage configuration. See [Shared-storage access](shared-storage-access.md).
 
+### Optional HTTPS
+
+Plain HTTP needs no TLS settings. To reach the master over HTTPS, set
+`DET_MASTER=https://determined.example.org` in the secrets file; a URL with a scheme is
+used as given, and only a bare host gets `:8080`. Turn verification on with
+`--verify-ssl` or `DET_VERIFY_SSL=true`. Without it the connection is encrypted but the
+master's identity is not checked, and Requests prints `InsecureRequestWarning`. Requests
+reads `REQUESTS_CA_BUNDLE`, for a private CA, and `HTTPS_PROXY`, `HTTP_PROXY`, and
+`NO_PROXY` from the MCP process environment, which comes from the client and its `env`
+settings; proxy variables in the secrets file are not applied. When a proxy cannot reach the master, list
+the master's host or domain suffix in `NO_PROXY`:
+
+```json
+{
+  "command": "/absolute/path/to/determined_cluster_mcp/.venv/bin/determined-compute-mcp",
+  "args": [
+    "--profile", "/absolute/path/to/profile.yaml",
+    "--secrets-file", "/absolute/path/to/credentials.env",
+    "--verify-ssl"
+  ],
+  "env": {
+    "REQUESTS_CA_BUNDLE": "/absolute/path/to/organization-ca-bundle.pem",
+    "NO_PROXY": "determined.example.org"
+  }
+}
+```
+
+The secrets file binds its credentials to the master it names, so an `--api-url` or
+`DET_MASTER` with a different URL, such as `https://` instead of `http://`, is rejected.
+Change `DET_MASTER` in that client's secrets file or use a separate secrets file for
+HTTPS; another tool that reads the same file switches with it. Troubleshooting covers
+[certificate](troubleshooting.md#tls-certificate-verification-fails) and
+[proxy](troubleshooting.md#the-master-is-unreachable-through-a-proxy) failures.
+
 ### Upgrading from a version with a task database
 
 The server does not accept `--db` or `--owner`, and the profile does not accept

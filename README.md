@@ -27,11 +27,13 @@ cp cfg/examples/command_request.json .local/request.json
 Set the API URL and account credentials in `.local/credentials.env`:
 
 ```dotenv
-DET_MASTER=https://determined.example.org
+DET_MASTER=http://determined.example.org:8080
 DET_API_TOKEN=replace-with-your-token
 ```
 
 `DET_USERNAME` and `DET_PASSWORD` are also supported. Do not commit the credentials file. Fill `profile.yaml` with the administrator-provided image, resource pool, cluster-agent host paths, and container mount paths. Use container paths in task requests.
+
+HTTPS is optional: set `DET_MASTER=https://determined.example.org`, add `--verify-ssl` to the MCP arguments, and in the client's `env` pass `REQUESTS_CA_BUNDLE` for a private CA and `NO_PROXY` when a proxy cannot reach the master. See [optional HTTPS](docs/compute-service.md#optional-https).
 
 Compute tasks do not need a client storage configuration. Storage tools automatically use a local shared path when it matches the configured `host_path`. For a custom local mapping or login-node SSH, copy `cfg/storage-access.example.yaml` to `.local/storage.yaml`, edit it, and add `--storage-config /absolute/path/to/.local/storage.yaml` to the MCP arguments.
 
@@ -44,8 +46,7 @@ Add this server in the syntax used by your MCP client. Replace every example val
   "command": "/absolute/path/to/determined_cluster_mcp/.venv/bin/determined-compute-mcp",
   "args": [
     "--profile", "/absolute/path/to/determined_cluster_mcp/.local/profile.yaml",
-    "--secrets-file", "/absolute/path/to/determined_cluster_mcp/.local/credentials.env",
-    "--verify-ssl"
+    "--secrets-file", "/absolute/path/to/determined_cluster_mcp/.local/credentials.env"
   ]
 }
 ```
@@ -75,4 +76,4 @@ Start a new agent session to load it. A link keeps the skill current after `git 
 - [Agent workflow](docs/agent-workflow.md): prepare, plan, launch, monitor, and accept work
 - [Compute service reference](docs/compute-service.md): profiles, requests, tools, usage measurements, task identity and ownership, and unconfirmed launches
 - [Shared storage access](docs/shared-storage-access.md): local mounts, SSH, dry runs, and transfers
-- [Troubleshooting](docs/troubleshooting.md): startup, authentication, TLS, paths, capacity, unconfirmed launches, usage measurements, and refused task operations
+- [Troubleshooting](docs/troubleshooting.md): startup, authentication, TLS, proxies, paths, capacity, unconfirmed launches, usage measurements, and refused task operations
