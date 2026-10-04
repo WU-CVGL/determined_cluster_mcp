@@ -13,10 +13,13 @@ from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import requests
 import yaml
+from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
 
 from determined_compute.utils.secrets import load_secrets
 
 ErrorCode = Union[int, str, None]
+# Characters that YAML reads as line breaks, or refuses as unprintable, inside a quoted string.
+_YAML_UNSAFE = re.compile("[\x7f-\x9f\u2028\u2029\ufffe\uffff]")
 
 
 class APIError(RuntimeError):
@@ -47,19 +50,192 @@ def _normalize_api_url(api_url: Optional[str]) -> str:
     return url.rstrip("/")
 
 
+def _master_from(values: Mapping[str, str]) -> Optional[str]:
+    names = ("DET_MASTER", "DET_MASTER_ADDR", "DET_MASTER_HOST")
+    return next((values[name] for name in names if values.get(name)), None)
+
+
+def _config_text(config: Mapping[str, Any]) -> str:
+    """An experiment or generic task config as the YAML text the master reads: JSON, with every
+    string quoted.
+
+    The master's YAML 1.1 parser reads a plain ``y``, ``n`` or ``1e-3`` as a bool or a float,
+    and PyYAML writes them plain. It refuses the surrogate pairs that JSON escapes characters
+    outside the BMP with, so only the characters YAML itself would misread are escaped.
+    """
+
+    text = json.dumps(dict(config), ensure_ascii=False, allow_nan=False)
+    return _YAML_UNSAFE.sub(lambda match: f"\\u{ord(match.group()):04x}", text)
+
+
 def _bool_env(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     return default if raw is None else raw.lower() in {"1", "true", "yes", "y", "on"}
 
 
+# RFC 9209 error types with which a proxy reports that it never connected to the next hop,
+# so the request cannot have reached Determined.
+_PROXY_CONNECT_ERRORS = frozenset({
+    "dns_error",
+    "dns_timeout",
+    "destination_not_found",
+    "destination_unavailable",
+    "connection_refused",
+    "connection_timeout",
+    "destination_ip_prohibited",
+    "destination_ip_unroutable",
+})
+_SF_KEY = re.compile(r"[a-z*][a-z0-9_\-.*]*")
+_SF_TOKEN = re.compile(r"[A-Za-z*][!#$%&'*+\-.^_`|~0-9A-Za-z:/]*")
+_SF_NUMBER = re.compile(r"-?[0-9]{1,15}(?:\.[0-9]{1,3})?")
+_SF_BYTES = re.compile(r":[A-Za-z0-9+/=]*:")
+
+
+def _sf_bare_item(text: str, index: int) -> tuple[Any, int]:
+    """Parse one RFC 8941 bare item at ``index``; return its value and the next index."""
+    if index >= len(text):
+        raise ValueError("missing item")
+    head = text[index]
+    if head == '"':
+        value, index = [], index + 1
+        while index < len(text):
+            character = text[index]
+            if character == "\\":
+                if index + 1 >= len(text) or text[index + 1] not in '"\\':
+                    raise ValueError("bad escape")
+                value.append(text[index + 1])
+                index += 2
+            elif character == '"':
+                return "".join(value), index + 1
+            elif not " " <= character <= "~":
+                raise ValueError("bad string character")
+            else:
+                value.append(character)
+                index += 1
+        raise ValueError("unterminated string")
+    if head == "?":
+        if text[index + 1:index + 2] not in {"0", "1"}:
+            raise ValueError("bad boolean")
+        return text[index + 1] == "1", index + 2
+    for pattern in (_SF_BYTES, _SF_NUMBER, _SF_TOKEN):
+        match = pattern.match(text, index)
+        if match:
+            return match.group(), match.end()
+    raise ValueError("bad item")
+
+
+def _sf_parameters(text: str, index: int) -> tuple[Dict[str, Any], int]:
+    parameters: Dict[str, Any] = {}
+    while index < len(text) and text[index] == ";":
+        index += 1
+        while index < len(text) and text[index] == " ":
+            index += 1
+        match = _SF_KEY.match(text, index)
+        if not match:
+            raise ValueError("bad parameter key")
+        key, index = match.group(), match.end()
+        value: Any = True
+        if index < len(text) and text[index] == "=":
+            value, index = _sf_bare_item(text, index + 1)
+        parameters[key] = value
+    return parameters, index
+
+
+def _proxy_status_errors(value: str) -> List[str]:
+    """Return the ``error`` parameter of each member of an RFC 9209 Proxy-Status field.
+
+    The field is an RFC 8941 structured-field list; a field that does not parse is ignored
+    as a whole, as RFC 8941 requires, and yields no errors.
+    """
+    errors: List[str] = []
+    text, index = value.strip(" \t"), 0
+    try:
+        while index < len(text):
+            if text[index] == "(":
+                index += 1
+                while True:
+                    while index < len(text) and text[index] == " ":
+                        index += 1
+                    if index < len(text) and text[index] == ")":
+                        index += 1
+                        break
+                    _item, index = _sf_bare_item(text, index)
+                    _parameters, index = _sf_parameters(text, index)
+                    if index >= len(text) or text[index] not in " )":
+                        raise ValueError("bad inner list")
+            else:
+                _item, index = _sf_bare_item(text, index)
+            parameters, index = _sf_parameters(text, index)
+            error = parameters.get("error")
+            if isinstance(error, str):
+                errors.append(error)
+            while index < len(text) and text[index] in " \t":
+                index += 1
+            if index < len(text):
+                if text[index] != ",":
+                    raise ValueError("expected a comma")
+                index += 1
+                while index < len(text) and text[index] in " \t":
+                    index += 1
+                if index >= len(text):
+                    raise ValueError("trailing comma")
+    except ValueError:
+        return []
+    return errors
+
+
+def _header(response: requests.Response, name: str) -> Optional[str]:
+    headers = getattr(response, "headers", None) or {}
+    for key, value in headers.items():
+        if key.lower() == name.lower():
+            return value
+    return None
+
+
+def _proxy_answer(response: requests.Response, payload: Any) -> Optional[Dict[str, Any]]:
+    """Describe an error response that an HTTP proxy produced instead of Determined.
+
+    A Proxy-Status error that means the proxy never connected upstream always counts. Any
+    other response counts only when it is a 5xx whose body is empty or not JSON, so it is no
+    Determined error, and it carries a proxy header: Proxy-Connection, Via or Proxy-Status.
+    """
+    status = response.status_code
+    proxy_status = _header(response, "Proxy-Status")
+    errors = _proxy_status_errors(proxy_status) if proxy_status else []
+    connect_error = next((error for error in errors if error in _PROXY_CONNECT_ERRORS), None)
+    if connect_error is not None:
+        return {"source": "proxy", "status_code": status, "proxy_error": connect_error}
+    indicated = any(
+        _header(response, name) is not None for name in ("Proxy-Connection", "Via", "Proxy-Status")
+    )
+    if status >= 500 and payload is None and indicated:
+        answer: Dict[str, Any] = {"source": "proxy", "status_code": status}
+        if errors:
+            answer["proxy_error"] = errors[-1]
+        return answer
+    return None
+
+
 def _error_from_response(response: requests.Response) -> APIError:
     try:
-        payload = response.json()
+        payload = response.json() if (getattr(response, "content", None) or response.text) else None
     except (ValueError, requests.exceptions.JSONDecodeError):
-        payload = {}
+        payload = None
+    status = response.status_code
+    proxy = _proxy_answer(response, payload)
+    if proxy is not None and "proxy_error" in proxy and proxy["proxy_error"] in _PROXY_CONNECT_ERRORS:
+        return APIError(
+            f"{status} An HTTP proxy could not connect to Determined "
+            f"({proxy['proxy_error']}); the request did not reach the master",
+            code="transport_error", details=proxy, retryable=True,
+        )
+    if proxy is not None:
+        return APIError(
+            f"{status} An HTTP proxy, not Determined, answered; the master was probably unreachable",
+            code=status, details=proxy, retryable=status != 501,
+        )
     if not isinstance(payload, dict):
         payload = {}
-    status = response.status_code
     error = payload.get("error")
     if isinstance(error, dict):
         # The gRPC gateway nests its message: {"error": {"code", "reason", "error"}}.
@@ -70,6 +246,29 @@ def _error_from_response(response: requests.Response) -> APIError:
         # 501 means the master lacks the route; repeating the request cannot help.
         retryable=status == 429 or (status >= 500 and status != 501),
     )
+
+
+def _connection_never_opened(exc: requests.RequestException) -> bool:
+    """Return whether a request failed before a connection to the server (or proxy) was open.
+
+    Refused connections, failed name resolution and connect timeouts happen before any byte of
+    the request is sent. Everything later (read timeouts, dropped connections, TLS errors,
+    responses from a proxy) may follow a request the server received.
+    """
+    if isinstance(exc, requests.exceptions.ConnectTimeout):
+        return True
+    if not isinstance(exc, requests.exceptions.ConnectionError) or isinstance(
+        exc, requests.exceptions.SSLError
+    ):
+        return False
+    reason: Any = exc.args[0] if exc.args else None
+    # requests wraps urllib3's MaxRetryError, whose reason may be a ProxyError that wraps the
+    # failure to reach the proxy.
+    for _ in range(3):
+        reason = getattr(reason, "reason", None) or getattr(reason, "original_error", None) or reason
+        if isinstance(reason, (NewConnectionError, ConnectTimeoutError)):
+            return True
+    return False
 
 
 def _login_for_token(api_url: str, username: str, password: str, verify_ssl: bool) -> str:
@@ -90,10 +289,9 @@ def _login_for_token(api_url: str, username: str, password: str, verify_ssl: boo
     return str(token)
 
 
-# A strict generic-task config parse rejects unknown keys before the master persists
-# anything; older masters do not know the optional display fields.
+# Display fields of a generic task config; every master with the generic task list
+# (WU-CVGL/determined#27) accepts them.
 _GENERIC_METADATA_FIELDS = ("name", "description")
-_UNKNOWN_GENERIC_METADATA = re.compile(r'unknown field \\?"(?:name|description)\\?"')
 _GENERIC_STATE_PREFIX = "GENERIC_TASK_STATE_"
 
 
@@ -117,15 +315,24 @@ class DeterminedAPIClient:
 
     def __init__(self, api_url: Optional[str] = None, api_token: Optional[str] = None, secrets_path: Optional[Path] = None, verify_ssl: Optional[bool] = None) -> None:
         secrets = load_secrets(secrets_path)
-        secret_master = secrets.get("DET_MASTER") or secrets.get("DET_MASTER_ADDR") or secrets.get("DET_MASTER_HOST")
-        environment_master = (
-            os.environ.get("DET_MASTER")
-            or os.environ.get("DET_MASTER_ADDR")
-            or os.environ.get("DET_MASTER_HOST")
-        )
-        self.api_url = _normalize_api_url(api_url or environment_master or secret_master)
+        file_master, ambient_master = _master_from(secrets), _master_from(os.environ)
+        if file_master:
+            # A secrets file that names its master supplies the URL and the credentials
+            # together, so its credentials reach only that master and no ambient credential
+            # does. An explicit api_url, or else the environment's master, that names another
+            # master is refused here, before a login or any other request.
+            override, source = (api_url, "--api-url") if api_url else (ambient_master, "DET_MASTER")
+            if override and _normalize_api_url(override) != _normalize_api_url(file_master):
+                raise ValueError(
+                    f"{source} names a different master than the secrets file, whose credentials "
+                    "belong to its own master; unset the override or use a secrets file for that master"
+                )
+            ambient: Mapping[str, str] = {}
+        else:
+            ambient = os.environ
+        self.api_url = _normalize_api_url(api_url or file_master or ambient_master)
         self.verify_ssl = _bool_env("DET_VERIFY_SSL", False) if verify_ssl is None else verify_ssl
-        self.api_token = self._resolve_token(api_token, secrets)
+        self.api_token = self._resolve_token(api_token, secrets, ambient)
         self.headers: Dict[str, str] = {}
         if self.api_token:
             self.headers["Authorization"] = f"Bearer {self.api_token}"
@@ -137,7 +344,14 @@ class DeterminedAPIClient:
     def _json_response(response: requests.Response, *, mutation: bool = False) -> Dict[str, Any]:
         if response.status_code >= 400:
             error = _error_from_response(response)
-            if mutation and response.status_code >= 500:
+            if mutation and response.status_code >= 500 and error.code != "transport_error":
+                details = error.details if isinstance(error.details, dict) else {}
+                if details.get("source") == "proxy":
+                    raise SubmissionUncertainError(
+                        f"an HTTP proxy, not Determined, answered with HTTP {response.status_code}; "
+                        "the master was probably unreachable, but the outcome is unknown",
+                        details=details,
+                    ) from error
                 raise SubmissionUncertainError(
                     "Determined mutation outcome is unknown after a server error",
                     details={"status_code": response.status_code, "error": str(error)},
@@ -170,9 +384,33 @@ class DeterminedAPIClient:
         data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         try:
-            response = requests.post(self._url(endpoint), headers={**self.headers, "Content-Type": "application/json"}, json=data, timeout=60, verify=self.verify_ssl)
+            # A redirect is never followed: a failure on the way to its target would look like
+            # a request that was never sent, although this one was.
+            response = requests.post(
+                self._url(endpoint), headers={**self.headers, "Content-Type": "application/json"},
+                json=data, timeout=60, verify=self.verify_ssl, allow_redirects=False,
+            )
         except requests.RequestException as exc:
+            if _connection_never_opened(exc):
+                # Nothing reached the master, so the mutation certainly did not happen.
+                raise APIError(
+                    "Could not connect to Determined; the request was not sent",
+                    code="transport_error", details={"endpoint": endpoint}, retryable=True,
+                ) from exc
             raise SubmissionUncertainError("Determined mutation outcome is unknown", details={"endpoint": endpoint}) from exc
+        except ValueError as exc:
+            # requests parses a 3xx's Location even when it does not follow it, after this
+            # request was sent; an unparseable one fails there.
+            raise SubmissionUncertainError(
+                "Determined mutation outcome is unknown", details={"endpoint": endpoint}
+            ) from exc
+        if 300 <= response.status_code < 400:
+            # The target is left out of the error: its path or query can carry a session.
+            raise SubmissionUncertainError(
+                f"Determined mutation outcome is unknown after HTTP {response.status_code}, "
+                "a redirect that was not followed",
+                details={"endpoint": endpoint, "status_code": response.status_code},
+            )
         return self._json_response(response, mutation=True)
 
 
@@ -216,15 +454,17 @@ class DeterminedAPIClient:
                 close()
         return logs
 
-    def _resolve_token(self, api_token: Optional[str], secrets: Dict[str, str]) -> Optional[str]:
+    def _resolve_token(
+        self, api_token: Optional[str], secrets: Dict[str, str], ambient: Mapping[str, str]
+    ) -> Optional[str]:
         if api_token:
             return api_token
-        if os.environ.get("DET_API_TOKEN"):
-            return os.environ["DET_API_TOKEN"]
+        if ambient.get("DET_API_TOKEN"):
+            return ambient["DET_API_TOKEN"]
         if secrets.get("DET_API_TOKEN"):
             return secrets["DET_API_TOKEN"]
-        username = secrets.get("DET_USERNAME") or os.environ.get("DET_USERNAME")
-        password = secrets.get("DET_PASSWORD") or os.environ.get("DET_PASSWORD")
+        username = secrets.get("DET_USERNAME") or ambient.get("DET_USERNAME")
+        password = secrets.get("DET_PASSWORD") or ambient.get("DET_PASSWORD")
         return _login_for_token(self.api_url, username, password, self.verify_ssl) if username and password else None
 
     @classmethod
@@ -262,16 +502,6 @@ class DeterminedAPIClient:
         if not isinstance(username, str) or not username.strip():
             raise APIError("Current-user response is malformed", code="invalid_response")
         return {"id": user_id, "username": username.strip()}
-
-    def get_cluster_id(self) -> str:
-        response = self._get("info")
-        cluster_id = response.get("cluster_id")
-        if not isinstance(cluster_id, str):
-            raise APIError("Cluster-info response is malformed", code="invalid_response")
-        cluster_id = cluster_id.strip()
-        if not cluster_id or len(cluster_id.encode("utf-8")) > 256:
-            raise APIError("Cluster-info response is malformed", code="invalid_response")
-        return cluster_id
 
     def list_remote_tasks(
         self,
@@ -499,7 +729,7 @@ class DeterminedAPIClient:
             return self._launch_generic_task(config, options or {})
         if options:
             raise ValueError("launch options apply only to generic tasks")
-        body = {"config": yaml.safe_dump(config, sort_keys=False), "activate": True} if kind == "experiment" else {"config": config}
+        body = {"config": _config_text(config), "activate": True} if kind == "experiment" else {"config": config}
         entity = self._entity(self._post(f"api/v1/{kind}s", data=body), kind, mutation=True)
         return self._safe_shell(entity) if kind == "shell" else entity
 
@@ -513,58 +743,28 @@ class DeterminedAPIClient:
             if expected is None or not isinstance(value, expected):
                 raise ValueError(f"unsupported generic task launch option: {key}")
         # Code and data stay on shared mounts, so the context directory is always empty.
-        body: Dict[str, Any] = {"contextDirectory": [], **options}
-        warnings: List[Dict[str, str]] = []
-        try:
-            response = self._post(
-                "api/v1/generic-tasks",
-                data={**body, "config": yaml.safe_dump(config, sort_keys=False)},
-            )
-        except APIError as exc:
-            stripped = {
-                key: value for key, value in config.items() if key not in _GENERIC_METADATA_FIELDS
-            }
-            if stripped == config or not self._rejected_generic_metadata(exc):
-                raise
-            # The rejection happened while parsing the config, before the master stored
-            # anything, so this second request is the only possible submission.
-            response = self._post(
-                "api/v1/generic-tasks",
-                data={**body, "config": yaml.safe_dump(stripped, sort_keys=False)},
-            )
-            warnings.append({
-                "code": "generic_task_metadata_unsupported",
-                "message": (
-                    "The Determined master does not accept generic task name and description; "
-                    "the task was submitted without them and they are kept only locally."
-                ),
-            })
+        body: Dict[str, Any] = {"contextDirectory": [], "config": _config_text(config), **options}
+        response = self._post("api/v1/generic-tasks", data=body)
         task_id = response.get("taskId")
         if not isinstance(task_id, str) or not task_id:
             raise SubmissionUncertainError(
                 "Determined response did not contain a generic task id", details=response
             )
         launch_warnings = response.get("warnings") or []
-        if isinstance(launch_warnings, list):
-            warnings.extend(
-                {"code": "launch_warning", "message": item}
-                for item in launch_warnings
-                if isinstance(item, str) and item
-            )
+        warnings = [
+            {"code": "launch_warning", "message": item}
+            for item in (launch_warnings if isinstance(launch_warnings, list) else [])
+            if isinstance(item, str) and item
+        ]
         return {"id": task_id, "warnings": warnings}
 
-    @staticmethod
-    def _rejected_generic_metadata(exc: APIError) -> bool:
-        """Return whether the master rejected only the optional generic display fields."""
-        # Masters report the strict config parse failure as HTTP 500 (an untyped error)
-        # or, in some builds, HTTP 400; a 500 reaches us as an uncertain mutation.
-        rejection = exc.__cause__ if isinstance(exc, SubmissionUncertainError) else exc
-        return (
-            isinstance(rejection, APIError)
-            and not isinstance(rejection, SubmissionUncertainError)
-            and rejection.code in {400, 500}
-            and _UNKNOWN_GENERIC_METADATA.search(str(rejection)) is not None
-        )
+    def require_generic_task_list(self) -> None:
+        """Fail with ``unsupported`` unless the master lists generic tasks with their owners.
+
+        Without that list (WU-CVGL/determined#27) a generic task could be created but its
+        owner never verified, so it could not be managed afterwards.
+        """
+        self._generic_task_list({"limit": 1})
 
     def _generic_task_list(self, params: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -632,7 +832,7 @@ class DeterminedAPIClient:
                 if isinstance(config.get(field), str):
                     entity[field] = config[field]
         # The owner comes from the generic task list; a master without it leaves the entity
-        # ownerless, so ownership checks (adoption) fail instead of guessing.
+        # ownerless, so ownership checks fail instead of guessing.
         try:
             listed = self._generic_task_list({"taskIds": [task_id]}).get("tasks")
         except APIError as exc:
@@ -689,7 +889,9 @@ class DeterminedAPIClient:
         except SubmissionUncertainError as exc:
             # The master reports rejected preconditions, such as a task that is already
             # paused, as untyped server errors; keep that message visible to the caller.
-            if isinstance(exc.__cause__, APIError):
+            # A proxy's answer is already labelled as such.
+            proxy = isinstance(exc.details, dict) and exc.details.get("source") == "proxy"
+            if isinstance(exc.__cause__, APIError) and not proxy:
                 raise SubmissionUncertainError(
                     f"Determined {action} outcome is unknown after a server error: {exc.__cause__}",
                     details=exc.details,

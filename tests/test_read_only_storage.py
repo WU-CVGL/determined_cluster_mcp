@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from determined_compute.compute import ComputeProfile, ComputeService, SQLiteTaskStore, ValidationError
+from determined_compute.compute import ComputeProfile, ComputeService, ValidationError
 from determined_compute.storage import StorageAccessConfig, StorageError, StorageService
 
 
@@ -63,27 +63,25 @@ def test_shared_aliases_do_not_bypass_readonly_policy(setup, tmp_path):
 @pytest.mark.parametrize('storage_path', [None, 'data/checkpoints'])
 def test_checkpoint_cannot_write_readonly_host_path(setup, storage_path):
     profile, shared, data = setup
-    store = SQLiteTaskStore(':memory:')
-    service = ComputeService(None, store, profile)
+    service = ComputeService(None, profile)
     checkpoint = {'type': 'shared_fs', 'host_path': str(data if storage_path is None else shared)}
     if storage_path is not None:
         checkpoint['storage_path'] = storage_path
-    try:
-        with pytest.raises(ValidationError, match='read-only'):
-            service.plan({'kind': 'experiment', 'name': 'readonly-check', 'command': ['true'],
-                          'workdir': '/work/code', 'output_dir': '/work/output',
-                          'experiment_config': {'checkpoint_storage': checkpoint}})
-    finally:
-        store.close()
+    with pytest.raises(ValidationError, match='read-only'):
+        service.plan({'kind': 'experiment', 'name': 'readonly-check', 'command': ['true'],
+                      'workdir': '/work/code', 'output_dir': '/work/output',
+                      'experiment_config': {'checkpoint_storage': checkpoint}})
 
 
-def test_explicit_false_retains_legacy_mount_fingerprint(setup):
+def test_explicit_false_read_only_is_the_default_mount(setup):
     profile, shared, _ = setup
     base = {'mounts': [{'host_path': str(shared), 'container_path': '/work'}],
             'defaults': {'image': 'example', 'pool': 'example', 'slots': 0}}
     original = ComputeProfile.from_dict(base)
     base['mounts'][0]['read_only'] = False
-    assert original.fingerprint == ComputeProfile.from_dict(base).fingerprint
+    explicit = ComputeProfile.from_dict(base)
+    assert original == explicit
+    assert explicit.mounts[0].as_config() == {'host_path': str(shared), 'container_path': '/work'}
 
 
 @pytest.mark.parametrize('storage_path', ['checkpoints', 'ABSOLUTE_CHILD'])
@@ -91,47 +89,35 @@ def test_writable_checkpoint_storage_path_is_preserved(setup, storage_path):
     profile, shared, _ = setup
     if storage_path == 'ABSOLUTE_CHILD':
         storage_path = str(shared / 'checkpoints')
-    store = SQLiteTaskStore(':memory:')
-    try:
-        config = {'type': 'shared_fs', 'host_path': str(shared), 'storage_path': storage_path}
-        plan = ComputeService(None, store, profile).plan({
-            'kind': 'experiment', 'name': 'checkpoint-check', 'command': ['true'],
-            'workdir': '/work/code', 'output_dir': '/work/output',
-            'experiment_config': {'checkpoint_storage': config},
-        })
-        assert plan['config']['checkpoint_storage'] == config
-    finally:
-        store.close()
+    config = {'type': 'shared_fs', 'host_path': str(shared), 'storage_path': storage_path}
+    plan = ComputeService(None, profile).plan({
+        'kind': 'experiment', 'name': 'checkpoint-check', 'command': ['true'],
+        'workdir': '/work/code', 'output_dir': '/work/output',
+        'experiment_config': {'checkpoint_storage': config},
+    })
+    assert plan['config']['checkpoint_storage'] == config
 
 
 @pytest.mark.parametrize('checkpoint', ['s3://bucket', {'type': 's3', 'bucket': 'example'}])
 def test_explicit_checkpoint_shortcuts_cannot_bypass_shared_storage(setup, checkpoint):
     profile, _, _ = setup
-    store = SQLiteTaskStore(':memory:')
-    try:
-        with pytest.raises(ValidationError, match='shared_fs'):
-            ComputeService(None, store, profile).plan({
-                'kind': 'experiment', 'command': ['true'], 'workdir': '/work/code',
-                'output_dir': '/work/output', 'experiment_config': {'checkpoint_storage': checkpoint},
-            })
-    finally:
-        store.close()
+    with pytest.raises(ValidationError, match='shared_fs'):
+        ComputeService(None, profile).plan({
+            'kind': 'experiment', 'command': ['true'], 'workdir': '/work/code',
+            'output_dir': '/work/output', 'experiment_config': {'checkpoint_storage': checkpoint},
+        })
 
 
 def test_absolute_checkpoint_must_stay_inside_declared_host_root(setup):
     profile, shared, _ = setup
-    store = SQLiteTaskStore(':memory:')
-    try:
-        with pytest.raises(ValidationError, match='inside host_path'):
-            ComputeService(None, store, profile).plan({
-                'kind': 'experiment', 'command': ['true'], 'workdir': '/work/code',
-                'output_dir': '/work/output', 'experiment_config': {'checkpoint_storage': {
-                    'type': 'shared_fs', 'host_path': str(shared / 'one'),
-                    'storage_path': str(shared / 'other'),
-                }},
-            })
-    finally:
-        store.close()
+    with pytest.raises(ValidationError, match='inside host_path'):
+        ComputeService(None, profile).plan({
+            'kind': 'experiment', 'command': ['true'], 'workdir': '/work/code',
+            'output_dir': '/work/output', 'experiment_config': {'checkpoint_storage': {
+                'type': 'shared_fs', 'host_path': str(shared / 'one'),
+                'storage_path': str(shared / 'other'),
+            }},
+        })
 
 
 @pytest.mark.parametrize('existing', [True, False])
@@ -161,14 +147,10 @@ def test_fetch_cannot_write_through_readonly_subdirectory_mapping(tmp_path, exis
 @pytest.mark.parametrize('value', ['data/checkpoints', '/outside/checkpoints'])
 def test_legacy_checkpoint_path_aliases_cannot_bypass_policy(setup, alias, value):
     profile, shared, _ = setup
-    store = SQLiteTaskStore(':memory:')
-    try:
-        with pytest.raises(ValidationError, match='storage_path instead of legacy'):
-            ComputeService(None, store, profile).plan({
-                'kind': 'experiment', 'command': ['true'], 'workdir': '/work/code',
-                'output_dir': '/work/output', 'experiment_config': {'checkpoint_storage': {
-                    'type': 'shared_fs', 'host_path': str(shared), alias: value,
-                }},
-            })
-    finally:
-        store.close()
+    with pytest.raises(ValidationError, match='storage_path instead of legacy'):
+        ComputeService(None, profile).plan({
+            'kind': 'experiment', 'command': ['true'], 'workdir': '/work/code',
+            'output_dir': '/work/output', 'experiment_config': {'checkpoint_storage': {
+                'type': 'shared_fs', 'host_path': str(shared), alias: value,
+            }},
+        })

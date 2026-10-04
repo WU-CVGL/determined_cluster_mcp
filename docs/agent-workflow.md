@@ -29,12 +29,12 @@ Choose the task kind according to the work. The four kinds, from the simplest:
 
 - `command` runs your command once in a container and ends when it exits. Use it for finite, non-interactive work such as an evaluation, a conversion, or a build.
 - `shell` gives you a container to connect to over SSH instead of a command to run. Use it for interactive debugging and environment inspection.
-- `generic` runs your command once like a `command`, with a name, child tasks, and, if launched with `pausable: true`, pause and resume under the same task ID to free its slots. Resuming starts the command again from the beginning in a new container, and nothing restarts it after a failure, so make a task pausable only when it is safe to rerun; see [Pause and resume](#pause-and-resume). It requires the research-cluster fork 0.40.1 or later of the Determined master, and `kind: auto` never selects it.
+- `generic` runs your command once like a `command`, with a name, child tasks, and, if launched with `pausable: true`, pause and resume under the same task ID to free its slots. Resuming starts the command again from the beginning in a new container, and nothing restarts it after a failure, so make a task pausable only when it is safe to rerun; see [Pause and resume](#pause-and-resume). It requires a Determined master from the research-cluster fork with WU-CVGL/determined#27, which lists generic tasks with their owners; on an older master the launch fails with `unsupported` before anything is created. `kind: auto` never selects it.
 - `experiment` runs your command as one or more trials and adds Determined's experiment features:
   - a searcher, set in `experiment_config.searcher`, that runs a single trial or many trials over a hyperparameter space (grid, random, or adaptive search that stops weak trials early);
   - automatic restarts: a failed trial, including one whose agent was lost, starts again up to `max_restarts` times (Determined's default is 5);
   - checkpoints that the workload saves through Determined's Core API, kept in `checkpoint_storage` under its retention policy (`save_trial_best`, `save_trial_latest`), so a restarted trial can continue from its latest checkpoint instead of from the start;
-  - training and validation metrics that the workload reports through the Core API, which the searcher compares and `compute_status` reports as trial progress and summary metrics;
+  - training and validation metrics that the workload reports through the Core API, which the searcher compares and `compute_usage` reports as trial progress and summary metrics;
   - pause and resume: pausing asks each trial to save a checkpoint and stop, and resuming continues each trial from its latest checkpoint.
 
   A workload that does not use the Core API still gets the searcher, the restarts, and pause and resume, but a restart or a resume then runs it from the beginning, and it reports no checkpoints or metrics. Use an experiment for training, hyperparameter searches, and long or overnight work that should survive a node failure.
@@ -91,19 +91,19 @@ Create a request with a meaningful `name` and `description`, the selected `kind`
 
 Call `compute_plan(request)` and inspect the resolved kind, image, pool, mounts, working directory, output directory, resource fields, and advisories. Planning validates and renders locally; it does not prove that remote files, permissions, credentials, or live capacity are valid.
 
-Generate one stable, caller-controlled `request_id`, then call `compute_launch(request, request_id)`. Preserve the returned local `task_id` and remote ID in the work record. Repeating an identical request with the same request ID is idempotent; reusing it for different content is rejected.
+Call `compute_launch(request)` once. It returns the task's `kind` and `id`, Determined's own task ID: a UUID for a command, shell, or generic task and an integer for an experiment. Every later tool takes this pair. The MCP keeps no record of the launch, so write the kind, ID, name, and `submission_marker` into your own work record. Every call is a new submission: calling `compute_launch` again with the same request starts a second task.
 
-If the launch result is uncertain, do not create a new request ID or submit again. Inspect the local task and remote system. Use `compute_reconcile(task_id, remote_id)` only when repairing that same uncertain local submission and after identifying the matching remote task. See [troubleshooting](troubleshooting.md#submission-outcome-is-uncertain).
+If the launch returns `submission_uncertain`, the submission is unconfirmed: Determined may or may not have created the task, and it may still appear. Do not launch again automatically. Call `compute_list(kind, marker=...)` with the `submission_marker` from the error details and a small `limit`. One returned task is most likely your submission; continue with its ID. Several returned tasks share a copied config; show them to the user instead of choosing one. An empty result does not prove that the submission failed, because each search covers one page and the master may store the task later. Report the unconfirmed launch and leave the decision to submit again to the user. See [troubleshooting](troubleshooting.md#submission-outcome-is-uncertain).
 
 ## Monitor and accept the result
 
-Call `compute_status(task_id)` until the task reaches a terminal state, and use `compute_logs(task_id, tail)` to inspect progress and the final messages. Cancel a running task with `compute_cancel(task_id)` when the user no longer needs it.
+Call `compute_status(kind, id)` until the task reaches a terminal state, and use `compute_logs(kind, id, tail)` to inspect progress and the final messages. Cancel a running task with `compute_cancel(kind, id)` when the user no longer needs it.
 
-Call `compute_usage(task_id)` when you need to know how much CPU, memory, and GPU a running job uses, for example to spot near-zero GPU utilization or an idle allocation before proposing a resize, cancellation, or relaunch; for an ended task it reports the window before the task ended. It is read-only and requires the master's task-resources integration; `task_resources_disabled` or `task_resources_unsupported` means measurements are unavailable, not that the task is idle. Inspect `warnings` first. A null or missing value means no measurement, never zero, and an empty `series` list means no data for the window. Values are point samples taken every `step` seconds, and GPU metrics cover the whole assigned device, which can include other processes. An experiment reports its latest trial unless `trial_id` is given. `gpus` compares each allocation's GPUs even when `metrics` hides their series: a large `utilization_spread_percent`, a low mean on `least_utilized_gpu_uuid`, or a high `idle_fraction` points to idle or straggling GPUs, and a `gpu_count` below `requested_slots` means fewer GPUs returned a series than the allocation holds, not necessarily that the rest are unused. For an experiment, `trial.batches_per_second_lower_bound` is a lifetime floor, because its wall-clock denominator can also count image pull, startup, initialization, and allocations lost to restarts (not scheduler queue time or gaps between allocations); a `total_batches_processed` of 0 is expected when the workload does not report through Determined's Core API. Report what you observe; changing slots or pools remains an explicit workload decision. See [task usage measurements](compute-service.md#task-usage-measurements).
+Call `compute_usage(kind, id)` when you need to know how much CPU, memory, and GPU a running job uses, for example to spot near-zero GPU utilization or an idle allocation before proposing a resize, cancellation, or relaunch; for an ended task it reports the window before the task ended. It is read-only and requires the master's task-resources integration; `task_resources_disabled` or `task_resources_unsupported` means measurements are unavailable, not that the task is idle. Inspect `warnings` first. A null or missing value means no measurement, never zero, and an empty `series` list means no data for the window. Values are point samples taken every `step` seconds, and GPU metrics cover the whole assigned device, which can include other processes. An experiment reports its latest trial unless `trial_id` is given. `gpus` compares each allocation's GPUs even when `metrics` hides their series: a large `utilization_spread_percent`, a low mean on `least_utilized_gpu_uuid`, or a high `idle_fraction` points to idle or straggling GPUs, and a `gpu_count` below `requested_slots` means fewer GPUs returned a series than the allocation holds, not necessarily that the rest are unused. For an experiment, `trial.batches_per_second_lower_bound` is a lifetime floor, because its wall-clock denominator can also count image pull, startup, initialization, and allocations lost to restarts (not scheduler queue time or gaps between allocations); a `total_batches_processed` of 0 is expected when the workload does not report through Determined's Core API. Report what you observe; changing slots or pools remains an explicit workload decision. See [task usage measurements](compute-service.md#task-usage-measurements).
 
 A successful submission or a terminal state alone is not acceptance. Check the process exit information and the success criteria defined at the start. When storage access is configured, verify expected shared artifacts with `storage_check`; otherwise use workload output or another explicit task-level check. When a local copy is needed, configure storage access, preview `storage_fetch(shared_dir, local_dir, dry_run=true)`, review it, then execute with `dry_run=false` and inspect the fetched result.
 
-Report the local task ID, remote ID, final state, exit result when available, output path, and observed artifact or metric. Never include tokens, passwords, private keys, cookies, or secrets-file contents.
+Report the task kind and ID, final state, exit result when available, output path, and observed artifact or metric. Never include tokens, passwords, private keys, cookies, or secrets-file contents.
 
 ## Pause and resume
 
@@ -118,39 +118,24 @@ Resuming continues differently by kind:
 
 To pause and resume:
 
-1. Call `compute_pause(task_id)`.
-2. Poll `compute_status(task_id)` until `remote_state` is `STATE_PAUSED`. A paused task is not finished. A generic task reports `STATE_STOPPING_PAUSED` while it stops; an experiment reports `STATE_PAUSED` as soon as the pause is accepted, and its trials can take until their timeout to stop.
-3. Call `compute_resume(task_id)` when the work should continue, and check `compute_logs` that it continued from a checkpoint or skipped completed units.
+1. Call `compute_pause(kind, id)`.
+2. Poll `compute_status(kind, id)` until `state` is `STATE_PAUSED`. A paused task is not finished. A generic task reports `STATE_STOPPING_PAUSED` while it stops; an experiment reports `STATE_PAUSED` as soon as the pause is accepted, and its trials can take until their timeout to stop.
+3. Call `compute_resume(kind, id)` when the work should continue, and check `compute_logs` that it continued from a checkpoint or skipped completed units.
 
 A pause or resume that the master refuses, for example pausing a paused task, returns the master's reason as an error, and nothing changed. A master that predates the generic-task fixes of the research-cluster fork reports refused generic-task requests as server errors instead; these arrive as `submission_uncertain`, so check `compute_status` before trying again.
 
 `compute_cancel` kills a generic task and all its descendants. Exit status 0 ends a generic task as `STATE_COMPLETED`; a non-zero exit or a lost agent ends it as `STATE_ERROR`, and it is not restarted.
 
-Give a generic task a meaningful `name` and `description` as for any launch. A master that predates generic task names rejects them; the service then submits the task without them once, keeps them in the local record, and returns a `generic_task_metadata_unsupported` warning. Treat that warning as informational. The task then appears without a name in the WebUI, so record the local and remote IDs.
+Give a generic task a meaningful `name` and `description` as for any launch; Determined stores them, and they appear in the WebUI and in `compute_list`.
 
-## Discover and adopt existing remote tasks
+## Find existing tasks
 
-Use discovery and adoption for a task created independently through the Determined WebUI, native CLI, or another device under the same Determined account:
+`compute_list(kind, limit=50, offset=0)` lists the tasks owned by the authenticated Determined account, newest first, whether they were launched through this MCP, the WebUI, the native CLI, or another device. Each entry has the kind, ID, name, state, resource pool, and start time, and `pagination.next_offset` points to the next page. Use the kind and ID with `compute_status`, `compute_logs`, `compute_usage`, `compute_cancel`, `compute_pause`, and `compute_resume`. Listing is read-only. Generic tasks need a master with the research-cluster fork's generic task list (WU-CVGL/determined#27); an older master returns `unsupported`.
 
-1. Call `compute_discover(kind, limit=50, offset=0)` with `command`, `shell`, `generic`, or `experiment`. This is a read-only remote query; it does not create a local record or submit work. Generic tasks need a master with the research-cluster fork's generic task list (WU-CVGL/determined#27); an older master returns `unsupported`.
-2. Select the intended remote result, then call `compute_adopt(kind, remote_id)`.
-3. Keep the returned local `task_id` and use it with `compute_status`, `compute_logs`, `compute_usage`, and `compute_cancel`.
+With `marker`, `compute_list` returns the tasks on the selected page whose config carries that submission marker. It reads each task of the page, so keep `limit` small, such as 5 or 10, when you look for a launch you just made, and follow `pagination.next_offset` to older pages. A marker is a correlation label, not an identity: a config copied outside the MCP carries the same one, so more than one task can match, and an empty page does not show that a task was never created.
 
-Adoption verifies the actual cluster, current authenticated account, and remote owner. It creates an idempotent local record and never relaunches the remote task. Unknown work paths, output paths, or revisions remain unknown. Adoption does not grant storage access or new cluster permissions.
+## Ownership and records
 
-Reconciliation has a narrower purpose: `compute_reconcile` repairs an existing local submission whose remote acceptance is uncertain by verifying its submission marker. It does not import independently created tasks. If an uncertain local record exists, reconcile it rather than adopting the corresponding remote task.
+The Determined account selected by the MCP server's credentials is the only identity. Every tool that acts on a task first checks that this account owns it, and refuses another user's task with `ownership_mismatch`, even when the account is an administrator. A generic task whose owner the master cannot report is refused with `ownership_unavailable`. To act on another account's task, use that account's credentials.
 
-## Keep identity boundaries separate
-
-Four values participate in task identity and access:
-
-| Value | Meaning |
-| --- | --- |
-| SQLite database | Local durable task records, idempotency, and reconciliation state |
-| `owner` | Namespace within that database; it is not authentication |
-| Determined account | API identity and remote authorization selected by credentials |
-| Cluster identity | Actual remote cluster used to prevent cross-cluster task confusion |
-
-Sessions share local records only when they use the same database and owner. Separate databases can adopt the same remote task independently. Keep the database on local durable disk rather than shared NFS. Sharing an owner does not share credentials, and changing credentials does not rename the owner namespace.
-
-On the Determined fork 0.40.1 or later with basic authorization, only a task's Determined owner or an administrator can cancel it. A submitted record binds to the profile and endpoint rather than the account, so after credentials switch to another account, `compute_cancel` can return HTTP 403 for a command or shell and HTTP 404 for an experiment; an adopted record reports `ownership_mismatch` instead. Use the account that owns the task.
+The MCP keeps no task records. Determined keeps the tasks, their logs, and their experiment data; you keep the record of what you launched and why, such as the kind, ID, name, revision, and output path. Determined serves an ended command or shell for only 24 hours after it ends, so read its logs and usage while it is available.

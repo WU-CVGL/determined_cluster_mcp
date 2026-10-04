@@ -5,7 +5,7 @@ description: Plan, launch, inspect, and stop resource-intensive GPU or CPU work 
 
 # Intensive Compute Runner
 
-Use this repository's `ComputeService` for heavy-compute planning, idempotent launch, task state, logs, measured usage, and cancellation. Any MCP-capable agent can use the tools with its own model. Install the skill by linking this directory into the agent's skills directory, as the repository README describes; relative links such as `../../docs/` then resolve through that link to the repository checkout.
+Use this repository's `ComputeService` for heavy-compute planning, launch, task state, logs, measured usage, and cancellation. It keeps no task records: tools address tasks by Determined's own IDs and act only on tasks owned by the configured account, so keep your own record of what you launch. Any MCP-capable agent can use the tools with its own model. Install the skill by linking this directory into the agent's skills directory, as the repository README describes; relative links such as `../../docs/` then resolve through that link to the repository checkout.
 
 ## Choose a mode
 
@@ -18,7 +18,7 @@ Let `kind: auto` select from intent when the request is clear:
 
 Set `interactive` or `overnight` explicitly when intent would otherwise be ambiguous. Use the minimum suitable `slots`; heavy CPU work can use zero GPU slots only if the service and target pool support it.
 
-Give each request a short, task-specific `name` and a `description` that states its purpose or config. Do not use task IDs, request IDs, or UUIDs as display names.
+Give each request a short, task-specific `name` and a `description` that states its purpose or config. Do not use task IDs or UUIDs as display names.
 
 ## Prepare durable inputs
 
@@ -35,15 +35,15 @@ If the client lacks cluster mounts, read [the shared-storage access guide](../..
 1. Call `compute_plan`; inspect the resolved kind, config, paths, revision, and advisories.
 2. Call `compute_resources` for the requested slots and pool. Capacity is a snapshot, not a reservation; do not switch pool or location automatically.
 3. Keep `allow_queue: false` unless queueing is approved for this call. Resolve unsafe or unknown capacity before launch.
-4. Call `compute_launch` with a stable `request_id`. Keep its local `task_id`, which differs from the remote ID.
-5. Observe with `compute_status`, `compute_logs`, and `compute_list_tasks`; use `compute_usage` to check measured CPU, memory, and GPU use before proposing a resize. Cancel only the intended task.
+4. Call `compute_launch(request)` once. Record the returned `kind`, `id` (Determined's task ID), name, and `submission_marker`; every call is a new submission.
+5. Observe with `compute_status(kind, id)` and `compute_logs(kind, id)`, and find the account's tasks with `compute_list(kind)`; use `compute_usage(kind, id)` to check measured CPU, memory, and GPU use before proposing a resize. Cancel only the intended task.
 
 Never include credentials in requests, configs, logs, or reports. A launch with `allow_queue: false` performs admission checking and rejects busy or unknown capacity without submitting; `true` explicitly permits scheduler queueing.
 
-If launch outcome is unknown after a timeout or connection loss, do not submit again blindly. Use `compute_reconcile` only with a verified remote ID for the known task; the service checks its submission marker before binding. If authentication fails, stop and report the configuration problem; do not fall back to local execution.
+If `compute_launch` returns `submission_uncertain`, do not submit again automatically. Look for the task with `compute_list(kind, marker=...)`, using the `submission_marker` from the error details and a small `limit`. One match is most likely the submission; several matches share a copied config, so ask the user. An empty result does not prove that the submission failed; report the unconfirmed launch and let the user decide whether to submit again. If authentication fails, stop and report the configuration problem; do not fall back to local execution.
 
 ## Report
 
-Return the name, mode, IDs, state, pool, slots, mapped paths, revision, and next status/log/cancel action. Omit secrets.
+Return the name, kind and ID, state, pool, slots, mapped paths, revision, and next status/log/cancel action. Omit secrets.
 
 Read [references/compute-workflow.md](references/compute-workflow.md) for request fields, storage preparation, failure handling, and deployment-specific shell policy.

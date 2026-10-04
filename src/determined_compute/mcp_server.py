@@ -1,8 +1,8 @@
-"""Local stdio MCP adapter for the persistent compute service.
+"""Local stdio MCP adapter for the stateless compute service.
 
-The configured owner is a local namespace, not an authentication mechanism.
-This server is intended for a trusted same-user MCP client launched as a child
-process.  No tool accepts an owner argument.
+The server keeps no task records. Tools address tasks by Determined's own IDs and
+act only on tasks owned by the account whose credentials the process was started
+with. It is intended for a trusted same-user MCP client launched as a child process.
 """
 
 from __future__ import annotations
@@ -12,24 +12,11 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence, Union
 
-from determined_compute.compute import ComputeError, ComputeProfile, ComputeService, SQLiteTaskStore
+from determined_compute.compute import ComputeError, ComputeProfile, ComputeService
 from determined_compute.core.api_client import APIError as ClientAPIError
 from determined_compute.core.api_client import DeterminedAPIClient
-
-
-DEFAULT_DB_PATH = Path("~/.local/state/determined-compute/tasks.sqlite3").expanduser()
-
-
-def normalize_owner(value: str) -> str:
-    """Validate the owner namespace bound at startup."""
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("owner must be a non-empty string")
-    value = value.strip()
-    if len(value.encode("utf-8")) > 256:
-        raise ValueError("owner is too long")
-    return value
 
 
 class _LazyClient:
@@ -56,11 +43,11 @@ class _LazyClient:
 
 def safe_error_details(exc: BaseException) -> dict[str, Any]:
     details = getattr(exc, "details", None)
-    allowed = {"task_id", "resource_pool", "requested_slots", "available", "candidate_pools"}
-    result = {key: value for key, value in details.items() if key in allowed} if isinstance(details, dict) else {}
-    if "task_id" not in result and getattr(exc, "task_id", None):
-        result["task_id"] = str(exc.task_id)
-    return result
+    allowed = {
+        "kind", "submission_marker", "source", "status_code", "proxy_error", "resource_pool",
+        "requested_slots", "available", "candidate_pools",
+    }
+    return {key: value for key, value in details.items() if key in allowed} if isinstance(details, dict) else {}
 
 
 def _tool_error(exc: BaseException) -> dict[str, Any]:
@@ -79,13 +66,11 @@ def _tool_error(exc: BaseException) -> dict[str, Any]:
 
 def create_server(
     service: ComputeService,
-    owner: str,
     storage_service: Any = None,
     resource_inspector: Any = None,
 ) -> Any:
-    """Create an MCP server bound to one local owner namespace."""
+    """Create an MCP server for the compute service and optional storage access."""
 
-    owner = normalize_owner(owner)
     try:
         from mcp.server import MCPServer
         from mcp.server.mcpserver.exceptions import ToolError
@@ -101,8 +86,12 @@ def create_server(
             "Choose a meaningful request.name and request.description for each launch. "
             "Check capacity with compute_resources; queuing requires explicit allow_queue=true. "
             "Keep code and data on shared mounts; use storage_check/sync/fetch for file access. "
-            "Plan before launch, keep request_id stable, and use the returned task_id for control. "
-            "Use compute_usage to check a task's measured CPU, memory, and GPU use. "
+            "Plan before launch. Every launch is a new submission: the server keeps no task "
+            "records, so keep the returned kind and id, which are Determined's own task ID. "
+            "If a launch is unconfirmed, look for it with compute_list(kind, marker=...); an "
+            "empty result does not prove it failed, so never launch again automatically: "
+            "resubmitting is the user's decision. Use compute_list to find the account's tasks "
+            "and compute_usage to check a task's measured CPU, memory, and GPU use. "
             "Experiments and generic tasks can be paused and resumed; a resumed experiment "
             "continues from its trials' latest checkpoints, a resumed generic task reruns its "
             "command from the start. "
@@ -133,36 +122,41 @@ def create_server(
         return await call(service.plan, request)
 
     @server.tool(annotations=ToolAnnotations(
-        read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
+        read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True,
     ))
-    async def compute_launch(request: dict[str, Any], request_id: str) -> dict[str, Any]:
-        """Launch a named request idempotently, checking capacity unless allow_queue=true."""
+    async def compute_launch(request: dict[str, Any]) -> dict[str, Any]:
+        """Submit a request once and return its kind and Determined id; checks capacity unless allow_queue=true.
 
-        return await call(service.launch, request, request_id, owner)
+        Every call is a new submission. On an unconfirmed outcome, look for the task with
+        compute_list and the returned marker, and leave any resubmission to the user.
+        """
+
+        return await call(service.launch, request)
 
     @server.tool(annotations=ToolAnnotations(
         read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
     ))
-    async def compute_status(task_id: str) -> dict[str, Any]:
-        """Refresh and return a task in the server's owner namespace."""
+    async def compute_status(kind: str, id: Union[int, str]) -> dict[str, Any]:
+        """Return the current state of one of the account's tasks by kind and Determined id."""
 
-        return await call(service.status, task_id, owner)
+        return await call(service.status, kind, id)
 
     @server.tool(annotations=ToolAnnotations(
         read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
     ))
-    async def compute_logs(task_id: str, tail: int = 200) -> list[Any]:
-        """Return the latest task log records; tail must be a positive integer."""
+    async def compute_logs(kind: str, id: Union[int, str], tail: int = 200) -> list[Any]:
+        """Return a task's latest log records; tail must be a positive integer."""
 
         if tail < 1:
             fail(ValueError("tail must be at least 1"))
-        return await call(service.logs, task_id, owner, tail)
+        return await call(service.logs, kind, id, tail)
 
     @server.tool(annotations=ToolAnnotations(
         read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
     ))
     async def compute_usage(
-        task_id: str,
+        kind: str,
+        id: Union[int, str],
         window_seconds: int = 3600,
         allocation_id: Optional[str] = None,
         trial_id: Optional[int] = None,
@@ -172,67 +166,46 @@ def create_server(
         """Summarize one task's measured CPU, memory, and GPU use; compute_resources is cluster capacity."""
 
         return await call(
-            service.usage, task_id, owner, window_seconds, allocation_id, trial_id,
+            service.usage, kind, id, window_seconds, allocation_id, trial_id,
             metrics, include_samples,
         )
 
     @server.tool(annotations=ToolAnnotations(
         read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=True,
     ))
-    async def compute_cancel(task_id: str) -> dict[str, Any]:
-        """Cancel a task in the server's owner namespace."""
+    async def compute_cancel(kind: str, id: Union[int, str]) -> dict[str, Any]:
+        """Cancel one of the account's tasks; a generic task's descendants are killed with it."""
 
-        return await call(service.cancel, task_id, owner)
+        return await call(service.cancel, kind, id)
 
     @server.tool(annotations=ToolAnnotations(
         read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=True,
     ))
-    async def compute_pause(task_id: str) -> dict[str, Any]:
+    async def compute_pause(kind: str, id: Union[int, str]) -> dict[str, Any]:
         """Pause an experiment, or a generic task and its pausable descendants."""
 
-        return await call(service.pause, task_id, owner)
+        return await call(service.pause, kind, id)
 
     @server.tool(annotations=ToolAnnotations(
         read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
     ))
-    async def compute_resume(task_id: str) -> dict[str, Any]:
+    async def compute_resume(kind: str, id: Union[int, str]) -> dict[str, Any]:
         """Resume a paused experiment or generic task."""
 
-        return await call(service.resume, task_id, owner)
-
-    @server.tool(annotations=ToolAnnotations(
-        read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
-    ))
-    async def compute_reconcile(task_id: str, remote_id: str) -> dict[str, Any]:
-        """Bind an uncertain task to a remote id after verifying its identity marker."""
-
-        return await call(service.reconcile, task_id, owner, remote_id)
-
-    @server.tool(annotations=ToolAnnotations(
-        read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=False,
-    ))
-    async def compute_list_tasks() -> list[dict[str, Any]]:
-        """List tasks in the server's owner namespace."""
-
-        return await call(service.list_tasks, owner)
+        return await call(service.resume, kind, id)
 
     @server.tool(annotations=ToolAnnotations(
         read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
     ))
-    async def compute_discover(
-        kind: str, limit: int = 50, offset: int = 0
+    async def compute_list(
+        kind: str, limit: int = 50, offset: int = 0, marker: Optional[str] = None
     ) -> dict[str, Any]:
-        """Discover one kind of remote task with bounded pagination; this does not adopt it."""
+        """List one page of the account's tasks of one kind, newest first.
 
-        return await call(service.discover, kind, owner, limit, offset)
+        With marker, return the tasks on that page (one read each) whose config carries it.
+        """
 
-    @server.tool(annotations=ToolAnnotations(
-        read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
-    ))
-    async def compute_adopt(kind: str, remote_id: str) -> dict[str, Any]:
-        """Register an existing remote task in the local owner namespace without submitting work."""
-
-        return await call(service.adopt, kind, remote_id, owner)
+        return await call(service.list_tasks, kind, limit, offset, marker)
 
     if resource_inspector is not None:
 
@@ -276,13 +249,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--profile", help="Compute profile YAML (or DETERMINED_COMPUTE_PROFILE)")
     parser.add_argument("--storage-config", help="Client storage access YAML (or DETERMINED_COMPUTE_STORAGE)")
-    parser.add_argument("--db", help="Shared SQLite database (or DETERMINED_COMPUTE_DB)")
     parser.add_argument(
-        "--owner",
-        help="Bound owner namespace (or DETERMINED_COMPUTE_OWNER)",
+        "--api-url",
+        help="Determined master URL (defaults to the secrets file's DET_MASTER, else DET_MASTER); "
+        "must match a master the secrets file names",
     )
-    parser.add_argument("--api-url", help="Determined master URL (defaults to DET_MASTER)")
-    parser.add_argument("--api-token", help="Determined API token (defaults to DET_API_TOKEN)")
+    parser.add_argument(
+        "--api-token",
+        help="Determined API token for the selected master; replaces any other token or login",
+    )
     parser.add_argument("--secrets-file", help="Path to a KEY=VALUE secrets file")
     verify = parser.add_mutually_exclusive_group()
     verify.add_argument("--verify-ssl", action="store_true", dest="verify_ssl")
@@ -291,23 +266,11 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _runtime(args: argparse.Namespace) -> tuple[Any, str]:
+def _runtime(args: argparse.Namespace) -> Any:
     profile_path = args.profile or os.environ.get("DETERMINED_COMPUTE_PROFILE")
     if not profile_path:
         raise ValueError("--profile or DETERMINED_COMPUTE_PROFILE is required")
-
-    db_path = Path(args.db or os.environ.get("DETERMINED_COMPUTE_DB") or DEFAULT_DB_PATH)
-    if db_path == Path(":memory:"):
-        raise ValueError("MCP requires a persistent local database; :memory: is unsupported")
-    owner = args.owner or os.environ.get("DETERMINED_COMPUTE_OWNER")
-    if not owner:
-        raise ValueError("--owner or DETERMINED_COMPUTE_OWNER is required")
-    owner = normalize_owner(owner)
-    if db_path != Path(":memory:"):
-        db_path.expanduser().parent.mkdir(parents=True, exist_ok=True)
-        db_path = db_path.expanduser()
     profile = ComputeProfile.from_file(profile_path)
-    store = SQLiteTaskStore(db_path)
 
     def make_client() -> DeterminedAPIClient:
         return DeterminedAPIClient(
@@ -317,7 +280,7 @@ def _runtime(args: argparse.Namespace) -> tuple[Any, str]:
             verify_ssl=args.verify_ssl,
         )
 
-    service = ComputeService(_LazyClient(make_client), store, profile)
+    service = ComputeService(_LazyClient(make_client), profile)
 
     from determined_compute.storage import StorageAccessConfig, StorageService
     access_path = args.storage_config or os.environ.get("DETERMINED_COMPUTE_STORAGE")
@@ -325,13 +288,13 @@ def _runtime(args: argparse.Namespace) -> tuple[Any, str]:
     storage = StorageService(profile, access, Path(args.secrets_file).expanduser() if args.secrets_file else None)
 
     from determined_compute.compute.admission import ResourceInspector
-    return create_server(service, owner, storage, ResourceInspector(service.client)), owner
+    return create_server(service, storage, ResourceInspector(service.client))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        server, _owner = _runtime(args)
+        server = _runtime(args)
     except Exception as exc:
         # stdout is reserved for MCP frames.
         print(f"determined-compute-mcp: {exc}", file=os.sys.stderr)

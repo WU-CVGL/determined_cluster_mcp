@@ -8,7 +8,7 @@ An already prepared workload needs only Determined authentication to launch. SSH
 
 ## Configure access separately
 
-Keep storage access in its own YAML file and pass it with `--storage-config PATH` or `DETERMINED_COMPUTE_STORAGE`. It does not change the compute-profile fingerprint or task identity.
+Keep storage access in its own YAML file and pass it with `--storage-config PATH` or `DETERMINED_COMPUTE_STORAGE`. It does not change the compute profile or how tasks are submitted.
 
 ```yaml
 mode: auto                 # auto, local, or ssh

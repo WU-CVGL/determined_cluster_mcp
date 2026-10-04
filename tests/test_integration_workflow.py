@@ -1,4 +1,4 @@
-"""Exercise the real planning, durable state and HTTP adapter together, offline."""
+"""Exercise the real planning, task control and HTTP adapter together, offline."""
 from __future__ import annotations
 
 import json
@@ -6,7 +6,9 @@ import json
 import pytest
 import requests
 
-from determined_compute.compute import ComputeProfile, ComputeService, SQLiteTaskStore
+from determined_compute.compute import (
+    APIError, ComputeProfile, ComputeService, SubmissionUncertainError,
+)
 from determined_compute.core.api_client import DeterminedAPIClient
 
 
@@ -50,18 +52,32 @@ def mock_cluster_capacity(monkeypatch):
     monkeypatch.setattr(requests, 'get', get)
 
 
-def test_command_round_trip_keeps_shared_paths_and_identity_after_restart(tmp_path, monkeypatch):
+COMMAND_ID = '6f1e2d3c-4b5a-4968-8776-655443322110'
+ME = {'user': {'id': 7, 'username': 'alice'}}
+
+
+def routes(monkeypatch, extra):
+    capacity = requests.get
+
+    def get(url, **kwargs):
+        path = url.split('cluster.example:443/', 1)[1]
+        if path in extra:
+            return response(extra[path])
+        return capacity(url, **kwargs)
+    monkeypatch.setattr(requests, 'get', get)
+
+
+def test_command_round_trip_returns_the_native_id_and_reads_it_back(monkeypatch):
     sent = []
     def post(url, **kwargs):
         sent.append((url, kwargs['json']))
-        return response({'command': {'id': 'remote-command-1', 'state': 'STATE_RUNNING'}})
+        return response({'command': {'id': COMMAND_ID, 'state': 'STATE_RUNNING'}})
     monkeypatch.setattr(requests, 'post', post)
     client = DeterminedAPIClient(api_url='https://cluster.example:443', api_token='test-token')
-    db = tmp_path / 'tasks.sqlite3'
-    store = SQLiteTaskStore(db)
-    service = ComputeService(client, store, profile())
-    record = service.launch(request(), 'request-1', 'session-a')
-    assert record['remote_id'] == 'remote-command-1'
+    service = ComputeService(client, profile())
+    launched = service.launch(request())
+    assert launched['kind'] == 'command'
+    assert launched['id'] == COMMAND_ID
     assert len(sent) == 1
     assert sent[0][0].endswith('/api/v1/commands')
     payload = sent[0][1]
@@ -71,47 +87,70 @@ def test_command_round_trip_keeps_shared_paths_and_identity_after_restart(tmp_pa
     assert payload['config']['resources']['slots'] == 1
     assert 'slots_per_trial' not in payload['config']['resources']
     assert '/work/revisions/abc' in str(payload['config']['entrypoint'])
-    store.close()
-    new_store = SQLiteTaskStore(db)
-    resumed = ComputeService(client, new_store, profile())
-    assert resumed.launch(request(), 'request-1', 'session-a')['task_id'] == record['task_id']
-    assert len(sent) == 1
-    assert resumed.list_tasks('other-session') == []
-    monkeypatch.setattr(requests, 'get', lambda *a, **kw: response({
-        'command': {'id': 'remote-command-1', 'state': 'STATE_TERMINATED', 'exitStatus': 'exit code 2'}}))
-    status = resumed.status(record['task_id'], 'session-a')
+    # A new process needs nothing but the kind and the ID.
+    routes(monkeypatch, {
+        'api/v1/me': ME,
+        f'api/v1/commands/{COMMAND_ID}': {'command': {
+            'id': COMMAND_ID, 'userId': 7, 'state': 'STATE_TERMINATED',
+            'exitStatus': 'exit code 2'}},
+    })
+    restarted = ComputeService(
+        DeterminedAPIClient(api_url='https://cluster.example:443', api_token='test-token'),
+        profile(),
+    )
+    status = restarted.status('command', launched['id'])
     assert status['remote']['exitStatus'] == 'exit code 2'
-    assert status.get('success') is not True
-    new_store.close()
+    assert status['state'] == 'STATE_TERMINATED'
+    assert len(sent) == 1
 
 
-def test_http_auth_failure_does_not_become_uncertain_submission(tmp_path, monkeypatch):
-    monkeypatch.setattr(requests, 'post', lambda *a, **kw: response({'message': 'denied'}, 403))
-    store = SQLiteTaskStore(tmp_path / 'tasks.sqlite3')
-    client = DeterminedAPIClient(api_url='https://cluster.example:443', api_token='test-token')
-    service = ComputeService(client, store, profile())
-    with pytest.raises(Exception):
-        service.launch(request(), 'auth-test', 'session-a')
-    record = service.list_tasks('session-a')[0]
-    assert record['state'] == 'failed'
-    assert record['error_code'] != 'submission_uncertain'
-    store.close()
-
-
-def test_timeout_persists_identity_and_repeated_request_never_reposts(tmp_path, monkeypatch):
+def test_http_auth_failure_does_not_become_uncertain_submission(monkeypatch):
     calls = []
-    def uncertain(url, **kw):
-        calls.append(url)
+    def denied(*args, **kwargs):
+        calls.append(args)
+        return response({'message': 'denied'}, 403)
+    monkeypatch.setattr(requests, 'post', denied)
+    client = DeterminedAPIClient(api_url='https://cluster.example:443', api_token='test-token')
+    service = ComputeService(client, profile())
+    with pytest.raises(APIError) as caught:
+        service.launch(request())
+    assert not isinstance(caught.value, SubmissionUncertainError)
+    assert caught.value.code == 403
+    assert len(calls) == 1
+
+
+def test_timeout_is_unconfirmed_never_reposted_and_found_by_marker(monkeypatch):
+    calls = []
+    def uncertain(url, **kwargs):
+        calls.append(kwargs['json'])
         raise requests.ReadTimeout('simulated ambiguous acceptance')
     monkeypatch.setattr(requests, 'post', uncertain)
-    store = SQLiteTaskStore(tmp_path / 'tasks.sqlite3')
     client = DeterminedAPIClient(api_url='https://cluster.example:443', api_token='test-token')
-    service = ComputeService(client, store, profile())
-    with pytest.raises(Exception):
-        service.launch(request(), 'uncertain-test', 'session-a')
-    record = service.list_tasks('session-a')[0]
-    assert record['state'] == 'submission_uncertain'
-    repeated = service.launch(request(), 'uncertain-test', 'session-a')
-    assert repeated['task_id'] == record['task_id']
+    service = ComputeService(client, profile())
+    with pytest.raises(SubmissionUncertainError) as caught:
+        service.launch(request())
     assert len(calls) == 1
-    store.close()
+    marker = caught.value.details['submission_marker']
+    variables = calls[0]['config']['environment']['environment_variables']
+    assert f'COMPUTE_SUBMISSION_MARKER={marker}' in variables
+
+    # The master did accept it; the marker in its stored config identifies it.
+    listed = {'id': COMMAND_ID, 'userId': 7, 'username': 'alice',
+              'description': 'command: abc', 'state': 'STATE_RUNNING'}
+    routes(monkeypatch, {
+        'api/v1/me': ME,
+        'api/v1/commands': {
+            'commands': [listed],
+            'pagination': {'limit': 5, 'offset': 0, 'startIndex': 0, 'endIndex': 1,
+                           'total': 1},
+        },
+        f'api/v1/commands/{COMMAND_ID}': {
+            'command': listed,
+            'config': {'environment': {'environment_variables': {
+                'cpu': variables, 'cuda': variables, 'rocm': variables}}},
+        },
+    })
+    found = service.list_tasks('command', limit=5, marker=marker)
+    assert [(task['id'], task['submission_marker']) for task in found['tasks']] == [
+        (COMMAND_ID, marker)]
+    assert len(calls) == 1
