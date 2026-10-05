@@ -46,7 +46,7 @@ If `compute_launch` returns `submission_uncertain`, do not submit again automati
 
 ## Local workstation runs
 
-Only when the user has authorized it for the work at hand, and only for a short single-GPU job whose cluster slot would sit mostly idle: run the request's own command in the cluster's container image on a local GPU with `scripts/run_local.sh <request.json> <gpu-uuid>` (`--dry` prints the docker command). Training, RAM-heavy work and anything that wants many parallel CPU processes stay on the cluster. Read [references/local-runs.md](references/local-runs.md) before the first local run: it gives the pre-launch checks, the memory limit and watch, the launch record that replaces a Determined ID, and the rule that a local card is never compared bitwise with the cluster's.
+Only when the user has authorized it for the work at hand, and only for a short single-GPU job whose cluster slot would sit mostly idle: run the request's own command in the cluster's container image on a local GPU with `scripts/run_local.sh <request.json> <gpu-uuid> --shared-root <mount>` (`--dry` prints the docker command and the launch record and runs nothing). Training, RAM-heavy work and anything that wants many parallel CPU processes stay on the cluster. Read [references/local-runs.md](references/local-runs.md) before the first local run: it gives the pre-launch checks, the memory limit and watch, the launch record that replaces a Determined ID, and the rule that a local card is never compared bitwise with the cluster's.
 
 ## Report
 
