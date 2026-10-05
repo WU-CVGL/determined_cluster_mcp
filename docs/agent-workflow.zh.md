@@ -150,3 +150,9 @@ master 拒绝的暂停或恢复（例如暂停已暂停的任务）会以错误�
 MCP server 的凭据所选定的 Determined 账户是唯一的身份。每个操作任务的工具都会先检查该账户是否拥有该任务；对其他用户的任务，即使该账户是管理员，也会以 `ownership_mismatch` 拒绝。master 无法报告所有者的 generic 任务会以 `ownership_unavailable` 拒绝。要操作其他账户的任务，请使用该账户的凭据。
 
 MCP 不保存任务记录。任务、日志和 experiment 数据保存在 Determined 中；提交了什么以及为什么提交（例如 kind、ID、名称、版本和输出路径）由你自己记录。Determined 只在已结束的 command 或 shell 结束后 24 小时内提供它，因此应在此期间读取其日志和用量。
+
+<a id="local-workstation-runs"></a>
+## 本地工作站运行
+
+只有在用户为当前工作明确授权时，才可以把一个短小的单 GPU 任务（其集群 slot 大部分时间会闲置）放到本地工作站运行。训练、占用大量内存的工作，以及需要许多并行 CPU 进程的工作仍然留在集群上（批量 CPU 工作用零 slot 任务提交）。启动前，用 `nvidia-smi` 查看该 GPU 的其他使用者，并读取 `/proc/meminfo` 中的 `MemAvailable`；当可用内存低于容器内存上限加上主机余量时拒绝启动；一次只运行一个容器。用集群使用的同一容器镜像运行请求自身的命令，按相同路径挂载共享存储，并设置不带交换空间的硬性 `--memory` 上限（`skills/intensive-compute-runner/scripts/run_local.sh <request.json> <gpu-uuid>`；`--dry` 只打印 docker 命令）。在输出目录中写一份本地启动记录以代替 Determined ID（主机、GPU UUID 与名称、驱动、镜像摘要、请求文件 sha256、开始与结束时间、退出码），把输出放在集群任务会放的位置，运行期间监视内存，并且绝不把本地显卡的结果与集群显卡的结果按位比较。
+

@@ -1,6 +1,6 @@
 ---
 name: intensive-compute-runner
-description: Plan, launch, inspect, and stop resource-intensive GPU or CPU work on a Determined cluster through the determined-compute MCP tools (compute_* and storage_*). Use for heavy compute or managed cluster tasks; small local checks and hardware inspection alone are outside scope.
+description: Plans, launches, inspects and stops resource-intensive GPU or CPU work on a Determined cluster through the determined-compute MCP tools (compute_* and storage_*), and runs a user-authorized short single-GPU job on the local workstation in the cluster's container image. Use for heavy compute, managed cluster tasks, request planning and capacity checks, and when the user asks to run a cluster job locally; hardware inspection alone is outside scope.
 ---
 
 # Intensive Compute Runner
@@ -19,6 +19,8 @@ Let `kind: auto` select from intent when the request is clear:
 Set `interactive` or `overnight` explicitly when intent would otherwise be ambiguous. Use the minimum suitable `slots`; heavy CPU work can use zero GPU slots only if the service and target pool support it.
 
 Give each request a short, task-specific `name` and a `description` that states its purpose or config. Do not use task IDs or UUIDs as display names.
+
+The service validates `name` to at most 128 characters and `description` to at most 2,048 characters and refuses a longer value before anything is submitted. A validation refusal (`invalid_request`, not retryable) means no task was created: shorten the field, confirm with `compute_list(kind, limit=5)` that nothing matching the name exists, and launch once more.
 
 ## Prepare durable inputs
 
@@ -41,6 +43,10 @@ If the client lacks cluster mounts, read [the shared-storage access guide](../..
 Never include credentials in requests, configs, logs, or reports. A launch with `allow_queue: false` performs admission checking and rejects busy or unknown capacity without submitting; `true` explicitly permits scheduler queueing.
 
 If `compute_launch` returns `submission_uncertain`, do not submit again automatically. Look for the task with `compute_list(kind, marker=...)`, using the `submission_marker` from the error details and a small `limit`. One match is most likely the submission; several matches share a copied config, so ask the user. An empty result does not prove that the submission failed; report the unconfirmed launch and let the user decide whether to submit again. If authentication fails, stop and report the configuration problem; do not fall back to local execution.
+
+## Local workstation runs
+
+Only when the user has authorized it for the work at hand, and only for a short single-GPU job whose cluster slot would sit mostly idle: run the request's own command in the cluster's container image on a local GPU with `scripts/run_local.sh <request.json> <gpu-uuid>` (`--dry` prints the docker command). Training, RAM-heavy work and anything that wants many parallel CPU processes stay on the cluster. Read [references/local-runs.md](references/local-runs.md) before the first local run: it gives the pre-launch checks, the memory limit and watch, the launch record that replaces a Determined ID, and the rule that a local card is never compared bitwise with the cluster's.
 
 ## Report
 
