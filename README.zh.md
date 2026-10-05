@@ -73,7 +73,7 @@ mkdir -p "$HOME/.claude/skills"
 ln -s "$PWD/skills/intensive-compute-runner" "$HOME/.claude/skills/"
 ```
 
-启动新的 agent 会话即可加载。使用链接时，`git pull` 后 skill 会自动保持最新，skill 中的相对链接也会经由该链接指向本仓库的 `docs/`；因此应使用链接而不是复制，并保持仓库目录不动。若只想在某个 Claude Code 项目中使用，改为链接到该项目的 `.claude/skills/`。skill 要求上述 MCP 服务已接入。删除该链接即可卸载。
+启动新的 agent 会话即可加载。使用链接时，`git pull` 后 skill 会自动保持最新，skill 中的相对链接也会经由该链接的真实路径指向本仓库的 `docs/`；因此应使用链接而不是复制，并保持仓库目录不动。若只想在某个 Claude Code 项目中使用，改为链接到该项目的 `.claude/skills/`。skill 要求上述 MCP 服务已接入。删除该链接即可卸载。
 
 <a id="documentation"></a>
 ## 文档

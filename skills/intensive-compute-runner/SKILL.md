@@ -1,11 +1,11 @@
 ---
 name: intensive-compute-runner
-description: Plan, launch, monitor, and stop GPU or CPU jobs through the Determined compute MCP tools. Use for cluster workloads, capacity questions, and explicitly authorized short local GPU runs.
+description: Plan, launch, monitor, and stop GPU or CPU jobs through the Determined compute MCP tools. Use for Determined cluster workloads and cluster capacity questions, and for a user-authorized short local run of a cluster task; ordinary local runs and hardware inspection are out of scope.
 ---
 
 # Intensive Compute Runner
 
-Use the project's configured account, image, pool, and mount mappings. Keep credentials service-side. Get the command, inputs, output location, and success criteria from the task.
+Use the project's configured account, image, pool, and mount mappings. Keep credentials service-side. Get the command, inputs, output location, and success criteria from the task. Links to `../../docs/` are relative to this skill directory's real path; if the base directory is a symlink, resolve it first (for example `realpath <base directory>`) before reading them.
 
 ## Choose execution
 
@@ -20,11 +20,11 @@ Use the cluster for training, long runs, and heavy CPU or memory use.
 
 Use `kind: auto` when intent is clear; it never selects `generic`. Use the minimum suitable slots; CPU-only work can use `slots: 0` where supported. See the [compute reference](../../docs/compute-service.md) for request fields and kind selection.
 
-For a short single-GPU task already authorized to run locally, follow [local workstation runs](../../docs/agent-workflow.md#local-workstation-runs).
+For a short single-GPU task already authorized to run locally, read [local workstation runs](../../docs/agent-workflow.md#local-workstation-runs) first; if it cannot be read, do not run locally.
 
 ## Run a cluster task
 
-1. Prepare code, dependencies, and outputs on mapped shared storage. Use container paths for `workdir` and `output_dir`, and a stable revision for durable work. If needed, stage files through the [storage workflow](../../docs/shared-storage-access.md), reviewing the transfer preview and secret exclusions. Submit mapped paths without a source archive.
+1. Prepare code, dependencies, and outputs on mapped shared storage. Use container paths for `workdir` and `output_dir`. For durable work, stage each revision in its own directory, record it as `code_revision`, and do not sync into that directory afterwards: a restart or resume runs whatever it then holds. If needed, stage files through the [storage workflow](../../docs/shared-storage-access.md), reviewing the transfer preview and secret exclusions. Submit mapped paths without a source archive.
 2. Give the request a meaningful `name` (at most 128 characters) and `description` (at most 2,048). Call `compute_plan(request)` and inspect the resolved kind, image, paths, mounts, pool, and slots. Planning is offline.
 3. Keep `allow_queue: false` unless queueing is authorized. `compute_launch` checks capacity; use `compute_resources` when a capacity decision needs a live snapshot. Do not change the pool, slots, or execution location automatically.
 4. Call `compute_launch(request)` once. Every call is a new submission. Keep the returned `kind`, native Determined `id`, and `submission_marker`; the MCP stores no task records and manages only the configured account's tasks.
@@ -36,7 +36,7 @@ If `name` or `description` is rejected as too long with `invalid_request`, short
 
 For `submission_uncertain`, do not launch again automatically. Search with `compute_list(kind, marker=...)` using the returned `submission_marker`. An empty result does not prove failure; report an unresolved or ambiguous result and leave resubmission to the user. See [unconfirmed submissions](../../docs/troubleshooting.md#submission-outcome-is-uncertain).
 
-Report authentication or configuration errors and fix their cause. They do not authorize a local fallback.
+Stop and report authentication or deployment-configuration errors without reading credential values or changing the secrets file or MCP configuration; see [authentication fails](../../docs/troubleshooting.md#authentication-fails). They do not authorize a local fallback.
 
 ## Report
 
