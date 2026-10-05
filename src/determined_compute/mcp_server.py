@@ -84,7 +84,8 @@ def create_server(
         "determined-compute",
         instructions=(
             "Choose a meaningful request.name and request.description for each launch. "
-            "Check capacity with compute_resources; queuing requires explicit allow_queue=true. "
+            "Use compute_resources for capacity questions. Launch checks capacity unless "
+            "queuing is explicitly authorized with allow_queue=true. "
             "Keep code and data on shared mounts; use storage_check/sync/fetch for file access. "
             "Plan before launch. Every launch is a new submission: the server keeps no task "
             "records, so keep the returned kind and id, which are Determined's own task ID. "

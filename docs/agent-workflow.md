@@ -67,13 +67,13 @@ A transfer copies directory contents and does not delete extra destination files
 
 ## Check capacity and avoid accidental queues
 
-Call `compute_resources(slots, pool)` with the requested pool and slot count. A zero-slot command still needs the auxiliary-capacity check. Capacity is a current snapshot, not a reservation.
+Use `compute_resources(slots, pool)` when choosing resources, answering a capacity question, or investigating a capacity rejection. Positive slots check schedulable agent slots; zero slots check auxiliary-container capacity. The result is a snapshot, not a reservation. With `allow_queue: false`, `compute_launch` performs this admission check before submitting, so a separate capacity query is not required for every launch.
 
 Keep `allow_queue: false` unless the user explicitly wants the task to wait in a queue. If capacity is unavailable or unknown, report that result. Do not silently switch pools, change the slot count, or enable queuing.
 
 ## Plan, review, and launch once
 
-Create a request with a meaningful `name` and `description`, the selected `kind`, command, container `workdir`, container `output_dir`, slot count, `allow_queue`, and a revision or content identifier when available. The image and pool may come from the compute profile or explicit approved overrides.
+Create a request with a meaningful `name` (at most 128 characters) and `description` (at most 2,048), the selected `kind`, command, container `workdir`, container `output_dir`, slot count, `allow_queue`, and a revision or content identifier when available. The image and pool may come from the compute profile or explicit approved overrides. An overlong name or description is rejected with `invalid_request` before submission; shorten it and submit the corrected request.
 
 ```json
 {
@@ -142,5 +142,8 @@ The MCP keeps no task records. Determined keeps the tasks, their logs, and their
 
 ## Local workstation runs
 
-When the user authorizes it for the work at hand, a short single-GPU job whose cluster slot would sit mostly idle may run on the local workstation instead. Keep training, RAM-heavy work and anything that wants many parallel CPU processes on the cluster (bulk CPU work as zero-slot tasks). Before launching, read `nvidia-smi` for the GPU's other users and `MemAvailable` from `/proc/meminfo`, and refuse when the available memory is below the container's limit plus headroom; run one container at a time. Run the request's command in the cluster's own container image with the shared storage mounted at the same path and a hard `--memory` limit without swap (`skills/intensive-compute-runner/scripts/run_local.sh <request.json> <gpu-uuid>`; `--dry` prints the docker command). Write a local launch record in the output directory in place of a Determined ID (host, GPU UUID and name, driver, image digest, request sha256, start and end time, exit code), keep the outputs where a cluster job would put them, watch memory while the job runs, and never compare a local card's rows bitwise with the cluster's.
+Use the local workstation for a short single-GPU task only when the user has authorized local execution for that work. Keep training, long runs, and heavy CPU or memory use on the cluster. Cluster authentication or capacity errors do not authorize a local fallback.
 
+Use the project's existing Docker command or a direct `docker run` with the workstation's installed GPU runtime. Reuse the selected image, workload command, working directory, and required environment. Map each local source directory to its intended container path, preserving read-only mounts. Check the selected GPU's availability and host memory, then set explicit `--cpus` and `--memory` limits that leave room for other work; set `--memory-swap` equal to `--memory` to disable container swap.
+
+Keep the container ID, capture its logs and exit result, and verify the expected outputs in the project's chosen location. If interrupted or abandoning the run, stop that container and confirm it exited. Report the actual GPU, image, revision, and result; a local container has no Determined task ID.

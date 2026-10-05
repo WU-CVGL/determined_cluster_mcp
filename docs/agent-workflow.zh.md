@@ -73,14 +73,14 @@ MCP 不接受 `kind: notebook`。
 <a id="check-capacity-and-avoid-accidental-queues"></a>
 ## 检查容量并避免意外排队
 
-使用所需资源池和槽位数调用 `compute_resources(slots, pool)`。零槽位 command 仍需检查辅助容器容量。容量结果只是当前快照，不是资源预留。
+需要选择资源、回答容量问题或排查容量拒绝时，调用 `compute_resources(slots, pool)`。正槽位数检查可调度的 agent slot，零槽位检查辅助容器容量。结果只是快照，不是资源预留。`allow_queue: false` 时，`compute_launch` 会在提交前执行这项准入检查，因此不必在每次提交前单独查询容量。
 
 除非用户明确要求等待，否则保持 `allow_queue: false`。容量不足或无法确定时，报告该结果。不要擅自切换资源池、改变槽位数或开启排队。
 
 <a id="plan-review-and-launch-once"></a>
 ## 规划、审核并只提交一次
 
-创建请求时填写有意义的 `name` 和 `description`，并提供选定的 `kind`、命令、容器 `workdir`、容器 `output_dir`、槽位数、`allow_queue`，以及存在时的版本或内容标识。镜像和资源池可来自计算 profile，也可使用明确批准的覆盖值。
+创建请求时填写有意义的 `name`（最多 128 个字符）和 `description`（最多 2,048 个字符），并提供选定的 `kind`、命令、容器 `workdir`、容器 `output_dir`、槽位数、`allow_queue`，以及存在时的版本或内容标识。镜像和资源池可来自计算 profile，也可使用明确批准的覆盖值。过长的名称或描述会在提交前以 `invalid_request` 拒绝；缩短后提交修正的请求即可。
 
 ```json
 {
@@ -154,5 +154,8 @@ MCP 不保存任务记录。任务、日志和 experiment 数据保存在 Determ
 <a id="local-workstation-runs"></a>
 ## 本地工作站运行
 
-只有在用户为当前工作明确授权时，才可以把一个短小的单 GPU 任务（其集群 slot 大部分时间会闲置）放到本地工作站运行。训练、占用大量内存的工作，以及需要许多并行 CPU 进程的工作仍然留在集群上（批量 CPU 工作用零 slot 任务提交）。启动前，用 `nvidia-smi` 查看该 GPU 的其他使用者，并读取 `/proc/meminfo` 中的 `MemAvailable`；当可用内存低于容器内存上限加上主机余量时拒绝启动；一次只运行一个容器。用集群使用的同一容器镜像运行请求自身的命令，按相同路径挂载共享存储，并设置不带交换空间的硬性 `--memory` 上限（`skills/intensive-compute-runner/scripts/run_local.sh <request.json> <gpu-uuid>`；`--dry` 只打印 docker 命令）。在输出目录中写一份本地启动记录以代替 Determined ID（主机、GPU UUID 与名称、驱动、镜像摘要、请求文件 sha256、开始与结束时间、退出码），把输出放在集群任务会放的位置，运行期间监视内存，并且绝不把本地显卡的结果与集群显卡的结果按位比较。
+只有用户已为当前工作授权本地执行时，才在本地工作站运行短小的单 GPU 任务。训练、长时间运行，以及大量使用 CPU 或内存的工作留在集群。集群认证或容量错误不构成本地回退授权。
 
+使用项目已有的 Docker 命令，或通过工作站已安装的 GPU runtime 直接执行 `docker run`。沿用选定的镜像、任务命令、工作目录和必要的环境变量。将每个本地源目录映射到所需的容器路径，并保留只读挂载。检查选定 GPU 的可用情况和主机内存，再明确设置 `--cpus` 和 `--memory` 上限，为其他工作留出余量；将 `--memory-swap` 设为与 `--memory` 相同的值，禁用容器交换空间。
+
+保留容器 ID，收集日志和退出结果，并在项目选定的位置验证预期输出。运行被中断或不再继续时，停止该容器并确认它已退出。报告实际 GPU、镜像、版本和结果；本地容器没有 Determined 任务 ID。
