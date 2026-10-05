@@ -68,19 +68,19 @@ MCP 不接受 `kind: notebook`。
 4. 仅当预览正确时，以 `dry_run=false` 调用完全相同的操作。
 5. 对准备好的工作目录和所需输入再次调用 `storage_check`。
 
-传输会复制目录内容，不会删除目标中多余的文件；但可能覆盖同名文件，因此预览是安全检查的一部分。没有存储后端时，规划仍不会验证远端文件是否存在或权限是否有效；应让任务自身验证所需输入并写出可观察的结果。SSH 认证、排除规则和传输行为见[共享存储访问](shared-storage-access.zh.md)。
+传输会复制目录内容，不会删除目标中多余的文件；但可能覆盖同名文件，因此预览是安全检查的一部分。可能重启或恢复的任务，应把每个版本放在单独的目录中，之后不要再向该目录同步；重启或恢复会运行该目录当时的内容，而 `code_revision` 仍记录原来的版本。没有存储后端时，规划仍不会验证远端文件是否存在或权限是否有效；应让任务自身验证所需输入并写出可观察的结果。SSH 认证、排除规则和传输行为见[共享存储访问](shared-storage-access.zh.md)。
 
 <a id="check-capacity-and-avoid-accidental-queues"></a>
 ## 检查容量并避免意外排队
 
-使用所需资源池和槽位数调用 `compute_resources(slots, pool)`。零槽位 command 仍需检查辅助容器容量。容量结果只是当前快照，不是资源预留。
+需要选择资源、回答容量问题或排查容量拒绝时，调用 `compute_resources(slots, pool)`。正槽位数检查可调度的 agent slot，零槽位检查辅助容器容量。结果只是快照，不是资源预留。`allow_queue: false` 时，`compute_launch` 会在提交前执行这项准入检查，因此不必在每次提交前单独查询容量。
 
 除非用户明确要求等待，否则保持 `allow_queue: false`。容量不足或无法确定时，报告该结果。不要擅自切换资源池、改变槽位数或开启排队。
 
 <a id="plan-review-and-launch-once"></a>
 ## 规划、审核并只提交一次
 
-创建请求时填写有意义的 `name` 和 `description`，并提供选定的 `kind`、命令、容器 `workdir`、容器 `output_dir`、槽位数、`allow_queue`，以及存在时的版本或内容标识。镜像和资源池可来自计算 profile，也可使用明确批准的覆盖值。
+创建请求时填写有意义的 `name`（最多 128 个字符）和 `description`（最多 2,048 个字符），并提供选定的 `kind`、命令、容器 `workdir`、容器 `output_dir`、槽位数、`allow_queue`，以及存在时的版本或内容标识。镜像和资源池可来自计算 profile，也可使用明确批准的覆盖值。过长的名称或描述会在提交前以 `invalid_request` 拒绝；缩短后提交修正的请求即可。
 
 ```json
 {
@@ -150,3 +150,12 @@ master 拒绝的暂停或恢复（例如暂停已暂停的任务）会以错误�
 MCP server 的凭据所选定的 Determined 账户是唯一的身份。每个操作任务的工具都会先检查该账户是否拥有该任务；对其他用户的任务，即使该账户是管理员，也会以 `ownership_mismatch` 拒绝。master 无法报告所有者的 generic 任务会以 `ownership_unavailable` 拒绝。要操作其他账户的任务，请使用该账户的凭据。
 
 MCP 不保存任务记录。任务、日志和 experiment 数据保存在 Determined 中；提交了什么以及为什么提交（例如 kind、ID、名称、版本和输出路径）由你自己记录。Determined 只在已结束的 command 或 shell 结束后 24 小时内提供它，因此应在此期间读取其日志和用量。
+
+<a id="local-workstation-runs"></a>
+## 本地工作站运行
+
+只有用户已为当前工作授权本地执行时，才在本地工作站运行短小的单 GPU 任务。训练、长时间运行，以及大量使用 CPU 或内存的工作留在集群。集群认证或容量错误不构成本地回退授权。
+
+使用项目已有的 Docker 命令，或通过工作站已安装的 GPU runtime 直接执行 `docker run`。从 `compute_plan` 渲染出的配置中取镜像、环境变量和 `entrypoint`，而不只是请求本身：只有渲染出的 entrypoint 包含服务的 `mkdir`/`cd` 准备步骤，只有渲染出的环境变量包含 `COMPUTE_WORKDIR`、`COMPUTE_OUTPUT_DIR`，以及请求设置了 `code_revision` 时的 `COMPUTE_CODE_REVISION`。直接 `docker run` 时，用 `--entrypoint ''` 清除镜像入口，因为 Determined 也会替换它。`entrypoint` 为列表时（command 和 generic 任务），按原顺序作为独立参数传入；为字符串时（experiment），像 Determined 一样把完整字符串作为 `sh -c` 后的一个参数。将每个本地源目录映射到所需的容器路径，并保留只读挂载。检查选定 GPU 的可用情况和主机内存，再明确设置 `--cpus` 和 `--memory` 上限，为其他工作留出余量；将 `--memory-swap` 设为与 `--memory` 相同的值，禁用容器交换空间。
+
+以分离模式（`docker run -d`）并用唯一的 `--name` 启动容器，避免 shell 工具超时或 `docker` 客户端中断后留下无法找到和停止的运行中容器。保留容器 ID，收集日志和退出结果，并在项目选定的位置验证预期输出。运行被中断或不再继续时，停止该容器并确认它已退出。报告实际 GPU、镜像、版本和结果；本地容器没有 Determined 任务 ID。

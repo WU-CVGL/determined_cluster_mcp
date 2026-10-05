@@ -63,17 +63,17 @@ If the project is already complete on shared storage and the caller supplied its
 4. Call the identical operation with `dry_run=false` only when that preview is correct.
 5. Call `storage_check` again for the prepared working directory and required inputs.
 
-A transfer copies directory contents and does not delete extra destination files. It can replace same-named files, so the preview is part of the safety check. Without a storage backend, planning still does not verify remote file existence or permissions; make the workload validate required inputs and write an observable result. See [shared storage access](shared-storage-access.md) for SSH authentication, exclusions, and transfer behavior.
+A transfer copies directory contents and does not delete extra destination files. It can replace same-named files, so the preview is part of the safety check. Stage each revision of work that can restart or resume in its own directory and do not sync into it afterwards; a restart or resume runs whatever that directory then holds, while `code_revision` still names the original revision. Without a storage backend, planning still does not verify remote file existence or permissions; make the workload validate required inputs and write an observable result. See [shared storage access](shared-storage-access.md) for SSH authentication, exclusions, and transfer behavior.
 
 ## Check capacity and avoid accidental queues
 
-Call `compute_resources(slots, pool)` with the requested pool and slot count. A zero-slot command still needs the auxiliary-capacity check. Capacity is a current snapshot, not a reservation.
+Use `compute_resources(slots, pool)` when choosing resources, answering a capacity question, or investigating a capacity rejection. Positive slots check schedulable agent slots; zero slots check auxiliary-container capacity. The result is a snapshot, not a reservation. With `allow_queue: false`, `compute_launch` performs this admission check before submitting, so a separate capacity query is not required for every launch.
 
 Keep `allow_queue: false` unless the user explicitly wants the task to wait in a queue. If capacity is unavailable or unknown, report that result. Do not silently switch pools, change the slot count, or enable queuing.
 
 ## Plan, review, and launch once
 
-Create a request with a meaningful `name` and `description`, the selected `kind`, command, container `workdir`, container `output_dir`, slot count, `allow_queue`, and a revision or content identifier when available. The image and pool may come from the compute profile or explicit approved overrides.
+Create a request with a meaningful `name` (at most 128 characters) and `description` (at most 2,048), the selected `kind`, command, container `workdir`, container `output_dir`, slot count, `allow_queue`, and a revision or content identifier when available. The image and pool may come from the compute profile or explicit approved overrides. An overlong name or description is rejected with `invalid_request` before submission; shorten it and submit the corrected request.
 
 ```json
 {
@@ -139,3 +139,11 @@ With `marker`, `compute_list` returns the tasks on the selected page whose confi
 The Determined account selected by the MCP server's credentials is the only identity. Every tool that acts on a task first checks that this account owns it, and refuses another user's task with `ownership_mismatch`, even when the account is an administrator. A generic task whose owner the master cannot report is refused with `ownership_unavailable`. To act on another account's task, use that account's credentials.
 
 The MCP keeps no task records. Determined keeps the tasks, their logs, and their experiment data; you keep the record of what you launched and why, such as the kind, ID, name, revision, and output path. Determined serves an ended command or shell for only 24 hours after it ends, so read its logs and usage while it is available.
+
+## Local workstation runs
+
+Use the local workstation for a short single-GPU task only when the user has authorized local execution for that work. Keep training, long runs, and heavy CPU or memory use on the cluster. Cluster authentication or capacity errors do not authorize a local fallback.
+
+Use the project's existing Docker command or a direct `docker run` with the workstation's installed GPU runtime. Take the image, environment variables, and `entrypoint` from `compute_plan`'s rendered config, not just the request: only the rendered entrypoint has the service's `mkdir`/`cd` setup step, and only the rendered environment has `COMPUTE_WORKDIR`, `COMPUTE_OUTPUT_DIR`, and, when the request sets `code_revision`, `COMPUTE_CODE_REVISION`. For a direct `docker run`, clear the image entrypoint with `--entrypoint ''`, since Determined replaces it. Pass a list-valued `entrypoint` (commands and generic tasks) as separate arguments in order; pass a string-valued one (experiments) as a single argument to `sh -c`, as Determined does. Map each local source directory to its intended container path, preserving read-only mounts. Check the selected GPU's availability and host memory, then set explicit `--cpus` and `--memory` limits that leave room for other work; set `--memory-swap` equal to `--memory` to disable container swap.
+
+Start the container detached (`docker run -d`) with a unique `--name`, so a shell-tool timeout or an interrupted `docker` client cannot leave a running container you cannot find and stop. Keep the container ID, capture its logs and exit result, and verify the expected outputs in the project's chosen location. If interrupted or abandoning the run, stop that container and confirm it exited. Report the actual GPU, image, revision, and result; a local container has no Determined task ID.

@@ -68,7 +68,7 @@ mkdir -p "$HOME/.claude/skills"
 ln -s "$PWD/skills/intensive-compute-runner" "$HOME/.claude/skills/"
 ```
 
-Start a new agent session to load it. A link keeps the skill current after `git pull`, and the skill's relative links reach this checkout's `docs/` through it, so link rather than copy and keep the checkout in place. To use the skill in one Claude Code project only, link it into that project's `.claude/skills/` instead. The skill expects the MCP server above to be connected. Remove the link to uninstall.
+Start a new agent session to load it. A link keeps the skill current after `git pull`, and the skill's relative links reach this checkout's `docs/` through the link's real path, so link rather than copy and keep the checkout in place. To use the skill in one Claude Code project only, link it into that project's `.claude/skills/` instead. The skill expects the MCP server above to be connected. Remove the link to uninstall.
 
 ## Documentation
 
