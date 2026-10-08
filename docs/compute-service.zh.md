@@ -360,9 +360,9 @@ generic 任务，该实体合并任务记录（`GET /api/v1/tasks/{id}`）和提
 | --- | --- |
 | `resource_pool` | 作业所在队列的资源池 |
 | `state` | 调度器状态：`STATE_QUEUED`、`STATE_SCHEDULED` 或 `STATE_SCHEDULED_BACKFILLED` |
-| `jobs_ahead` | 资源池队列中排在该作业之前的作业数；资源池的调度器不为作业排序（fair share）时为 `null` |
+| `jobs_ahead` | 作业在资源池队列中的位置：调度器排在它之前的作业数，可能包括已在运行的作业。它不是等待时间的预测；资源池的调度器不为作业排序（fair share）时为 `null` |
 | `requested_slots`、`allocated_slots` | 作业请求和持有的槽位数 |
-| `placement` | `{agent_id, device_ids}` 列表，作业在哪个 agent 上持有槽位就有一项；device ID 升序排列，与该 agent 所在节点上 `nvidia-smi` 的编号一致。排队中或零槽位的作业为 `[]`；早于 research-cluster fork 0.42.0 的 master 为 `null` |
+| `placement` | `{agent_id, device_ids}` 列表，作业在哪个 agent 上持有槽位就有一项；`device_ids` 是该 agent 的槽位 device ID，升序排列；只有 NVIDIA GPU 槽位的 device ID 才与该 agent 所在节点上 `nvidia-smi` 的编号一致。排队中或零槽位的作业为 `[]`；早于 research-cluster fork 0.42.0 的 master 为 `null` |
 
 有结束时间的任务已结束；command 和 shell 不报告结束时间，状态为 `STATE_TERMINATED` 时即已结束。
 已结束的任务得到 `queue: null`，不发送请求。找不到作业时，`queue` 为 `null`，并由

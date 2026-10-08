@@ -28,7 +28,7 @@ For a short single-GPU task already authorized to run locally, read [local works
 2. Give the request a meaningful `name` (at most 128 characters) and `description` (at most 2,048). Call `compute_plan(request)` and inspect the resolved kind, image, paths, mounts, pool, and slots. Planning is offline.
 3. Keep `allow_queue: false` unless queueing is authorized. `compute_launch` checks capacity; use `compute_resources` when a capacity decision needs a live snapshot. Do not change the pool, slots, or execution location automatically.
 4. Call `compute_launch(request)` once. Every call is a new submission. Keep the returned `kind`, native Determined `id`, and `submission_marker`; the MCP stores no task records and manages only the configured account's tasks.
-5. Follow `compute_status` and `compute_logs`, then check the exit result and expected outputs. Use `compute_usage` when resource measurements are needed; missing values do not mean idle resources. While the task has not ended, `compute_status.queue` gives `jobs_ahead` and, once scheduled, the agents and GPUs in `placement`; a null `queue` does not mean the task is not queued. Use `compute_cancel` to stop the intended task.
+5. Follow `compute_status` and `compute_logs`, then check the exit result and expected outputs. Use `compute_usage` when resource measurements are needed; missing values do not mean idle resources. While the task has not ended, `compute_status.queue` gives the queue position `jobs_ahead` (not a wait-time prediction) and, once scheduled, the agents and slot device IDs in `placement`; a null `queue` does not mean the task is not queued. Use `compute_cancel` to stop the intended task.
 
 ## Handle failed submissions
 

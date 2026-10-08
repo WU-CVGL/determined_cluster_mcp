@@ -402,9 +402,9 @@ the ownership check, and reports the task's own job as `queue`:
 | --- | --- |
 | `resource_pool` | Pool whose queue holds the job |
 | `state` | The scheduler's state: `STATE_QUEUED`, `STATE_SCHEDULED`, or `STATE_SCHEDULED_BACKFILLED` |
-| `jobs_ahead` | Jobs ahead of this one in the pool's queue; `null` when the pool's scheduler does not rank jobs (fair share) |
+| `jobs_ahead` | The job's position in the pool's queue: the number of jobs the scheduler ranks ahead of it, which can include jobs already running. It is not a prediction of wait time; `null` when the pool's scheduler does not rank jobs (fair share) |
 | `requested_slots`, `allocated_slots` | Slots the job requests and holds |
-| `placement` | List of `{agent_id, device_ids}`, one per agent where the job holds slots; device IDs ascend and match the `nvidia-smi` index on that agent's node. `[]` for a queued or zero-slot job; `null` on a master older than the research-cluster fork 0.42.0 |
+| `placement` | List of `{agent_id, device_ids}`, one per agent where the job holds slots; `device_ids` are the agent's slot device IDs, ascending, which equal the `nvidia-smi` index on that agent's node only for NVIDIA GPU slots. `[]` for a queued or zero-slot job; `null` on a master older than the research-cluster fork 0.42.0 |
 
 A task with an end time has ended; a command or shell, which reports no end time, has
 ended once its state is `STATE_TERMINATED`. An ended task gets `queue: null` without a
