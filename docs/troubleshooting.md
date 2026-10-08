@@ -94,7 +94,7 @@ Drained or disabled slots and disabled agents are not capacity. When the agent l
 
 For a request with `prefer_gpu_topology: "strong"` and 2 or more slots:
 
-- `capacity_unavailable` with `retryable: false`: the master refuses this `"strong"` request with the pool's current agents; no agent, or no NUMA node, has N slots. Choosing `"soft"`, fewer GPUs, or another pool is the user's decision.
+- `capacity_unavailable` with `retryable: false`: the master refuses this `"strong"` request with the pool's current agents, static or provisioned. When no agent has N slots, the request needs fewer slots or another pool; when an agent has N slots but no NUMA node does, `"soft"` may also fit. The choice is the user's.
 - `capacity_unknown` naming GPU topology: the account cannot see agent GPU topology, or it does not match the slots. Requests without `"strong"` do not need it. Queue only with the user's consent.
 - A queued `"strong"` task logs `GPU topology preference strong: waiting until one NUMA node of an agent in pool P has N free GPUs`. It can still fail later with `no NUMA node in pool P has N slots; use soft`, for example after a master restart or a GPU exclusion; a trial that fails this way is not restarted.
 

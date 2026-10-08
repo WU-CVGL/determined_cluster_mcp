@@ -261,8 +261,10 @@ agent 运行，准入不检查这种情况：只要有一个 agent 有足够空�
 设置 `prefer_gpu_topology: "strong"` 且请求 2 个及以上 slot 时，所有任务类型（包括 experiment）
 都需要一个可调度 agent 在其同一 NUMA 节点上有 N 个空闲 GPU；`"soft"` 按无偏好的方式检查。对于
 `"strong"`，如果某个 agent 的 GPU 拓扑对当前账户不可见或与其 slot 不一致，容量同样为未知。master
-在资源池当前的 agent 下会拒绝的 `"strong"` 请求（没有 agent 或没有 NUMA 节点拥有 N 个 slot）会以
-`capacity_unavailable`、`retryable: false` 和 master 给出的原因失败。请求 0 或 1 个 slot 时该偏好
+在资源池当前的 agent 下（无论静态还是自动扩缩的资源池）会拒绝的 `"strong"` 请求会以
+`capacity_unavailable` 和 `retryable: false` 失败：没有 agent 拥有 N 个 slot 时，需要减少 slot 或
+换用其他资源池；有 agent 拥有 N 个 slot 但没有 NUMA 节点拥有时，`"soft"` 可能放得下。尚无 agent
+的非静态资源池会等待其 agent。请求 0 或 1 个 slot 时该偏好
 不起作用：它不会被发送，规划结果带有 advisory `gpu_topology_ignored`。准入看不到正在等待的任务：
 一个等待 NUMA 节点的高优先级任务可能让已通过准入的低优先级任务一直排队。
 

@@ -102,7 +102,7 @@ Requests 从 MCP 进程环境读取 `HTTPS_PROXY`、`HTTP_PROXY` 和 `NO_PROXY` 
 
 对于设置 `prefer_gpu_topology: "strong"` 且请求 2 个及以上 slot 的请求：
 
-- `capacity_unavailable` 且 `retryable: false`：master 在资源池当前的 agent 下会拒绝这个 `"strong"` 请求；没有 agent 或没有 NUMA 节点拥有 N 个 slot。是否改用 `"soft"`、更少 GPU 或其他资源池由用户决定。
+- `capacity_unavailable` 且 `retryable: false`：master 在资源池当前的 agent 下（无论静态还是自动扩缩的资源池）会拒绝这个 `"strong"` 请求。没有 agent 拥有 N 个 slot 时，需要减少 slot 或换用其他资源池；有 agent 拥有 N 个 slot 但没有 NUMA 节点拥有时，`"soft"` 也可能放得下。如何选择由用户决定。
 - 指明 GPU 拓扑的 `capacity_unknown`：当前账户看不到 agent 的 GPU 拓扑，或拓扑与 slot 不一致。不设置 `"strong"` 的请求不需要拓扑。只有在用户同意时才排队。
 - 排队中的 `"strong"` 任务会记录日志 `GPU topology preference strong: waiting until one NUMA node of an agent in pool P has N free GPUs`。它之后仍可能以 `no NUMA node in pool P has N slots; use soft` 失败，例如在 master 重启或某个 GPU 被排除之后；以这种方式失败的 trial 不会被重启。
 

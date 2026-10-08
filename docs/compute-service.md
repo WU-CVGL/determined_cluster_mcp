@@ -288,9 +288,11 @@ With `prefer_gpu_topology: "strong"` and 2 or more slots, every kind, an experim
 included, needs one schedulable agent with N free GPUs on one NUMA node of that agent;
 `"soft"` is checked like no preference. For `"strong"`, capacity is also unknown when an
 agent's GPU topology is not visible to the account or does not match its slots. A
-`"strong"` request that the master refuses with the pool's current agents (no agent, or
-no NUMA node, with N slots) fails with `capacity_unavailable`, `retryable: false`, and the
-master's reason. With 0 or 1 slot the preference has no effect: it is not sent, and the
+`"strong"` request that the master refuses with the pool's current agents, static or
+provisioned, fails with `capacity_unavailable` and `retryable: false`: when no agent has N
+slots, the request needs fewer slots or another pool; when an agent has N slots but no NUMA
+node does, `"soft"` may fit. A pool that is not static and has no agents yet waits for them.
+With 0 or 1 slot the preference has no effect: it is not sent, and the
 plan carries the advisory `gpu_topology_ignored`. Admission does not see waiting tasks: a
 higher-priority task waiting for a NUMA node can keep an admitted lower-priority task
 queued.
