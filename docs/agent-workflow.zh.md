@@ -77,7 +77,7 @@ MCP 不接受 `kind: notebook`。
 
 对于多 GPU 数据并行任务，`prefer_gpu_topology` 可取 `"strong"`（全部 GPU 在同一 agent 的同一 NUMA 节点上；等待到有这样的节点空闲）或 `"soft"`（不会为等待更好的 GPU 拓扑而额外排队；GPU 可能跨 NUMA 节点）；不设置表示没有偏好。用户明确提出拓扑要求时照做；否则保持默认，即没有偏好。向 `compute_resources(slots=N, pool=P, prefer_gpu_topology=...)` 和 `compute_launch` 传入同一个值。只有当拓扑决定任务能否运行且用户意图不明确时，才询问用户。`max_numa_node_free_slots` 是当前能放下的最大 `"strong"` 任务，`max_numa_node_slots` 是 master 接受的最大值。N 更大时，向用户报告拒绝信息给出的选项（更少 GPU、其他资源池，或在某个 agent 有 N 个 slot 时改用 `"soft"`）；不要自行切换。`"strong"` experiment 的每个 trial 分别需要同一 NUMA 节点上的 N 个空闲 GPU；多个 trial 可以共用一个节点。以资源池的默认优先级提交 `"strong"` 任务：未开启抢占时，一个等待中的任务会挡住所有需要 slot 的低优先级任务。
 
-除非用户明确要求等待，否则保持 `allow_queue: false`。容量不足或无法确定，或资源池不存在或对你不可用时，报告该结果；指明某个资源池的 `permission_denied` 错误表示当前账户无权使用该资源池。不要擅自切换资源池、改变槽位数或开启排队。
+除非用户明确要求等待，否则保持 `allow_queue: false`。容量不足或无法确定，或资源池不存在或对你不可用时，报告该结果；指明某个资源池的 `permission_denied` 错误表示当前账户无权使用该资源池。不要擅自切换资源池、改变槽位数或开启排队。以 `capacity_unknown` 或 `capacity_unavailable` 被拒绝的提交没有提交任何任务。不要循环重新提交；报告该结果，或请用户决定使用 `allow_queue: true` 或其他资源池。在 research-cluster fork 0.41.1 或更高版本上，排队中的任务在 master 重启后仍保持排队。
 
 <a id="plan-review-and-launch-once"></a>
 ## 规划、审核并只提交一次
@@ -107,9 +107,11 @@ MCP 不接受 `kind: notebook`。
 <a id="monitor-and-accept-the-result"></a>
 ## 跟踪并验收结果
 
-调用 `compute_status(kind, id)`，直到任务进入终态；使用 `compute_logs(kind, id, tail)` 检查进度和最后的消息。用户不再需要运行中的任务时，调用 `compute_cancel(kind, id)`。
+调用 `compute_status(kind, id)`，直到任务进入终态；使用 `compute_logs(kind, id, tail)` 检查进度和最后的消息。用户不再需要运行中的任务时，调用 `compute_cancel(kind, id)`。 后台 shell 无法调用 MCP 工具，因此应在你自己的回合中轮询 `compute_status`。发生故障或收到 5xx 之后，在你自己的回合中用 `compute_resources` 检查 master 是否应答；不要启动在 shell 中监视 master 的脚本。要一次检查多个 experiment 或 generic 任务，调用 `compute_list(kind, states=["STATE_ACTIVE"])`：它按页列出该账户 active 的任务，包括排队中和运行中的；沿 `pagination.next_offset` 查看后续页，直到其为 null。从该列表中消失的任务可能处于暂停或停止中，而不是已经结束；验收结果前先用 `compute_status(kind, id)` 确认任务已进入终态。
 
-需要了解运行中的任务实际使用了多少 CPU、内存和 GPU 时，例如在提议调整资源、取消或重新提交之前确认 GPU 利用率是否接近零或 allocation 是否空闲，调用 `compute_usage(kind, id)`；对于已结束的任务，它报告任务结束前的窗口。该工具只读，并要求 master 启用任务资源集成；`task_resources_disabled` 或 `task_resources_unsupported` 表示无法取得测量值，而不是任务空闲。先检查 `warnings`。null 或缺失值表示没有测量，绝不表示零；空的 `series` 列表表示该窗口没有数据。数值是每 `step` 秒一次的点采样，GPU 指标覆盖整块分配到的设备，可能包含其他进程。除非指定 `trial_id`，experiment 报告其最新 trial。即使 `metrics` 隐藏了 GPU 序列，`gpus` 仍会比较每个 allocation 的各块 GPU：`utilization_spread_percent` 较大、`least_utilized_gpu_uuid` 的均值很低或 `idle_fraction` 较高，都提示存在空闲或掉队的 GPU；`gpu_count` 小于 `requested_slots` 表示返回了序列的 GPU 少于该 allocation 持有的槽位，并不一定表示其余 GPU 未被使用。对于 experiment，`trial.batches_per_second_lower_bound` 是整个生命周期的下界，因为作为分母的挂钟时间还可能计入镜像拉取、启动、初始化以及因重启损失的 allocation 时间（不含调度排队时间和 allocation 之间的暂停间隔）；工作负载不通过 Determined 的 Core API 报告时，`total_batches_processed` 为 0 属于预期。只报告观察结果；更改槽位数或资源池仍需明确的任务决策。参见[任务用量测量](compute-service.zh.md#task-usage-measurements)。
+任务尚未结束时，`compute_status` 还返回 `queue`，即其作业在资源池队列中的情况。`jobs_ahead` 是作业在该队列中的位置，即排在它之前的作业数，可能包括运行中的作业；它不是等待时间的预测，资源池的调度器不为作业排序时为 `null`。报告排队中的任务时，引用其 `jobs_ahead`。已调度作业的 `placement` 列出每个 agent 及作业在其上持有的槽位 device ID；只有 NVIDIA GPU 槽位的 device ID 才是 `nvidia-smi` 的编号。`queue: null` 加 `queue_note` 表示在该队列中找不到作业；加 `context_unavailable: ["queue"]` 表示查询失败，这绝不说明任务没有排队。无论哪种情况，`state` 仍是权威状态。参见[状态](compute-service.zh.md#status-logs-and-cancellation)。
+
+需要了解运行中的任务实际使用了多少 CPU、内存和 GPU 时，例如在提议调整资源、取消或重新提交之前确认 GPU 利用率是否接近零或 allocation 是否空闲，调用 `compute_usage(kind, id)`；对于已结束的任务，它报告任务结束前的窗口。该工具只读，并要求 master 启用任务资源集成；`task_resources_disabled` 或 `task_resources_unsupported` 表示无法取得测量值，而不是任务空闲。先检查 `warnings`。null 或缺失值表示没有测量，绝不表示零；空的 `series` 列表表示该窗口没有数据。如果集群的任务映射延迟不为 0（该 fork 默认 5 分钟），每个 allocation 最初几分钟（从 allocation 开始计时，包括镜像拉取）的测量值不会归属到任务，之后也不会回填，因此刚启动或运行时间很短的 allocation 没有数据；扩大窗口或指定 `allocation_id` 仍可能返回较早 allocation 已有的数据。数值是每 `step` 秒一次的点采样，GPU 指标覆盖整块分配到的设备，可能包含其他进程。除非指定 `trial_id`，experiment 报告其最新 trial。即使 `metrics` 隐藏了 GPU 序列，`gpus` 仍会比较每个 allocation 的各块 GPU：`utilization_spread_percent` 较大、`least_utilized_gpu_uuid` 的均值很低或 `idle_fraction` 较高，都提示存在空闲或掉队的 GPU；`gpu_count` 小于 `requested_slots` 表示返回了序列的 GPU 少于该 allocation 持有的槽位，并不一定表示其余 GPU 未被使用。对于 experiment，`trial.batches_per_second_lower_bound` 是整个生命周期的下界，因为作为分母的挂钟时间还可能计入镜像拉取、启动、初始化以及因重启损失的 allocation 时间（不含调度排队时间和 allocation 之间的暂停间隔）；工作负载不通过 Determined 的 Core API 报告时，`total_batches_processed` 为 0 属于预期。只报告观察结果；更改槽位数或资源池仍需明确的任务决策。参见[任务用量测量](compute-service.zh.md#task-usage-measurements)。
 
 提交成功或进入终态本身不等于验收通过。检查进程退出信息和任务开始时定义的成功判据。已经配置存储访问时，使用 `storage_check` 验证预期共享产物；否则使用任务输出或另一项明确的任务内检查。需要本地副本时，先配置存储访问，再调用 `storage_fetch(shared_dir, local_dir, dry_run=true)` 预览，审核后以 `dry_run=false` 执行，并检查取回的结果。
 
@@ -142,9 +144,9 @@ master 拒绝的暂停或恢复（例如暂停已暂停的任务）会以错误�
 <a id="find-existing-tasks"></a>
 ## 查找已有任务
 
-`compute_list(kind, limit=50, offset=0)` 按从新到旧列出已认证 Determined 账户拥有的任务，无论它们是通过本 MCP、WebUI、原生 CLI 还是另一台设备提交的。每个条目包含 kind、ID、名称、状态、资源池和开始时间，`pagination.next_offset` 指向下一页。把 kind 和 ID 用于 `compute_status`、`compute_logs`、`compute_usage`、`compute_cancel`、`compute_pause` 和 `compute_resume`。列表是只读的。generic 任务需要带有 research-cluster fork generic 任务列表（WU-CVGL/determined#27）的 master；较旧的 master 返回 `unsupported`。
+`compute_list(kind, limit=50, offset=0)` 按从新到旧列出已认证 Determined 账户拥有的任务，无论它们是通过本 MCP、WebUI、原生 CLI 还是另一台设备提交的。每个条目包含 kind、ID、名称、状态、资源池和开始时间，`pagination.next_offset` 指向下一页。把 kind 和 ID 用于 `compute_status`、`compute_logs`、`compute_usage`、`compute_cancel`、`compute_pause` 和 `compute_resume`。列表是只读的。对 experiment 和 generic 任务，`states` 只列出处于给定状态的任务；接受的名称见[列出任务](compute-service.zh.md#list-tasks-and-find-a-submission)。generic 任务需要带有 research-cluster fork generic 任务列表（WU-CVGL/determined#27）的 master；较旧的 master 返回 `unsupported`。
 
-指定 `marker` 时，`compute_list` 返回所选页中配置带有该提交标记的任务。它会读取该页中的每个任务，所以查找刚刚提交的任务时，应使用较小的 `limit`（例如 5 或 10），并沿 `pagination.next_offset` 查看更早的页。标记是关联标签而不是身份：在 MCP 之外复制的配置带有同一个标记，所以可能有多个任务匹配；某一页为空也不能说明任务从未创建。
+指定 `marker` 时，`compute_list` 返回所选页中配置带有该提交标记的任务。它会读取该页中的每个任务，所以查找刚刚提交的任务时，应使用较小的 `limit`（例如 5 或 10），并沿 `pagination.next_offset` 查看更早的页。标记是关联标签而不是身份：在 MCP 之外复制的配置带有同一个标记，所以可能有多个任务匹配；某一页为空也不能说明任务从未创建。同时指定 `states` 时，`states` 过滤的是列表，每个返回的任务显示的是它自身读取时的状态，可能比过滤时匹配的状态更新。
 
 <a id="ownership-and-records"></a>
 ## 所有权与记录

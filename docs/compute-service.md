@@ -251,13 +251,13 @@ positive integer for an experiment, which can also be passed as a numeric string
 | --- | --- | --- |
 | `compute_plan` | `request` | Offline normalized plan; no cluster access |
 | `compute_launch` | `request` | Submits once; returns `kind`, `id`, `name`, `description`, `state`, `submission_marker`, `advisories`, and any `warnings` |
-| `compute_status` | `kind`, `id` | Task summary, submission marker, and sanitized remote entity |
+| `compute_status` | `kind`, `id` | Task summary, submission marker, sanitized remote entity, and the task's place in its pool's job queue |
 | `compute_logs` | `kind`, `id`, optional `tail=200` | Chronological list of the newest remote log records |
 | `compute_usage` | `kind`, `id`, optional `window_seconds=3600`, `allocation_id`, `trial_id`, `metrics`, `include_samples=false` | Read-only summary of one task's measured CPU, memory, and GPU use |
 | `compute_cancel` | `kind`, `id` | Task summary, remote cancellation response, and `cancellation_acknowledged` |
 | `compute_pause` | `kind`, `id` | Experiments and generic tasks: task summary, remote response, and `pause_acknowledged` |
 | `compute_resume` | `kind`, `id` | Experiments and generic tasks: task summary, remote response, and `resume_acknowledged` |
-| `compute_list` | `kind`, optional `limit=50`, `offset=0`, `marker` | One page of the account's tasks, newest first; with `marker`, the tasks on that page whose config carries it |
+| `compute_list` | `kind`, optional `limit=50`, `offset=0`, `marker`, `states` | One page of the account's tasks, newest first; with `states`, only experiments or generic tasks in those states; with `marker`, the tasks on that page whose config carries it |
 | `compute_resources` | optional `slots=1`, `pool`, `prefer_gpu_topology` | Current scheduler capacity and candidate pools. With `"strong"` and 2 or more slots, each pool adds `max_numa_node_free_slots` (largest `"strong"` task that fits now) and `max_numa_node_slots` (largest the master accepts with the current agents). Each pool also has `description` and `gpu_models` |
 | `storage_check` | `path` | Access information for a mapped container path |
 | `storage_sync` | `local_dir`, `shared_dir`, optional `dry_run=true` | Preview or copy local directory contents to shared storage |
@@ -359,7 +359,11 @@ Do not launch again automatically. Whether to submit again is the user's decisio
 checking, for example in the WebUI or with a later search. A duplicate cancelled
 afterwards may already have had effects, such as files it wrote, that cancelling does not
 undo. A definite rejection, such as HTTP 400, 401, or 403, is an ordinary error: nothing
-was submitted.
+was submitted. When the research-cluster fork 0.42.0 or later cannot check whether the
+account may use the requested pool, it answers a launch or resume with HTTP 503 `could not
+check access to resource pool "<pool>": ...; try again`. The service reports that answer as
+`submission_uncertain`, like any other 5xx; check a launch with the marker as above, and a
+resume with `compute_status`.
 
 A failure before any connection was open (a refused connection, a failed name lookup, a
 connect timeout, or an unreachable HTTP proxy) is a retryable `transport_error`: the
@@ -412,9 +416,10 @@ the name on the first line of their description. It adds `submission_marker` whe
 task's config carries one and the sanitized entity as `remote`. For a generic task, the
 entity combines the task record (`GET /api/v1/tasks/{id}`) with its submitted config
 (`GET /api/v1/tasks/{id}/config`), whose environment variables are redacted, and adds
-`resourcePool`, `name`, and `description` from that config. Its `taskState` is reported
-in `state` with the `GENERIC_TASK_STATE_` prefix replaced by `STATE_`, the experiment
-vocabulary:
+`resourcePool`, `name`, and `description` from that config; `jobId`, and `resourcePool`
+when the config sets none, come from the generic task list item. Its `taskState` is
+reported in `state` with the `GENERIC_TASK_STATE_` prefix replaced by `STATE_`, the
+experiment vocabulary:
 
 | `state` | Meaning |
 | --- | --- |
@@ -428,6 +433,27 @@ vocabulary:
 
 The entity's `allocations` list each run of the task; a resumed task has one allocation
 per run.
+
+For a task that has not ended, `compute_status` also reads one page of its pool's job
+queue (`GET /api/v1/job-queues-v2` with the task's `resourcePool` and `limit=1000`) after
+the ownership check, and reports the task's own job as `queue`:
+
+| Field | Meaning |
+| --- | --- |
+| `resource_pool` | Pool whose queue holds the job |
+| `state` | The scheduler's state: `STATE_QUEUED`, `STATE_SCHEDULED`, or `STATE_SCHEDULED_BACKFILLED` |
+| `jobs_ahead` | The job's position in the pool's queue: the number of jobs the scheduler ranks ahead of it, which can include jobs already running. It is not a prediction of wait time; `null` when the pool's scheduler does not rank jobs (fair share) |
+| `requested_slots`, `allocated_slots` | Slots the job requests and holds |
+| `placement` | List of `{agent_id, device_ids}`, one per agent where the job holds slots; `device_ids` are the agent's slot device IDs, ascending, which equal the `nvidia-smi` index on that agent's node only for NVIDIA GPU slots. `[]` for a queued or zero-slot job; `null` on a master older than the research-cluster fork 0.42.0 |
+
+A task with an end time has ended; a command or shell, which reports no end time, has
+ended once its state is `STATE_TERMINATED`. An ended task gets `queue: null` without a
+request. When the job is not found, `queue` is `null` and `queue_note` says why: the task
+reports no resource pool or job ID, and no request is sent; the job is not in the pool's
+queue because it is not yet queued, paused, or just ended; or the pool has more than 1000
+jobs and the job is not among the first 1000. A failed lookup gives `queue: null` and
+`context_unavailable: ["queue"]`; it never means that the task is not queued, and `state`
+remains the authority. The lookup does not page, poll, or return other jobs.
 
 `compute_logs` requires a positive `tail`. Command, shell, and generic task logs come
 from their task log API; a resumed generic task's logs include every run. Experiment
@@ -551,8 +577,17 @@ are per GPU UUID and cover the whole assigned device, which can include other pr
 Inspect `warnings`, such as `rss_unverified` or `gpu_full_device`, before drawing
 conclusions. An empty `series` list means no data for the window, not an idle task; if a
 `metrics` filter removed every returned series, `explanation` names the metrics that
-were returned. When `trial_id` is omitted and the experiment has several trials,
-`explanation` states how many exist and which one is reported.
+were returned. The MCP cannot read the cluster's task-mapping delay
+(`observability.task_mapping_delay`, 5 minutes by default in the fork; only `0s` turns it
+off). If it is nonzero, measurements from the first minutes of each allocation, counted
+from allocation start including image pull, are not attributed to the task and are never
+backfilled, so an allocation that ended sooner has none, `allocation_active` included; a
+wider window or an `allocation_id` can still return an earlier allocation's data.
+`advisory` says so only when the delay can explain missing data: no series was returned,
+or an allocation's first 5 minutes fall inside the window.
+`explanation` says so when no measurements were returned. When
+`trial_id` is omitted and the experiment has several trials, `explanation` states how
+many exist and which one is reported.
 
 `gpus` compares the GPUs within each allocation. It has one entry per `allocation_id`
 with GPU utilization or memory series and uses every such series returned for the
@@ -630,7 +665,7 @@ task, or a requested trial ID, is missing or inaccessible. See
 
 ### List tasks and find a submission
 
-`compute_list(kind, limit=50, offset=0, marker=None)` lists the tasks owned by the
+`compute_list(kind, limit=50, offset=0, marker=None, states=None)` lists the tasks owned by the
 authenticated account, newest first by start time. `limit` must be 1 through 100 and
 `offset` must be non-negative. The result has `kind`, `account` (`id` and `username`),
 `tasks`, and `pagination` with `offset`, `limit`, `total`, and `next_offset`, which is
@@ -642,6 +677,32 @@ CLI, or another device under the same account.
 
 Generic tasks are listed through Determined's generic task list, which needs a master
 with WU-CVGL/determined#27; an older master returns `unsupported`.
+
+`states` is a non-empty list of state names, and Determined filters the list by them, so
+`pagination.total` is the filtered total; the result repeats the filter as
+`filters: {"states": [...]}`. It applies to experiments and generic tasks only: Determined's
+command and shell lists have no state filter, so `states` with `kind` `command` or `shell`
+is `invalid_request`. The accepted names are the states Determined stores:
+
+| `kind` | Accepted `states` |
+| --- | --- |
+| `experiment` | `STATE_ACTIVE`, `STATE_PAUSED`, `STATE_STOPPING_COMPLETED`, `STATE_STOPPING_CANCELED`, `STATE_STOPPING_ERROR`, `STATE_STOPPING_KILLED`, `STATE_COMPLETED`, `STATE_CANCELED`, `STATE_ERROR`, `STATE_DELETING`, `STATE_DELETE_FAILED` |
+| `generic` | `STATE_ACTIVE`, `STATE_PAUSED`, `STATE_STOPPING_PAUSED`, `STATE_STOPPING_CANCELED`, `STATE_STOPPING_COMPLETED`, `STATE_STOPPING_ERROR`, `STATE_CANCELED`, `STATE_COMPLETED`, `STATE_ERROR` |
+
+Determined stores a running or waiting experiment as active and lists it as
+`STATE_QUEUED`, `STATE_PULLING`, `STATE_STARTING`, or `STATE_RUNNING`. A filter on one of
+those four names would fail or match nothing, so it is `invalid_request`: filter with
+`STATE_ACTIVE`, which returns all four. Any other name, such as `STATE_DELETED`, is also
+`invalid_request`, and no request is sent for a rejected filter. Determined ignores a
+filter it does not apply instead of refusing it, so the service checks the state of every
+returned task against the requested states, counting the four listed active states as
+`STATE_ACTIVE` for experiments; a task outside them is an `invalid_response` error, not an
+unfiltered page shown as a filtered one. `states` filters the list itself. `marker` and
+`states` combine: the marker search covers the selected page of the filtered list, and each
+returned task shows the state from its own detail read, which can be newer than the state the
+filter matched, such as a task listed as active that has completed by then; that state is not
+checked against `states` again. To follow a batch of experiments or generic tasks, page
+through `compute_list(kind, states=[...])`; to follow one task, call `compute_status(kind, id)`.
 
 `marker` is a submission marker of the form `determined-compute:<uuid>`, as returned by
 `compute_launch` or by an unconfirmed launch. List entries do not contain the config, so
@@ -681,10 +742,12 @@ the master lacks the route. Usage-specific codes are described in
 HTTP 403, Determined's permission refusal, has the code `permission_denied` and is not
 retryable. The research-cluster fork 0.42.0 or later checks the resource pool when a task
 is launched and when an experiment or generic task is resumed. When it refuses a pool the
-account may not use, the message is `resource pool '<pool>' is not available to you` and
-`details.resource_pool` names the pool; choose another pool or ask an administrator for
-access. Any other 403 keeps the form `403 <message>`. A 403 whose body is not Determined's
-JSON error, such as an HTTP proxy's page, keeps the code 403.
+account may not use, the message is the master's own refusal in the form `403 <message>`,
+for example `403 failed to prepare launch params: user "<username>" may not use resource
+pool "<pool>": the pool is restricted; choose another pool or ask an administrator for
+access (...)`, and `details.resource_pool` names the pool. Any other 403 keeps the same
+form. A 403 whose body is not Determined's JSON error, such as an HTTP proxy's page, keeps
+the code 403.
 
 The service acts only on tasks owned by the authenticated account and checks this
 before acting on a task, so another account's task returns `ownership_mismatch` even when the

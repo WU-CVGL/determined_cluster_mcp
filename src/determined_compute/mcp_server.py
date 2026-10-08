@@ -106,7 +106,12 @@ def create_server(
             "If a launch is unconfirmed, look for it with compute_list(kind, marker=...); an "
             "empty result does not prove it failed, so never launch again automatically: "
             "resubmitting is the user's decision. Use compute_list to find the account's tasks "
+            "(compute_list(kind, states=['STATE_ACTIVE']) lists the active experiments or "
+            "generic tasks, queued or running, one page at a time; follow pagination.next_offset "
+            "until it is null) "
             "and compute_usage to check a task's measured CPU, memory, and GPU use. "
+            "compute_status gives an unended task's queue position (queue.jobs_ahead) and "
+            "placement; a null queue does not mean the task is not queued. "
             "Experiments and generic tasks can be paused and resumed; a resumed experiment "
             "continues from its trials' latest checkpoints, a resumed generic task reruns its "
             "command from the start. "
@@ -153,7 +158,13 @@ def create_server(
         read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
     ))
     async def compute_status(kind: str, id: Union[int, str]) -> dict[str, Any]:
-        """Return the current state of one of the account's tasks by kind and Determined id."""
+        """Return the current state of one of the account's tasks by kind and Determined id.
+
+        For a task that has not ended, queue is its job in the pool's queue (state,
+        jobs_ahead, slots, placement), or null with queue_note or context_unavailable.
+        An ended task (end time set, or a command or shell in STATE_TERMINATED) gets
+        queue: null.
+        """
 
         return await call(service.status, kind, id)
 
@@ -214,14 +225,20 @@ def create_server(
         read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
     ))
     async def compute_list(
-        kind: str, limit: int = 50, offset: int = 0, marker: Optional[str] = None
+        kind: str,
+        limit: int = 50,
+        offset: int = 0,
+        marker: Optional[str] = None,
+        states: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """List one page of the account's tasks of one kind, newest first.
 
+        With states (experiments and generic tasks only), list only tasks in those states;
+        STATE_ACTIVE covers experiments shown as QUEUED, PULLING, STARTING or RUNNING.
         With marker, return the tasks on that page (one read each) whose config carries it.
         """
 
-        return await call(service.list_tasks, kind, limit, offset, marker)
+        return await call(service.list_tasks, kind, limit, offset, marker, states)
 
     if resource_inspector is not None:
 
