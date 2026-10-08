@@ -250,7 +250,7 @@ positive integer for an experiment, which can also be passed as a numeric string
 | --- | --- | --- |
 | `compute_plan` | `request` | Offline normalized plan; no cluster access |
 | `compute_launch` | `request` | Submits once; returns `kind`, `id`, `name`, `description`, `state`, `submission_marker`, `advisories`, and any `warnings` |
-| `compute_status` | `kind`, `id` | Task summary, submission marker, and sanitized remote entity |
+| `compute_status` | `kind`, `id` | Task summary, submission marker, sanitized remote entity, and the task's place in its pool's job queue |
 | `compute_logs` | `kind`, `id`, optional `tail=200` | Chronological list of the newest remote log records |
 | `compute_usage` | `kind`, `id`, optional `window_seconds=3600`, `allocation_id`, `trial_id`, `metrics`, `include_samples=false` | Read-only summary of one task's measured CPU, memory, and GPU use |
 | `compute_cancel` | `kind`, `id` | Task summary, remote cancellation response, and `cancellation_acknowledged` |
@@ -392,6 +392,26 @@ vocabulary:
 
 The entity's `allocations` list each run of the task; a resumed task has one allocation
 per run.
+
+For a task without an end time, `compute_status` also reads one page of its pool's job
+queue (`GET /api/v1/job-queues-v2` with the task's `resourcePool` and `limit=1000`) after
+the ownership check, and reports the task's own job as `queue`:
+
+| Field | Meaning |
+| --- | --- |
+| `resource_pool` | Pool whose queue holds the job |
+| `state` | The scheduler's state: `STATE_QUEUED`, `STATE_SCHEDULED`, or `STATE_SCHEDULED_BACKFILLED` |
+| `jobs_ahead` | Jobs ahead of this one in the pool's queue |
+| `requested_slots`, `allocated_slots` | Slots the job requests and holds |
+| `placement` | List of `{agent_id, device_ids}`, one per agent where the job holds slots; device IDs ascend and match the `nvidia-smi` index on that agent's node. `[]` for a queued or zero-slot job; `null` on a master older than the research-cluster fork 0.42.0 |
+
+An ended task gets `queue: null` without a request. When the job is not found, `queue`
+is `null` and `queue_note` says why: the task reports no resource pool or job ID, and no
+request is sent; the job is not in the pool's queue because it is not yet queued, paused,
+or just ended; or the pool has more than 1000 jobs and the job is not among the first
+1000. A failed lookup gives `queue: null` and `context_unavailable: ["queue"]`; it never
+means that the task is not queued, and `state` remains the authority. The lookup does not
+page, poll, or return other jobs.
 
 `compute_logs` requires a positive `tail`. Command, shell, and generic task logs come
 from their task log API; a resumed generic task's logs include every run. Experiment
