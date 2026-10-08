@@ -30,7 +30,7 @@ DET_API_TOKEN=replace-with-your-token
 
 Secrets 文件设置了 `DET_MASTER` 时，其凭据只发送给该 master。若报错说明 `--api-url` 或 `DET_MASTER` 指向的 master 与 secrets 文件不同，表示有覆盖项指向了别处：取消该覆盖项，或改用属于该 master 的 secrets 文件。
 
-MCP 在每个进程中只获取一次令牌，来源是 `--api-token`、`DET_API_TOKEN`，或使用 `DET_USERNAME` 和 `DET_PASSWORD` 登录，之后不会重新登录。登录令牌在 7 天后过期，修改密码会吊销该账户的会话和令牌；发生其中任一情况后，每次调用都以 HTTP 401 失败，401 的错误消息会说明如何恢复。如果只是登录令牌过期，重启 MCP 即可重新登录。如果密码已修改，或 API 令牌已过期或被吊销，先在 MCP 读取它的位置（MCP 参数中的 `--api-token`、secrets 文件或环境）更新，再重启 MCP。重试无济于事：报告该错误，由用户执行这些步骤。
+MCP 在每个进程中只获取一次令牌，来源是 `--api-token`、`DET_API_TOKEN`，或使用 `DET_USERNAME` 和 `DET_PASSWORD` 登录；取得令牌后不会再重新登录。登录本身返回 401 表示 master 拒绝了该用户名和密码：在 MCP 读取它的位置更正；secrets 文件的修改在下一次调用时生效，环境变量的修改需要重启。登录令牌在 7 天后过期，修改密码会吊销该账户的会话和令牌；发生其中任一情况后，每次调用都以 HTTP 401 失败，401 的错误消息会说明如何恢复。如果只是登录令牌过期，重启 MCP 即可重新登录。如果密码已修改，或 API 令牌已过期或被吊销，先在 MCP 读取它的位置（MCP 参数中的 `--api-token`、secrets 文件或环境）更新，再重启 MCP。重试无济于事：报告该错误，由用户执行这些步骤。
 
 不要把凭据放进计算 profile、任务请求、任务名称或描述。限制 secrets 文件的访问权限；排查时只检查必需变量名是否存在，不要读取其值。
 
@@ -133,7 +133,7 @@ HTTP 503 表示测量后端繁忙或不可用；每个 master 同时最多运行
 
 `context_unavailable` 非空并不致命。它列出因 Determined API 错误而失败的上下文查询（`resource_pool`、`allocation_details` 或 `gpu_models`）；相关字段为空或 `null`，但返回的测量值仍然有效。需要这些上下文时，可稍后重试。出现传输失败后会跳过其余查询，因此可能同时列出多个名称。`gpu_model` 为 `null` 而 `context_unavailable` 中没有 `gpu_models` 时，可能是 RBAC 对当前账户隐藏了设备 UUID，因而无法匹配型号名称。工作负载不通过 Determined 的 Core API 报告进度（例如普通 bash 入口）或尚未报告时，trial 的 `total_batches_processed` 为 0 属于预期；这不能说明工作负载没有任何进展，应改为根据日志、实测用量和预期产物判断进展。
 
-空的 `series` 列表表示该窗口没有数据，而不是任务空闲：任务可能未在该窗口内运行，或监控系统没有保留其数据。如果集群设置了任务映射延迟（`observability.task_mapping_delay`，该 fork 默认 5 分钟；MCP 无法读取该设置），每个 allocation 最初几分钟（从 allocation 开始计时，包括镜像拉取）的测量值不会归属到任务，之后也不会回填，因此在此之前就结束的 allocation 没有数据。将窗口及其 `anchor` 与 `task_start_time` 和 `allocations` 对照；如果较早的 allocation 在窗口开始之前就已结束（例如暂停后恢复），请传入该 `allocation_id`，或使用足以覆盖它的 `window_seconds`。如果 `samples_omitted` 为 true，应缩短窗口、减少指标或选择一个 allocation。agent 断开期间，任务可能仍保持 `RUNNING` 最多约 150 秒，因为该 fork 默认会等待 agent 重连这么久（`agent_reconnect_wait`）；因此仅凭 `RUNNING` 状态不能证明任务在推进。字段含义和限制见[任务用量测量](compute-service.zh.md#task-usage-measurements)。
+空的 `series` 列表表示该窗口没有数据，而不是任务空闲：任务可能未在该窗口内运行，或监控系统没有保留其数据。如果集群的任务映射延迟不为 0（`observability.task_mapping_delay`，该 fork 默认 5 分钟；MCP 无法读取该设置），每个 allocation 最初几分钟（从 allocation 开始计时，包括镜像拉取）的测量值不会归属到任务，之后也不会回填，因此在此之前就结束的 allocation 没有数据。将窗口及其 `anchor` 与 `task_start_time` 和 `allocations` 对照；如果较早的 allocation 在窗口开始之前就已结束（例如暂停后恢复），请传入该 `allocation_id`，或使用足以覆盖它的 `window_seconds`。如果 `samples_omitted` 为 true，应缩短窗口、减少指标或选择一个 allocation。agent 断开期间，任务可能仍保持 `RUNNING` 最多约 150 秒，因为该 fork 默认会等待 agent 重连这么久（`agent_reconnect_wait`）；因此仅凭 `RUNNING` 状态不能证明任务在推进。字段含义和限制见[任务用量测量](compute-service.zh.md#task-usage-measurements)。
 
 <a id="a-task-operation-is-refused"></a>
 ## 任务操作被拒绝

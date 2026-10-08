@@ -516,11 +516,11 @@ Inspect `warnings`, such as `rss_unverified` or `gpu_full_device`, before drawin
 conclusions. An empty `series` list means no data for the window, not an idle task; if a
 `metrics` filter removed every returned series, `explanation` names the metrics that
 were returned. The MCP cannot read the cluster's task-mapping delay
-(`observability.task_mapping_delay`, 5 minutes by default in the fork). If the cluster
-sets one, measurements from the first minutes of each allocation, counted from allocation
-start including image pull, are not attributed to the task and are never backfilled, so an
-allocation that ended sooner has none, `allocation_active` included; a wider window or an
-`allocation_id` can still return an earlier allocation's data.
+(`observability.task_mapping_delay`, 5 minutes by default in the fork; only `0s` turns it
+off). If it is nonzero, measurements from the first minutes of each allocation, counted
+from allocation start including image pull, are not attributed to the task and are never
+backfilled, so an allocation that ended sooner has none, `allocation_active` included; a
+wider window or an `allocation_id` can still return an earlier allocation's data.
 `advisory` says so only when the delay can explain missing data: no series was returned,
 or an allocation's first 5 minutes fall inside the window.
 `explanation` says so when no measurements were returned. When

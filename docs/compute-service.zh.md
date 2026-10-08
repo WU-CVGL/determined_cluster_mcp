@@ -454,10 +454,11 @@ Determined agent 为该 `gpu_uuid` 报告的型号名称；非 GPU 序列或设�
 序列按 GPU UUID 区分，覆盖整块分配到的设备，可能包含其他进程。下结论前先检查 `warnings`，
 例如 `rss_unverified` 或 `gpu_full_device`。空的 `series` 列表表示该窗口没有数据，
 而不是任务空闲；如果 `metrics` 过滤掉了所有返回的序列，`explanation` 会列出实际返回的指标。
-MCP 无法读取集群的任务映射延迟（`observability.task_mapping_delay`，该 fork 默认 5 分钟）。
-如果集群设置了该延迟，每个 allocation 最初几分钟（从 allocation 开始计时，包括镜像拉取）的测量值
-不会归属到任务，之后也不会回填，因此在此之前就结束的 allocation 没有数据，`allocation_active`
-也不例外；扩大窗口或指定 `allocation_id` 仍可能返回较早 allocation 已有的数据。
+MCP 无法读取集群的任务映射延迟（`observability.task_mapping_delay`，该 fork 默认 5 分钟；
+只有设为 `0s` 才会关闭）。如果该延迟不为 0，每个 allocation 最初几分钟（从 allocation
+开始计时，包括镜像拉取）的测量值不会归属到任务，之后也不会回填，因此在此之前就结束的
+allocation 没有数据，`allocation_active` 也不例外；扩大窗口或指定 `allocation_id` 仍可能
+返回较早 allocation 已有的数据。
 只有当这一延迟可以解释缺失的数据时，`advisory` 才会说明这一点：没有返回任何序列，或某个
 allocation 的最初 5 分钟落入窗口。
 没有返回任何测量值时，`explanation` 也会说明。
