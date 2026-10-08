@@ -1212,13 +1212,15 @@ class DeterminedAPIClient:
                 continue
             job = entry.get("full")
             summary = job.get("summary") if isinstance(job, Mapping) else None
+            jobs_ahead = summary.get("jobsAhead") if isinstance(summary, Mapping) else None
             if (
                 not isinstance(summary, Mapping)
                 or not isinstance(job.get("jobId"), str)
                 or not job["jobId"]
                 or not isinstance(job.get("resourcePool"), str)
                 or not isinstance(summary.get("state"), str)
-                or not count(summary.get("jobsAhead"))
+                # A scheduler that does not rank jobs (fair share) reports -1.
+                or not (count(jobs_ahead) or (jobs_ahead == -1 and type(jobs_ahead) is int))
                 or not count(job.get("requestedSlots"))
                 or not count(job.get("allocatedSlots"))
             ):
@@ -1243,7 +1245,7 @@ class DeterminedAPIClient:
                 "job_id": job["jobId"],
                 "resource_pool": job["resourcePool"],
                 "state": summary["state"],
-                "jobs_ahead": summary["jobsAhead"],
+                "jobs_ahead": None if jobs_ahead == -1 else jobs_ahead,
                 "requested_slots": job["requestedSlots"],
                 "allocated_slots": job["allocatedSlots"],
                 "placement": placement,

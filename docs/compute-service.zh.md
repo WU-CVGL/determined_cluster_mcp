@@ -336,8 +336,9 @@ HTTP 404。
 任务配置带有提交标记时还会返回 `submission_marker`，并在 `remote` 中包含清理后的实体。对于
 generic 任务，该实体合并任务记录（`GET /api/v1/tasks/{id}`）和提交时的配置
 （`GET /api/v1/tasks/{id}/config`，其中环境变量已脱敏），并从该配置补充 `resourcePool`、
-`name` 和 `description`。其 `taskState` 去掉 `GENERIC_TASK_STATE_` 前缀、改用与 experiment
-相同的 `STATE_` 前缀后写入 `state`：
+`name` 和 `description`；`jobId`（以及配置未设置时的 `resourcePool`）来自 generic 任务列表项。
+其 `taskState` 去掉 `GENERIC_TASK_STATE_` 前缀、改用与 experiment 相同的 `STATE_` 前缀后写入
+`state`：
 
 | `state` | 含义 |
 | --- | --- |
@@ -351,7 +352,7 @@ generic 任务，该实体合并任务记录（`GET /api/v1/tasks/{id}`）和提
 
 实体的 `allocations` 列出任务的每次运行；恢复过的任务每次运行各有一个 allocation。
 
-对于没有结束时间的任务，`compute_status` 在所有权检查之后还会读取其资源池作业队列的一页
+对于尚未结束的任务，`compute_status` 在所有权检查之后还会读取其资源池作业队列的一页
 （`GET /api/v1/job-queues-v2`，带任务的 `resourcePool` 和 `limit=1000`），并把任务自己的
 作业作为 `queue` 返回：
 
@@ -359,10 +360,11 @@ generic 任务，该实体合并任务记录（`GET /api/v1/tasks/{id}`）和提
 | --- | --- |
 | `resource_pool` | 作业所在队列的资源池 |
 | `state` | 调度器状态：`STATE_QUEUED`、`STATE_SCHEDULED` 或 `STATE_SCHEDULED_BACKFILLED` |
-| `jobs_ahead` | 资源池队列中排在该作业之前的作业数 |
+| `jobs_ahead` | 资源池队列中排在该作业之前的作业数；资源池的调度器不为作业排序（fair share）时为 `null` |
 | `requested_slots`、`allocated_slots` | 作业请求和持有的槽位数 |
 | `placement` | `{agent_id, device_ids}` 列表，作业在哪个 agent 上持有槽位就有一项；device ID 升序排列，与该 agent 所在节点上 `nvidia-smi` 的编号一致。排队中或零槽位的作业为 `[]`；早于 research-cluster fork 0.42.0 的 master 为 `null` |
 
+有结束时间的任务已结束；command 和 shell 不报告结束时间，状态为 `STATE_TERMINATED` 时即已结束。
 已结束的任务得到 `queue: null`，不发送请求。找不到作业时，`queue` 为 `null`，并由
 `queue_note` 说明原因：任务没有报告资源池或作业 ID，此时不发送请求；作业不在该资源池的
 队列中，因为它尚未入队、已暂停或刚刚结束；或者资源池有超过 1000 个作业，而该作业不在前

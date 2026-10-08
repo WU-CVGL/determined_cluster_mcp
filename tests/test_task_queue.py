@@ -229,6 +229,41 @@ def test_a_command_uses_its_reported_job_id(profile):
     ]
 
 
+@pytest.mark.parametrize("kind", ["command", "shell"])
+def test_a_terminated_command_or_shell_makes_no_queue_request(profile, kind):
+    # Commands and shells report no end time; the master keeps them as STATE_TERMINATED.
+    task = entity(id=COMMAND_ID, state="STATE_TERMINATED", description="eval", jobId="job-c")
+    del task["name"]
+    client = FakeClient(task, jobs=[queued("job-c")])
+
+    result = status(profile, client, kind, COMMAND_ID)
+
+    assert queue_calls(client) == []
+    assert result["queue"] is None
+    assert result["context_unavailable"] == []
+    assert "queue_note" not in result
+
+
+def test_a_terminating_command_still_reads_the_queue(profile):
+    task = entity(id=COMMAND_ID, state="STATE_TERMINATING", description="eval", jobId="job-c")
+    del task["name"]
+    client = FakeClient(task, jobs=[queued("job-c")])
+
+    result = status(profile, client, "command", COMMAND_ID)
+
+    assert len(queue_calls(client)) == 1
+    assert result["queue"]["state"] == "STATE_SCHEDULED"
+
+
+def test_an_unranked_job_reports_null_jobs_ahead(profile):
+    client = FakeClient(entity(), jobs=[queued(state="STATE_QUEUED", jobs_ahead=None)])
+
+    queue = status(profile, client)["queue"]
+
+    assert queue["state"] == "STATE_QUEUED"
+    assert queue["jobs_ahead"] is None
+
+
 class Response:
     def __init__(self, payload):
         self.payload = payload

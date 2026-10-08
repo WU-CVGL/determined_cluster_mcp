@@ -1664,6 +1664,20 @@ def test_job_queue_reports_missing_placement_as_null(monkeypatch):
     assert client().job_queue("gpu")["jobs"][0]["placement"] is None
 
 
+def test_job_queue_reads_the_fair_share_jobs_ahead_as_null(monkeypatch):
+    # A fair-share pool does not rank jobs; the master reports jobsAhead -1 for each.
+    job = queue_job("job-1", summary={"state": "STATE_QUEUED", "jobsAhead": -1},
+                    allocatedSlots=0, placement=[])
+    monkeypatch.setattr(
+        requests, "get",
+        lambda *a, **k: Response({"jobs": [job], "pagination": {"total": 1}}),
+    )
+    assert client().job_queue("gpu")["jobs"] == [{
+        "job_id": "job-1", "resource_pool": "gpu", "state": "STATE_QUEUED",
+        "jobs_ahead": None, "requested_slots": 2, "allocated_slots": 0, "placement": [],
+    }]
+
+
 @pytest.mark.parametrize("pool", ["", None, 3])
 def test_job_queue_never_queries_without_a_pool(monkeypatch, pool):
     def get(*args, **kwargs):
@@ -1685,6 +1699,12 @@ def test_job_queue_never_queries_without_a_pool(monkeypatch, pool):
         {"jobs": [{"full": None}], "pagination": {"total": 1}},
         {"jobs": [queue_job("")], "pagination": {"total": 1}},
         {"jobs": [queue_job("job-1", summary={"state": "STATE_QUEUED"})],
+         "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", summary={"state": "STATE_QUEUED", "jobsAhead": -2})],
+         "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", summary={"state": "STATE_QUEUED", "jobsAhead": -1.0})],
+         "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", summary={"state": "STATE_QUEUED", "jobsAhead": True})],
          "pagination": {"total": 1}},
         {"jobs": [queue_job("job-1", requestedSlots=True)], "pagination": {"total": 1}},
         {"jobs": [queue_job("job-1", allocatedSlots=-1)], "pagination": {"total": 1}},

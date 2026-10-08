@@ -764,7 +764,11 @@ class ComputeService:
     def _queue(self, entity: Mapping[str, Any]) -> Dict[str, Any]:
         """Find an unended task's job in its pool's queue; ``state`` stays the authority."""
         result: Dict[str, Any] = {"queue": None, "context_unavailable": []}
-        if self._remote_text(entity.get("endTime")) is not None:
+        # Commands and shells report no end time; STATE_TERMINATED is how they end.
+        if (
+            self._remote_text(entity.get("endTime")) is not None
+            or entity.get("state") == "STATE_TERMINATED"
+        ):
             return result
         pool, job_id = entity.get("resourcePool"), entity.get("jobId")
         # An empty pool would query the default pool, where a miss could read as "not queued".
