@@ -337,3 +337,46 @@ def test_every_call_reads_agents_then_pools_exactly_once():
         "resources": {"slots_per_trial": 2, "resource_pool": "gpu"}
     })
     assert client.calls == expected
+
+
+@pytest.mark.parametrize("used, holding", [(2, 1), (0, 1)])
+def test_used_slots_that_differ_from_busy_slots_are_unknown_for_two_or_more_slots(used, holding):
+    agents = [agent(slots=4, occupied=holding)]
+    inspector = ResourceInspector(Client([pool(total=4, used=used)], agents))
+
+    selected = inspector.resources(slots=2, pool="gpu")["selected_pool"]
+    expected = (
+        f"used slots ({used}) differ from slots holding containers ({holding}); "
+        "a task may be starting or stopping"
+    )
+    assert selected["available"] is None
+    assert selected["available_capacity"] is None
+    assert selected["explanation"] == expected
+    with pytest.raises(APIError) as caught:
+        inspector.require_capacity("command", command_config(slots=2))
+    assert caught.value.code == "capacity_unknown"
+    assert caught.value.retryable is False
+    assert caught.value.details["available"] is None
+    assert str(caught.value) == f"capacity for resource pool 'gpu' is unknown: {expected}"
+
+
+@pytest.mark.parametrize("used", [2, 0])
+def test_the_used_slot_check_does_not_apply_to_zero_or_one_slot(used):
+    inspector = ResourceInspector(
+        Client([pool(total=4, used=used)], [agent(slots=4, occupied=1)])
+    )
+
+    admitted = inspector.require_capacity("command", command_config(slots=1))
+    assert admitted["selected_pool"]["available_capacity"] == 3
+    assert inspector.require_capacity("command", command_config(slots=0))["admitted"] is True
+
+
+def test_the_used_slot_count_includes_busy_slots_of_a_draining_agent():
+    drained = agent("drained", slots=4, occupied=2, draining=True)
+    idle = agent("idle", slots=4)
+    selected = ResourceInspector(
+        Client([pool(total=6, used=2, agents=2)], [drained, idle])
+    ).resources(slots=2, pool="gpu")["selected_pool"]
+
+    assert selected["available"] is True
+    assert selected["per_agent_free_slots"] == {"drained": 0, "idle": 4}
