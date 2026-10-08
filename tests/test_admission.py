@@ -307,12 +307,41 @@ def test_a_slot_disabled_without_drain_is_not_counted_while_its_container_is_kil
     assert report["selected_pool"]["available"] is True
     assert report["selected_pool"]["available_capacity"] == 7
 
+    # Its container is not among the used slots either (the pool reports 0 used).
+    selected = ResourceInspector(Client([pool(total=7, used=0)], [killing])).resources(
+        slots=2, pool="gpu"
+    )["selected_pool"]
+    assert selected["available"] is True
+    assert selected["available_capacity"] == 7
+
     # Under an agent drain it is not counted either.
     drained = agent(slots=8, occupied=2, enabled=False, draining=True)
     set_slot(drained, 0, enabled=False)
     report = ResourceInspector(Client([pool(total=1, used=1)], [drained])).resources(pool="gpu")
     assert report["selected_pool"]["available"] is False
     assert report["selected_pool"]["available_capacity"] == 0
+
+    selected = ResourceInspector(Client([pool(total=1, used=1)], [drained])).resources(
+        slots=2, pool="gpu"
+    )["selected_pool"]
+    assert selected["available"] is False
+    assert selected["available_capacity"] == 0
+
+
+def test_a_busy_enabled_slot_on_a_disabled_agent_counts_as_used():
+    # A slot re-enabled on a disabled agent gets its device back with its container: the
+    # pool counts it as used although the agent adds no slots.
+    off = agent("off", slots=4, occupied=1, enabled=False, draining=False)
+    for index in range(1, 4):
+        set_slot(off, index, enabled=False)
+    on = agent("on", slots=4)
+    selected = ResourceInspector(
+        Client([pool(total=4, used=1, agents=2)], [off, on])
+    ).resources(slots=2, pool="gpu")["selected_pool"]
+
+    assert selected["available"] is True
+    assert selected["available_capacity"] == 4
+    assert selected["per_agent_free_slots"] == {"off": 0, "on": 4}
 
 
 def test_a_disabled_agent_counts_no_slots():
