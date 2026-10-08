@@ -1701,9 +1701,8 @@ def test_a_listed_state_outside_the_filter_is_an_invalid_response(monkeypatch, k
 
 
 def test_an_unfiltered_listing_does_not_check_states(monkeypatch):
-    monkeypatch.setattr(
-        requests, "get", lambda *a, **k: listing("experiments", [{"id": 1}, {"id": 2, "state": "X"}])
-    )
+    items = [{"id": 1}, {"id": 2, "state": "X"}]
+    monkeypatch.setattr(requests, "get", lambda *a, **k: listing("experiments", items))
     page = client().list_remote_tasks("experiment", user_id="7")
     assert [task.get("state") for task in page["tasks"]] == [None, "X"]
 
