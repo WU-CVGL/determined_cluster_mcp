@@ -24,7 +24,7 @@
 确认 API 地址和凭据属于同一个 Determined 部署。Secrets 文件可以使用 `DET_API_TOKEN`，也可以同时使用 `DET_USERNAME` 和 `DET_PASSWORD`：
 
 ```dotenv
-DET_MASTER=https://determined.example.org
+DET_MASTER=http://determined.example.org:8080
 DET_API_TOKEN=replace-with-your-token
 ```
 
@@ -44,7 +44,7 @@ export REQUESTS_CA_BUNDLE=/absolute/path/to/organization-ca-bundle.pem
 export DET_VERIFY_SSL=true
 ```
 
-使用 MCP 时，在服务参数中保留 `--verify-ssl`，并通过 stdio 客户端的环境配置传入 CA 变量。外围字段需按客户端的 MCP 语法调整：
+使用 MCP 时，在服务参数中加入 `--verify-ssl`，并通过 stdio 客户端的环境配置传入 CA 变量。外围字段需按客户端的 MCP 语法调整：
 
 ```json
 {
@@ -59,6 +59,19 @@ export DET_VERIFY_SSL=true
 GUI 应用可能不会继承终端中导出的变量。应在客户端的 MCP 环境设置中配置该变量，或从包含该变量的环境启动客户端，然后重启 MCP 服务。MCP 进程必须能够读取 CA bundle。
 
 正确的 CA 链可以解决未知签发者问题。证书过期或主机名不匹配必须由部署运维方修正；关闭验证不能修复证书身份。
+
+Python 3.13 及以上版本以 OpenSSL 的严格 X.509 模式验证。此时私有 CA 证书需要标记为 critical 且为 `CA:TRUE` 的 `basicConstraints`、包含 `keyCertSign` 的 `keyUsage` 和 Subject Key Identifier，服务端证书需要 Authority Key Identifier。否则验证失败，错误消息会给出原因，例如 `Missing Authority Key Identifier`、`CA cert does not include key usage extension` 或 `Basic Constraints of CA cert not marked critical`，即使 curl 和较旧的 Python 版本接受该证书链。以严格模式检查证书链：
+
+```bash
+openssl verify -x509_strict -CAfile ca.pem server.pem
+```
+
+解决方法是重新签发带有这些扩展的证书；MCP 始终保持严格验证。TLS 连接失败（例如 `WRONG_VERSION_NUMBER`）通常表示 `DET_MASTER` 指向纯 HTTP 端口，例如 master 的 `:8080`；请使用部署公布的 HTTPS 地址。经代理访问 HTTPS master 时，不带验证原因的 TLS 连接失败（例如 `UNEXPECTED_EOF_WHILE_READING`）通常表示代理无法访问 master；见[通过代理无法访问 master](#the-master-is-unreachable-through-a-proxy)。
+
+<a id="the-master-is-unreachable-through-a-proxy"></a>
+## 通过代理无法访问 master
+
+Requests 从 MCP 进程环境读取 `HTTPS_PROXY`、`HTTP_PROXY` 和 `NO_PROXY` 或其优先生效的小写形式，该环境来自 MCP 客户端；secrets 文件中的代理变量不会生效。错误消息提示无法连接代理时，表示 MCP 连不上这些变量指定的代理：修正或删除这些变量，或按下文让对 master 的请求绕过代理。代理无法访问 master 时，请求失败，错误消息提示代理拒绝或无法访问 master，或者对 HTTPS master 提示与 master 的 TLS 连接失败；其他工具可能报告 TLS connect error。如果只能经代理访问 master，请检查代理及其凭据。如果不经代理即可访问 master，把其主机名或域名后缀（例如 `.example.org`）同时加入客户端 `env` 中的 `NO_PROXY` 和 `no_proxy`，然后重启 MCP 服务；示例见[可选 HTTPS](compute-service.zh.md#optional-https)。代理代替 master 应答的情况见[提交结果不确定](#submission-outcome-is-uncertain)。
 
 <a id="a-shared-path-is-rejected-or-missing"></a>
 ## 共享路径被拒绝或不存在
@@ -94,7 +107,7 @@ GUI 应用可能不会继承终端中导出的变量。应在客户端的 MCP �
 
 提交请求发出后连接中断或超时、返回 HTTP 5xx、返回重定向（HTTP 3xx，任何变更请求都不会跟随），或响应中没有任务 ID，都可能表示 Determined 已经创建了任务，只是客户端没有收到 ID。此时 `compute_launch` 返回 `submission_uncertain`，错误 details 中包含 `kind` 和 `submission_marker`，且不会重试。在任何连接建立之前发生的失败（例如连接被拒绝或域名解析失败）则是可重试的 `transport_error`：请求没有发出。
 
-错误 details 带有 `source: "proxy"` 时，作出应答的是本机与 master 之间的 HTTP 代理，而不是 Determined。master 很可能无法访问：检查 API 地址、master 是否在运行，以及其地址是否应加入 `NO_PROXY`。以这种方式得到应答的提交或其他修改仍属于未确认，因为代理可能在转发请求之后才失败。如果代理在 `Proxy-Status` 头中表明它从未连上 master（例如 `error=dns_error` 或 `error=connection_refused`），则返回带有 `proxy_error` 的可重试 `transport_error`，因为请求没有到达 master。代理应答的识别方式见[未确认的提交](compute-service.zh.md#unconfirmed-launches)。
+错误 details 带有 `source: "proxy"` 时，作出应答的是本机与 master 之间的 HTTP 代理，而不是 Determined。master 很可能无法访问：检查 API 地址、master 是否在运行，以及其地址是否应加入 `NO_PROXY` 和 `no_proxy`。以这种方式得到应答的提交或其他修改仍属于未确认，因为代理可能在转发请求之后才失败。如果代理在 `Proxy-Status` 头中表明它从未连上 master（例如 `error=dns_error` 或 `error=connection_refused`），则返回带有 `proxy_error` 的可重试 `transport_error`，因为请求没有到达 master。代理应答的识别方式见[未确认的提交](compute-service.zh.md#unconfirmed-launches)。
 
 不要自动再次提交。使用较小的 `limit` 调用 `compute_list(kind, marker=submission_marker)`：它读取该账户最新的任务，并返回存储配置中带有该标记的所有任务。只返回一个任务时，它很可能就是这次提交，继续使用它的 ID；返回多个任务时，它们共用一份复制的配置，应由用户判断哪一个（如果有的话）是这次提交。空结果不能证明提交失败：可以沿 `pagination.next_offset` 查看更早的页，稍后再次搜索（master 可能在搜索之后才保存任务），或在 WebUI 中查看。Determined 不再提供的已结束 command 或 shell 根本不会出现。是否重新提交由用户在检查之后决定；事后取消的重复任务可能已经写入文件或产生了取消无法撤销的其他影响。参见[未确认的提交](compute-service.zh.md#unconfirmed-launches)。
 

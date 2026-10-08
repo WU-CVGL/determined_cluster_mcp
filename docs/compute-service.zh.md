@@ -152,13 +152,12 @@ generic 任务的生命周期：
 ```bash
 determined-compute-mcp \
   --profile /absolute/path/to/compute-profile.yaml \
-  --secrets-file /absolute/path/to/credentials.env \
-  --verify-ssl
+  --secrets-file /absolute/path/to/credentials.env
 ```
 
 `--profile` 对应 `DETERMINED_COMPUTE_PROFILE`，`--storage-config` 对应
 `DETERMINED_COMPUTE_STORAGE`；`--secrets-file` 也可通过 `DETERMINED_COMPUTE_SECRETS`
-提供。TLS 验证默认来自 `DET_VERIFY_SSL`。设置了 `DET_MASTER` 的 secrets 文件同时提供 API
+提供。设置了 `DET_MASTER` 的 secrets 文件同时提供 API
 URL 和凭据：此时忽略环境中的 `DET_API_TOKEN`、`DET_USERNAME` 和 `DET_PASSWORD`；若
 `--api-url` 或环境中的 `DET_MASTER` 指向另一个 master，会在发出任何请求前被拒绝。没有
 `DET_MASTER` 的 secrets 文件使用 `--api-url`，否则使用 `DET_MASTER`；环境中的
@@ -169,6 +168,40 @@ URL 和凭据：此时忽略环境中的 `DET_API_TOKEN`、`DET_USERNAME` 和 `D
 
 客户端访问映射共享存储的可选功能使用同一计算配置和独立的存储配置。参见
 [共享存储访问](shared-storage-access.zh.md)。
+
+<a id="optional-https"></a>
+### 可选 HTTPS
+
+纯 HTTP 无需任何 TLS 设置。要通过 HTTPS 访问 master，在 secrets 文件中设置
+`DET_MASTER=https://determined.example.org`；带协议的 URL 按原样使用，只有裸主机名才会补上
+`:8080`。用 `--verify-ssl` 或 MCP 进程环境中的 `DET_VERIFY_SSL=true` 开启验证。不开启时连接
+虽然加密，但不校验 master 的身份，Requests 会输出 `InsecureRequestWarning`。Requests 从 MCP
+进程环境读取用于私有 CA 的 `REQUESTS_CA_BUNDLE`，以及 `HTTPS_PROXY`、`HTTP_PROXY` 和
+`NO_PROXY` 或其优先生效的小写形式，该环境来自客户端及其 `env` 设置；secrets 文件只提供 master
+和凭据，其中的 TLS 和代理变量不会生效。代理无法访问 master 时，把 master 的主机名或域名后缀同时
+加入 `NO_PROXY` 和 `no_proxy`：
+
+```json
+{
+  "command": "/absolute/path/to/determined_cluster_mcp/.venv/bin/determined-compute-mcp",
+  "args": [
+    "--profile", "/absolute/path/to/profile.yaml",
+    "--secrets-file", "/absolute/path/to/credentials.env",
+    "--verify-ssl"
+  ],
+  "env": {
+    "REQUESTS_CA_BUNDLE": "/absolute/path/to/organization-ca-bundle.pem",
+    "NO_PROXY": "determined.example.org",
+    "no_proxy": "determined.example.org"
+  }
+}
+```
+
+Secrets 文件把其凭据绑定到它指定的 master，因此 URL 不同的 `--api-url` 或 `DET_MASTER`（例如
+用 `https://` 代替 `http://`）会被拒绝。请修改该客户端 secrets 文件中的 `DET_MASTER`，或为
+HTTPS 使用单独的 secrets 文件；读取同一文件的其他工具会随之切换。证书和代理问题分别见
+[TLS 证书验证失败](troubleshooting.zh.md#tls-certificate-verification-fails)和
+[通过代理无法访问 master](troubleshooting.zh.md#the-master-is-unreachable-through-a-proxy)。
 
 <a id="upgrading-from-a-version-with-a-task-database"></a>
 ### 从带任务数据库的版本升级

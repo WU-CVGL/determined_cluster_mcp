@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+import ssl
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Union
@@ -289,12 +290,48 @@ def _connection_never_opened(exc: requests.RequestException) -> bool:
     return False
 
 
+def _transport_message(message: str, exc: requests.RequestException) -> str:
+    """Add what failed when TLS or an HTTP proxy stopped a request to ``message``.
+
+    Only a fixed phrase and the short reason of the ``ssl`` exception are added: the text of
+    the wrapping exceptions carries the URL, with its query string, and the proxy's address.
+    """
+    if isinstance(exc, requests.exceptions.ProxyError):
+        failure = (
+            "the proxy could not be reached" if _connection_never_opened(exc)
+            else "the proxy refused or could not reach the master"
+        )
+        return (
+            f"{message}: {failure}; "
+            "see docs/troubleshooting.md#the-master-is-unreachable-through-a-proxy"
+        )
+    if not isinstance(exc, requests.exceptions.SSLError):
+        return message
+    # requests wraps urllib3's MaxRetryError, whose reason is urllib3's SSLError around ssl's.
+    cause: Any = exc.args[0] if exc.args else None
+    for _ in range(3):
+        if isinstance(cause, ssl.SSLError):
+            break
+        cause = getattr(cause, "reason", None) or next(iter(getattr(cause, "args", ())), None)
+    if isinstance(cause, ssl.SSLCertVerificationError):
+        failure, reason = "TLS verification of the master failed", getattr(cause, "verify_message", None)
+    else:
+        failure = "the TLS connection to the master failed"
+        reason = getattr(cause, "reason", None) if isinstance(cause, ssl.SSLError) else None
+    if isinstance(reason, str) and reason:
+        failure = f"{failure} ({reason})"
+    return f"{message}: {failure}; see docs/troubleshooting.md#tls-certificate-verification-fails"
+
+
 def _login_for_token(api_url: str, username: str, password: str, verify_ssl: bool) -> str:
     endpoint = urljoin(api_url.rstrip("/") + "/", "api/v1/auth/login")
     try:
         response = requests.post(endpoint, headers={"Content-Type": "application/json"}, json={"username": username, "password": password}, timeout=15, verify=verify_ssl)
     except requests.RequestException as exc:
-        raise APIError("Could not authenticate with Determined", code="transport_error", details={"endpoint": "api/v1/auth/login"}, retryable=True) from exc
+        raise APIError(
+            _transport_message("Could not authenticate with Determined", exc),
+            code="transport_error", details={"endpoint": "api/v1/auth/login"}, retryable=True,
+        ) from exc
     if response.status_code >= 400:
         raise _error_from_response(response)
     try:
@@ -393,7 +430,10 @@ class DeterminedAPIClient:
         try:
             response = requests.get(self._url(endpoint), headers=self.headers, params=params, timeout=30, verify=self.verify_ssl)
         except requests.RequestException as exc:
-            raise APIError("Determined request failed", code="transport_error", details={"endpoint": endpoint}, retryable=True) from exc
+            raise APIError(
+                _transport_message("Determined request failed", exc),
+                code="transport_error", details={"endpoint": endpoint}, retryable=True,
+            ) from exc
         return self._json_response(response)
 
     def _post(
@@ -412,10 +452,12 @@ class DeterminedAPIClient:
             if _connection_never_opened(exc):
                 # Nothing reached the master, so the mutation certainly did not happen.
                 raise APIError(
-                    "Could not connect to Determined; the request was not sent",
+                    _transport_message("Could not connect to Determined; the request was not sent", exc),
                     code="transport_error", details={"endpoint": endpoint}, retryable=True,
                 ) from exc
-            raise SubmissionUncertainError("Determined mutation outcome is unknown", details={"endpoint": endpoint}) from exc
+            raise SubmissionUncertainError(
+                _transport_message("Determined mutation outcome is unknown", exc), details={"endpoint": endpoint}
+            ) from exc
         except ValueError as exc:
             # requests parses a 3xx's Location even when it does not follow it, after this
             # request was sent; an unparseable one fails there.
@@ -436,7 +478,10 @@ class DeterminedAPIClient:
         try:
             response = requests.get(self._url(endpoint), headers=self.headers, params=params, timeout=30, verify=self.verify_ssl, stream=True)
         except requests.RequestException as exc:
-            raise APIError("Determined log request failed", code="transport_error", details={"endpoint": endpoint}, retryable=True) from exc
+            raise APIError(
+                _transport_message("Determined log request failed", exc),
+                code="transport_error", details={"endpoint": endpoint}, retryable=True,
+            ) from exc
         if response.status_code >= 400:
             raise _error_from_response(response)
         logs: List[Dict[str, Any]] = []

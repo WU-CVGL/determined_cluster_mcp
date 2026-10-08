@@ -21,7 +21,7 @@ Compute tasks do not need `--storage-config`. Storage tools automatically use a 
 Confirm that the API URL and credentials refer to the same Determined deployment. The secrets file supports either `DET_API_TOKEN`, or both `DET_USERNAME` and `DET_PASSWORD`:
 
 ```dotenv
-DET_MASTER=https://determined.example.org
+DET_MASTER=http://determined.example.org:8080
 DET_API_TOKEN=replace-with-your-token
 ```
 
@@ -40,7 +40,7 @@ export REQUESTS_CA_BUNDLE=/absolute/path/to/organization-ca-bundle.pem
 export DET_VERIFY_SSL=true
 ```
 
-For MCP, keep `--verify-ssl` in the server arguments and pass the CA variable through the stdio client's environment configuration. Adapt the surrounding keys to the client's MCP syntax:
+For MCP, add `--verify-ssl` to the server arguments and pass the CA variable through the stdio client's environment configuration. Adapt the surrounding keys to the client's MCP syntax:
 
 ```json
 {
@@ -55,6 +55,18 @@ For MCP, keep `--verify-ssl` in the server arguments and pass the CA variable th
 A GUI application may not inherit variables exported in a terminal. Configure the variable in the client's MCP environment settings or start the client from an environment that contains it, then restart the MCP server. The CA bundle must be readable by the MCP process.
 
 An unknown issuer is addressed by the correct CA chain. An expired certificate or hostname mismatch must be corrected by the deployment operator; disabling verification does not repair the certificate identity.
+
+Python 3.13 and later verify in OpenSSL's strict X.509 mode. A private CA certificate then needs a critical `basicConstraints` with `CA:TRUE`, `keyUsage` with `keyCertSign`, and a Subject Key Identifier, and the server certificate needs an Authority Key Identifier. Otherwise verification fails, and the error message names the reason, such as `Missing Authority Key Identifier`, `CA cert does not include key usage extension`, or `Basic Constraints of CA cert not marked critical`, although curl and older Python versions accept the chain. Check the chain in strict mode:
+
+```bash
+openssl verify -x509_strict -CAfile ca.pem server.pem
+```
+
+The fix is to reissue the certificates with these extensions; the MCP keeps strict verification on. A TLS connection failure such as `WRONG_VERSION_NUMBER` usually means that `DET_MASTER` names a plain HTTP port, such as the master's `:8080`; use the HTTPS address the deployment publishes. When an HTTPS master is reached through a proxy, a TLS connection failure without a verification reason, such as `UNEXPECTED_EOF_WHILE_READING`, usually means that the proxy could not reach the master; see [the master is unreachable through a proxy](#the-master-is-unreachable-through-a-proxy).
+
+## The master is unreachable through a proxy
+
+Requests reads `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY`, or their lowercase forms, which take precedence, from the MCP process environment, which comes from the MCP client; proxy variables in the secrets file are not applied. An error saying that the proxy could not be reached means that the MCP could not connect to the proxy those variables name: fix or remove them, or bypass the proxy for the master as below. When the proxy cannot reach the master, requests fail with an error saying that the proxy refused or could not reach the master or, for an HTTPS master, that the TLS connection to the master failed; other tools may report a TLS connect error. If the master is reachable only through the proxy, check the proxy and its credentials. If the master is reachable without the proxy, add its host, or its domain suffix such as `.example.org`, to both `NO_PROXY` and `no_proxy` in the client's `env` and restart the MCP server; [optional HTTPS](compute-service.md#optional-https) shows an example. An HTTP proxy that answers in place of the master is covered in [submission outcome is uncertain](#submission-outcome-is-uncertain).
 
 ## A shared path is rejected or missing
 
@@ -86,7 +98,7 @@ On the research-cluster fork 0.42.0 or later, an administrator can restrict a po
 
 A connection that drops or times out after a launch request was sent, an HTTP 5xx response, a redirect (HTTP 3xx, which no mutation follows), or a response without a task ID may mean that Determined created the task even though the client did not receive its ID. `compute_launch` then returns `submission_uncertain` with `kind` and `submission_marker` in the error details, and does not retry. A failure before any connection opened, such as a refused connection or a failed name lookup, is a retryable `transport_error` instead: nothing was sent.
 
-When the error details carry `source: "proxy"`, an HTTP proxy between this machine and the master answered, not Determined. The master was probably unreachable: check the API URL, whether the master is up, and whether its address belongs in `NO_PROXY`. A launch or other change answered this way is still unconfirmed, because the proxy may have failed after forwarding the request. A proxy that reports in its `Proxy-Status` header that it never connected to the master (for example `error=dns_error` or `error=connection_refused`) gives a retryable `transport_error` with `proxy_error` instead, since nothing reached the master. See [unconfirmed launches](compute-service.md#unconfirmed-launches) for how a proxy's answer is recognized.
+When the error details carry `source: "proxy"`, an HTTP proxy between this machine and the master answered, not Determined. The master was probably unreachable: check the API URL, whether the master is up, and whether its address belongs in `NO_PROXY` and `no_proxy`. A launch or other change answered this way is still unconfirmed, because the proxy may have failed after forwarding the request. A proxy that reports in its `Proxy-Status` header that it never connected to the master (for example `error=dns_error` or `error=connection_refused`) gives a retryable `transport_error` with `proxy_error` instead, since nothing reached the master. See [unconfirmed launches](compute-service.md#unconfirmed-launches) for how a proxy's answer is recognized.
 
 Do not launch again automatically. Call `compute_list(kind, marker=submission_marker)` with a small `limit`: it reads the newest tasks of the account and returns every one whose stored config carries that marker. One returned task is most likely the submission; continue with its ID. Several returned tasks share a copied config; let the user decide which one, if any, is the submission. An empty result does not prove that the submission failed: follow `pagination.next_offset` to older pages, search again later, since the master may store the task after the search, or check the WebUI. An ended command or shell that Determined no longer serves does not appear at all. Whether to submit again is the user's decision after checking; a duplicate cancelled afterwards may already have written files or had other effects that cancelling does not undo. See [unconfirmed launches](compute-service.md#unconfirmed-launches).
 

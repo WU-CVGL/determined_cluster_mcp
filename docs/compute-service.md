@@ -170,13 +170,12 @@ Start one stdio process per configured client:
 ```bash
 determined-compute-mcp \
   --profile /absolute/path/to/compute-profile.yaml \
-  --secrets-file /absolute/path/to/credentials.env \
-  --verify-ssl
+  --secrets-file /absolute/path/to/credentials.env
 ```
 
 `--profile` corresponds to `DETERMINED_COMPUTE_PROFILE` and `--storage-config` to
 `DETERMINED_COMPUTE_STORAGE`; `--secrets-file` can instead be supplied through
-`DETERMINED_COMPUTE_SECRETS`. TLS verification defaults to `DET_VERIFY_SSL`. A secrets
+`DETERMINED_COMPUTE_SECRETS`. A secrets
 file that sets `DET_MASTER` supplies the API URL and the credentials together: the
 environment's `DET_API_TOKEN`, `DET_USERNAME`, and `DET_PASSWORD` are then ignored, and an
 `--api-url` or environment `DET_MASTER` that names a different master is rejected before
@@ -190,6 +189,43 @@ that it loads the current tool set.
 
 Optional client-side access to mapped storage uses the same profile and a separate
 storage configuration. See [Shared-storage access](shared-storage-access.md).
+
+### Optional HTTPS
+
+Plain HTTP needs no TLS settings. To reach the master over HTTPS, set
+`DET_MASTER=https://determined.example.org` in the secrets file; a URL with a scheme is
+used as given, and only a bare host gets `:8080`. Turn verification on with
+`--verify-ssl`, or with `DET_VERIFY_SSL=true` in the MCP process environment. Without it
+the connection is encrypted but the master's identity is not checked, and Requests prints
+`InsecureRequestWarning`. Requests reads `REQUESTS_CA_BUNDLE`, for a private CA, and
+`HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY`, or their lowercase forms, which take
+precedence, from the MCP process environment, which comes from the client and its `env`
+settings; the secrets file supplies only the master and credentials, so TLS and proxy
+variables there are not applied. When a proxy cannot reach the master, list the master's
+host or domain suffix in both `NO_PROXY` and `no_proxy`:
+
+```json
+{
+  "command": "/absolute/path/to/determined_cluster_mcp/.venv/bin/determined-compute-mcp",
+  "args": [
+    "--profile", "/absolute/path/to/profile.yaml",
+    "--secrets-file", "/absolute/path/to/credentials.env",
+    "--verify-ssl"
+  ],
+  "env": {
+    "REQUESTS_CA_BUNDLE": "/absolute/path/to/organization-ca-bundle.pem",
+    "NO_PROXY": "determined.example.org",
+    "no_proxy": "determined.example.org"
+  }
+}
+```
+
+The secrets file binds its credentials to the master it names, so an `--api-url` or
+`DET_MASTER` with a different URL, such as `https://` instead of `http://`, is rejected.
+Change `DET_MASTER` in that client's secrets file or use a separate secrets file for
+HTTPS; another tool that reads the same file switches with it. Troubleshooting covers
+[certificate](troubleshooting.md#tls-certificate-verification-fails) and
+[proxy](troubleshooting.md#the-master-is-unreachable-through-a-proxy) failures.
 
 ### Upgrading from a version with a task database
 
