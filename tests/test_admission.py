@@ -466,7 +466,7 @@ def test_every_call_reads_agents_then_pools_exactly_once():
 
 
 @pytest.mark.parametrize("used, holding", [(2, 1), (0, 1)])
-def test_used_slots_that_differ_from_busy_slots_are_unknown_for_two_or_more_slots(used, holding):
+def test_used_slots_that_differ_from_busy_slots_are_unknown_for_two_slots(used, holding):
     agents = [agent(slots=4, occupied=holding)]
     inspector = ResourceInspector(Client([pool(total=4, used=used)], agents))
 
@@ -487,14 +487,31 @@ def test_used_slots_that_differ_from_busy_slots_are_unknown_for_two_or_more_slot
 
 
 @pytest.mark.parametrize("used", [2, 0])
-def test_the_used_slot_check_does_not_apply_to_zero_or_one_slot(used):
+def test_the_used_slot_check_does_not_apply_to_zero_slots(used):
     inspector = ResourceInspector(
         Client([pool(total=4, used=used)], [agent(slots=4, occupied=1)])
     )
 
-    admitted = inspector.require_capacity("command", command_config(slots=1))
-    assert admitted["selected_pool"]["available_capacity"] == 3
     assert inspector.require_capacity("command", command_config(slots=0))["admitted"] is True
+
+
+@pytest.mark.parametrize("used, holding", [(4, 3), (0, 1)])
+def test_used_slots_that_differ_from_busy_slots_are_unknown_for_one_slot(used, holding):
+    # A reserved slot counts as used before its container is visible on the agent.
+    inspector = ResourceInspector(
+        Client([pool(total=4, used=used)], [agent(slots=4, occupied=holding)])
+    )
+
+    selected = inspector.resources(slots=1, pool="gpu")["selected_pool"]
+    assert selected["available"] is None
+    assert selected["available_capacity"] is None
+    assert selected["explanation"] == (
+        f"used slots ({used}) differ from slots holding containers ({holding}); "
+        "a task may be starting or stopping"
+    )
+    with pytest.raises(APIError) as caught:
+        inspector.require_capacity("command", command_config(slots=1))
+    assert caught.value.code == "capacity_unknown"
 
 
 def test_the_used_slot_count_includes_busy_slots_of_a_draining_agent():
@@ -511,14 +528,6 @@ def test_the_used_slot_count_includes_busy_slots_of_a_draining_agent():
 # prefer_gpu_topology "strong": all slots on one NUMA node of one agent.
 
 PENDING = "not reported since the master started"
-
-
-def test_the_pending_reason_is_the_forks_constant():
-    # Fork 0.42.0 or later (reasonNotReportedSinceMasterStart); re-check on fork upgrades, since
-    # a renamed constant would read as an agent without NUMA nodes.
-    from determined_compute.compute import admission
-
-    assert admission._TOPOLOGY_PENDING == PENDING
 
 
 def numa_agent(name="agent-1", pool_name="gpu", nodes=((0, 1, 2, 3), (4, 5, 6, 7)),
@@ -610,6 +619,10 @@ def no_node_holds(slots):
     return f"no NUMA node in pool gpu has {slots} slots; use soft"
 
 
+def no_agent_holds(slots):
+    return f"no agent in pool gpu has {slots} slots; request fewer slots or use another pool"
+
+
 @pytest.mark.parametrize("kind", ["command", "shell", "generic", "experiment"])
 def test_strong_is_admitted_when_one_numa_node_has_the_free_gpus(kind):
     # T1: node 0 is free, node 1 is busy.
@@ -678,7 +691,7 @@ def test_strong_waits_with_one_free_gpu_per_numa_node():
 @pytest.mark.parametrize("slots, retryable, message", [
     (4, True, wait_message(4, 0)),
     (5, True, wait_message(5, 0)),
-    (9, False, no_node_holds(9)),
+    (9, False, no_agent_holds(9)),
 ])
 def test_an_agent_pending_its_topology_lets_strong_wait(slots, retryable, message):
     # T5: the master waits for a pending agent's report; a request larger than every agent is
@@ -805,7 +818,7 @@ def test_a_request_larger_than_every_agent_is_refused_even_with_unreadable_topol
     error = refused(inspector, strong_config(9))
     assert error.code == "capacity_unavailable"
     assert error.retryable is False
-    assert str(error) == no_node_holds(9)
+    assert str(error) == no_agent_holds(9)
     assert error.details["available"] is None
 
 
@@ -917,7 +930,7 @@ def test_a_strong_experiment_always_uses_one_agent(extra):
     error = refused(inspector, strong_config(8, "experiment", **extra), "experiment")
     assert error.code == "capacity_unavailable"
     assert error.retryable is False
-    assert str(error) == no_node_holds(8)
+    assert str(error) == no_agent_holds(8)
     # Without strong the experiment may span agents, which is not checked.
     plain = refused(inspector, experiment_config(8, **extra), "experiment")
     assert plain.code == "capacity_unknown"
@@ -978,13 +991,22 @@ def test_a_static_pool_without_agents_refuses_strong():
     error = refused(inspector, strong_config(2))
     assert error.code == "capacity_unavailable"
     assert error.retryable is False
-    assert str(error) == NO_NODES
+    assert str(error) == no_agent_holds(2)
     assert error.details["available"] == 0
 
 
+def test_strong_larger_than_every_agent_does_not_suggest_soft():
+    # soft cannot fit 9 slots on an 8-slot agent either.
+    error = refused(strong_inspector([numa_agent()]), strong_config(9))
+    assert error.code == "capacity_unavailable"
+    assert error.retryable is False
+    assert str(error) == no_agent_holds(9)
+    assert "soft" not in str(error)
+
+
 @pytest.mark.parametrize("pool_type", ["RESOURCE_POOL_TYPE_AWS", None])
-def test_a_pool_that_is_not_static_never_refuses_strong(pool_type):
-    # T16: provisioned pools check the instance size themselves.
+def test_a_pool_that_is_not_static_waits_without_agents(pool_type):
+    # T16: a provisioned pool checks its instance size itself and waits for its agents.
     empty = pool(total=0, agents=0, type=pool_type)
     if pool_type is None:
         del empty["type"]
@@ -993,10 +1015,26 @@ def test_a_pool_that_is_not_static_never_refuses_strong(pool_type):
     assert error.retryable is True
     assert str(error) == wait_message(2, 0)
 
-    agents = [numa_agent()]
-    error = refused(strong_inspector(agents, type=pool_type), strong_config(5))
+
+@pytest.mark.parametrize("pool_type", ["RESOURCE_POOL_TYPE_AWS", None])
+@pytest.mark.parametrize("slots, message", [(5, no_node_holds(5)), (9, no_agent_holds(9))])
+def test_a_pool_that_is_not_static_refuses_strong_with_its_reported_agents(
+    pool_type, slots, message
+):
+    # The master's strongCannotFit applies to the pool's current agents whatever the pool type.
+    error = refused(strong_inspector([numa_agent()], type=pool_type), strong_config(slots))
+    assert error.code == "capacity_unavailable"
+    assert error.retryable is False
+    assert str(error) == message
+
+
+def test_a_pool_that_is_not_static_waits_for_a_pending_agent():
+    pending = numa_agent("pending", reason=PENDING, nodes=({"ids": range(8), "node": -1},))
+    inspector = strong_inspector([pending], type="RESOURCE_POOL_TYPE_AWS")
+
+    error = refused(inspector, strong_config(5))
     assert error.retryable is True
-    assert str(error) == wait_message(5, 4)
+    assert str(error) == wait_message(5, 0)
 
 
 @pytest.mark.parametrize("change", [_redacted, _duplicate_device])
@@ -1033,7 +1071,7 @@ def test_a_used_slot_mismatch_is_unknown_for_strong_after_the_slot_count_check(u
     error = refused(inspector, strong_config(9))
     assert error.code == "capacity_unavailable"
     assert error.retryable is False
-    assert str(error) == no_node_holds(9)
+    assert str(error) == no_agent_holds(9)
     selected = inspector.resources(9, "gpu", "strong")["selected_pool"]
     assert selected["available"] is False
     assert selected["max_numa_node_free_slots"] is None

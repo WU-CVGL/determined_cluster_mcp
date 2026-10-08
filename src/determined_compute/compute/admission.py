@@ -88,9 +88,13 @@ def _valid_preference(value: Any) -> bool:
     )
 
 
+# Why a "strong" request cannot run in a pool. "use soft" is offered only when an agent has the
+# slots but no NUMA node does.
+def _no_agent_holds(pool: str, slots: int) -> str:
+    return f"no agent in pool {pool} has {slots} slots; request fewer slots or use another pool"
+
+
 def _no_numa_nodes(pool: str) -> str:
-    # The master's own reasons for refusing a "strong" request (errStrongNoNUMANodes and
-    # errStrongNoNUMANodeHolds), with the pool name as it writes it.
     return f"no agent in pool {pool} reports NUMA nodes; use soft"
 
 
@@ -201,7 +205,7 @@ class ResourceInspector:
     def _resources(
         self, *, slots: int, pool: Optional[str], preference: Any
     ) -> Tuple[Dict[str, Any], Dict[str, str]]:
-        """Return the report and, by pool, the master's reason for refusing the request."""
+        """Return the report and, by pool, why the master refuses the request."""
 
         # "strong" takes effect from 2 slots, as in the scheduler's strongTopology.
         strong = preference == "strong" and slots >= 2
@@ -297,7 +301,7 @@ class ResourceInspector:
         slots: int,
         strong: bool = False,
     ) -> Tuple[Dict[str, Any], Optional[str]]:
-        """Assess one pool; also return the master's reason for refusing the request, if any."""
+        """Assess one pool; also return why the master refuses the request, if it does."""
 
         name = str(raw["name"])
         total = _nonnegative_int(raw.get("slotsAvailable"))
@@ -341,7 +345,7 @@ class ResourceInspector:
             )
             complete = known
             problem = agent_problem
-            if known and slots >= 2 and used != holding:
+            if known and used != holding:
                 # The pool's used count is the slots holding containers (numUsedSlots).
                 known = False
                 problem = (
@@ -418,19 +422,16 @@ class ResourceInspector:
 
         ``complete`` says the agent list matches the pool, and ``known`` that the used slots
         match as well. Returns the verdict, the largest "strong" task that fits now, the
-        explanation, the master's reason for refusing the request (or None), and the pool's
-        NUMA fields.
+        explanation, why the master refuses the request (or None), and the pool's NUMA fields.
         """
 
         refusal: Optional[str] = None
-        if complete and static:
-            # The master refuses a request larger than every agent at submit, from slot counts
-            # alone (ValidateResources), whatever the topology or the slots in use.
-            largest = max((len(entries) for _id, _agent, entries in members), default=0)
-            if largest < slots:
-                refusal = (
-                    _no_numa_node_holds(name, slots) if members else _no_numa_nodes(name)
-                )
+        largest = max((len(entries) for _id, _agent, entries in members), default=0)
+        if complete and static and largest < slots:
+            # The master refuses a request larger than every agent of a static pool at submit,
+            # from slot counts alone (ValidateResources), whatever the topology or the slots in
+            # use. A provisioned pool checks its instance size instead, which is not read here.
+            refusal = _no_agent_holds(name, slots)
 
         layouts = [
             (agent_id, *_numa_layout(agent, entries)) for agent_id, agent, entries in members
@@ -484,11 +485,17 @@ class ResourceInspector:
         )
         if max_free >= slots:
             return True, max_free, explained(summary), None, numa
-        if static and not pending and max_total < slots:
-            # The master refuses the request once every agent has reported its topology
-            # (strongCannotFit); disabled and draining slots count toward a node.
+        if layouts and not pending and max_total < slots:
+            # The master refuses the request once every current agent of the pool, static or
+            # provisioned, has reported its topology (strongCannotFit); disabled and draining
+            # slots count toward a node. A pool without agents waits.
             nodes = any(total for _id, _cls, total, _free, _r in known_layouts)
-            refusal = _no_numa_node_holds(name, slots) if nodes else _no_numa_nodes(name)
+            if largest < slots:
+                refusal = _no_agent_holds(name, slots)
+            elif nodes:
+                refusal = _no_numa_node_holds(name, slots)
+            else:
+                refusal = _no_numa_nodes(name)
             return False, max_free, explained(refusal), refusal, numa
         return False, max_free, explained(summary), None, numa
 

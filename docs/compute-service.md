@@ -78,7 +78,7 @@ does not enforce an idle timeout.
 | `workdir` | absolute container path | Working directory under a writable configured mount |
 | `output_dir` | absolute container path | Output directory under a writable configured mount |
 | `slots` | non-negative integer | Requested slots; defaults to the profile value |
-| `prefer_gpu_topology` | `"soft"`, `"strong"`, `false`, or null | GPU placement for 2 or more slots; requires the research-cluster fork 0.42.0 or later. `"strong"` takes all GPUs from one NUMA node of one agent and waits until one has them free; `"soft"` never waits, never guarantees one NUMA node, and prefers the best-connected free GPUs of the chosen agent. Sent only with 2 or more slots and `"soft"` or `"strong"`. An experiment sets it here, not in `experiment_config.resources` |
+| `prefer_gpu_topology` | `"soft"`, `"strong"`, `false`, or null | GPU placement for 2 or more slots; requires the research-cluster fork 0.42.0 or later. `"strong"` takes all GPUs from one NUMA node of one agent and waits until one has them free; `"soft"` does not queue extra to wait for a better GPU topology, never guarantees one NUMA node, and prefers the best-connected free GPUs of the chosen agent. Sent only with 2 or more slots and `"soft"` or `"strong"`. An experiment sets it here, not in `experiment_config.resources` |
 | `pool`, `image` | string | Optional overrides of profile defaults |
 | `code_revision` | string or null | Caller-provided revision or content identifier |
 | `experiment_config` | object | Extra experiment configuration; requires experiment mode |
@@ -287,7 +287,7 @@ admission.
 Admission counts slots as the pool does: a drained or disabled slot, and every slot of a
 disabled agent, is not capacity, and a draining slot or agent counts only the slots that
 still hold a container. A command, shell, or generic task, and an experiment with
-`is_single_node: true`, needs one schedulable agent with the requested free slots. For 2 or
+`is_single_node: true`, needs one schedulable agent with the requested free slots. For 1 or
 more slots, capacity is unknown when the pool's used-slot count differs from the slots
 holding containers, which means a task is starting or stopping. An experiment with 2 or
 more `slots_per_trial` and without `is_single_node: true` may span agents, which admission
@@ -299,9 +299,11 @@ With `prefer_gpu_topology: "strong"` and 2 or more slots, every kind, an experim
 included, needs one schedulable agent with N free GPUs on one NUMA node of that agent;
 `"soft"` is checked like no preference. For `"strong"`, capacity is also unknown when an
 agent's GPU topology is not visible to the account or does not match its slots. A
-`"strong"` request that the master refuses with the pool's current agents (no agent, or
-no NUMA node, with N slots) fails with `capacity_unavailable`, `retryable: false`, and the
-master's reason. With 0 or 1 slot the preference has no effect: it is not sent, and the
+`"strong"` request that the master refuses with the pool's current agents, static or
+provisioned, fails with `capacity_unavailable` and `retryable: false`: when no agent has N
+slots, the request needs fewer slots or another pool; when an agent has N slots but no NUMA
+node does, `"soft"` may fit. A pool that is not static and has no agents yet waits for them.
+With 0 or 1 slot the preference has no effect: it is not sent, and the
 plan carries the advisory `gpu_topology_ignored`. Admission does not see waiting tasks: a
 higher-priority task waiting for a NUMA node can keep an admitted lower-priority task
 queued.

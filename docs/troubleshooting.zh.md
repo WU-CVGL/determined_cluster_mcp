@@ -98,11 +98,11 @@ Requests 从 MCP 进程环境读取 `HTTPS_PROXY`、`HTTP_PROXY` 和 `NO_PROXY` 
 
 当 `allow_queue: false` 时，容量不足或无法确定会拒绝提交，而不是进入队列。不要擅自选择建议的其他资源池、减少资源或设置 `allow_queue: true`；这些变化需要明确的任务决策。认证或资源清单结构错误属于错误，不能当作容量存在的证据。
 
-已 drain 或已禁用的 slot 以及已禁用的 agent 都不算容量。如果 agent 列表仍与资源池不一致，`capacity_unknown` 的消息会给出资源池报告的 slot 数和 agent 数，以及 agent 列表得到的数目。请求 2 个及以上 slot 时，如果消息说明已用 slot 数与有容器占用的 slot 数不同，表示资源池中有任务正在启动或停止；请报告该情况，用户可以再次检查；不要循环重试。可能跨 agent 运行的 experiment（`slots_per_trial` 为 2 或以上且未设置 `is_single_node: true`）如果无法放进单个 agent，会得到 `capacity_unknown`，因为服务不检查跨 agent 的放置：若任务能放在一个 agent 上，请设置 `is_single_node: true`；只有在用户同意时才用 `allow_queue: true` 排队。
+已 drain 或已禁用的 slot 以及已禁用的 agent 都不算容量。如果 agent 列表仍与资源池不一致，`capacity_unknown` 的消息会给出资源池报告的 slot 数和 agent 数，以及 agent 列表得到的数目。请求 1 个及以上 slot 时，如果消息说明已用 slot 数与有容器占用的 slot 数不同，表示资源池中有任务正在启动或停止；请报告该情况，用户可以再次检查；不要循环重试。可能跨 agent 运行的 experiment（`slots_per_trial` 为 2 或以上且未设置 `is_single_node: true`）如果无法放进单个 agent，会得到 `capacity_unknown`，因为服务不检查跨 agent 的放置：若任务能放在一个 agent 上，请设置 `is_single_node: true`；只有在用户同意时才用 `allow_queue: true` 排队。
 
 对于设置 `prefer_gpu_topology: "strong"` 且请求 2 个及以上 slot 的请求：
 
-- `capacity_unavailable` 且 `retryable: false`：master 在资源池当前的 agent 下会拒绝这个 `"strong"` 请求；没有 agent 或没有 NUMA 节点拥有 N 个 slot。是否改用 `"soft"`、更少 GPU 或其他资源池由用户决定。
+- `capacity_unavailable` 且 `retryable: false`：master 在资源池当前的 agent 下（无论静态还是自动扩缩的资源池）会拒绝这个 `"strong"` 请求。没有 agent 拥有 N 个 slot 时，需要减少 slot 或换用其他资源池；有 agent 拥有 N 个 slot 但没有 NUMA 节点拥有时，`"soft"` 也可能放得下。如何选择由用户决定。
 - 指明 GPU 拓扑的 `capacity_unknown`：当前账户看不到 agent 的 GPU 拓扑，或拓扑与 slot 不一致。不设置 `"strong"` 的请求不需要拓扑。只有在用户同意时才排队。
 - 排队中的 `"strong"` 任务会记录日志 `GPU topology preference strong: waiting until one NUMA node of an agent in pool P has N free GPUs`。它之后仍可能以 `no NUMA node in pool P has N slots; use soft` 失败，例如在 master 重启或某个 GPU 被排除之后；以这种方式失败的 trial 不会被重启。
 

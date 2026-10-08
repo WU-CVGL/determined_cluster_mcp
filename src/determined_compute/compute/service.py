@@ -445,9 +445,10 @@ class ComputeService:
                 {
                     "code": "gpu_topology_soft",
                     "message": (
-                        "soft never waits and never guarantees one NUMA node: on the chosen "
-                        "agent it prefers the best-connected free GPUs (fewer in error, then "
-                        "P2P/NVLink and NUMA locality), and in some pools it prefers an agent "
+                        "soft does not queue extra to wait for a better GPU topology and never "
+                        "guarantees one NUMA node: on the chosen agent it prefers the "
+                        "best-connected free GPUs (fewer in error, then P2P/NVLink and NUMA "
+                        "locality), and in some pools it prefers an agent "
                         "where one NUMA node holds the task. It has no effect when the task "
                         "spans several agents."
                     ),

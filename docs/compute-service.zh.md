@@ -75,7 +75,7 @@ shell_inactivity_seconds: 7200
 | `workdir` | 容器绝对路径 | 可写已配置挂载下的工作目录 |
 | `output_dir` | 容器绝对路径 | 可写已配置挂载下的输出目录 |
 | `slots` | 非负整数 | 请求的 slot 数；默认使用配置值 |
-| `prefer_gpu_topology` | `"soft"`、`"strong"`、`false` 或 null | 2 个及以上 slot 的 GPU 放置偏好；需要 research-cluster fork 0.42.0 或更高版本。`"strong"` 要求全部 GPU 来自同一 agent 的同一 NUMA 节点，并等待到有这样的节点空闲；`"soft"` 从不因此等待，也不保证同一 NUMA 节点，只在所选 agent 上优先选择连接最好的空闲 GPU。仅在 2 个及以上 slot 且值为 `"soft"` 或 `"strong"` 时发送。experiment 也在这里设置，不能写在 `experiment_config.resources` 中 |
+| `prefer_gpu_topology` | `"soft"`、`"strong"`、`false` 或 null | 2 个及以上 slot 的 GPU 放置偏好；需要 research-cluster fork 0.42.0 或更高版本。`"strong"` 要求全部 GPU 来自同一 agent 的同一 NUMA 节点，并等待到有这样的节点空闲；`"soft"` 不会为等待更好的 GPU 拓扑而额外排队，也不保证同一 NUMA 节点，只在所选 agent 上优先选择连接最好的空闲 GPU。仅在 2 个及以上 slot 且值为 `"soft"` 或 `"strong"` 时发送。experiment 也在这里设置，不能写在 `experiment_config.resources` 中 |
 | `pool`、`image` | 字符串 | 可选的配置默认值覆盖 |
 | `code_revision` | 字符串或 null | 调用方提供的版本或内容标识 |
 | `experiment_config` | 对象 | 额外的实验配置；要求 experiment 模式 |
@@ -259,7 +259,7 @@ brand 无法读取时为 `null`。这两项都不影响准入。
 
 准入按资源池自身的方式计算 slot：已 drain 或已禁用的 slot，以及已禁用 agent 的所有 slot，都不算
 容量；正在 drain 的 slot 或 agent 只计入仍有容器占用的 slot。command、shell、generic 任务以及
-设置了 `is_single_node: true` 的 experiment 需要一个可调度 agent 有所需数量的空闲 slot。请求 2 个
+设置了 `is_single_node: true` 的 experiment 需要一个可调度 agent 有所需数量的空闲 slot。请求 1 个
 及以上 slot 时，如果资源池的已用 slot 数与有容器占用的 slot 数不同，说明有任务正在启动或停止，
 容量为未知。`slots_per_trial` 为 2 或以上且未设置 `is_single_node: true` 的 experiment 可能跨
 agent 运行，准入不检查这种情况：只要有一个 agent 有足够空闲 slot 就放行，否则为
@@ -269,8 +269,10 @@ agent 运行，准入不检查这种情况：只要有一个 agent 有足够空�
 设置 `prefer_gpu_topology: "strong"` 且请求 2 个及以上 slot 时，所有任务类型（包括 experiment）
 都需要一个可调度 agent 在其同一 NUMA 节点上有 N 个空闲 GPU；`"soft"` 按无偏好的方式检查。对于
 `"strong"`，如果某个 agent 的 GPU 拓扑对当前账户不可见或与其 slot 不一致，容量同样为未知。master
-在资源池当前的 agent 下会拒绝的 `"strong"` 请求（没有 agent 或没有 NUMA 节点拥有 N 个 slot）会以
-`capacity_unavailable`、`retryable: false` 和 master 给出的原因失败。请求 0 或 1 个 slot 时该偏好
+在资源池当前的 agent 下（无论静态还是自动扩缩的资源池）会拒绝的 `"strong"` 请求会以
+`capacity_unavailable` 和 `retryable: false` 失败：没有 agent 拥有 N 个 slot 时，需要减少 slot 或
+换用其他资源池；有 agent 拥有 N 个 slot 但没有 NUMA 节点拥有时，`"soft"` 可能放得下。尚无 agent
+的非静态资源池会等待其 agent。请求 0 或 1 个 slot 时该偏好
 不起作用：它不会被发送，规划结果带有 advisory `gpu_topology_ignored`。准入看不到正在等待的任务：
 一个等待 NUMA 节点的高优先级任务可能让已通过准入的低优先级任务一直排队。
 
