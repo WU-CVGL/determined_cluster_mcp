@@ -100,6 +100,8 @@ Requests 从 MCP 进程环境读取 `HTTPS_PROXY`、`HTTP_PROXY` 和 `NO_PROXY` 
 
 当 `allow_queue: false` 时，容量不足或无法确定会拒绝提交，而不是进入队列。不要擅自选择建议的其他资源池、减少资源或设置 `allow_queue: true`；这些变化需要明确的任务决策。认证或资源清单结构错误属于错误，不能当作容量存在的证据。
 
+已 drain 或已禁用的 slot 以及已禁用的 agent 都不算容量。如果 agent 列表仍与资源池不一致，`capacity_unknown` 的消息会给出资源池报告的 slot 数和 agent 数，以及 agent 列表得到的数目。请求 1 个及以上 slot 时，如果消息说明已用 slot 数与有容器占用的 slot 数不同，表示资源池中有任务正在启动或停止；请报告该情况，用户可以再次检查；不要循环重试。可能跨 agent 运行的 experiment（`slots_per_trial` 为 2 或以上且未设置 `is_single_node: true`）如果无法放进单个 agent，会得到 `capacity_unknown`，因为服务不检查跨 agent 的放置：若任务能放在一个 agent 上，请设置 `is_single_node: true`；只有在用户同意时才用 `allow_queue: true` 排队。
+
 管理员动态创建的资源池只有在进入 Ready 状态后才会出现在 `compute_resources` 中。处于 Pending 或 Failed 状态的资源池不会出现：结果会说明该资源池不存在或对你不可用，且可用性未知，不排队的提交会以 `capacity_unknown` 被拒绝。本 MCP 不提供动态资源池管理 API，请向管理员确认该资源池的状态。
 
 在 research-cluster fork 0.42.0 或更高版本上，管理员可以把资源池限定给部分账户使用，资源池列表会省略当前账户无权使用的资源池，因此 `compute_resources` 和不排队的提交会以同样方式报告它。设置 `allow_queue: true` 的提交，或恢复该资源池中的 experiment 或 generic 任务，会以 `permission_denied` 失败；其消息和 `details.resource_pool` 会给出该资源池。请与用户一起选择其他资源池，或请管理员授予权限。

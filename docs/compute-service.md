@@ -272,6 +272,17 @@ research-cluster fork 0.42.0 or later, the pool list holds only the pools the ac
 use, so a requested pool missing from it is reported as not present or not available to
 you, with unknown availability.
 
+Admission counts slots as the pool does: a drained or disabled slot, and every slot of a
+disabled agent, is not capacity, and a draining slot or agent counts only the slots that
+still hold a container. A command, shell, or generic task, and an experiment with
+`is_single_node: true`, needs one schedulable agent with the requested free slots. For 1 or
+more slots, capacity is unknown when the pool's used-slot count differs from the slots
+holding containers, which means a task is starting or stopping. An experiment with 2 or
+more `slots_per_trial` and without `is_single_node: true` may span agents, which admission
+does not check: it is admitted when one agent has the free slots and is otherwise
+`capacity_unknown`, so set `is_single_node: true` when it fits on one agent, or use
+`allow_queue: true` when the user agrees to wait.
+
 `compute_launch` checks capacity unless `allow_queue` is explicitly true, then submits
 the request once. A pool missing from the account's pool list fails that check with
 `capacity_unknown`; a pool that the master refuses fails with `permission_denied` (see

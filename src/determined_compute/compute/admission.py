@@ -12,6 +12,9 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from determined_compute.core.api_client import APIError
 
 
+_STATISTICS_MISSING = "complete per-agent slot capacity statistics are missing"
+
+
 def _observed_at() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -41,16 +44,16 @@ class ResourceInspector:
         self.client = client
 
     def resources(self, slots: int = 1, pool: Optional[str] = None) -> Dict[str, Any]:
-        """Return conservative, per-pool capacity for a single-node request."""
+        """Return conservative, per-pool capacity for a request on one agent."""
 
-        return self._resources(slots=slots, pool=pool, single_node=True)
-
-    def _resources(
-        self, *, slots: int, pool: Optional[str], single_node: bool
-    ) -> Dict[str, Any]:
         self._validate_request(slots, pool)
-        pools_value = self.client._get("api/v1/resource-pools", params={"limit": 0})
+        return self._resources(slots=slots, pool=pool)
+
+    def _resources(self, *, slots: int, pool: Optional[str]) -> Dict[str, Any]:
+        # Agents first: a slot taken before or between the two reads then shows as a
+        # used-slot mismatch, not as a free slot.
         agents_value = self.client._get("api/v1/agents", params={"limit": 0})
+        pools_value = self.client._get("api/v1/resource-pools", params={"limit": 0})
         pools = pools_value.get("resourcePools") if isinstance(pools_value, Mapping) else None
         agents = agents_value.get("agents") if isinstance(agents_value, Mapping) else None
         if not isinstance(pools, list) or not isinstance(agents, list):
@@ -66,7 +69,7 @@ class ResourceInspector:
             )
 
         assessments = [
-            self._assess_pool(item, agents, slots=slots, single_node=single_node)
+            self._assess_pool(item, agents, slots=slots)
             for item in pools
             if isinstance(item, Mapping) and isinstance(item.get("name"), str)
         ]
@@ -106,7 +109,7 @@ class ResourceInspector:
             "observed_at": _observed_at(),
             "requested_slots": slots,
             "requested_pool": pool,
-            "single_node": single_node,
+            "single_node": True,
             "available": available,
             "selected_pool": selected,
             "pools": assessments,
@@ -133,7 +136,6 @@ class ResourceInspector:
         agents: List[Any],
         *,
         slots: int,
-        single_node: bool,
     ) -> Dict[str, Any]:
         name = str(raw["name"])
         total = _nonnegative_int(raw.get("slotsAvailable"))
@@ -142,7 +144,8 @@ class ResourceInspector:
         slot_type = raw.get("slotType")
         aux_capacity = _nonnegative_int(raw.get("auxContainerCapacity"))
         aux_running = _nonnegative_int(raw.get("auxContainersRunning"))
-        per_agent, agent_data_known = self._agent_free(name, agents, num_agents, total)
+        per_agent, holding, agent_problem = self._agent_free(name, agents, num_agents, total)
+        agent_data_known = agent_problem is None
 
         if slots == 0:
             capacity_kind = "aux_containers"
@@ -161,7 +164,7 @@ class ResourceInspector:
                 else "auxiliary-container capacity statistics are missing"
             )
         else:
-            capacity_kind = "slots_single_agent" if single_node else "slots_aggregate"
+            capacity_kind = "slots_single_agent"
             known = (
                 agent_data_known
                 and used is not None
@@ -170,20 +173,25 @@ class ResourceInspector:
                 and isinstance(slot_type, str)
                 and bool(slot_type)
             )
+            problem = agent_problem
+            if known and used != holding:
+                # The pool's used count is the slots holding containers (numUsedSlots).
+                known = False
+                problem = (
+                    f"used slots ({used}) differ from slots holding containers ({holding}); "
+                    "a task may be starting or stopping"
+                )
             if known:
-                aggregate_free = sum(per_agent.values())
-                max_agent_free = max(per_agent.values(), default=0)
-                available_capacity = max_agent_free if single_node else aggregate_free
+                available_capacity = max(per_agent.values(), default=0)
                 available = available_capacity >= slots
-                fit = "one schedulable agent" if single_node else "schedulable agents"
                 explanation = (
-                    f"{available_capacity} slot(s) are currently free across {fit}; "
-                    f"{slots} requested"
+                    f"{available_capacity} slot(s) are currently free across one "
+                    f"schedulable agent; {slots} requested"
                 )
             else:
                 available_capacity = None
                 available = None
-                explanation = "complete per-agent slot capacity statistics are missing"
+                explanation = problem or _STATISTICS_MISSING
 
         return {
             "resource_pool": name,
@@ -197,9 +205,6 @@ class ResourceInspector:
             "per_agent_free_slots": per_agent if agent_data_known else None,
             "max_single_agent_free_slots": (
                 max(per_agent.values(), default=0) if agent_data_known else None
-            ),
-            "aggregate_schedulable_free_slots": (
-                sum(per_agent.values()) if agent_data_known else None
             ),
             "aux_container_capacity": aux_capacity,
             "aux_containers_running": aux_running,
@@ -220,9 +225,19 @@ class ResourceInspector:
         agents: List[Any],
         expected_agents: Optional[int],
         expected_slots: Optional[int],
-    ) -> Tuple[Dict[str, int], bool]:
+    ) -> Tuple[Dict[str, int], int, Optional[str]]:
+        """Return each agent's free slots and the counted slots holding a container.
+
+        The third value says why the agent list does not match the pool, or is None.
+
+        Slots are counted the way the pool counts them (numSlots in the scheduler's agent
+        state): a slot counts when it takes new work, or when it is draining and still holds a
+        container. A draining agent counts only its counted slots that hold a container, and a
+        disabled agent counts none.
+        """
+
         if expected_agents is None or expected_slots is None:
-            return {}, False
+            return {}, 0, _STATISTICS_MISSING
         matching: List[Mapping[str, Any]] = []
         for item in agents:
             if not isinstance(item, Mapping):
@@ -230,11 +245,10 @@ class ResourceInspector:
             memberships = item.get("resourcePools")
             if isinstance(memberships, list) and pool in memberships:
                 matching.append(item)
-        if len(matching) != expected_agents:
-            return {}, False
 
         result: Dict[str, int] = {}
-        observed_slots = 0
+        counted_slots = 0
+        holding = 0
         for agent in matching:
             agent_id = agent.get("id")
             entries = _slots(agent.get("slots"))
@@ -248,23 +262,34 @@ class ResourceInspector:
                 or not isinstance(enabled, bool)
                 or not isinstance(draining, bool)
             ):
-                return {}, False
-            observed_slots += len(entries)
-            if not enabled or draining:
-                result[agent_id] = 0
-                continue
+                return {}, 0, _STATISTICS_MISSING
+            counted = 0
+            counted_busy = 0
             free = 0
             for slot in entries:
                 slot_enabled = slot.get("enabled", True)
                 slot_draining = slot.get("draining", False)
                 if not isinstance(slot_enabled, bool) or not isinstance(slot_draining, bool):
-                    return {}, False
-                if slot_enabled and not slot_draining and slot.get("container") is None:
+                    return {}, 0, _STATISTICS_MISSING
+                busy = slot.get("container") is not None
+                if (slot_enabled and not slot_draining) or (slot_draining and busy):
+                    counted += 1
+                    counted_busy += busy
+                if slot_enabled and not slot_draining and not busy:
                     free += 1
-            result[agent_id] = free
-        if observed_slots != expected_slots:
-            return {}, False
-        return result, True
+            if draining:
+                counted_slots += counted_busy
+            elif enabled:
+                counted_slots += counted
+            holding += counted_busy
+            result[agent_id] = free if enabled and not draining else 0
+        if len(matching) != expected_agents or counted_slots != expected_slots:
+            return {}, 0, (
+                f"pool reports {expected_slots} slot(s) on {expected_agents} agent(s); "
+                f"the agent list gives {counted_slots} counted slot(s) on "
+                f"{len(matching)} agent(s)"
+            )
+        return result, holding, None
 
     def require_capacity(self, kind: str, config: Mapping[str, Any]) -> Dict[str, Any]:
         """Require current capacity for the config's exact selected pool."""
@@ -282,25 +307,32 @@ class ResourceInspector:
         self._validate_request(slots, pool)
         if pool is None:
             raise ValueError("config.resources.resource_pool must be a non-empty string")
-        is_single_node = resources.get("is_single_node", True)
-        if not isinstance(is_single_node, bool):
-            raise ValueError("config.resources.is_single_node must be a boolean")
-        report = self._resources(slots=slots, pool=pool, single_node=is_single_node)
+        is_single_node = resources.get("is_single_node")
+        if is_single_node is not None and not isinstance(is_single_node, bool):
+            raise ValueError("config.resources.is_single_node must be a boolean or null")
+        # A trial is multi-agent unless is_single_node is true (absent or null included). The
+        # scheduler tries one agent first; spanning agents is not modelled, so a trial that
+        # fits on no single agent has unknown capacity.
+        may_span_agents = kind == "experiment" and slots >= 2 and is_single_node is not True
+        report = self._resources(slots=slots, pool=pool)
         selected = report["selected_pool"]
         if selected is not None and selected["available"] is True:
             return {**report, "admitted": True}
 
-        code = (
-            "capacity_unknown"
-            if selected is None or selected["available"] is None
-            else "capacity_unavailable"
-        )
         available = selected["available_capacity"] if selected is not None else None
+        code = "capacity_unknown"
         if selected is None:
             message = f"resource pool {pool!r} is not present or not available to you"
-        elif code == "capacity_unknown":
-            message = f"capacity for resource pool {pool!r} is unknown"
+        elif selected["available"] is None:
+            message = f"capacity for resource pool {pool!r} is unknown: {selected['explanation']}"
+        elif may_span_agents:
+            message = (
+                f"capacity for resource pool {pool!r} is unknown: this experiment may span "
+                "agents, which this service does not check; set is_single_node: true, or "
+                "launch with allow_queue=true"
+            )
         else:
+            code = "capacity_unavailable"
             message = f"resource pool {pool!r} cannot currently fit the request without queueing"
         raise APIError(
             message,
