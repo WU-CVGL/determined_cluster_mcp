@@ -928,3 +928,186 @@ def test_pause_and_resume_reject_commands_and_shells_before_network(profile, kin
             action(kind, str(uuid.UUID(int=1)))
         assert caught.value.code == "unsupported_kind"
     assert client.me_calls == 0 and client.gets == [] and client.controls == []
+
+
+def topology_request(command_request, kind, slots, **fields):
+    request = dict(command_request, kind=kind, slots=slots, name="multi-gpu", **fields)
+    if kind == "shell":
+        request.pop("command")
+    return request
+
+
+_KINDS = ["command", "shell", "generic", "experiment"]
+
+
+def _resources_of(plan):
+    return plan["config"]["resources"]
+
+
+def _codes(plan):
+    return {item["code"] for item in plan["advisories"]}
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("fields", [{}, {"prefer_gpu_topology": None},
+                                    {"prefer_gpu_topology": False}])
+def test_an_off_gpu_topology_preference_is_not_sent(profile, command_request, kind, fields):
+    plan = ComputeService(FakeClient(), profile).plan(
+        topology_request(command_request, kind, 4, **fields)
+    )
+
+    assert "prefer_gpu_topology" not in _resources_of(plan)
+    assert not {code for code in _codes(plan) if code.startswith("gpu_topology")}
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("value", ["soft", "strong"])
+def test_a_gpu_topology_preference_is_sent_from_two_slots(profile, command_request, kind, value):
+    plan = ComputeService(FakeClient(), profile).plan(
+        topology_request(command_request, kind, 2, prefer_gpu_topology=value)
+    )
+
+    slot_key = "slots_per_trial" if kind == "experiment" else "slots"
+    assert _resources_of(plan) == {
+        slot_key: 2, "resource_pool": "gpu", "prefer_gpu_topology": value,
+    }
+    assert f"gpu_topology_{value}" in _codes(plan)
+    assert "gpu_topology_ignored" not in _codes(plan)
+
+
+def test_a_generic_task_sends_the_preference_in_its_config_text(profile, command_request):
+    from determined_compute.core.api_client import _config_text
+
+    plan = ComputeService(FakeClient(), profile).plan(
+        topology_request(command_request, "generic", 4, prefer_gpu_topology="strong")
+    )
+
+    assert json.loads(_config_text(plan["config"]))["resources"]["prefer_gpu_topology"] == (
+        "strong"
+    )
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("slots", [0, 1, 2])
+@pytest.mark.parametrize("value", [True, "Soft", "STRONG", "off", "", 0, 1, {}, ["soft"]])
+def test_other_gpu_topology_values_are_invalid_for_every_slot_count(
+    profile, command_request, kind, slots, value
+):
+    service = ComputeService(FakeClient(), profile)
+
+    with pytest.raises(ValidationError) as caught:
+        service.plan(topology_request(command_request, kind, slots, prefer_gpu_topology=value))
+    assert caught.value.code == "invalid_request"
+    assert str(caught.value) == 'prefer_gpu_topology must be "soft", "strong", false, or null'
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+@pytest.mark.parametrize("slots", [0, 1])
+@pytest.mark.parametrize("value", ["soft", "strong"])
+def test_a_preference_below_two_slots_is_ignored_with_an_advisory(
+    profile, command_request, kind, slots, value
+):
+    inspector = ToggleInspector()
+    client = FakeClient()
+    service = ComputeService(client, profile, inspector=inspector)
+    request = topology_request(command_request, kind, slots, prefer_gpu_topology=value)
+
+    plan = service.plan(request)
+    assert "prefer_gpu_topology" not in _resources_of(plan)
+    advisories = {item["code"]: item["message"] for item in plan["advisories"]}
+    assert advisories["gpu_topology_ignored"] == (
+        "prefer_gpu_topology affects only tasks with 2 or more slots; it was not sent."
+    )
+    assert "gpu_topology_strong" not in advisories
+    assert "gpu_topology_soft" not in advisories
+
+    service.launch(request)
+    (_kind, admitted_config), = inspector.calls
+    assert "prefer_gpu_topology" not in admitted_config["resources"]
+    assert "prefer_gpu_topology" not in client.launches[0][1]["resources"]
+
+
+@pytest.mark.parametrize("value", ["strong", False, None, "soft"])
+def test_an_experiment_sets_the_preference_only_at_the_top_level(profile, command_request, value):
+    request = topology_request(
+        command_request, "experiment", 4,
+        experiment_config={"resources": {"prefer_gpu_topology": value}},
+    )
+
+    with pytest.raises(ValidationError) as caught:
+        ComputeService(FakeClient(), profile).plan(request)
+    assert caught.value.code == "invalid_request"
+    assert str(caught.value) == "set prefer_gpu_topology at the top level"
+
+
+def test_an_experiment_keeps_its_other_resources_with_the_preference(profile, command_request):
+    request = topology_request(
+        command_request, "experiment", 4, prefer_gpu_topology="strong",
+        experiment_config={"resources": {"is_single_node": True, "priority": 42}},
+    )
+
+    plan = ComputeService(FakeClient(), profile).plan(request)
+    assert _resources_of(plan) == {
+        "is_single_node": True,
+        "priority": 42,
+        "slots_per_trial": 4,
+        "resource_pool": "gpu",
+        "prefer_gpu_topology": "strong",
+    }
+
+
+def test_topology_advisories_have_fixed_text(profile, command_request):
+    service = ComputeService(FakeClient(), profile)
+
+    strong = service.plan(
+        topology_request(command_request, "command", 4, prefer_gpu_topology="strong")
+    )
+    soft = service.plan(
+        topology_request(command_request, "command", 4, prefer_gpu_topology="soft")
+    )
+    strong_text = {item["code"]: item["message"] for item in strong["advisories"]}
+    soft_text = {item["code"]: item["message"] for item in soft["advisories"]}
+    assert strong_text["gpu_topology_strong"] == (
+        "strong takes all 4 GPUs from one NUMA node of one agent; is_single_node has no "
+        "effect. Without allow_queue it launches only if such a node is free now; with "
+        "allow_queue=true, and when resumed, it waits without a time limit. Each experiment "
+        "trial separately needs 4 free GPUs on one NUMA node; trials can share a node."
+    )
+    assert "gpu_topology_soft" not in strong_text
+    assert soft_text["gpu_topology_soft"] == (
+        "soft never waits and never guarantees one NUMA node: on the chosen agent it prefers "
+        "the best-connected free GPUs (fewer in error, then P2P/NVLink and NUMA locality), "
+        "and in some pools it prefers an agent where one NUMA node holds the task. It has no "
+        "effect when the task spans several agents."
+    )
+    assert "gpu_topology_strong" not in soft_text
+
+
+def test_a_queued_launch_sends_the_preference_without_a_capacity_check(
+    profile, command_request
+):
+    inspector = ToggleInspector(available=False)
+    client = FakeClient()
+    service = ComputeService(client, profile, inspector=inspector)
+
+    service.launch(topology_request(
+        command_request, "command", 4, prefer_gpu_topology="strong", allow_queue=True
+    ))
+
+    assert inspector.calls == []
+    assert client.launches[0][1]["resources"]["prefer_gpu_topology"] == "strong"
+
+
+def test_an_admitted_launch_checks_the_config_it_sends(profile, command_request):
+    inspector = ToggleInspector()
+    client = FakeClient()
+    service = ComputeService(client, profile, inspector=inspector)
+
+    service.launch(topology_request(
+        command_request, "experiment", 2, prefer_gpu_topology="soft"
+    ))
+
+    (kind, admitted_config), = inspector.calls
+    assert kind == "experiment"
+    assert admitted_config["resources"]["prefer_gpu_topology"] == "soft"
+    assert client.launches[0][1]["resources"]["prefer_gpu_topology"] == "soft"
