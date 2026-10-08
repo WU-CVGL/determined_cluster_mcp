@@ -100,6 +100,12 @@ Requests 从 MCP 进程环境读取 `HTTPS_PROXY`、`HTTP_PROXY` 和 `NO_PROXY` 
 
 已 drain 或已禁用的 slot 以及已禁用的 agent 都不算容量。如果 agent 列表仍与资源池不一致，`capacity_unknown` 的消息会给出资源池报告的 slot 数和 agent 数，以及 agent 列表得到的数目。请求 2 个及以上 slot 时，如果消息说明已用 slot 数与有容器占用的 slot 数不同，表示资源池中有任务正在启动或停止；请报告该情况，用户可以再次检查；不要循环重试。可能跨 agent 运行的 experiment（`slots_per_trial` 为 2 或以上且未设置 `is_single_node: true`）如果无法放进单个 agent，会得到 `capacity_unknown`，因为服务不检查跨 agent 的放置：若任务能放在一个 agent 上，请设置 `is_single_node: true`；只有在用户同意时才用 `allow_queue: true` 排队。
 
+对于设置 `prefer_gpu_topology: "strong"` 且请求 2 个及以上 slot 的请求：
+
+- `capacity_unavailable` 且 `retryable: false`：master 在资源池当前的 agent 下会拒绝这个 `"strong"` 请求；没有 agent 或没有 NUMA 节点拥有 N 个 slot。是否改用 `"soft"`、更少 GPU 或其他资源池由用户决定。
+- 指明 GPU 拓扑的 `capacity_unknown`：当前账户看不到 agent 的 GPU 拓扑，或拓扑与 slot 不一致。不设置 `"strong"` 的请求不需要拓扑。只有在用户同意时才排队。
+- 排队中的 `"strong"` 任务会记录日志 `GPU topology preference strong: waiting until one NUMA node of an agent in pool P has N free GPUs`。它之后仍可能以 `no NUMA node in pool P has N slots; use soft` 失败，例如在 master 重启或某个 GPU 被排除之后；以这种方式失败的 trial 不会被重启。
+
 管理员动态创建的资源池只有在进入 Ready 状态后才会出现在 `compute_resources` 中。处于 Pending 或 Failed 状态的资源池不会出现：结果会说明该资源池不存在或对你不可用，且可用性未知，不排队的提交会以 `capacity_unknown` 被拒绝。本 MCP 不提供动态资源池管理 API，请向管理员确认该资源池的状态。
 
 在 research-cluster fork 0.42.0 或更高版本上，管理员可以把资源池限定给部分账户使用，资源池列表会省略当前账户无权使用的资源池，因此 `compute_resources` 和不排队的提交会以同样方式报告它。设置 `allow_queue: true` 的提交，或恢复该资源池中的 experiment 或 generic 任务，会以 `permission_denied` 失败；其消息和 `details.resource_pool` 会给出该资源池。请与用户一起选择其他资源池，或请管理员授予权限。

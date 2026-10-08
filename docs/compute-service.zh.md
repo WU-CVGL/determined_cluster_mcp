@@ -75,6 +75,7 @@ shell_inactivity_seconds: 7200
 | `workdir` | 容器绝对路径 | 可写已配置挂载下的工作目录 |
 | `output_dir` | 容器绝对路径 | 可写已配置挂载下的输出目录 |
 | `slots` | 非负整数 | 请求的 slot 数；默认使用配置值 |
+| `prefer_gpu_topology` | `"soft"`、`"strong"`、`false` 或 null | 2 个及以上 slot 的 GPU 放置偏好；需要 research-cluster fork 0.42.0 或更高版本。`"strong"` 要求全部 GPU 来自同一 agent 的同一 NUMA 节点，并等待到有这样的节点空闲；`"soft"` 从不因此等待，也不保证同一 NUMA 节点，只在所选 agent 上优先选择连接最好的空闲 GPU。仅在 2 个及以上 slot 且值为 `"soft"` 或 `"strong"` 时发送。experiment 也在这里设置，不能写在 `experiment_config.resources` 中 |
 | `pool`、`image` | 字符串 | 可选的配置默认值覆盖 |
 | `code_revision` | 字符串或 null | 调用方提供的版本或内容标识 |
 | `experiment_config` | 对象 | 额外的实验配置；要求 experiment 模式 |
@@ -234,7 +235,7 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 | `compute_pause` | `kind`、`id` | experiment 和 generic 任务：任务摘要、远端响应和 `pause_acknowledged` |
 | `compute_resume` | `kind`、`id` | experiment 和 generic 任务：任务摘要、远端响应和 `resume_acknowledged` |
 | `compute_list` | `kind`，可选 `limit=50`、`offset=0`、`marker` | 当前账户的一页任务，最新的在前；指定 `marker` 时返回该页中配置带有该标记的任务 |
-| `compute_resources` | 可选 `slots=1`、`pool` | 当前调度容量和候选资源池 |
+| `compute_resources` | 可选 `slots=1`、`pool`、`prefer_gpu_topology` | 当前调度容量和候选资源池。值为 `"strong"` 且请求 2 个及以上 slot 时，每个资源池会增加 `max_numa_node_free_slots`（当前能放下的最大 `"strong"` 任务）和 `max_numa_node_slots`（master 在当前 agent 下接受的最大值） |
 | `storage_check` | `path` | 映射容器路径的访问情况 |
 | `storage_sync` | `local_dir`、`shared_dir`，可选 `dry_run=true` | 预览或把本地目录内容复制到共享存储 |
 | `storage_fetch` | `shared_dir`、`local_dir`，可选 `dry_run=true` | 预览或把共享目录内容复制到本地 |
@@ -256,6 +257,14 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 agent 运行，准入不检查这种情况：只要有一个 agent 有足够空闲 slot 就放行，否则为
 `capacity_unknown`；若任务能放在一个 agent 上，请设置 `is_single_node: true`，或在用户同意等待时
 使用 `allow_queue: true`。
+
+设置 `prefer_gpu_topology: "strong"` 且请求 2 个及以上 slot 时，所有任务类型（包括 experiment）
+都需要一个可调度 agent 在其同一 NUMA 节点上有 N 个空闲 GPU；`"soft"` 按无偏好的方式检查。对于
+`"strong"`，如果某个 agent 的 GPU 拓扑对当前账户不可见或与其 slot 不一致，容量同样为未知。master
+在资源池当前的 agent 下会拒绝的 `"strong"` 请求（没有 agent 或没有 NUMA 节点拥有 N 个 slot）会以
+`capacity_unavailable`、`retryable: false` 和 master 给出的原因失败。请求 0 或 1 个 slot 时该偏好
+不起作用：它不会被发送，规划结果带有 advisory `gpu_topology_ignored`。准入看不到正在等待的任务：
+一个等待 NUMA 节点的高优先级任务可能让已通过准入的低优先级任务一直排队。
 
 除非显式设置 `allow_queue: true`，`compute_launch` 会先检查容量，然后把请求提交一次。不在
 当前账户资源池列表中的资源池会使该检查以 `capacity_unknown` 失败；master 拒绝的资源池会以
@@ -393,6 +402,9 @@ HTTP 404，对不允许该操作的状态（例如暂停已暂停的任务或不
 HTTP 400，在另一个暂停、恢复或终止进行中时返回 HTTP 409；这些都是带有 master 原因的普通错误。
 较旧的 master 把同样的拒绝报告为服务器错误，因此会以 `submission_uncertain` 错误返回，消息中
 包含 master 给出的原因；重复调用前先检查 `compute_status`。
+
+恢复不检查容量：任务会排队直到能放下；设置 `prefer_gpu_topology: "strong"` 时，它会无时间限制地
+等待，直到某个 NUMA 节点上有足够的空闲 slot。
 
 对于正在运行的 shell，应使用已清理的 `reconnectCommand`，当前为
 `det shell show_ssh_command <id>`，`compute_launch` 也会以 `reconnect_command` 返回它。适配器
