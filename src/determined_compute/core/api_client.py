@@ -377,7 +377,6 @@ class DeterminedAPIClient:
         "userId",
         "username",
         "name",
-        "displayName",
         "description",
         "state",
         "resourcePool",
@@ -910,6 +909,7 @@ class DeterminedAPIClient:
         """Map a listed generic task to the fields of other kinds' remote entities."""
         summary: Dict[str, Any] = {
             "id": item.get("taskId"),
+            "jobId": item.get("jobId") or None,
             "userId": item.get("userId"),
             "username": item.get("username"),
             "name": item.get("name"),
@@ -969,9 +969,12 @@ class DeterminedAPIClient:
             for item in listed:
                 if isinstance(item, Mapping) and item.get("taskId") == task_id:
                     summary = self._generic_summary(item)
-                    for field in ("userId", "username", "name"):
+                    for field in ("userId", "username", "name", "jobId"):
                         if field in summary:
                             entity[field] = summary[field]
+                    # The task record has no pool; the config's pool, when set, wins.
+                    if "resourcePool" not in entity and "resourcePool" in summary:
+                        entity["resourcePool"] = summary["resourcePool"]
         return entity
 
     def get_task(self, kind: str, task_id: str) -> Dict[str, Any]:
@@ -1240,6 +1243,76 @@ class DeterminedAPIClient:
                 ):
                     models[uuid_text] = brand[:256]
         return models
+
+    def job_queue(self, pool: str, limit: int = 1000) -> Dict[str, Any]:
+        """Return the jobs among the first ``limit`` of one pool's queue shown in full.
+
+        Entries the account may see only in limited form are skipped. ``placement`` is
+        ``None`` when the master does not report it (before the fork 0.42.0).
+        """
+        if not isinstance(pool, str) or not pool:
+            # An empty pool would quietly query the default pool.
+            raise ValueError("pool must be a non-empty string")
+        response = self._get("api/v1/job-queues-v2", params={"resourcePool": pool, "limit": limit})
+        malformed = APIError("Job-queue response is malformed", code="invalid_response")
+
+        def count(value: Any) -> bool:
+            return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+        entries, pagination = response.get("jobs"), response.get("pagination")
+        if (
+            not isinstance(entries, list)
+            or not isinstance(pagination, Mapping)
+            or not count(pagination.get("total"))
+        ):
+            raise malformed
+        jobs: List[Dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, Mapping) or len(entry) != 1:
+                raise malformed
+            if "limited" in entry:
+                continue
+            job = entry.get("full")
+            summary = job.get("summary") if isinstance(job, Mapping) else None
+            jobs_ahead = summary.get("jobsAhead") if isinstance(summary, Mapping) else None
+            if (
+                not isinstance(summary, Mapping)
+                or not isinstance(job.get("jobId"), str)
+                or not job["jobId"]
+                or not isinstance(job.get("resourcePool"), str)
+                or not isinstance(summary.get("state"), str)
+                # A scheduler that does not rank jobs (fair share) reports -1.
+                or not (count(jobs_ahead) or (jobs_ahead == -1 and type(jobs_ahead) is int))
+                or not count(job.get("requestedSlots"))
+                or not count(job.get("allocatedSlots"))
+            ):
+                raise malformed
+            placement: Optional[List[Dict[str, Any]]] = None
+            if "placement" in job:
+                if not isinstance(job["placement"], list):
+                    raise malformed
+                placement = []
+                for item in job["placement"]:
+                    if (
+                        not isinstance(item, Mapping)
+                        or not isinstance(item.get("agentId"), str)
+                        or not isinstance(item.get("deviceIds"), list)
+                        or not all(count(device) for device in item["deviceIds"])
+                    ):
+                        raise malformed
+                    placement.append(
+                        {"agent_id": item["agentId"], "device_ids": list(item["deviceIds"])}
+                    )
+            jobs.append({
+                "job_id": job["jobId"],
+                "resource_pool": job["resourcePool"],
+                "state": summary["state"],
+                "jobs_ahead": None if jobs_ahead == -1 else jobs_ahead,
+                "requested_slots": job["requestedSlots"],
+                "allocated_slots": job["allocatedSlots"],
+                "placement": placement,
+            })
+        return {"jobs": jobs, "total": pagination["total"]}
 
     def get_task_resources(
         self,

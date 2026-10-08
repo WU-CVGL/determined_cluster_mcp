@@ -594,7 +594,6 @@ def test_list_remote_tasks_filters_pages_and_redacts(kind, monkeypatch):
         "userId": "7",
         "username": "alice",
         "name": "native-name",
-        "displayName": "display",
         "description": "safe description",
         "state": "STATE_RUNNING",
         "resourcePool": "gpu",
@@ -606,8 +605,33 @@ def test_list_remote_tasks_filters_pages_and_redacts(kind, monkeypatch):
         "state": "STATE_COMPLETED",
     }
     encoded = json.dumps(result)
-    for forbidden in ("config", "privateKey", "environment", "hyperparameters", "secret"):
+    for forbidden in (
+        "config", "privateKey", "environment", "hyperparameters", "secret", "displayName",
+    ):
         assert forbidden not in encoded
+
+
+@pytest.mark.parametrize("kind", ["command", "shell"])
+@pytest.mark.parametrize("display_name", ["Alice Owner", 7, {"nested": "value"}])
+def test_list_remote_tasks_drops_the_owner_display_name(kind, display_name, monkeypatch):
+    # displayName is the owner's display name; it is neither returned nor validated.
+    item = {"id": "task-id", "userId": 7, "displayName": display_name, "description": "x\ny"}
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda *a, **k: Response(
+            {
+                f"{kind}s": [item],
+                "pagination": {
+                    "limit": 50, "offset": 0, "startIndex": 0, "endIndex": 1, "total": 1,
+                },
+            }
+        ),
+    )
+
+    result = client().list_remote_tasks(kind, user_id="7")
+
+    assert result["tasks"] == [{"id": "task-id", "userId": 7, "description": "x\ny"}]
 
 
 @pytest.mark.parametrize(
@@ -1745,3 +1769,162 @@ def test_unsupported_state_filters_are_rejected_before_any_request(
     monkeypatch.setattr(requests, "get", get)
     with pytest.raises(ValueError, match=message):
         client().list_remote_tasks(kind, user_id="7", states=states)
+
+
+def queue_job(job_id, **overrides):
+    job = {
+        "jobId": job_id, "type": "TYPE_EXPERIMENT", "username": "alice", "userId": 7,
+        "resourcePool": "gpu", "summary": {"state": "STATE_SCHEDULED", "jobsAhead": 0},
+        "requestedSlots": 2, "allocatedSlots": 2, "name": "train", "entityId": "11",
+        "placement": [{"agentId": "agent-1", "deviceIds": [0, 3]}],
+    }
+    job.update(overrides)
+    return {"full": job}
+
+
+def test_generic_task_takes_job_id_and_pool_from_the_list_without_a_config_pool(monkeypatch):
+    submitted = generic_config()
+    del submitted["resources"]["resource_pool"]
+    responses = {
+        f"/api/v1/tasks/{GENERIC_ID}": Response({"task": {
+            "taskId": GENERIC_ID, "taskType": "TASK_TYPE_GENERIC",
+            "taskState": "GENERIC_TASK_STATE_ACTIVE", "startTime": "2026-10-01T00:00:00Z",
+        }}),
+        f"/api/v1/tasks/{GENERIC_ID}/config": Response({"config": json.dumps(submitted)}),
+        "/api/v1/generic-tasks": Response({
+            "tasks": [{
+                "taskId": GENERIC_ID, "jobId": "job-9", "userId": 7, "username": "alice",
+                "name": "eval-shard", "state": "GENERIC_TASK_STATE_ACTIVE",
+                "resourcePool": "default-pool",
+            }],
+            "pagination": {"limit": 0, "offset": 0, "startIndex": 0, "endIndex": 1, "total": 1},
+        }),
+    }
+    requested = []
+
+    def get(url, **kwargs):
+        requested.append(url)
+        return responses[url.removeprefix("http://master:8080")]
+
+    monkeypatch.setattr(requests, "get", get)
+    task = client().get_task("generic", GENERIC_ID)
+
+    assert task["jobId"] == "job-9"
+    assert task["resourcePool"] == "default-pool"
+    assert len(requested) == 3
+
+    # The config's pool, when set, wins over the listed one.
+    submitted["resources"]["resource_pool"] = "gpu"
+    responses[f"/api/v1/tasks/{GENERIC_ID}/config"] = Response({"config": json.dumps(submitted)})
+    assert client().get_task("generic", GENERIC_ID)["resourcePool"] == "gpu"
+
+
+def test_job_queue_sends_the_pool_and_limit_and_keeps_full_entries(monkeypatch):
+    requested = []
+    payload = {
+        "jobs": [
+            queue_job("job-1"),
+            {"limited": {
+                "jobId": "job-2", "type": "TYPE_COMMAND", "resourcePool": "gpu",
+                "summary": {"state": "STATE_QUEUED", "jobsAhead": 1},
+                "requestedSlots": 1, "allocatedSlots": 0,
+            }},
+            queue_job(
+                "job-3", summary={"state": "STATE_QUEUED", "jobsAhead": 3},
+                allocatedSlots=0, placement=[],
+            ),
+        ],
+        "pagination": {"offset": 0, "limit": 1000, "startIndex": 0, "endIndex": 3, "total": 3},
+    }
+
+    def get(url, **kwargs):
+        requested.append((url, kwargs.get("params")))
+        return Response(payload)
+
+    monkeypatch.setattr(requests, "get", get)
+    page = client().job_queue("gpu", 1000)
+
+    assert requested == [
+        ("http://master:8080/api/v1/job-queues-v2", {"resourcePool": "gpu", "limit": 1000})
+    ]
+    assert page == {
+        "total": 3,
+        "jobs": [
+            {
+                "job_id": "job-1", "resource_pool": "gpu", "state": "STATE_SCHEDULED",
+                "jobs_ahead": 0, "requested_slots": 2, "allocated_slots": 2,
+                "placement": [{"agent_id": "agent-1", "device_ids": [0, 3]}],
+            },
+            {
+                "job_id": "job-3", "resource_pool": "gpu", "state": "STATE_QUEUED",
+                "jobs_ahead": 3, "requested_slots": 2, "allocated_slots": 0, "placement": [],
+            },
+        ],
+    }
+
+
+def test_job_queue_reports_missing_placement_as_null(monkeypatch):
+    job = queue_job("job-1")
+    del job["full"]["placement"]
+    monkeypatch.setattr(
+        requests, "get",
+        lambda *a, **k: Response({"jobs": [job], "pagination": {"total": 1}}),
+    )
+    assert client().job_queue("gpu")["jobs"][0]["placement"] is None
+
+
+def test_job_queue_reads_the_fair_share_jobs_ahead_as_null(monkeypatch):
+    # A fair-share pool does not rank jobs; the master reports jobsAhead -1 for each.
+    job = queue_job("job-1", summary={"state": "STATE_QUEUED", "jobsAhead": -1},
+                    allocatedSlots=0, placement=[])
+    monkeypatch.setattr(
+        requests, "get",
+        lambda *a, **k: Response({"jobs": [job], "pagination": {"total": 1}}),
+    )
+    assert client().job_queue("gpu")["jobs"] == [{
+        "job_id": "job-1", "resource_pool": "gpu", "state": "STATE_QUEUED",
+        "jobs_ahead": None, "requested_slots": 2, "allocated_slots": 0, "placement": [],
+    }]
+
+
+@pytest.mark.parametrize("pool", ["", None, 3])
+def test_job_queue_never_queries_without_a_pool(monkeypatch, pool):
+    def get(*args, **kwargs):
+        raise AssertionError("no request without a pool")
+
+    monkeypatch.setattr(requests, "get", get)
+    with pytest.raises(ValueError):
+        client().job_queue(pool)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"jobs": []},
+        {"jobs": {}, "pagination": {"total": 0}},
+        {"jobs": [], "pagination": {"total": "1"}},
+        {"jobs": [{}], "pagination": {"total": 1}},
+        {"jobs": [{"full": {}, "limited": {}}], "pagination": {"total": 1}},
+        {"jobs": [{"full": None}], "pagination": {"total": 1}},
+        {"jobs": [queue_job("")], "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", summary={"state": "STATE_QUEUED"})],
+         "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", summary={"state": "STATE_QUEUED", "jobsAhead": -2})],
+         "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", summary={"state": "STATE_QUEUED", "jobsAhead": -1.0})],
+         "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", summary={"state": "STATE_QUEUED", "jobsAhead": True})],
+         "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", requestedSlots=True)], "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", allocatedSlots=-1)], "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", placement=None)], "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", placement=[{"agentId": "a", "deviceIds": ["0"]}])],
+         "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", placement=["agent"])], "pagination": {"total": 1}},
+    ],
+)
+def test_job_queue_rejects_a_malformed_response(monkeypatch, payload):
+    monkeypatch.setattr(requests, "get", lambda *a, **k: Response(payload))
+    with pytest.raises(APIError) as caught:
+        client().job_queue("gpu")
+    assert caught.value.code == "invalid_response"
