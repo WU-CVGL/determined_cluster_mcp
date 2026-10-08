@@ -326,7 +326,8 @@ undo. A definite rejection, such as HTTP 400, 401, or 403, is an ordinary error:
 was submitted. When the research-cluster fork 0.42.0 or later cannot check whether the
 account may use the requested pool, it answers a launch or resume with HTTP 503 `could not
 check access to resource pool "<pool>": ...; try again`. The service reports that answer as
-`submission_uncertain`, like any other 5xx; check with the marker as above.
+`submission_uncertain`, like any other 5xx; check a launch with the marker as above, and a
+resume with `compute_status`.
 
 A failure before any connection was open (a refused connection, a failed name lookup, a
 connect timeout, or an unreachable HTTP proxy) is a retryable `transport_error`: the
@@ -517,7 +518,8 @@ conclusions. An empty `series` list means no data for the window, not an idle ta
 were returned. Determined attributes measurements to a task only after its allocation
 has run for the master's task-mapping delay (`observability.task_mapping_delay`, 5
 minutes by default), so the first minutes of each allocation, and any allocation that
-ended sooner, have no data, `allocation_active` included; a longer window does not help.
+ended sooner, have no data, `allocation_active` included; a longer window does not recover
+them.
 `advisory` says so, and so does `explanation` when no measurements were returned. When
 `trial_id` is omitted and the experiment has several trials, `explanation` states how
 many exist and which one is reported.

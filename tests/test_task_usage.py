@@ -477,7 +477,7 @@ def test_paused_trial_window_ends_at_last_allocation_end(tmp_path, profile):
 def test_paused_then_cancelled_trial_uses_allocation_end_before_task_end(tmp_path, profile):
     service, client, task = launched(tmp_path, profile)
     client.task_info[CMD] = {
-        "task_id": CMD, "start_time": TASK_START, "end_time": "2027-01-15T07:00:00Z",
+        "task_id": CMD, "start_time": TASK_START, "end_time": "2027-01-15T07:00:00+00:00",
         "allocations": [allocation(f"{CMD}.1", "2027-01-15T03:00:00", "2027-01-15T04:00:00")],
     }
 
@@ -529,7 +529,7 @@ def test_task_without_allocations_or_with_unparsable_allocation_time_uses_now(
     ("start_time", "end_time", "expected_end"),
     [
         ("2027-01-15T08:00:05Z", None, NOW),  # master clock ahead of the client
-        ("2027-01-15T07:00:00Z", "2027-01-15T07:00:00.5Z", NOW - 3600),  # same second
+        ("2027-01-15T07:00:00+00:00", "2027-01-15T07:00:00.5Z", NOW - 3600),  # same second
     ],
 )
 def test_window_is_never_empty_or_inverted(
@@ -612,7 +612,7 @@ def test_no_measurements_name_the_task_mapping_delay(tmp_path, profile):
 def test_the_task_mapping_delay_ends_an_explanation_with_other_clauses(tmp_path, profile):
     service, client, task = launched(tmp_path, profile)
     client.task_info[CMD] = {
-        "task_id": CMD, "start_time": TASK_START, "end_time": "2027-01-15T07:00:00Z",
+        "task_id": CMD, "start_time": TASK_START, "end_time": "2027-01-15T07:00:00+00:00",
         "allocations": [allocation(f"{CMD}.1", "2027-01-15T03:00:00", "2027-01-15T04:00:00")],
     }
 
@@ -641,6 +641,44 @@ def test_returned_measurements_do_not_name_the_delay(tmp_path, profile, returned
 
     assert MAPPING_DELAY not in result["explanation"]
     assert MAPPING_DELAY in result["advisory"]
+
+
+def test_an_earlier_allocation_outside_the_default_window_is_reached_by_its_id(
+    tmp_path, profile
+):
+    # Ran 00:00-02:00, was paused, and resumed at 07:57: the default window holds only the
+    # pause gap and the young allocation's unmapped minutes, but the first allocation's own
+    # window still reaches its data.
+    service, client, task = launched(tmp_path, profile)
+    client.task_info[CMD] = {
+        "task_id": CMD, "start_time": "2027-01-15T00:00:00Z", "end_time": None,
+        "allocations": [
+            allocation(f"{CMD}.1", "2027-01-15T00:00:00", "2027-01-15T02:00:00"),
+            allocation(f"{CMD}.2", "2027-01-15T07:57:00", None),
+        ],
+    }
+
+    result = service.usage(task["kind"], task["id"])
+
+    assert result["series"] == []
+    assert result["window"]["anchor"] == "now"
+    assert result["window"]["start_at"] == "2027-01-15T07:00:00+00:00"
+    assert result["explanation"].endswith(MAPPING_DELAY)
+
+    client.calls.clear()
+    window = service.usage(task["kind"], task["id"], allocation_id=f"{CMD}.1")["window"]
+
+    assert window["anchor"] == "allocation_end"
+    assert (window["start_at"], window["end_at"]) == (
+        "2027-01-15T01:00:00+00:00", "2027-01-15T02:00:00+00:00"
+    )
+    assert resources_call(client)[5] == f"{CMD}.1"
+
+    client.calls.clear()
+    window = service.usage(task["kind"], task["id"], window_seconds=8 * 3600)["window"]
+
+    assert window["anchor"] == "now"
+    assert window["start_at"] == "2027-01-15T00:00:00+00:00"
 
 
 def test_experiment_usage_through_real_client_wire_format(tmp_path, profile, monkeypatch):
