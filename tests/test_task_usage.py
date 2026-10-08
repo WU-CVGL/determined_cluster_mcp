@@ -640,7 +640,57 @@ def test_returned_measurements_do_not_name_the_delay(tmp_path, profile, returned
     result = service.usage(task["kind"], task["id"], metrics=metrics)
 
     assert MAPPING_DELAY not in result["explanation"]
-    assert MAPPING_DELAY in result["advisory"]
+    assert MAPPING_DELAY not in result["advisory"]
+    assert result["advisory"].endswith("monitoring retention.")
+
+
+def at(stamp):
+    return service_module._iso_seconds(stamp)
+
+
+@pytest.mark.parametrize(
+    ("task_start", "task_end", "allocations", "returned", "named"),
+    [
+        # Long-running and measured across the trailing window.
+        (TASK_START, None, [(TASK_START, None)],
+         [series("cpu_cores", [[NOW - 3600 + i * 15, 0.5] for i in range(241)])], False),
+        # Started inside the window and measured from the end of the default delay.
+        (at(NOW - 1800), None, [(at(NOW - 1800), None)],
+         [series("cpu_cores", [[NOW - 1500, 0.5], [NOW, 0.5]])], False),
+        # Young: running for two minutes.
+        (at(NOW - 120), None, [(at(NOW - 120), None)],
+         [series("cpu_cores", [[NOW, 0.5]])], True),
+        # Short: ended after two minutes.
+        (at(NOW - 3600), at(NOW - 3480), [(at(NOW - 3600), at(NOW - 3480))],
+         [series("cpu_cores", [[NOW - 3480, 0.5]])], True),
+        # The first sample arrives later than the default delay explains.
+        (at(NOW - 3600), None, [(at(NOW - 3600), None)],
+         [series("cpu_cores", [[NOW - 3000, 0.5], [NOW, 0.5]])], True),
+        # A resumed allocation inside the window has no samples yet.
+        (TASK_START, None, [(TASK_START, at(NOW - 1800)), (at(NOW - 1200), None)],
+         [series("cpu_cores", [[NOW - 3600, 0.5], [NOW - 1800, 0.5]])], True),
+    ],
+    ids=["long-running", "measured-from-start", "young", "short", "late-first-sample",
+         "resumed-unmeasured"],
+)
+def test_advisory_names_the_delay_only_when_it_can_explain_missing_data(
+    tmp_path, profile, task_start, task_end, allocations, returned, named
+):
+    service, client, task = launched(tmp_path, profile)
+    client.task_info[CMD] = {
+        "task_id": CMD, "start_time": task_start, "end_time": task_end,
+        "allocations": [
+            allocation(f"{CMD}.{index}", began, ended)
+            for index, (began, ended) in enumerate(allocations, start=1)
+        ],
+    }
+    client.series = returned
+
+    result = service.usage(task["kind"], task["id"])
+
+    assert result["series"]
+    assert (MAPPING_DELAY in result["advisory"]) is named
+    assert MAPPING_DELAY not in result["explanation"]
 
 
 def test_an_earlier_allocation_outside_the_default_window_is_reached_by_its_id(

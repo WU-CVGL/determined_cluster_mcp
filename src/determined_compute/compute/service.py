@@ -92,7 +92,8 @@ _USAGE_SUMMARY_STATISTICS = ("count", "sum", "min", "max", "last", "mean")
 # A GPU utilization sample below this percentage counts as idle.
 _GPU_IDLE_PERCENT = 10
 # Determined attributes measurements to a task only after its allocation has run for the
-# master's observability.task_mapping_delay.
+# master's observability.task_mapping_delay (default below).
+_USAGE_MAPPING_DELAY_SECONDS = 300
 _USAGE_MAPPING_DELAY = (
     "Determined attributes measurements to a task only after its allocation has run for the "
     "master's task-mapping delay (5 minutes by default), so the first minutes of each "
@@ -106,7 +107,7 @@ _USAGE_ADVISORY = (
     "include other processes. allocation_active above zero means the allocation was running. "
     f"idle_fraction is the share of GPU utilization samples below {_GPU_IDLE_PERCENT}%, and "
     "p50 and p95 are nearest-rank percentiles of the available samples. "
-    "Coverage depends on the cluster's monitoring retention. " + _USAGE_MAPPING_DELAY
+    "Coverage depends on the cluster's monitoring retention."
 )
 _TIMESTAMP = re.compile(
     r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})?"
@@ -982,7 +983,11 @@ class ComputeService:
             "context_unavailable": unavailable,
             "explanation": explanation,
             "observed_at": _iso_seconds(now),
-            "advisory": _USAGE_ADVISORY,
+            "advisory": (
+                _USAGE_ADVISORY + " " + _USAGE_MAPPING_DELAY
+                if self._usage_delay_applies(returned, selected, task_start, start, end)
+                else _USAGE_ADVISORY
+            ),
         }
         if len(allocations) > _USAGE_MAX_ALLOCATION_DETAILS:
             result["allocation_details_limit"] = _USAGE_MAX_ALLOCATION_DETAILS
@@ -1081,6 +1086,42 @@ class ComputeService:
                 result.setdefault(group, {})[name] = entry
                 kept += 1
         return result, False
+
+    @staticmethod
+    def _usage_delay_applies(
+        returned: Sequence[Mapping[str, Any]],
+        selected: Sequence[Mapping[str, Any]],
+        task_start: Optional[int],
+        start: int,
+        end: int,
+    ) -> bool:
+        """Whether the task-mapping delay can explain missing data in the window."""
+        if not returned:
+            return True
+        first: Dict[Optional[str], int] = {}
+        for item in returned:
+            stamps = [stamp for stamp, value in item["samples"] if value is not None]
+            if stamps:
+                key = item["labels"]["allocation_id"]
+                first[key] = min(first.get(key, stamps[0]), *stamps)
+        delay = _USAGE_MAPPING_DELAY_SECONDS
+        for item in selected:
+            began = _lenient_unix_seconds(item["start_time"])
+            if began is None:
+                began = task_start
+            ended = _lenient_unix_seconds(item["end_time"])
+            if ended is None:
+                ended = end
+            if began is None or began > end or ended < start:
+                continue
+            # A young or short allocation, or unmapped minutes inside the window with no
+            # sample once the default delay has passed.
+            if ended - began < delay:
+                return True
+            earliest = first.get(item["allocation_id"])
+            if began + delay > start and (earliest is None or earliest > began + delay):
+                return True
+        return False
 
     @staticmethod
     def _usage_series(series: Mapping[str, Any], gpu_models: Mapping[str, str]) -> Dict[str, Any]:
