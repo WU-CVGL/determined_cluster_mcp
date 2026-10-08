@@ -462,7 +462,7 @@ def test_every_call_reads_agents_then_pools_exactly_once():
 
 
 @pytest.mark.parametrize("used, holding", [(2, 1), (0, 1)])
-def test_used_slots_that_differ_from_busy_slots_are_unknown_for_two_or_more_slots(used, holding):
+def test_used_slots_that_differ_from_busy_slots_are_unknown_for_two_slots(used, holding):
     agents = [agent(slots=4, occupied=holding)]
     inspector = ResourceInspector(Client([pool(total=4, used=used)], agents))
 
@@ -483,14 +483,31 @@ def test_used_slots_that_differ_from_busy_slots_are_unknown_for_two_or_more_slot
 
 
 @pytest.mark.parametrize("used", [2, 0])
-def test_the_used_slot_check_does_not_apply_to_zero_or_one_slot(used):
+def test_the_used_slot_check_does_not_apply_to_zero_slots(used):
     inspector = ResourceInspector(
         Client([pool(total=4, used=used)], [agent(slots=4, occupied=1)])
     )
 
-    admitted = inspector.require_capacity("command", command_config(slots=1))
-    assert admitted["selected_pool"]["available_capacity"] == 3
     assert inspector.require_capacity("command", command_config(slots=0))["admitted"] is True
+
+
+@pytest.mark.parametrize("used, holding", [(4, 3), (0, 1)])
+def test_used_slots_that_differ_from_busy_slots_are_unknown_for_one_slot(used, holding):
+    # A reserved slot counts as used before its container is visible on the agent.
+    inspector = ResourceInspector(
+        Client([pool(total=4, used=used)], [agent(slots=4, occupied=holding)])
+    )
+
+    selected = inspector.resources(slots=1, pool="gpu")["selected_pool"]
+    assert selected["available"] is None
+    assert selected["available_capacity"] is None
+    assert selected["explanation"] == (
+        f"used slots ({used}) differ from slots holding containers ({holding}); "
+        "a task may be starting or stopping"
+    )
+    with pytest.raises(APIError) as caught:
+        inspector.require_capacity("command", command_config(slots=1))
+    assert caught.value.code == "capacity_unknown"
 
 
 def test_the_used_slot_count_includes_busy_slots_of_a_draining_agent():

@@ -174,7 +174,7 @@ class ResourceInspector:
                 and bool(slot_type)
             )
             problem = agent_problem
-            if known and slots >= 2 and used != holding:
+            if known and used != holding:
                 # The pool's used count is the slots holding containers (numUsedSlots).
                 known = False
                 problem = (
