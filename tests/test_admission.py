@@ -70,8 +70,8 @@ def test_busy_pool_is_unavailable_even_if_slots_are_low_utilization():
     assert caught.value.code == "capacity_unavailable"
     assert caught.value.details["available"] == 0
     assert client.calls == [
-        ("api/v1/resource-pools", {"limit": 0}),
         ("api/v1/agents", {"limit": 0}),
+        ("api/v1/resource-pools", {"limit": 0}),
     ]
 
 
@@ -320,3 +320,20 @@ def test_generic_task_uses_slots_for_admission():
     with pytest.raises(APIError) as caught:
         busy.require_capacity("generic", command_config())
     assert caught.value.code == "capacity_unavailable"
+
+
+def test_every_call_reads_agents_then_pools_exactly_once():
+    client = Client([pool()], [agent()])
+    inspector = ResourceInspector(client)
+    expected = [("api/v1/agents", {"limit": 0}), ("api/v1/resource-pools", {"limit": 0})]
+
+    inspector.resources(slots=2, pool="gpu")
+    assert client.calls == expected
+    client.calls.clear()
+    inspector.require_capacity("command", command_config(slots=2))
+    assert client.calls == expected
+    client.calls.clear()
+    inspector.require_capacity("experiment", {
+        "resources": {"slots_per_trial": 2, "resource_pool": "gpu"}
+    })
+    assert client.calls == expected

@@ -52,8 +52,10 @@ class ResourceInspector:
         self, *, slots: int, pool: Optional[str], single_node: bool
     ) -> Dict[str, Any]:
         self._validate_request(slots, pool)
-        pools_value = self.client._get("api/v1/resource-pools", params={"limit": 0})
+        # Agents first: a slot taken before or between the two reads then shows as a
+        # used-slot mismatch, not as a free slot.
         agents_value = self.client._get("api/v1/agents", params={"limit": 0})
+        pools_value = self.client._get("api/v1/resource-pools", params={"limit": 0})
         pools = pools_value.get("resourcePools") if isinstance(pools_value, Mapping) else None
         agents = agents_value.get("agents") if isinstance(agents_value, Mapping) else None
         if not isinstance(pools, list) or not isinstance(agents, list):
