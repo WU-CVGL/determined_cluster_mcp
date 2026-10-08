@@ -219,6 +219,108 @@ def test_list_generic_tasks_by_owner(profile):
     ]
 
 
+# A command's or shell's displayName is its owner's display name, never the task's name.
+
+
+@pytest.mark.parametrize("kind", ["command", "shell"])
+@pytest.mark.parametrize(
+    ("description", "name"),
+    [
+        ("x\ny", "x"),
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("  padded\nsecond", "padded"),
+    ],
+)
+@pytest.mark.parametrize("operation", ["list", "status", "cancel"])
+def test_command_and_shell_names_ignore_the_owner_display_name(
+    profile, kind, description, name, operation
+):
+    service, client = service_for(profile)
+    entity = command_entity(displayName="Alice Owner")
+    if description is None:
+        del entity["description"]
+    else:
+        entity["description"] = description
+    client.pages[kind] = page([entity])
+    client.entities[(kind, COMMAND_ID)] = entity
+
+    if operation == "list":
+        (task,) = service.list_tasks(kind)["tasks"]
+    else:
+        task = operate(service, operation, kind, COMMAND_ID)
+
+    assert task["name"] == name
+
+
+def test_marker_listing_ignores_the_owner_display_name(profile):
+    service, client = service_for(profile)
+    listed = command_entity(displayName="Alice Owner")
+    del listed["description"]
+    client.pages["shell"] = page([listed])
+    client.entities[("shell", COMMAND_ID)] = command_entity(
+        displayName="Alice Owner", description=None, submissionMarker=MARKER
+    )
+
+    (task,) = service.list_tasks("shell", marker=MARKER)["tasks"]
+
+    assert task["name"] is None
+    assert task["submission_marker"] == MARKER
+
+
+def test_a_long_first_description_line_is_truncated_to_256_characters(profile):
+    service, client = service_for(profile)
+    client.pages["command"] = page(
+        [command_entity(displayName="Alice Owner", description="n" * 300 + "\nrest")]
+    )
+
+    (task,) = service.list_tasks("command")["tasks"]
+
+    assert task["name"] == "n" * 256
+
+
+@pytest.mark.parametrize(
+    ("kind", "remote_id", "entity", "name"),
+    [
+        (
+            "experiment",
+            "12",
+            {"id": 12, "userId": 7, "name": "train", "displayName": "Alice Owner",
+             "description": "about\nmore", "state": "STATE_ACTIVE"},
+            "train",
+        ),
+        ("generic", GENERIC_ID, generic_entity(displayName="Alice Owner"), "eval-shards"),
+    ],
+)
+@pytest.mark.parametrize("operation", ["list", "status"])
+def test_experiment_and_generic_names_are_their_native_names(
+    profile, kind, remote_id, entity, name, operation
+):
+    service, client = service_for(profile)
+    client.pages[kind] = page([entity])
+    client.entities[(kind, remote_id)] = entity
+
+    if operation == "list":
+        (task,) = service.list_tasks(kind)["tasks"]
+    else:
+        task = service.status(kind, remote_id)
+
+    assert task["name"] == name
+
+
+def test_an_experiment_without_a_name_does_not_take_the_owner_display_name(profile):
+    service, client = service_for(profile)
+    client.pages["experiment"] = page(
+        [{"id": 12, "userId": 7, "name": "", "displayName": "Alice Owner",
+          "state": "STATE_ACTIVE"}]
+    )
+
+    (task,) = service.list_tasks("experiment")["tasks"]
+
+    assert task["name"] is None
+
+
 @pytest.mark.parametrize(
     ("kind", "limit", "offset", "marker"),
     [
