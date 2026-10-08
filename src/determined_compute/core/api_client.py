@@ -348,6 +348,23 @@ def _login_for_token(api_url: str, username: str, password: str, verify_ssl: boo
 # (WU-CVGL/determined#27) accepts them.
 _GENERIC_METADATA_FIELDS = ("name", "description")
 _GENERIC_STATE_PREFIX = "GENERIC_TASK_STATE_"
+# States a list can be filtered by: the values the master stores. Managed experiments are
+# stored as ACTIVE and listed as QUEUED, PULLING, STARTING or RUNNING (DET-9567); the master
+# answers a filter on those with an error or no rows.
+_EXPERIMENT_FILTER_STATES = (
+    "STATE_ACTIVE", "STATE_PAUSED",
+    "STATE_STOPPING_COMPLETED", "STATE_STOPPING_CANCELED", "STATE_STOPPING_ERROR",
+    "STATE_STOPPING_KILLED", "STATE_COMPLETED", "STATE_CANCELED", "STATE_ERROR",
+    "STATE_DELETING", "STATE_DELETE_FAILED",
+)
+_EXPERIMENT_ACTIVE_DISPLAY_STATES = (
+    "STATE_QUEUED", "STATE_PULLING", "STATE_STARTING", "STATE_RUNNING",
+)
+_GENERIC_FILTER_STATES = (
+    "STATE_ACTIVE", "STATE_PAUSED",
+    "STATE_STOPPING_PAUSED", "STATE_STOPPING_CANCELED", "STATE_STOPPING_COMPLETED",
+    "STATE_STOPPING_ERROR", "STATE_CANCELED", "STATE_COMPLETED", "STATE_ERROR",
+)
 
 
 class DeterminedAPIClient:
@@ -565,6 +582,34 @@ class DeterminedAPIClient:
             raise APIError("Current-user response is malformed", code="invalid_response")
         return {"id": user_id, "username": username.strip()}
 
+    @staticmethod
+    def validate_list_states(kind: str, states: Any) -> Optional[List[str]]:
+        """Check a list's state filter; return it unchanged, or None for no filter."""
+        if states is None:
+            return None
+        if kind in {"command", "shell"}:
+            raise ValueError(
+                f"{kind}s cannot be filtered by state: Determined's {kind} list has no state "
+                "filter; list without states"
+            )
+        if (
+            not isinstance(states, list)
+            or not states
+            or not all(isinstance(state, str) for state in states)
+        ):
+            raise ValueError("states must be a non-empty list of state names")
+        allowed = _GENERIC_FILTER_STATES if kind == "generic" else _EXPERIMENT_FILTER_STATES
+        for state in states:
+            if state in allowed:
+                continue
+            if kind == "experiment" and state in _EXPERIMENT_ACTIVE_DISPLAY_STATES:
+                raise ValueError(
+                    "filter with STATE_ACTIVE; the list shows active experiments as QUEUED, "
+                    "PULLING, STARTING or RUNNING"
+                )
+            raise ValueError(f"{kind} states must be among: " + ", ".join(allowed))
+        return list(states)
+
     def list_remote_tasks(
         self,
         kind: str,
@@ -572,6 +617,7 @@ class DeterminedAPIClient:
         user_id: str,
         limit: int = 50,
         offset: int = 0,
+        states: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         if kind not in self._LISTABLE_KINDS:
             raise ValueError("kind must be one of: command, shell, generic, experiment")
@@ -580,11 +626,17 @@ class DeterminedAPIClient:
             raise ValueError("limit must be an integer between 1 and 100")
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise ValueError("offset must be a non-negative integer")
+        states = self.validate_list_states(kind, states)
         if kind == "generic":
             # The generic task list is always newest first.
-            response = self._generic_task_list(
-                {"userIds": [int(normalized_user_id)], "limit": limit, "offset": offset}
-            )
+            params: Dict[str, Any] = {
+                "userIds": [int(normalized_user_id)], "limit": limit, "offset": offset,
+            }
+            if states is not None:
+                params["states"] = [
+                    _GENERIC_STATE_PREFIX + state[len("STATE_"):] for state in states
+                ]
+            response = self._generic_task_list(params)
             collection = response.get("tasks")
             if isinstance(collection, list):
                 collection = [
@@ -592,19 +644,22 @@ class DeterminedAPIClient:
                     for item in collection
                 ]
         else:
-            response = self._get(
-                f"api/v1/{kind}s",
-                params={
-                    "userIds": [int(normalized_user_id)],
-                    "limit": limit,
-                    "offset": offset,
-                    "orderBy": "ORDER_BY_DESC",
-                    "sortBy": "SORT_BY_START_TIME",
-                },
-            )
+            params = {
+                "userIds": [int(normalized_user_id)],
+                "limit": limit,
+                "offset": offset,
+                "orderBy": "ORDER_BY_DESC",
+                "sortBy": "SORT_BY_START_TIME",
+            }
+            if states is not None:
+                params["states"] = list(states)
+            response = self._get(f"api/v1/{kind}s", params=params)
             collection = response.get(f"{kind}s")
         if not isinstance(collection, list):
             raise APIError("Remote-task response is malformed", code="invalid_response")
+        accepted = set(states or ())
+        if kind == "experiment" and "STATE_ACTIVE" in accepted:
+            accepted.update(_EXPERIMENT_ACTIVE_DISPLAY_STATES)
         tasks: List[Dict[str, Any]] = []
         for item in collection:
             if not isinstance(item, Mapping):
@@ -621,6 +676,14 @@ class DeterminedAPIClient:
                 if not valid:
                     raise APIError("Remote-task response is malformed", code="invalid_response")
                 summary[key] = value
+            if states is not None and summary.get("state") not in accepted:
+                # The master ignores a parameter it does not apply, so an unfiltered list
+                # would otherwise read as a filtered one.
+                raise APIError(
+                    "A listed task's state is outside the requested states; the master may "
+                    "not have applied the state filter",
+                    code="invalid_response",
+                )
             tasks.append(summary)
         pagination = response.get("pagination")
         if not isinstance(pagination, Mapping):

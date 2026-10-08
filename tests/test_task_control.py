@@ -36,10 +36,11 @@ class FakeClient:
         self.calls.append(("GET", "api/v1/me"))
         return copy.deepcopy(self.user)
 
-    def list_remote_tasks(self, kind, *, user_id, limit, offset):
-        self.calls.append(
-            ("GET", f"api/v1/{kind}s", {"user_id": user_id, "limit": limit, "offset": offset})
-        )
+    def list_remote_tasks(self, kind, *, user_id, limit, offset, states=None):
+        query = {"user_id": user_id, "limit": limit, "offset": offset}
+        if states is not None:
+            query["states"] = states
+        self.calls.append(("GET", f"api/v1/{kind}s", query))
         return copy.deepcopy(
             self.pages.get(
                 kind,
@@ -185,7 +186,7 @@ def test_list_is_owner_filtered_bounded_and_metadata_only(profile):
             "end_time": None,
         }
     ]
-    assert "marker" not in result and "searched" not in result
+    assert "marker" not in result and "searched" not in result and "filters" not in result
     assert secret not in repr(result)
 
 
@@ -443,7 +444,7 @@ def test_marker_search_continues_to_the_next_page(profile):
     ]
     original = command_entity()
     listing = newer + [original]
-    client.list_remote_tasks = lambda kind, *, user_id, limit, offset: copy.deepcopy(
+    client.list_remote_tasks = lambda kind, *, user_id, limit, offset, states=None: copy.deepcopy(
         page(listing[offset:offset + limit], limit=limit, offset=offset, total=len(listing))
     )
     for entity in newer:
@@ -485,6 +486,133 @@ def test_marker_search_verifies_the_owner_of_each_read_task(profile):
         service.list_tasks("command", marker=MARKER)
 
     assert caught.value.code == "ownership_mismatch"
+
+
+# Listing by state
+
+
+def test_list_filters_experiments_by_state_and_echoes_the_filter(profile):
+    service, client = service_for(profile)
+    client.pages["experiment"] = page(
+        [{"id": 12, "userId": 7, "name": "train", "state": "STATE_RUNNING"}], total=1
+    )
+
+    result = service.list_tasks("experiment", states=["STATE_ACTIVE"])
+
+    assert client.calls == [
+        ("GET", "api/v1/me"),
+        ("GET", "api/v1/experiments",
+         {"user_id": "7", "limit": 50, "offset": 0, "states": ["STATE_ACTIVE"]}),
+    ]
+    assert result["filters"] == {"states": ["STATE_ACTIVE"]}
+    assert [(task["id"], task["state"]) for task in result["tasks"]] == [(12, "STATE_RUNNING")]
+    assert result["pagination"]["total"] == 1
+
+
+def test_list_filters_generic_tasks_by_state(profile):
+    service, client = service_for(profile)
+    client.pages["generic"] = page([generic_entity(state="STATE_PAUSED")])
+
+    result = service.list_tasks("generic", states=["STATE_PAUSED", "STATE_STOPPING_PAUSED"])
+
+    assert client.calls[-1][2]["states"] == ["STATE_PAUSED", "STATE_STOPPING_PAUSED"]
+    assert result["filters"] == {"states": ["STATE_PAUSED", "STATE_STOPPING_PAUSED"]}
+    assert [task["state"] for task in result["tasks"]] == ["STATE_PAUSED"]
+
+
+def test_list_with_states_pages_through_the_filtered_total(profile):
+    service, client = service_for(profile)
+    finished = [
+        {"id": index, "userId": 7, "state": "STATE_COMPLETED"} for index in (30, 29, 28)
+    ]
+    client.list_remote_tasks = lambda kind, *, user_id, limit, offset, states=None: copy.deepcopy(
+        page(finished[offset:offset + limit], limit=limit, offset=offset, total=len(finished))
+    )
+
+    first = service.list_tasks("experiment", limit=2, states=["STATE_COMPLETED"])
+    second = service.list_tasks("experiment", limit=2, offset=2, states=["STATE_COMPLETED"])
+
+    assert [task["id"] for task in first["tasks"]] == [30, 29]
+    assert first["pagination"] == {"offset": 0, "limit": 2, "total": 3, "next_offset": 2}
+    assert [task["id"] for task in second["tasks"]] == [28]
+    assert second["pagination"]["next_offset"] is None
+
+
+def test_marker_search_covers_the_filtered_page(profile):
+    service, client = service_for(profile)
+    task = generic_entity()
+    client.pages["generic"] = page([task], limit=5)
+    client.entities[("generic", GENERIC_ID)] = dict(task, submissionMarker=MARKER)
+
+    result = service.list_tasks("generic", limit=5, marker=MARKER, states=["STATE_ACTIVE"])
+
+    assert client.calls[1] == (
+        "GET", "api/v1/generics",
+        {"user_id": "7", "limit": 5, "offset": 0, "states": ["STATE_ACTIVE"]},
+    )
+    assert [t["id"] for t in result["tasks"]] == [GENERIC_ID]
+    assert result["marker"] == MARKER and result["searched"] == 1
+    assert result["filters"] == {"states": ["STATE_ACTIVE"]}
+
+
+def test_marker_search_shows_a_state_newer_than_the_filter(profile):
+    service, client = service_for(profile)
+    client.pages["generic"] = page([generic_entity()], limit=5)
+    client.entities[("generic", GENERIC_ID)] = generic_entity(
+        state="STATE_COMPLETED", submissionMarker=MARKER
+    )
+
+    result = service.list_tasks("generic", limit=5, marker=MARKER, states=["STATE_ACTIVE"])
+
+    assert [(t["id"], t["state"]) for t in result["tasks"]] == [(GENERIC_ID, "STATE_COMPLETED")]
+    assert result["filters"] == {"states": ["STATE_ACTIVE"]}
+
+
+def test_list_with_states_still_checks_every_owner(profile):
+    service, client = service_for(profile)
+    client.pages["experiment"] = page([{"id": 12, "userId": 8, "state": "STATE_PAUSED"}])
+
+    with pytest.raises(ConflictError) as caught:
+        service.list_tasks("experiment", states=["STATE_PAUSED"])
+
+    assert caught.value.code == "ownership_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("kind", "states", "message"),
+    [
+        ("command", ["STATE_ACTIVE"], "commands cannot be filtered by state"),
+        ("shell", ["STATE_COMPLETED"], "shells cannot be filtered by state"),
+        ("experiment", ["STATE_RUNNING"], "filter with STATE_ACTIVE"),
+        ("experiment", ["STATE_QUEUED"], "filter with STATE_ACTIVE"),
+        ("experiment", ["STATE_DELETED"], "must be among"),
+        ("generic", ["STATE_DELETING"], "must be among"),
+        ("generic", [], "non-empty list"),
+        ("experiment", "STATE_ACTIVE", "non-empty list"),
+    ],
+)
+def test_list_rejects_unsupported_states_before_network(profile, kind, states, message):
+    service, client = service_for(profile)
+
+    with pytest.raises(ValidationError, match=message) as caught:
+        service.list_tasks(kind, states=states)
+
+    assert caught.value.code == "invalid_request"
+    assert client.calls == []
+
+
+def test_list_reports_a_filter_the_master_did_not_apply(profile):
+    service, client = service_for(profile)
+
+    def ignored_filter(kind, *, user_id, limit, offset, states=None):
+        raise APIError("outside the requested states", code="invalid_response")
+
+    client.list_remote_tasks = ignored_filter
+
+    with pytest.raises(APIError) as caught:
+        service.list_tasks("experiment", states=["STATE_COMPLETED"])
+
+    assert caught.value.code == "invalid_response"
 
 
 # Ownership of every task operation

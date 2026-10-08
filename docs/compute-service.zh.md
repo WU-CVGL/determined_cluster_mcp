@@ -233,7 +233,7 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 | `compute_cancel` | `kind`、`id` | 任务摘要、远端取消响应和 `cancellation_acknowledged` |
 | `compute_pause` | `kind`、`id` | experiment 和 generic 任务：任务摘要、远端响应和 `pause_acknowledged` |
 | `compute_resume` | `kind`、`id` | experiment 和 generic 任务：任务摘要、远端响应和 `resume_acknowledged` |
-| `compute_list` | `kind`，可选 `limit=50`、`offset=0`、`marker` | 当前账户的一页任务，最新的在前；指定 `marker` 时返回该页中配置带有该标记的任务 |
+| `compute_list` | `kind`，可选 `limit=50`、`offset=0`、`marker`、`states` | 当前账户的一页任务，最新的在前；指定 `states` 时只列出处于这些状态的 experiment 或 generic 任务；指定 `marker` 时返回该页中配置带有该标记的任务 |
 | `compute_resources` | 可选 `slots=1`、`pool` | 当前调度容量和候选资源池 |
 | `storage_check` | `path` | 映射容器路径的访问情况 |
 | `storage_sync` | `local_dir`、`shared_dir`，可选 `dry_run=true` | 预览或把本地目录内容复制到共享存储 |
@@ -532,7 +532,7 @@ task 或指定的 trial ID 不存在或无权访问时返回 HTTP 404。参见
 <a id="list-tasks-and-find-a-submission"></a>
 ### 列出任务并查找提交
 
-`compute_list(kind, limit=50, offset=0, marker=None)` 列出已认证账户拥有的任务，按开始时间
+`compute_list(kind, limit=50, offset=0, marker=None, states=None)` 列出已认证账户拥有的任务，按开始时间
 从新到旧排列。`limit` 必须在 1 到 100 之间，`offset` 必须是非负数。结果包含 `kind`、
 `account`（`id` 和 `username`）、`tasks`，以及含 `offset`、`limit`、`total` 和
 `next_offset` 的 `pagination`；最后一页的 `next_offset` 为 `null`。每个任务包含
@@ -542,6 +542,28 @@ task 或指定的 trial ID 不存在或无权访问时返回 HTTP 404。参见
 
 generic 任务通过 Determined 的 generic 任务列表列出，这需要带有 WU-CVGL/determined#27 的
 master；较旧的 master 返回 `unsupported`。
+
+`states` 是非空的状态名列表，Determined 按这些状态过滤列表，所以 `pagination.total` 是过滤后的
+总数；结果以 `filters: {"states": [...]}` 重复给出该过滤条件。它只适用于 experiment 和 generic
+任务：Determined 的 command 和 shell 列表没有状态过滤，所以 `kind` 为 `command` 或 `shell` 时
+指定 `states` 会返回 `invalid_request`。接受的名称是 Determined 存储的状态：
+
+| `kind` | 接受的 `states` |
+| --- | --- |
+| `experiment` | `STATE_ACTIVE`、`STATE_PAUSED`、`STATE_STOPPING_COMPLETED`、`STATE_STOPPING_CANCELED`、`STATE_STOPPING_ERROR`、`STATE_STOPPING_KILLED`、`STATE_COMPLETED`、`STATE_CANCELED`、`STATE_ERROR`、`STATE_DELETING`、`STATE_DELETE_FAILED` |
+| `generic` | `STATE_ACTIVE`、`STATE_PAUSED`、`STATE_STOPPING_PAUSED`、`STATE_STOPPING_CANCELED`、`STATE_STOPPING_COMPLETED`、`STATE_STOPPING_ERROR`、`STATE_CANCELED`、`STATE_COMPLETED`、`STATE_ERROR` |
+
+Determined 把运行中或等待中的 experiment 存储为 active，在列表中显示为 `STATE_QUEUED`、
+`STATE_PULLING`、`STATE_STARTING` 或 `STATE_RUNNING`。按这四个名称之一过滤会失败或匹配不到任何
+任务，所以返回 `invalid_request`：请用 `STATE_ACTIVE` 过滤，它会返回这四种状态的任务。其他名称
+（例如 `STATE_DELETED`）同样返回 `invalid_request`；被拒绝的过滤条件不会发送任何请求。
+Determined 会忽略它没有应用的过滤条件而不是拒绝它，所以服务会把每个返回任务的状态与所请求的
+状态比对，对 experiment 而言，上述四种显示的 active 状态算作 `STATE_ACTIVE`；超出范围的任务
+返回 `invalid_response` 错误，而不是把未过滤的一页当作已过滤的结果。`states` 过滤的是列表本身。
+`marker` 和 `states` 可以同时使用：标记搜索覆盖过滤后列表的所选页，每个返回的任务显示的是
+它自身详情读取时的状态，可能比过滤时匹配的状态更新，例如列出时为 active、读取时已经完成；
+该状态不会再与 `states` 比对。要跟踪一批 experiment 或 generic 任务，按页调用
+`compute_list(kind, states=[...])`；要跟踪单个任务，调用 `compute_status(kind, id)`。
 
 `marker` 是形如 `determined-compute:<uuid>` 的提交标记，来自 `compute_launch` 的返回值或
 未确认提交的错误。列表条目不含配置，因此服务会从新到旧读取所选页中的每个任务（command、shell

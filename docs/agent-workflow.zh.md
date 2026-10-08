@@ -105,7 +105,7 @@ MCP 不接受 `kind: notebook`。
 <a id="monitor-and-accept-the-result"></a>
 ## 跟踪并验收结果
 
-调用 `compute_status(kind, id)`，直到任务进入终态；使用 `compute_logs(kind, id, tail)` 检查进度和最后的消息。用户不再需要运行中的任务时，调用 `compute_cancel(kind, id)`。
+调用 `compute_status(kind, id)`，直到任务进入终态；使用 `compute_logs(kind, id, tail)` 检查进度和最后的消息。用户不再需要运行中的任务时，调用 `compute_cancel(kind, id)`。要一次检查多个 experiment 或 generic 任务，调用 `compute_list(kind, states=["STATE_ACTIVE"])`：它按页列出该账户 active 的任务，包括排队中和运行中的；沿 `pagination.next_offset` 查看后续页，直到其为 null。从该列表中消失的任务可能处于暂停或停止中，而不是已经结束；验收结果前先用 `compute_status(kind, id)` 确认任务已进入终态。
 
 任务尚未结束时，`compute_status` 还返回 `queue`，即其作业在资源池队列中的情况。`jobs_ahead` 是作业在该队列中的位置，即排在它之前的作业数，可能包括运行中的作业；它不是等待时间的预测，资源池的调度器不为作业排序时为 `null`。报告排队中的任务时，引用其 `jobs_ahead`。已调度作业的 `placement` 列出每个 agent 及作业在其上持有的槽位 device ID；只有 NVIDIA GPU 槽位的 device ID 才是 `nvidia-smi` 的编号。`queue: null` 加 `queue_note` 表示在该队列中找不到作业；加 `context_unavailable: ["queue"]` 表示查询失败，这绝不说明任务没有排队。无论哪种情况，`state` 仍是权威状态。参见[状态](compute-service.zh.md#status-logs-and-cancellation)。
 
@@ -142,9 +142,9 @@ master 拒绝的暂停或恢复（例如暂停已暂停的任务）会以错误�
 <a id="find-existing-tasks"></a>
 ## 查找已有任务
 
-`compute_list(kind, limit=50, offset=0)` 按从新到旧列出已认证 Determined 账户拥有的任务，无论它们是通过本 MCP、WebUI、原生 CLI 还是另一台设备提交的。每个条目包含 kind、ID、名称、状态、资源池和开始时间，`pagination.next_offset` 指向下一页。把 kind 和 ID 用于 `compute_status`、`compute_logs`、`compute_usage`、`compute_cancel`、`compute_pause` 和 `compute_resume`。列表是只读的。generic 任务需要带有 research-cluster fork generic 任务列表（WU-CVGL/determined#27）的 master；较旧的 master 返回 `unsupported`。
+`compute_list(kind, limit=50, offset=0)` 按从新到旧列出已认证 Determined 账户拥有的任务，无论它们是通过本 MCP、WebUI、原生 CLI 还是另一台设备提交的。每个条目包含 kind、ID、名称、状态、资源池和开始时间，`pagination.next_offset` 指向下一页。把 kind 和 ID 用于 `compute_status`、`compute_logs`、`compute_usage`、`compute_cancel`、`compute_pause` 和 `compute_resume`。列表是只读的。对 experiment 和 generic 任务，`states` 只列出处于给定状态的任务；接受的名称见[列出任务](compute-service.zh.md#list-tasks-and-find-a-submission)。generic 任务需要带有 research-cluster fork generic 任务列表（WU-CVGL/determined#27）的 master；较旧的 master 返回 `unsupported`。
 
-指定 `marker` 时，`compute_list` 返回所选页中配置带有该提交标记的任务。它会读取该页中的每个任务，所以查找刚刚提交的任务时，应使用较小的 `limit`（例如 5 或 10），并沿 `pagination.next_offset` 查看更早的页。标记是关联标签而不是身份：在 MCP 之外复制的配置带有同一个标记，所以可能有多个任务匹配；某一页为空也不能说明任务从未创建。
+指定 `marker` 时，`compute_list` 返回所选页中配置带有该提交标记的任务。它会读取该页中的每个任务，所以查找刚刚提交的任务时，应使用较小的 `limit`（例如 5 或 10），并沿 `pagination.next_offset` 查看更早的页。标记是关联标签而不是身份：在 MCP 之外复制的配置带有同一个标记，所以可能有多个任务匹配；某一页为空也不能说明任务从未创建。同时指定 `states` 时，`states` 过滤的是列表，每个返回的任务显示的是它自身读取时的状态，可能比过滤时匹配的状态更新。
 
 <a id="ownership-and-records"></a>
 ## 所有权与记录

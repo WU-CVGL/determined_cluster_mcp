@@ -1586,6 +1586,191 @@ def test_a_mutation_names_a_tls_or_proxy_failure_and_keeps_its_classification(mo
     assert error.details == {"endpoint": "api/v1/commands"}
 
 
+# Listing by state
+
+EXPERIMENT_FILTER_STATES = [
+    "STATE_ACTIVE", "STATE_PAUSED", "STATE_STOPPING_COMPLETED", "STATE_STOPPING_CANCELED",
+    "STATE_STOPPING_ERROR", "STATE_STOPPING_KILLED", "STATE_COMPLETED", "STATE_CANCELED",
+    "STATE_ERROR", "STATE_DELETING", "STATE_DELETE_FAILED",
+]
+GENERIC_FILTER_STATES = [
+    "STATE_ACTIVE", "STATE_PAUSED", "STATE_STOPPING_PAUSED", "STATE_STOPPING_CANCELED",
+    "STATE_STOPPING_COMPLETED", "STATE_STOPPING_ERROR", "STATE_CANCELED", "STATE_COMPLETED",
+    "STATE_ERROR",
+]
+
+
+def listing(collection_key, items, total=None):
+    count = len(items)
+    return Response({
+        collection_key: items,
+        "pagination": {
+            "limit": 50, "offset": 0, "startIndex": 0, "endIndex": count,
+            "total": count if total is None else total,
+        },
+    })
+
+
+def test_experiment_states_are_sent_as_repeated_parameters(monkeypatch):
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs.get("params")))
+        return listing("experiments", [
+            {"id": 3, "state": "STATE_PAUSED"}, {"id": 2, "state": "STATE_COMPLETED"},
+        ], total=9)
+
+    monkeypatch.setattr(requests, "get", get)
+    page = client().list_remote_tasks(
+        "experiment", user_id="7", states=["STATE_PAUSED", "STATE_COMPLETED"]
+    )
+
+    params = {
+        "userIds": [7], "limit": 50, "offset": 0, "orderBy": "ORDER_BY_DESC",
+        "sortBy": "SORT_BY_START_TIME", "states": ["STATE_PAUSED", "STATE_COMPLETED"],
+    }
+    assert calls == [("http://master:8080/api/v1/experiments", params)]
+    prepared = requests.Request("GET", calls[0][0], params=calls[0][1]).prepare()
+    assert "states=STATE_PAUSED&states=STATE_COMPLETED" in prepared.url
+    assert page["pagination"]["total"] == 9
+    assert [task["state"] for task in page["tasks"]] == ["STATE_PAUSED", "STATE_COMPLETED"]
+
+
+@pytest.mark.parametrize("state", EXPERIMENT_FILTER_STATES)
+def test_every_stored_experiment_state_is_a_filter(monkeypatch, state):
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append(kwargs.get("params")["states"])
+        return listing("experiments", [{"id": 1, "state": state}])
+
+    monkeypatch.setattr(requests, "get", get)
+    page = client().list_remote_tasks("experiment", user_id="7", states=[state])
+    assert calls == [[state]]
+    assert page["tasks"] == [{"id": 1, "state": state}]
+
+
+def test_active_experiment_filter_accepts_the_displayed_active_states(monkeypatch):
+    displayed = ["STATE_QUEUED", "STATE_PULLING", "STATE_STARTING", "STATE_RUNNING", "STATE_ACTIVE"]
+    items = [{"id": index + 1, "state": state} for index, state in enumerate(displayed)]
+    monkeypatch.setattr(requests, "get", lambda *a, **k: listing("experiments", items))
+    page = client().list_remote_tasks("experiment", user_id="7", states=["STATE_ACTIVE"])
+    assert [task["state"] for task in page["tasks"]] == displayed
+
+
+@pytest.mark.parametrize("state", GENERIC_FILTER_STATES)
+def test_generic_states_map_to_the_generic_task_enum(monkeypatch, state):
+    calls = []
+    generic_state = "GENERIC_TASK_STATE_" + state[len("STATE_"):]
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs.get("params")))
+        return listing("tasks", [{"taskId": GENERIC_ID, "userId": 7, "state": generic_state}])
+
+    monkeypatch.setattr(requests, "get", get)
+    page = client().list_remote_tasks("generic", user_id="7", states=[state])
+    assert calls == [(
+        "http://master:8080/api/v1/generic-tasks",
+        {"userIds": [7], "limit": 50, "offset": 0, "states": [generic_state]},
+    )]
+    assert page["tasks"] == [{"id": GENERIC_ID, "userId": 7, "state": state}]
+
+
+def test_generic_states_keep_their_order_when_mapped(monkeypatch):
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append(kwargs.get("params")["states"])
+        return listing("tasks", [])
+
+    monkeypatch.setattr(requests, "get", get)
+    page = client().list_remote_tasks(
+        "generic", user_id="7", states=["STATE_COMPLETED", "STATE_STOPPING_PAUSED"]
+    )
+    assert calls == [["GENERIC_TASK_STATE_COMPLETED", "GENERIC_TASK_STATE_STOPPING_PAUSED"]]
+    assert page["tasks"] == [] and page["pagination"]["total"] == 0
+
+
+@pytest.mark.parametrize(
+    ("kind", "states", "item"),
+    [
+        # The master ignored the filter and returned another state.
+        ("experiment", ["STATE_COMPLETED"], {"id": 1, "state": "STATE_ERROR"}),
+        # A displayed active state passes only a STATE_ACTIVE filter.
+        ("experiment", ["STATE_PAUSED"], {"id": 1, "state": "STATE_RUNNING"}),
+        ("experiment", ["STATE_COMPLETED"], {"id": 1}),
+        ("experiment", ["STATE_COMPLETED"], {"id": 1, "state": None}),
+        ("generic", ["STATE_COMPLETED"],
+         {"taskId": GENERIC_ID, "userId": 7, "state": "GENERIC_TASK_STATE_ERROR"}),
+        # A state without the generic prefix cannot be compared and is not a match.
+        ("generic", ["STATE_COMPLETED"],
+         {"taskId": GENERIC_ID, "userId": 7, "state": "STATE_COMPLETED"}),
+        ("generic", ["STATE_COMPLETED"], {"taskId": GENERIC_ID, "userId": 7}),
+        # QUEUED is shown for experiments only; generic tasks have no such state.
+        ("generic", ["STATE_ACTIVE"],
+         {"taskId": GENERIC_ID, "userId": 7, "state": "GENERIC_TASK_STATE_QUEUED"}),
+    ],
+)
+def test_a_listed_state_outside_the_filter_is_an_invalid_response(monkeypatch, kind, states, item):
+    key = "tasks" if kind == "generic" else "experiments"
+    matching = (
+        {"taskId": GENERIC_ID, "userId": 7, "state": "GENERIC_TASK_STATE_" + states[0][6:]}
+        if kind == "generic" else {"id": 2, "state": states[0]}
+    )
+    monkeypatch.setattr(requests, "get", lambda *a, **k: listing(key, [matching, item]))
+    with pytest.raises(APIError) as caught:
+        client().list_remote_tasks(kind, user_id="7", states=states)
+    assert caught.value.code == "invalid_response"
+    assert "state filter" in str(caught.value)
+
+
+def test_an_unfiltered_listing_does_not_check_states(monkeypatch):
+    items = [{"id": 1}, {"id": 2, "state": "X"}]
+    monkeypatch.setattr(requests, "get", lambda *a, **k: listing("experiments", items))
+    page = client().list_remote_tasks("experiment", user_id="7")
+    assert [task.get("state") for task in page["tasks"]] == [None, "X"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "states", "message"),
+    [
+        ("experiment", ["STATE_QUEUED"], "filter with STATE_ACTIVE"),
+        ("experiment", ["STATE_PULLING"], "filter with STATE_ACTIVE"),
+        ("experiment", ["STATE_STARTING"], "filter with STATE_ACTIVE"),
+        ("experiment", ["STATE_RUNNING"], "filter with STATE_ACTIVE"),
+        ("experiment", ["STATE_ACTIVE", "STATE_RUNNING"], "filter with STATE_ACTIVE"),
+        ("experiment", ["STATE_DELETED"], "experiment states must be among"),
+        ("experiment", ["STATE_UNSPECIFIED"], "experiment states must be among"),
+        ("experiment", ["STATE_STOPPING_PAUSED"], "experiment states must be among"),
+        ("experiment", ["state_active"], "experiment states must be among"),
+        ("experiment", ["ACTIVE"], "experiment states must be among"),
+        ("generic", ["STATE_QUEUED"], "generic states must be among"),
+        ("generic", ["STATE_RUNNING"], "generic states must be among"),
+        ("generic", ["STATE_STOPPING_KILLED"], "generic states must be among"),
+        ("generic", ["STATE_DELETING"], "generic states must be among"),
+        ("generic", ["STATE_UNSPECIFIED"], "generic states must be among"),
+        ("generic", ["GENERIC_TASK_STATE_ACTIVE"], "generic states must be among"),
+        ("experiment", [], "non-empty list"),
+        ("experiment", "STATE_ACTIVE", "non-empty list"),
+        ("experiment", ("STATE_ACTIVE",), "non-empty list"),
+        ("generic", [1], "non-empty list"),
+        ("generic", ["STATE_ACTIVE", None], "non-empty list"),
+        ("command", ["STATE_ACTIVE"], "commands cannot be filtered by state"),
+        ("shell", ["STATE_ACTIVE"], "shells cannot be filtered by state"),
+        ("command", [], "commands cannot be filtered by state"),
+    ],
+)
+def test_unsupported_state_filters_are_rejected_before_any_request(
+    monkeypatch, kind, states, message
+):
+    def get(*args, **kwargs):
+        raise AssertionError("no request may be sent")
+
+    monkeypatch.setattr(requests, "get", get)
+    with pytest.raises(ValueError, match=message):
+        client().list_remote_tasks(kind, user_id="7", states=states)
+
+
 def queue_job(job_id, **overrides):
     job = {
         "jobId": job_id, "type": "TYPE_EXPERIMENT", "username": "alice", "userId": 7,
