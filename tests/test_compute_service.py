@@ -105,7 +105,7 @@ class FakeClient:
         self.controls.append(("unpause", kind, remote_id))
         return {"id": remote_id, "acknowledged": True}
 
-    def list_remote_tasks(self, kind, *, user_id, limit, offset):
+    def list_remote_tasks(self, kind, *, user_id, limit, offset, states=None):
         owned = [
             {key: value for key, value in entity.items() if key != "submissionMarker"}
             for (entity_kind, _id), entity in reversed(list(self.entities.items()))

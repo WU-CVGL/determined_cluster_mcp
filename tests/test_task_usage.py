@@ -477,7 +477,7 @@ def test_paused_trial_window_ends_at_last_allocation_end(tmp_path, profile):
 def test_paused_then_cancelled_trial_uses_allocation_end_before_task_end(tmp_path, profile):
     service, client, task = launched(tmp_path, profile)
     client.task_info[CMD] = {
-        "task_id": CMD, "start_time": TASK_START, "end_time": "2027-01-15T07:00:00Z",
+        "task_id": CMD, "start_time": TASK_START, "end_time": "2027-01-15T07:00:00+00:00",
         "allocations": [allocation(f"{CMD}.1", "2027-01-15T03:00:00", "2027-01-15T04:00:00")],
     }
 
@@ -529,7 +529,7 @@ def test_task_without_allocations_or_with_unparsable_allocation_time_uses_now(
     ("start_time", "end_time", "expected_end"),
     [
         ("2027-01-15T08:00:05Z", None, NOW),  # master clock ahead of the client
-        ("2027-01-15T07:00:00Z", "2027-01-15T07:00:00.5Z", NOW - 3600),  # same second
+        ("2027-01-15T07:00:00+00:00", "2027-01-15T07:00:00.5Z", NOW - 3600),  # same second
     ],
 )
 def test_window_is_never_empty_or_inverted(
@@ -586,6 +586,157 @@ def test_filter_that_removes_every_series_names_the_returned_metrics(tmp_path, p
     assert result["series"] == []
     assert not result["explanation"].startswith("No measurements were returned")
     assert "allocation_active, cpu_cores" in result["explanation"]
+
+
+MAPPING_DELAY = (
+    "If the cluster's task-mapping delay is nonzero (5 minutes by default in the Determined "
+    "fork), measurements from the first minutes of each allocation, counted from its start "
+    "including image pull, are not attributed to the task and are never backfilled, so an "
+    "allocation that ended sooner has none; a wider window or an allocation_id can still "
+    "return an earlier allocation's data."
+)
+
+
+def test_no_measurements_name_the_task_mapping_delay(tmp_path, profile):
+    service, client, task = launched(tmp_path, profile)
+
+    result = service.usage(task["kind"], task["id"])
+
+    assert result["series"] == []
+    assert result["explanation"] == (
+        "No measurements were returned; the task may not have run in this window, or "
+        "monitoring retained no data for it. " + MAPPING_DELAY
+    )
+    assert result["advisory"].endswith(" " + MAPPING_DELAY)
+
+
+def test_the_task_mapping_delay_ends_an_explanation_with_other_clauses(tmp_path, profile):
+    service, client, task = launched(tmp_path, profile)
+    client.task_info[CMD] = {
+        "task_id": CMD, "start_time": TASK_START, "end_time": "2027-01-15T07:00:00+00:00",
+        "allocations": [allocation(f"{CMD}.1", "2027-01-15T03:00:00", "2027-01-15T04:00:00")],
+    }
+
+    explanation = service.usage(task["kind"], task["id"])["explanation"]
+
+    assert "no selected allocation is running. " + MAPPING_DELAY in explanation
+    assert explanation.endswith(MAPPING_DELAY)
+    assert explanation.count(MAPPING_DELAY) == 1
+
+
+@pytest.mark.parametrize(
+    ("returned", "metrics"),
+    [
+        # Measured series: the task was mapped.
+        ([series("cpu_cores", [[NOW, 0.5]])], None),
+        # A metrics filter hid every returned series, which still shows the task was mapped.
+        ([series("cpu_cores", [[NOW, 0.5]])], ["gpu_utilization_percent"]),
+    ],
+    ids=["measured", "filtered"],
+)
+def test_returned_measurements_do_not_name_the_delay(tmp_path, profile, returned, metrics):
+    service, client, task = launched(tmp_path, profile)
+    client.series = returned
+
+    result = service.usage(task["kind"], task["id"], metrics=metrics)
+
+    assert MAPPING_DELAY not in result["explanation"]
+    assert MAPPING_DELAY not in result["advisory"]
+    assert result["advisory"].endswith("monitoring retention.")
+
+
+def at(stamp):
+    return service_module._iso_seconds(stamp)
+
+
+@pytest.mark.parametrize(
+    ("task_start", "task_end", "allocations", "returned", "named"),
+    [
+        # Long-running and measured across the trailing window.
+        (TASK_START, None, [(TASK_START, None)],
+         [series("cpu_cores", [[NOW - 3600 + i * 15, 0.5] for i in range(241)])], False),
+        # Started inside the window: its first, unmapped minutes are inside it.
+        (at(NOW - 1800), None, [(at(NOW - 1800), None)],
+         [series("cpu_cores", [[NOW - 1500, 0.5], [NOW, 0.5]])], True),
+        # Young: running for two minutes.
+        (at(NOW - 120), None, [(at(NOW - 120), None)],
+         [series("cpu_cores", [[NOW, 0.5]])], True),
+        # Short: ended after two minutes.
+        (at(NOW - 3600), at(NOW - 3480), [(at(NOW - 3600), at(NOW - 3480))],
+         [series("cpu_cores", [[NOW - 3480, 0.5]])], True),
+        # The first sample arrives later than the default delay explains.
+        (at(NOW - 3600), None, [(at(NOW - 3600), None)],
+         [series("cpu_cores", [[NOW - 3000, 0.5], [NOW, 0.5]])], True),
+        # A resumed allocation inside the window has no samples yet.
+        (TASK_START, None, [(TASK_START, at(NOW - 1800)), (at(NOW - 1200), None)],
+         [series("cpu_cores", [[NOW - 3600, 0.5], [NOW - 1800, 0.5]])], True),
+        # Guards the overlap filter: an allocation that ended before the window does not count.
+        # Sequential allocations cannot reach this branch, so the timeline overlaps on purpose.
+        (TASK_START, None, [(at(NOW - 3700), at(NOW - 3650)), (TASK_START, None)],
+         [series("cpu_cores", [[NOW - 3600 + i * 15, 0.5] for i in range(241)],
+                 allocation=f"{CMD}.2")], False),
+        # An allocation without a start time is dated from the young task's start.
+        (at(NOW - 120), None, [(None, None)], [series("cpu_cores", [[NOW, 0.5]])], True),
+    ],
+    ids=["long-running", "started-inside-window", "young", "short", "late-first-sample",
+         "resumed-unmeasured", "ended-before-window", "unstarted-allocation-young-task"],
+)
+def test_advisory_names_the_delay_only_when_it_can_explain_missing_data(
+    tmp_path, profile, task_start, task_end, allocations, returned, named
+):
+    service, client, task = launched(tmp_path, profile)
+    client.task_info[CMD] = {
+        "task_id": CMD, "start_time": task_start, "end_time": task_end,
+        "allocations": [
+            allocation(f"{CMD}.{index}", began, ended)
+            for index, (began, ended) in enumerate(allocations, start=1)
+        ],
+    }
+    client.series = returned
+
+    result = service.usage(task["kind"], task["id"])
+
+    assert result["series"]
+    assert (MAPPING_DELAY in result["advisory"]) is named
+    assert MAPPING_DELAY not in result["explanation"]
+
+
+def test_an_earlier_allocation_outside_the_default_window_is_reached_by_its_id(
+    tmp_path, profile
+):
+    # Ran 00:00-02:00, was paused, and resumed at 07:57: the default window holds only the
+    # pause gap and the young allocation's unmapped minutes, but the first allocation's own
+    # window still reaches its data.
+    service, client, task = launched(tmp_path, profile)
+    client.task_info[CMD] = {
+        "task_id": CMD, "start_time": "2027-01-15T00:00:00Z", "end_time": None,
+        "allocations": [
+            allocation(f"{CMD}.1", "2027-01-15T00:00:00", "2027-01-15T02:00:00"),
+            allocation(f"{CMD}.2", "2027-01-15T07:57:00", None),
+        ],
+    }
+
+    result = service.usage(task["kind"], task["id"])
+
+    assert result["series"] == []
+    assert result["window"]["anchor"] == "now"
+    assert result["window"]["start_at"] == "2027-01-15T07:00:00+00:00"
+    assert result["explanation"].endswith(MAPPING_DELAY)
+
+    client.calls.clear()
+    window = service.usage(task["kind"], task["id"], allocation_id=f"{CMD}.1")["window"]
+
+    assert window["anchor"] == "allocation_end"
+    assert (window["start_at"], window["end_at"]) == (
+        "2027-01-15T01:00:00+00:00", "2027-01-15T02:00:00+00:00"
+    )
+    assert resources_call(client)[5] == f"{CMD}.1"
+
+    client.calls.clear()
+    window = service.usage(task["kind"], task["id"], window_seconds=8 * 3600)["window"]
+
+    assert window["anchor"] == "now"
+    assert window["start_at"] == "2027-01-15T00:00:00+00:00"
 
 
 def test_experiment_usage_through_real_client_wire_format(tmp_path, profile, monkeypatch):

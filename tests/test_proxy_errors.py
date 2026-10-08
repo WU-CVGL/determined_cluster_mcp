@@ -119,6 +119,24 @@ def test_a_proxy_refusal_is_no_determined_permission_error(monkeypatch):
     assert str(caught.value) == "403 <html>Forbidden</html>"
 
 
+def test_a_proxy_page_that_quotes_a_pool_refusal_stays_the_proxy_answer(monkeypatch):
+    page = '<html>user "alice" may not use resource pool "a100"</html>'
+    answer(monkeypatch, RawResponse(403, page, {"Via": "1.1 squid"}))
+    with pytest.raises(APIError) as caught:
+        client().launch_task("command", {"entrypoint": ["true"]})
+    assert not isinstance(caught.value, SubmissionUncertainError)
+    assert caught.value.code == 403 and caught.value.details is None
+    assert str(caught.value) == f"403 {page}"
+
+
+def test_a_proxy_authentication_page_gets_no_secrets_file_advice(monkeypatch):
+    answer(monkeypatch, RawResponse(401, "<html>Unauthorized</html>", {"Via": "1.1 squid"}))
+    with pytest.raises(APIError) as caught:
+        client().get_task("command", "c1")
+    assert caught.value.code == 401 and caught.value.retryable is False
+    assert str(caught.value) == "401 <html>Unauthorized</html>"
+
+
 @pytest.mark.parametrize(
     ("body", "headers"),
     [
