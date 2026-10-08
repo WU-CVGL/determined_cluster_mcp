@@ -655,6 +655,18 @@ def test_strong_larger_than_every_numa_node_is_refused_as_the_master_does():
     assert selected["max_numa_node_free_slots"] == 4
 
 
+def test_strong_equal_to_the_largest_agent_is_not_refused_by_step_b():
+    # One 8-slot agent with every slot on node 0: n equal to its slot count fits the agent.
+    full = strong_inspector([numa_agent(nodes=(range(8),))])
+    admitted = full.require_capacity("command", strong_config(8))
+    assert admitted["admitted"] is True
+    assert admitted["selected_pool"]["available_capacity"] == 8
+    error = refused(strong_inspector([numa_agent(nodes=(range(8),), busy={0})]), strong_config(8))
+    assert error.code == "capacity_unavailable"
+    assert error.retryable is True
+    assert str(error) == wait_message(8, 7)
+
+
 def test_strong_waits_with_one_free_gpu_per_numa_node():
     # T4
     error = refused(strong_inspector([numa_agent(busy={1, 2, 3, 5, 6, 7})]), strong_config(2))
@@ -807,6 +819,18 @@ def test_a_free_gpu_without_a_known_numa_node_does_not_count():
     assert str(error) == wait_message(4, 3)
 
 
+def test_gpus_with_no_numa_node_form_no_node():
+    # Every GPU reports numaNode -1 with an empty unknownReason: no node holds a slot.
+    inspector = strong_inspector([numa_agent(nodes=({"ids": range(8), "node": -1},))])
+    error = refused(inspector, strong_config(4))
+    assert error.code == "capacity_unavailable"
+    assert error.retryable is False
+    assert str(error) == NO_NODES
+    selected = inspector.resources(4, "gpu", "strong")["selected_pool"]
+    assert selected["max_numa_node_free_slots"] == 0
+    assert selected["max_numa_node_slots"] == 0
+
+
 def test_an_excluded_gpu_is_not_a_slot():
     # T9: a 7-slot agent whose topology also lists the excluded GPU.
     value = numa_agent(nodes=((0, 1, 2, 3), (5, 6, 7)), busy={5, 6, 7})
@@ -846,6 +870,22 @@ def test_a_disabled_slot_counts_toward_its_node_but_is_not_free():
     assert error.code == "capacity_unavailable"
     assert error.retryable is True
     assert str(error) == wait_message(4, 3)
+
+
+def test_a_draining_slot_counts_toward_its_node_but_is_not_free():
+    # T11 variant: idle slots 0-3 on node 0 are draining; node 1 is busy.
+    value = numa_agent(busy={4, 5, 6, 7})
+    for index in range(4):
+        value["slots"][str(index)]["draining"] = True
+    inspector = ResourceInspector(Client([pool(total=4, used=4)], [value]))
+
+    error = refused(inspector, strong_config(4))
+    assert error.code == "capacity_unavailable"
+    assert error.retryable is True
+    assert str(error) == wait_message(4, 0)
+    selected = inspector.resources(4, "gpu", "strong")["selected_pool"]
+    assert selected["max_numa_node_free_slots"] == 0
+    assert selected["max_numa_node_slots"] == 4
 
 
 @pytest.mark.parametrize("fields", [

@@ -472,7 +472,7 @@ def test_compute_resources_takes_the_requests_gpu_topology_values():
                     "compute_resources", {"slots": 4, "prefer_gpu_topology": value}
                 )
                 assert result.is_error is False
-            for value in ("Soft", True, 1, "off"):
+            for value in ("Soft", True, 1, 0, 0.0, "off"):
                 result = await client.call_tool(
                     "compute_resources", {"slots": 4, "prefer_gpu_topology": value}
                 )

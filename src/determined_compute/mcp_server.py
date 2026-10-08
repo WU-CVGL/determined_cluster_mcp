@@ -12,11 +12,23 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Any, Callable, Literal, Optional, Sequence, Union
+from typing import Annotated, Any, Callable, Literal, Optional, Sequence, Union
 
 from determined_compute.compute import ComputeError, ComputeProfile, ComputeService
 from determined_compute.core.api_client import APIError as ClientAPIError
 from determined_compute.core.api_client import DeterminedAPIClient
+
+try:  # pydantic ships with the optional mcp extra; tool annotations need it only then.
+    from pydantic import BeforeValidator
+except ImportError:  # pragma: no cover - exercised without the optional extra
+    BeforeValidator = None
+
+
+def _exact_preference(value: Any) -> Any:
+    # Lax validation would turn 0 and 0.0 into False; the request accepts only the bool.
+    if value is None or value is False or isinstance(value, str):
+        return value
+    raise ValueError('prefer_gpu_topology must be "soft", "strong", false, or null')
 
 
 class _LazyClient:
@@ -219,7 +231,9 @@ def create_server(
         async def compute_resources(
             slots: int = 1,
             pool: Optional[str] = None,
-            prefer_gpu_topology: Optional[Literal["soft", "strong", False]] = None,
+            prefer_gpu_topology: Annotated[
+                Optional[Literal["soft", "strong", False]], BeforeValidator(_exact_preference)
+            ] = None,
         ) -> dict[str, Any]:
             """Inspect current scheduler capacity; slots=0 checks auxiliary capacity, not free GPUs.
 
