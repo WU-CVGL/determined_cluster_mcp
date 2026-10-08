@@ -166,14 +166,120 @@ def test_draining_disabled_and_allocated_slots_are_not_free():
     mixed = agent("mixed", slots=3, occupied=1)
     mixed["slots"]["1"]["draining"] = True
     mixed["slots"]["2"]["enabled"] = False
+    # The pool counts only the busy slot: the draining agent's slots are idle, and the
+    # idle draining slot and the disabled slot leave the pool.
     inspector = ResourceInspector(
-        Client([pool(total=5, used=1, agents=2)], [draining, mixed])
+        Client([pool(total=1, used=1, agents=2)], [draining, mixed])
     )
 
     selected = inspector.resources(pool="gpu")["selected_pool"]
     assert selected["per_agent_free_slots"] == {"draining": 0, "mixed": 0}
-    assert selected["aggregate_reported_free_slots"] == 4
+    assert selected["aggregate_reported_free_slots"] == 0
     assert selected["available"] is False
+
+
+def set_slot(value, index, **fields):
+    value["slots"][str(index)].update(fields)
+    return value
+
+
+def test_a_drained_idle_slot_leaves_the_pool_and_the_rest_stays_known():
+    drained = set_slot(agent(slots=8), 0, draining=True)
+    report = ResourceInspector(Client([pool(total=7)], [drained])).resources(pool="gpu")
+
+    assert report["selected_pool"]["available"] is True
+    assert report["selected_pool"]["available_capacity"] == 7
+
+
+def test_a_drained_busy_slot_is_counted_but_not_free():
+    drained = set_slot(agent(slots=8, occupied=1), 0, draining=True)
+    report = ResourceInspector(Client([pool(total=8, used=1)], [drained])).resources(pool="gpu")
+
+    assert report["selected_pool"]["available"] is True
+    assert report["selected_pool"]["available_capacity"] == 7
+
+
+def test_a_disabled_idle_slot_is_not_counted():
+    disabled = set_slot(agent(slots=8), 3, enabled=False)
+    report = ResourceInspector(Client([pool(total=7)], [disabled])).resources(pool="gpu")
+
+    assert report["selected_pool"]["available_capacity"] == 7
+
+
+def test_a_slot_disabled_without_drain_is_not_counted_while_its_container_is_killed():
+    # The device leaves the pool at once, although the container is still listed.
+    killing = set_slot(agent(slots=8, occupied=1), 0, enabled=False)
+    report = ResourceInspector(Client([pool(total=7)], [killing])).resources(pool="gpu")
+
+    assert report["selected_pool"]["available"] is True
+    assert report["selected_pool"]["available_capacity"] == 7
+
+    # Under an agent drain it is not counted either.
+    drained = agent(slots=8, occupied=2, enabled=False, draining=True)
+    set_slot(drained, 0, enabled=False)
+    report = ResourceInspector(Client([pool(total=1, used=1)], [drained])).resources(pool="gpu")
+    assert report["selected_pool"]["available"] is False
+    assert report["selected_pool"]["available_capacity"] == 0
+
+
+def test_a_disabled_agent_counts_no_slots():
+    disabled = agent(slots=8, occupied=0, enabled=False, draining=False)
+    inspector = ResourceInspector(Client([pool(total=0)], [disabled]))
+
+    selected = inspector.resources(pool="gpu")["selected_pool"]
+    assert selected["available"] is False
+    assert selected["available_capacity"] == 0
+    with pytest.raises(APIError) as caught:
+        inspector.require_capacity("command", command_config())
+    assert caught.value.code == "capacity_unavailable"
+
+
+def test_an_agent_under_disable_drain_counts_only_its_busy_slots():
+    drained = agent(slots=8, occupied=2, enabled=False, draining=True)
+    selected = ResourceInspector(
+        Client([pool(total=2, used=2)], [drained])
+    ).resources(pool="gpu")["selected_pool"]
+
+    assert selected["available"] is False
+    assert selected["available_capacity"] == 0
+    assert selected["per_agent_free_slots"] == {"agent-1": 0}
+
+
+def test_an_agent_with_an_excluded_gpu_matches_its_pool():
+    report = ResourceInspector(Client([pool(total=7)], [agent(slots=7)])).resources(pool="gpu")
+
+    assert report["selected_pool"]["available"] is True
+    assert report["selected_pool"]["available_capacity"] == 7
+
+
+def test_a_slot_count_mismatch_is_unknown_and_names_both_counts():
+    inspector = ResourceInspector(Client([pool(total=7)], [agent(slots=8)]))
+
+    selected = inspector.resources(pool="gpu")["selected_pool"]
+    assert selected["available"] is None
+    assert selected["available_capacity"] is None
+    expected = (
+        "pool reports 7 slot(s) on 1 agent(s); "
+        "the agent list gives 8 counted slot(s) on 1 agent(s)"
+    )
+    assert selected["explanation"] == expected
+    with pytest.raises(APIError) as caught:
+        inspector.require_capacity("command", command_config())
+    assert caught.value.code == "capacity_unknown"
+    assert caught.value.retryable is False
+    assert str(caught.value) == f"capacity for resource pool 'gpu' is unknown: {expected}"
+
+
+def test_an_agent_count_mismatch_names_both_counts():
+    selected = ResourceInspector(
+        Client([pool(total=4, agents=2)], [agent(slots=4)])
+    ).resources(pool="gpu")["selected_pool"]
+
+    assert selected["available"] is None
+    assert selected["explanation"] == (
+        "pool reports 4 slot(s) on 2 agent(s); "
+        "the agent list gives 4 counted slot(s) on 1 agent(s)"
+    )
 
 
 def test_inventory_reports_multiple_pools_and_only_suggests_alternatives():

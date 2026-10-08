@@ -12,6 +12,9 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from determined_compute.core.api_client import APIError
 
 
+_STATISTICS_MISSING = "complete per-agent slot capacity statistics are missing"
+
+
 def _observed_at() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -142,7 +145,8 @@ class ResourceInspector:
         slot_type = raw.get("slotType")
         aux_capacity = _nonnegative_int(raw.get("auxContainerCapacity"))
         aux_running = _nonnegative_int(raw.get("auxContainersRunning"))
-        per_agent, agent_data_known = self._agent_free(name, agents, num_agents, total)
+        per_agent, agent_problem = self._agent_free(name, agents, num_agents, total)
+        agent_data_known = agent_problem is None
 
         if slots == 0:
             capacity_kind = "aux_containers"
@@ -183,7 +187,7 @@ class ResourceInspector:
             else:
                 available_capacity = None
                 available = None
-                explanation = "complete per-agent slot capacity statistics are missing"
+                explanation = agent_problem or _STATISTICS_MISSING
 
         return {
             "resource_pool": name,
@@ -220,9 +224,17 @@ class ResourceInspector:
         agents: List[Any],
         expected_agents: Optional[int],
         expected_slots: Optional[int],
-    ) -> Tuple[Dict[str, int], bool]:
+    ) -> Tuple[Dict[str, int], Optional[str]]:
+        """Return each agent's free slots, or why the agent list does not match the pool.
+
+        Slots are counted the way the pool counts them (numSlots in the scheduler's agent
+        state): a slot counts when it takes new work, or when it is draining and still holds a
+        container. A draining agent counts only its counted slots that hold a container, and a
+        disabled agent counts none.
+        """
+
         if expected_agents is None or expected_slots is None:
-            return {}, False
+            return {}, _STATISTICS_MISSING
         matching: List[Mapping[str, Any]] = []
         for item in agents:
             if not isinstance(item, Mapping):
@@ -230,11 +242,9 @@ class ResourceInspector:
             memberships = item.get("resourcePools")
             if isinstance(memberships, list) and pool in memberships:
                 matching.append(item)
-        if len(matching) != expected_agents:
-            return {}, False
 
         result: Dict[str, int] = {}
-        observed_slots = 0
+        counted_slots = 0
         for agent in matching:
             agent_id = agent.get("id")
             entries = _slots(agent.get("slots"))
@@ -248,23 +258,33 @@ class ResourceInspector:
                 or not isinstance(enabled, bool)
                 or not isinstance(draining, bool)
             ):
-                return {}, False
-            observed_slots += len(entries)
-            if not enabled or draining:
-                result[agent_id] = 0
-                continue
+                return {}, _STATISTICS_MISSING
+            counted = 0
+            counted_busy = 0
             free = 0
             for slot in entries:
                 slot_enabled = slot.get("enabled", True)
                 slot_draining = slot.get("draining", False)
                 if not isinstance(slot_enabled, bool) or not isinstance(slot_draining, bool):
-                    return {}, False
-                if slot_enabled and not slot_draining and slot.get("container") is None:
+                    return {}, _STATISTICS_MISSING
+                busy = slot.get("container") is not None
+                if (slot_enabled and not slot_draining) or (slot_draining and busy):
+                    counted += 1
+                    counted_busy += busy
+                if slot_enabled and not slot_draining and not busy:
                     free += 1
-            result[agent_id] = free
-        if observed_slots != expected_slots:
-            return {}, False
-        return result, True
+            if draining:
+                counted_slots += counted_busy
+            elif enabled:
+                counted_slots += counted
+            result[agent_id] = free if enabled and not draining else 0
+        if len(matching) != expected_agents or counted_slots != expected_slots:
+            return {}, (
+                f"pool reports {expected_slots} slot(s) on {expected_agents} agent(s); "
+                f"the agent list gives {counted_slots} counted slot(s) on "
+                f"{len(matching)} agent(s)"
+            )
+        return result, None
 
     def require_capacity(self, kind: str, config: Mapping[str, Any]) -> Dict[str, Any]:
         """Require current capacity for the config's exact selected pool."""
@@ -299,7 +319,7 @@ class ResourceInspector:
         if selected is None:
             message = f"resource pool {pool!r} is not present or not available to you"
         elif code == "capacity_unknown":
-            message = f"capacity for resource pool {pool!r} is unknown"
+            message = f"capacity for resource pool {pool!r} is unknown: {selected['explanation']}"
         else:
             message = f"resource pool {pool!r} cannot currently fit the request without queueing"
         raise APIError(
