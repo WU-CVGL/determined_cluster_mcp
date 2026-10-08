@@ -1150,3 +1150,223 @@ def test_every_strong_call_reads_agents_then_pools_exactly_once():
         except APIError:
             pass
         assert client.calls == expected
+
+
+def gpu_agent(name="agent-1", pool_name="gpu", brands=("Model A",) * 4, type="TYPE_CUDA",
+              occupied=0, **extra):
+    value = agent(name, pool_name, slots=len(brands), occupied=occupied, **extra)
+    for (index, slot), brand in zip(value["slots"].items(), brands):
+        slot["device"] = {"id": int(index), "type": type, "uuid": f"GPU-{name}-{index}",
+                          "brand": brand}
+    return value
+
+
+def pool_report(pools, agents, slots=1, pool_name="gpu", preference=None):
+    report = ResourceInspector(Client(pools, agents)).resources(slots, pool_name, preference)
+    return {item["resource_pool"]: item for item in report["pools"]}, report
+
+
+def test_a_pool_reports_the_sorted_distinct_gpu_models_of_its_agents():
+    agents = [
+        gpu_agent("a", brands=("Model B", "Model A", "Model B")),
+        gpu_agent("b", brands=("Model C", "Model A")),
+        gpu_agent("other", "other", brands=("Model Z",)),
+    ]
+    pools = [pool(total=5, agents=2), pool("other", total=1)]
+    by_name, report = pool_report(pools, agents)
+
+    assert by_name["gpu"]["gpu_models"] == ["Model A", "Model B", "Model C"]
+    assert by_name["other"]["gpu_models"] == ["Model Z"]
+    assert report["selected_pool"]["gpu_models"] == ["Model A", "Model B", "Model C"]
+
+
+def test_a_cpu_pool_and_a_pool_without_agents_report_no_gpu_models():
+    cpu = cpu_agent("cpu-agent", slots=1)
+    cpu["resourcePools"] = ["cpu"]
+    cpu["slots"]["0"]["device"]["brand"] = "Some CPU x 64 cores"
+    pools = [pool("cpu", total=1), pool("empty", total=0, agents=0), pool()]
+    by_name, _report = pool_report(pools, [cpu, gpu_agent()])
+
+    assert by_name["cpu"]["gpu_models"] == []
+    assert by_name["empty"]["gpu_models"] == []
+    assert by_name["gpu"]["gpu_models"] == ["Model A"]
+
+
+def test_rocm_slots_are_gpus():
+    agents = [gpu_agent("a", brands=("AMD",) * 2, type="TYPE_ROCM"), gpu_agent("b")]
+    by_name, _report = pool_report([pool(total=6, agents=2)], agents)
+    assert by_name["gpu"]["gpu_models"] == ["AMD", "Model A"]
+
+
+def test_an_agent_in_two_pools_gives_its_models_to_both():
+    shared = gpu_agent("shared")
+    shared["resourcePools"] = ["gpu", "other"]
+    by_name, _report = pool_report([pool(), pool("other")], [shared])
+    assert by_name["gpu"]["gpu_models"] == by_name["other"]["gpu_models"] == ["Model A"]
+
+
+def test_gpu_models_include_busy_disabled_and_draining_slots_and_agents():
+    # The models describe the pool's hardware, not its free slots.
+    disabled = gpu_agent("disabled", brands=("Model D",) * 2, enabled=False)
+    draining = gpu_agent("draining", brands=("Model E",) * 2, occupied=1, draining=True)
+    mixed = gpu_agent("mixed", brands=("Model A", "Model B", "Model C"), occupied=1)
+    mixed["slots"]["1"]["enabled"] = False
+    mixed["slots"]["2"]["draining"] = True
+    pools = [pool(total=2, used=2, agents=3)]
+    by_name, _report = pool_report(pools, [disabled, draining, mixed])
+
+    assert by_name["gpu"]["explanation"].startswith("0 slot(s) are currently free")
+    assert by_name["gpu"]["gpu_models"] == [
+        "Model A", "Model B", "Model C", "Model D", "Model E",
+    ]
+
+
+def test_gpu_models_survive_obfuscated_devices():
+    # Without the sensitive-agent permission the master hides device ids and UUIDs and the
+    # topology, but keeps each device's brand.
+    value = gpu_agent(gpuTopology=None)
+    for slot in value["slots"].values():
+        slot["device"].update({"id": -1, "uuid": "********"})
+    by_name, _report = pool_report([pool()], [value])
+    assert by_name["gpu"]["gpu_models"] == ["Model A"]
+
+
+def test_an_excluded_gpu_is_not_a_slot_and_adds_no_model():
+    value = numa_agent(nodes=((0, 1, 2, 3), (5, 6, 7)))
+    for slot in value["slots"].values():
+        slot["device"]["brand"] = "Model A"
+    value["gpuTopology"]["gpus"].append({
+        "deviceId": -1, "excluded": True, "numaNode": 1, "health": "GPU_HEALTH_OK",
+        "nvmlError": "", "uuid": "GPU-excluded",
+    })
+    by_name, _report = pool_report([pool(total=7)], [value], slots=2, preference="strong")
+    assert by_name["gpu"]["available"] is True
+    assert by_name["gpu"]["gpu_models"] == ["Model A"]
+
+
+def _slot_without_device(value):
+    del value["slots"]["1"]["device"]
+
+
+def _slot_without_type(value):
+    del value["slots"]["1"]["device"]["type"]
+
+
+def _gpu_without_brand(value):
+    del value["slots"]["1"]["device"]["brand"]
+
+
+def _gpu_with_empty_brand(value):
+    value["slots"]["1"]["device"]["brand"] = ""
+
+
+def _gpu_with_numeric_brand(value):
+    value["slots"]["1"]["device"]["brand"] = 4090
+
+
+@pytest.mark.parametrize("change", [
+    _slot_without_device, _slot_without_type, _gpu_without_brand, _gpu_with_empty_brand,
+    _gpu_with_numeric_brand,
+])
+def test_an_unreadable_gpu_slot_gives_unknown_models_not_a_partial_list(change):
+    value = gpu_agent()
+    change(value)
+    by_name, _report = pool_report([pool()], [value])
+    assert by_name["gpu"]["gpu_models"] is None
+    # Capacity does not depend on the models.
+    assert by_name["gpu"]["available"] is True
+
+
+def test_a_cpu_slot_without_a_brand_still_gives_known_models():
+    value = cpu_agent("cpu-agent", slots=1)
+    by_name, _report = pool_report([pool(total=1)], [value])
+    assert by_name["gpu"]["gpu_models"] == []
+
+
+@pytest.mark.parametrize("fields", [
+    {"numAgents": 2},
+    {"slotsAvailable": 8},
+    {"numAgents": None},
+])
+def test_agents_that_do_not_match_the_pool_give_unknown_models(fields):
+    by_name, _report = pool_report([{**pool(), **fields}], [gpu_agent()])
+    assert by_name["gpu"]["available"] is None
+    assert by_name["gpu"]["gpu_models"] is None
+
+
+def test_a_used_slot_mismatch_keeps_the_models():
+    by_name, _report = pool_report([pool(used=1)], [gpu_agent()], slots=2)
+    assert by_name["gpu"]["available"] is None
+    assert by_name["gpu"]["gpu_models"] == ["Model A"]
+
+
+def test_a_long_gpu_model_name_is_truncated():
+    by_name, _report = pool_report([pool(total=1)], [gpu_agent(brands=("M" * 300,))])
+    assert by_name["gpu"]["gpu_models"] == ["M" * 256]
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("  48 cores, 512 GB RAM per agent\n", "48 cores, 512 GB RAM per agent"),
+    ("", None),
+    ("   ", None),
+    (None, None),
+    (42, None),
+    ("x" * 5000, "x" * 4096),
+])
+def test_a_pool_reports_its_description_as_compute_usage_does(raw, expected):
+    value = pool()
+    value["description"] = raw
+    by_name, report = pool_report([value], [gpu_agent()])
+    assert by_name["gpu"]["description"] == expected
+    assert report["selected_pool"]["description"] == expected
+
+
+def test_a_pool_without_a_description_field_reports_null():
+    by_name, _report = pool_report([pool()], [gpu_agent()])
+    assert by_name["gpu"]["description"] is None
+
+
+@pytest.mark.parametrize("slots, preference", [(0, None), (1, None), (2, "strong")])
+def test_every_capacity_kind_reports_the_pool_facts(slots, preference):
+    value = numa_agent()
+    for slot in value["slots"].values():
+        slot["device"]["brand"] = "Model A"
+    raw = numa_pool([value])
+    raw["description"] = "described"
+    by_name, _report = pool_report([raw], [value], slots=slots, preference=preference)
+    assert by_name["gpu"]["description"] == "described"
+    assert by_name["gpu"]["gpu_models"] == ["Model A"]
+
+
+def test_admission_returns_the_pool_facts_with_two_get_requests_only():
+    raw = pool()
+    raw["description"] = "described"
+    client = Client([raw], [gpu_agent()])
+    result = ResourceInspector(client).require_capacity("command", command_config(slots=2))
+
+    assert result["admitted"] is True
+    assert result["selected_pool"]["description"] == "described"
+    assert result["selected_pool"]["gpu_models"] == ["Model A"]
+    assert client.calls == [
+        ("api/v1/agents", {"limit": 0}), ("api/v1/resource-pools", {"limit": 0}),
+    ]
+
+
+def test_the_pool_facts_do_not_change_the_verdict():
+    plain = [agent(occupied=2)]
+    described = [gpu_agent(brands=("Model A",) * 4, occupied=2)]
+    raw = pool(used=2)
+    with_description = {**raw, "description": "described"}
+    for slots in (1, 2, 3):
+        config = command_config(slots=slots)
+        first = _verdict(ResourceInspector(Client([raw], plain)), "command", config)
+        second = _verdict(
+            ResourceInspector(Client([with_description], described)), "command", config
+        )
+        if isinstance(first, dict):
+            for item in (first, second):
+                for key in ("description", "gpu_models"):
+                    item["selected_pool"].pop(key)
+                    for entry in item["pools"]:
+                        entry.pop(key, None)
+        assert first == second

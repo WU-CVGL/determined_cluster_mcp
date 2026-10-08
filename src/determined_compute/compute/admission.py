@@ -20,6 +20,8 @@ _GPU_TOPOLOGY_PREFERENCES = ("soft", "strong")
 _TOPOLOGY_PENDING = "not reported since the master started"
 _STATIC_POOL = "RESOURCE_POOL_TYPE_STATIC"
 _CUDA = "TYPE_CUDA"
+# Device types whose slots are GPUs, as the agent detects them (CPU slots carry a CPU brand).
+_GPU_TYPES = (_CUDA, "TYPE_ROCM")
 # Classes of an agent's GPU topology for a "strong" request.
 _KNOWN, _NONE, _PENDING, _HIDDEN, _MALFORMED = "known", "none", "pending", "hidden", "malformed"
 
@@ -44,6 +46,39 @@ def _slots(value: Any) -> Optional[List[Mapping[str, Any]]]:
     if not all(isinstance(item, Mapping) for item in entries):
         return None
     return entries
+
+
+def _pool_description(value: Any) -> Optional[str]:
+    """The pool's operator-written description, as compute_usage reports it."""
+
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text[:4096] if text else None
+
+
+def _gpu_models(
+    members: List[Tuple[str, Mapping[str, Any], List[Mapping[str, Any]]]]
+) -> Optional[List[str]]:
+    """Return the sorted, distinct model names of the GPU slots on a pool's agents.
+
+    Every slot of every agent counts, whatever its state. The list is empty only when no slot
+    is a GPU, and None when a slot's device type, or a GPU slot's model name, is unreadable.
+    """
+
+    models = set()
+    for _agent_id, _agent, entries in members:
+        for slot in entries:
+            device = slot.get("device")
+            if not isinstance(device, Mapping) or not isinstance(device.get("type"), str):
+                return None
+            if device["type"] not in _GPU_TYPES:
+                continue
+            brand = device.get("brand")
+            if not isinstance(brand, str) or not brand:
+                return None
+            models.add(brand[:256])
+    return sorted(models)
 
 
 def _valid_preference(value: Any) -> bool:
@@ -337,6 +372,10 @@ class ResourceInspector:
 
         return {
             "resource_pool": name,
+            "description": _pool_description(raw.get("description")),
+            # Read from the agents only when they match the pool, so a partial list never
+            # passes for the pool's models.
+            "gpu_models": _gpu_models(members) if agent_data_known else None,
             "slot_type": slot_type,
             "num_agents": num_agents,
             "total_slots": total,
