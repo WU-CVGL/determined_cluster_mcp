@@ -390,7 +390,8 @@ class ResourceInspector:
             # The master refuses a request larger than every agent of a static pool at submit,
             # from slot counts alone (ValidateResources), whatever the topology or the slots in
             # use. A provisioned pool checks its instance size instead, which is not read here.
-            refusal = _no_agent_holds(name, slots)
+            # A static pool without agents gets the master's "no NUMA nodes" reason.
+            refusal = _no_agent_holds(name, slots) if members else _no_numa_nodes(name)
 
         layouts = [
             (agent_id, *_numa_layout(agent, entries)) for agent_id, agent, entries in members
