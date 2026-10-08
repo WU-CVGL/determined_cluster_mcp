@@ -453,6 +453,19 @@ def test_marker_search_covers_the_filtered_page(profile):
     assert result["filters"] == {"states": ["STATE_ACTIVE"]}
 
 
+def test_marker_search_shows_a_state_newer_than_the_filter(profile):
+    service, client = service_for(profile)
+    client.pages["generic"] = page([generic_entity()], limit=5)
+    client.entities[("generic", GENERIC_ID)] = generic_entity(
+        state="STATE_COMPLETED", submissionMarker=MARKER
+    )
+
+    result = service.list_tasks("generic", limit=5, marker=MARKER, states=["STATE_ACTIVE"])
+
+    assert [(t["id"], t["state"]) for t in result["tasks"]] == [(GENERIC_ID, "STATE_COMPLETED")]
+    assert result["filters"] == {"states": ["STATE_ACTIVE"]}
+
+
 def test_list_with_states_still_checks_every_owner(profile):
     service, client = service_for(profile)
     client.pages["experiment"] = page([{"id": 12, "userId": 8, "state": "STATE_PAUSED"}])
