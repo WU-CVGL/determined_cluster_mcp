@@ -268,3 +268,31 @@ def test_timeout_is_unconfirmed_never_reposted_and_found_by_marker(monkeypatch):
     assert [(task['id'], task['submission_marker']) for task in found['tasks']] == [
         (COMMAND_ID, marker)]
     assert len(calls) == 1
+
+
+def test_state_filter_reaches_the_master_and_an_ignored_filter_fails(monkeypatch):
+    seen = []
+    items = [{'id': 31, 'userId': 7, 'username': 'alice', 'state': 'STATE_RUNNING'}]
+
+    def get(url, **kwargs):
+        path = url.split('cluster.example:443/', 1)[1]
+        if path == 'api/v1/me':
+            return response(ME)
+        assert path == 'api/v1/experiments'
+        seen.append(kwargs['params'].get('states'))
+        return response({'experiments': items, 'pagination': {
+            'limit': 50, 'offset': 0, 'startIndex': 0, 'endIndex': len(items),
+            'total': len(items)}})
+    monkeypatch.setattr(requests, 'get', get)
+    client = DeterminedAPIClient(api_url='https://cluster.example:443', api_token='test-token')
+    service = ComputeService(client, profile())
+
+    active = service.list_tasks('experiment', states=['STATE_ACTIVE'])
+    assert [(task['id'], task['state']) for task in active['tasks']] == [(31, 'STATE_RUNNING')]
+    assert active['filters'] == {'states': ['STATE_ACTIVE']}
+
+    # A master that ignores the filter returns a running experiment for a completed filter.
+    with pytest.raises(APIError) as caught:
+        service.list_tasks('experiment', states=['STATE_COMPLETED'])
+    assert caught.value.code == 'invalid_response'
+    assert seen == [['STATE_ACTIVE'], ['STATE_COMPLETED']]
