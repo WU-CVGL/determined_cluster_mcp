@@ -235,7 +235,7 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 | `compute_pause` | `kind`、`id` | experiment 和 generic 任务：任务摘要、远端响应和 `pause_acknowledged` |
 | `compute_resume` | `kind`、`id` | experiment 和 generic 任务：任务摘要、远端响应和 `resume_acknowledged` |
 | `compute_list` | `kind`，可选 `limit=50`、`offset=0`、`marker`、`states` | 当前账户的一页任务，最新的在前；指定 `states` 时只列出处于这些状态的 experiment 或 generic 任务；指定 `marker` 时返回该页中配置带有该标记的任务 |
-| `compute_resources` | 可选 `slots=1`、`pool`、`prefer_gpu_topology` | 当前调度容量和候选资源池。值为 `"strong"` 且请求 2 个及以上 slot 时，每个资源池会增加 `max_numa_node_free_slots`（当前能放下的最大 `"strong"` 任务）和 `max_numa_node_slots`（master 在当前 agent 下接受的最大值） |
+| `compute_resources` | 可选 `slots=1`、`pool`、`prefer_gpu_topology` | 当前调度容量和候选资源池。值为 `"strong"` 且请求 2 个及以上 slot 时，每个资源池会增加 `max_numa_node_free_slots`（当前能放下的最大 `"strong"` 任务）和 `max_numa_node_slots`（master 在当前 agent 下接受的最大值）。每个资源池还有 `description` 和 `gpu_models` |
 | `storage_check` | `path` | 映射容器路径的访问情况 |
 | `storage_sync` | `local_dir`、`shared_dir`，可选 `dry_run=true` | 预览或把本地目录内容复制到共享存储 |
 | `storage_fetch` | `shared_dir`、`local_dir`，可选 `dry_run=true` | 预览或把共享目录内容复制到本地 |
@@ -248,6 +248,14 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 容器容量。候选资源池只是建议，服务不会自动替换。在 research-cluster fork 0.42.0 或更高版本
 上，资源池列表只包含当前账户可以使用的资源池，因此不在其中的资源池会报告为不存在或对你不可用，
 可用性未知。
+
+`pools` 和 `selected_pool` 中的每个资源池还带有来自同样两次读取的两项事实。`description` 是
+管理员填写的自由文本资源池说明，原样传递：去掉首尾空白并截断到 4,096 个字符；资源池没有说明时为
+`null`。只有管理员写明时才包含 agent 的硬件信息。`gpu_models` 按排序、去重列出 Determined 为该
+资源池各 agent 的每个 GPU slot 报告的设备 brand（CUDA 上是 GPU 型号名；ROCm 上 Determined 报告的
+是显卡厂商，无法区分显卡型号），包括正在使用、已禁用或正在 drain 的 slot。资源池当前连接的 agent
+没有 GPU slot 时为 `[]`；资源池没有 agent、agent 列表与资源池不一致，或某个 slot 的设备或 GPU
+brand 无法读取时为 `null`。这两项都不影响准入。
 
 准入按资源池自身的方式计算 slot：已 drain 或已禁用的 slot，以及已禁用 agent 的所有 slot，都不算
 容量；正在 drain 的 slot 或 agent 只计入仍有容器占用的 slot。command、shell、generic 任务以及

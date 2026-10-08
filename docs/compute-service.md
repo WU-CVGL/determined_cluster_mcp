@@ -258,7 +258,7 @@ positive integer for an experiment, which can also be passed as a numeric string
 | `compute_pause` | `kind`, `id` | Experiments and generic tasks: task summary, remote response, and `pause_acknowledged` |
 | `compute_resume` | `kind`, `id` | Experiments and generic tasks: task summary, remote response, and `resume_acknowledged` |
 | `compute_list` | `kind`, optional `limit=50`, `offset=0`, `marker`, `states` | One page of the account's tasks, newest first; with `states`, only experiments or generic tasks in those states; with `marker`, the tasks on that page whose config carries it |
-| `compute_resources` | optional `slots=1`, `pool`, `prefer_gpu_topology` | Current scheduler capacity and candidate pools. With `"strong"` and 2 or more slots, each pool adds `max_numa_node_free_slots` (largest `"strong"` task that fits now) and `max_numa_node_slots` (largest the master accepts with the current agents) |
+| `compute_resources` | optional `slots=1`, `pool`, `prefer_gpu_topology` | Current scheduler capacity and candidate pools. With `"strong"` and 2 or more slots, each pool adds `max_numa_node_free_slots` (largest `"strong"` task that fits now) and `max_numa_node_slots` (largest the master accepts with the current agents). Each pool also has `description` and `gpu_models` |
 | `storage_check` | `path` | Access information for a mapped container path |
 | `storage_sync` | `local_dir`, `shared_dir`, optional `dry_run=true` | Preview or copy local directory contents to shared storage |
 | `storage_fetch` | `shared_dir`, `local_dir`, optional `dry_run=true` | Preview or copy shared directory contents locally |
@@ -272,6 +272,17 @@ Candidate pools are suggestions and are never substituted automatically. On the
 research-cluster fork 0.42.0 or later, the pool list holds only the pools the account may
 use, so a requested pool missing from it is reported as not present or not available to
 you, with unknown availability.
+
+Each pool in `pools` and `selected_pool` also carries two facts from the same two reads.
+`description` is the operator's free-text pool description, passed through: trimmed,
+truncated to 4,096 characters, or `null` when the pool has none. It states the agents'
+hardware only if the operator wrote it there. `gpu_models` lists, sorted and without
+duplicates, the device brand Determined reports for each GPU slot of the pool's agents (the
+GPU product name on CUDA; on ROCm, Determined reports the card vendor, which does not tell
+card classes apart), busy, disabled, or draining slots included. It is `[]` when the pool's
+connected agents have no GPU slot, and `null` when the pool has no agents, the agent list
+does not match the pool, or a slot's device or GPU brand is unreadable. Neither fact changes
+admission.
 
 Admission counts slots as the pool does: a drained or disabled slot, and every slot of a
 disabled agent, is not capacity, and a draining slot or agent counts only the slots that

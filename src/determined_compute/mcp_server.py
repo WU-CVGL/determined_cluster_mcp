@@ -254,8 +254,9 @@ def create_server(
         ) -> dict[str, Any]:
             """Inspect current scheduler capacity; slots=0 checks auxiliary capacity, not free GPUs.
 
-            Pass the request's prefer_gpu_topology; with "strong" and 2 or more slots each pool
-            adds max_numa_node_free_slots and max_numa_node_slots.
+            Each pool has description (null when the pool has none) and gpu_models (null when
+            unknown). Pass the request's prefer_gpu_topology; with "strong" and 2 or more slots
+            each pool adds max_numa_node_free_slots and max_numa_node_slots.
             """
             return await call(resource_inspector.resources, slots, pool, prefer_gpu_topology)
 

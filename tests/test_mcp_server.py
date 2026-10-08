@@ -474,6 +474,9 @@ def test_compute_resources_takes_the_requests_gpu_topology_values():
                 {"enum": ["soft", "strong", False]}, {"type": "null"},
             ]
             assert "prefer_gpu_topology" in tools["compute_plan"].description
+            described = " ".join(tools["compute_resources"].description.split())
+            assert "description (null when the pool has none)" in described
+            assert "gpu_models (null when unknown)" in described
             default = await client.call_tool("compute_resources", {"slots": 2})
             for value in ("soft", "strong", False, None):
                 result = await client.call_tool(
