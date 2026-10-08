@@ -105,7 +105,7 @@ MCP 不接受 `kind: notebook`。
 <a id="monitor-and-accept-the-result"></a>
 ## 跟踪并验收结果
 
-调用 `compute_status(kind, id)`，直到任务进入终态；使用 `compute_logs(kind, id, tail)` 检查进度和最后的消息。用户不再需要运行中的任务时，调用 `compute_cancel(kind, id)`。
+调用 `compute_status(kind, id)`，直到任务进入终态；使用 `compute_logs(kind, id, tail)` 检查进度和最后的消息。用户不再需要运行中的任务时，调用 `compute_cancel(kind, id)`。要一次检查多个 experiment 或 generic 任务，调用 `compute_list(kind, states=["STATE_ACTIVE"])`：一次调用即可列出该账户所有 active 的任务，包括排队中和运行中的。
 
 需要了解运行中的任务实际使用了多少 CPU、内存和 GPU 时，例如在提议调整资源、取消或重新提交之前确认 GPU 利用率是否接近零或 allocation 是否空闲，调用 `compute_usage(kind, id)`；对于已结束的任务，它报告任务结束前的窗口。该工具只读，并要求 master 启用任务资源集成；`task_resources_disabled` 或 `task_resources_unsupported` 表示无法取得测量值，而不是任务空闲。先检查 `warnings`。null 或缺失值表示没有测量，绝不表示零；空的 `series` 列表表示该窗口没有数据。数值是每 `step` 秒一次的点采样，GPU 指标覆盖整块分配到的设备，可能包含其他进程。除非指定 `trial_id`，experiment 报告其最新 trial。即使 `metrics` 隐藏了 GPU 序列，`gpus` 仍会比较每个 allocation 的各块 GPU：`utilization_spread_percent` 较大、`least_utilized_gpu_uuid` 的均值很低或 `idle_fraction` 较高，都提示存在空闲或掉队的 GPU；`gpu_count` 小于 `requested_slots` 表示返回了序列的 GPU 少于该 allocation 持有的槽位，并不一定表示其余 GPU 未被使用。对于 experiment，`trial.batches_per_second_lower_bound` 是整个生命周期的下界，因为作为分母的挂钟时间还可能计入镜像拉取、启动、初始化以及因重启损失的 allocation 时间（不含调度排队时间和 allocation 之间的暂停间隔）；工作负载不通过 Determined 的 Core API 报告时，`total_batches_processed` 为 0 属于预期。只报告观察结果；更改槽位数或资源池仍需明确的任务决策。参见[任务用量测量](compute-service.zh.md#task-usage-measurements)。
 
@@ -140,7 +140,7 @@ master 拒绝的暂停或恢复（例如暂停已暂停的任务）会以错误�
 <a id="find-existing-tasks"></a>
 ## 查找已有任务
 
-`compute_list(kind, limit=50, offset=0)` 按从新到旧列出已认证 Determined 账户拥有的任务，无论它们是通过本 MCP、WebUI、原生 CLI 还是另一台设备提交的。每个条目包含 kind、ID、名称、状态、资源池和开始时间，`pagination.next_offset` 指向下一页。把 kind 和 ID 用于 `compute_status`、`compute_logs`、`compute_usage`、`compute_cancel`、`compute_pause` 和 `compute_resume`。列表是只读的。generic 任务需要带有 research-cluster fork generic 任务列表（WU-CVGL/determined#27）的 master；较旧的 master 返回 `unsupported`。
+`compute_list(kind, limit=50, offset=0)` 按从新到旧列出已认证 Determined 账户拥有的任务，无论它们是通过本 MCP、WebUI、原生 CLI 还是另一台设备提交的。每个条目包含 kind、ID、名称、状态、资源池和开始时间，`pagination.next_offset` 指向下一页。把 kind 和 ID 用于 `compute_status`、`compute_logs`、`compute_usage`、`compute_cancel`、`compute_pause` 和 `compute_resume`。列表是只读的。对 experiment 和 generic 任务，`states` 只列出处于给定状态的任务；接受的名称见[列出任务](compute-service.zh.md#list-tasks-and-find-a-submission)。generic 任务需要带有 research-cluster fork generic 任务列表（WU-CVGL/determined#27）的 master；较旧的 master 返回 `unsupported`。
 
 指定 `marker` 时，`compute_list` 返回所选页中配置带有该提交标记的任务。它会读取该页中的每个任务，所以查找刚刚提交的任务时，应使用较小的 `limit`（例如 5 或 10），并沿 `pagination.next_offset` 查看更早的页。标记是关联标签而不是身份：在 MCP 之外复制的配置带有同一个标记，所以可能有多个任务匹配；某一页为空也不能说明任务从未创建。
 

@@ -256,7 +256,7 @@ positive integer for an experiment, which can also be passed as a numeric string
 | `compute_cancel` | `kind`, `id` | Task summary, remote cancellation response, and `cancellation_acknowledged` |
 | `compute_pause` | `kind`, `id` | Experiments and generic tasks: task summary, remote response, and `pause_acknowledged` |
 | `compute_resume` | `kind`, `id` | Experiments and generic tasks: task summary, remote response, and `resume_acknowledged` |
-| `compute_list` | `kind`, optional `limit=50`, `offset=0`, `marker` | One page of the account's tasks, newest first; with `marker`, the tasks on that page whose config carries it |
+| `compute_list` | `kind`, optional `limit=50`, `offset=0`, `marker`, `states` | One page of the account's tasks, newest first; with `states`, only experiments or generic tasks in those states; with `marker`, the tasks on that page whose config carries it |
 | `compute_resources` | optional `slots=1`, `pool` | Current scheduler capacity and candidate pools |
 | `storage_check` | `path` | Access information for a mapped container path |
 | `storage_sync` | `local_dir`, `shared_dir`, optional `dry_run=true` | Preview or copy local directory contents to shared storage |
@@ -590,7 +590,7 @@ task, or a requested trial ID, is missing or inaccessible. See
 
 ### List tasks and find a submission
 
-`compute_list(kind, limit=50, offset=0, marker=None)` lists the tasks owned by the
+`compute_list(kind, limit=50, offset=0, marker=None, states=None)` lists the tasks owned by the
 authenticated account, newest first by start time. `limit` must be 1 through 100 and
 `offset` must be non-negative. The result has `kind`, `account` (`id` and `username`),
 `tasks`, and `pagination` with `offset`, `limit`, `total`, and `next_offset`, which is
@@ -602,6 +602,28 @@ CLI, or another device under the same account.
 
 Generic tasks are listed through Determined's generic task list, which needs a master
 with WU-CVGL/determined#27; an older master returns `unsupported`.
+
+`states` is a non-empty list of state names, and Determined filters the list by them, so
+`pagination.total` is the filtered total; the result repeats the filter as
+`filters: {"states": [...]}`. It applies to experiments and generic tasks only: Determined's
+command and shell lists have no state filter, so `states` with `kind` `command` or `shell`
+is `invalid_request`. The accepted names are the states Determined stores:
+
+| `kind` | Accepted `states` |
+| --- | --- |
+| `experiment` | `STATE_ACTIVE`, `STATE_PAUSED`, `STATE_STOPPING_COMPLETED`, `STATE_STOPPING_CANCELED`, `STATE_STOPPING_ERROR`, `STATE_STOPPING_KILLED`, `STATE_COMPLETED`, `STATE_CANCELED`, `STATE_ERROR`, `STATE_DELETING`, `STATE_DELETE_FAILED` |
+| `generic` | `STATE_ACTIVE`, `STATE_PAUSED`, `STATE_STOPPING_PAUSED`, `STATE_STOPPING_CANCELED`, `STATE_STOPPING_COMPLETED`, `STATE_STOPPING_ERROR`, `STATE_CANCELED`, `STATE_COMPLETED`, `STATE_ERROR` |
+
+Determined stores a running or waiting experiment as active and lists it as
+`STATE_QUEUED`, `STATE_PULLING`, `STATE_STARTING`, or `STATE_RUNNING`. A filter on one of
+those four names would fail or match nothing, so it is `invalid_request`: filter with
+`STATE_ACTIVE`, which returns all four. Any other name, such as `STATE_DELETED`, is also
+`invalid_request`, and no request is sent for a rejected filter. Determined ignores a
+filter it does not apply instead of refusing it, so the service checks the state of every
+returned task against the requested states, counting the four listed active states as
+`STATE_ACTIVE` for experiments; a task outside them is an `invalid_response` error, not an
+unfiltered page shown as a filtered one. `marker` and `states` combine: the marker search
+covers the selected page of the filtered list.
 
 `marker` is a submission marker of the form `determined-compute:<uuid>`, as returned by
 `compute_launch` or by an unconfirmed launch. List entries do not contain the config, so
