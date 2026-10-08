@@ -93,6 +93,8 @@ def create_server(
             "empty result does not prove it failed, so never launch again automatically: "
             "resubmitting is the user's decision. Use compute_list to find the account's tasks "
             "and compute_usage to check a task's measured CPU, memory, and GPU use. "
+            "compute_status gives an unended task's queue position (queue.jobs_ahead) and "
+            "placement; a null queue does not mean the task is not queued. "
             "Experiments and generic tasks can be paused and resumed; a resumed experiment "
             "continues from its trials' latest checkpoints, a resumed generic task reruns its "
             "command from the start. "
@@ -138,7 +140,13 @@ def create_server(
         read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
     ))
     async def compute_status(kind: str, id: Union[int, str]) -> dict[str, Any]:
-        """Return the current state of one of the account's tasks by kind and Determined id."""
+        """Return the current state of one of the account's tasks by kind and Determined id.
+
+        For a task that has not ended, queue is its job in the pool's queue (state,
+        jobs_ahead, slots, placement), or null with queue_note or context_unavailable.
+        An ended task (end time set, or a command or shell in STATE_TERMINATED) gets
+        queue: null.
+        """
 
         return await call(service.status, kind, id)
 

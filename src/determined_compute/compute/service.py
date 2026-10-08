@@ -88,6 +88,8 @@ _USAGE_MAX_RETURNED_SAMPLES = 2880
 # fixed number of trial summary metrics.
 _USAGE_MAX_ALLOCATION_DETAILS = 8
 _USAGE_MAX_SUMMARY_METRICS = 100
+# compute_status reads one page of the task's pool queue and never pages further.
+_QUEUE_LIMIT = 1000
 _USAGE_SUMMARY_STATISTICS = ("count", "sum", "min", "max", "last", "mean")
 # A GPU utilization sample below this percentage counts as idle.
 _GPU_IDLE_PERCENT = 10
@@ -756,6 +758,42 @@ class ComputeService:
         if isinstance(marker, str):
             result["submission_marker"] = marker
         result["remote"] = entity
+        result.update(self._queue(entity))
+        return result
+
+    def _queue(self, entity: Mapping[str, Any]) -> Dict[str, Any]:
+        """Find an unended task's job in its pool's queue; ``state`` stays the authority."""
+        result: Dict[str, Any] = {"queue": None, "context_unavailable": []}
+        # Commands and shells report no end time; STATE_TERMINATED is how they end.
+        if (
+            self._remote_text(entity.get("endTime")) is not None
+            or entity.get("state") == "STATE_TERMINATED"
+        ):
+            return result
+        pool, job_id = entity.get("resourcePool"), entity.get("jobId")
+        # An empty pool would query the default pool, where a miss could read as "not queued".
+        if not isinstance(pool, str) or not pool:
+            result["queue_note"] = "task reports no resource pool"
+            return result
+        if not isinstance(job_id, str) or not job_id:
+            result["queue_note"] = "task reports no job ID"
+            return result
+        try:
+            page = self.client.job_queue(pool, _QUEUE_LIMIT)
+        except APIError:
+            result["context_unavailable"] = ["queue"]
+            return result
+        matches = [job for job in page["jobs"] if job["job_id"] == job_id]
+        if len(matches) > 1:
+            result["context_unavailable"] = ["queue"]
+        elif matches:
+            result["queue"] = {key: value for key, value in matches[0].items() if key != "job_id"}
+        elif page["total"] > _QUEUE_LIMIT:
+            result["queue_note"] = f"not among the first {_QUEUE_LIMIT} jobs of pool {pool}"
+        else:
+            result["queue_note"] = (
+                f"not in pool {pool}'s job queue: not yet queued, paused, or just ended"
+            )
         return result
 
     def logs(self, kind: str, task_id: Any, tail: int = 100) -> List[Any]:
