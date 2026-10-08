@@ -93,12 +93,12 @@ Unknown request fields and upload/context fields are rejected. In auto mode,
 command and receives an advisory. The four generic-only fields are rejected for every
 other kind.
 
-Planning is offline and does not authenticate, inspect capacity, create projects, or
-submit work. It returns `kind`, `name`, `description`, `allow_queue`, rendered `config`,
-`code_revision`, and `advisories`. If `name` is omitted, the service creates one and
-adds an advisory. Commands and shells place the name on the first description line;
-experiments and generic tasks use their native name and description fields. Top-level
-display metadata overrides matching experiment fields.
+Planning is offline and does not authenticate, inspect capacity or pool access, create
+projects, or submit work. It returns `kind`, `name`, `description`, `allow_queue`,
+rendered `config`, `code_revision`, and `advisories`. If `name` is omitted, the service
+creates one and adds an advisory. Commands and shells place the name on the first
+description line; experiments and generic tasks use their native name and description
+fields. Top-level display metadata overrides matching experiment fields.
 
 Command, generic, and experiment entrypoints render as
 `mkdir -p <output_dir> && cd <workdir> || exit $?`, a newline, and then the command, so a
@@ -231,10 +231,15 @@ positive integer for an experiment, which can also be passed as a numeric string
 Call `compute_plan` first and review resolved paths, mode, image, pool, slots, and
 advisories. `compute_resources` is a live snapshot, not a reservation. Positive slot
 requests inspect schedulable agent slots; zero checks auxiliary-container capacity.
-Candidate pools are suggestions and are never substituted automatically.
+Candidate pools are suggestions and are never substituted automatically. On the
+research-cluster fork 0.42.0 or later, the pool list holds only the pools the account may
+use, so a requested pool missing from it is reported as not present or not available to
+you, with unknown availability.
 
 `compute_launch` checks capacity unless `allow_queue` is explicitly true, then submits
-the request once. Every call is a new submission: launching the same request twice
+the request once. A pool missing from the account's pool list fails that check with
+`capacity_unknown`; a pool that the master refuses fails with `permission_denied` (see
+[Errors](#errors)). Every call is a new submission: launching the same request twice
 starts two tasks. On success it returns `kind`; `id`, Determined's task ID (a UUID
 string for a command, shell, or generic task, an integer for an experiment); `name` and
 `description`; the `state` reported at creation, or `null`; `submission_marker`; the
@@ -586,20 +591,29 @@ MCP failures use `isError: true`; their text content is compact JSON of this for
 `retryable` and `details` appear only when available, and structured content is null.
 Safe details can include the kind and submission marker of an unconfirmed launch;
 `source: "proxy"`, `status_code`, and `proxy_error` when an HTTP proxy answered instead
-of Determined; and capacity information. Authentication, permission, transport, and response-shape failures
-are errors rather than empty results. Error messages and reports may contain sanitized
-commands, paths, IDs, states, and error classes, but must not include credentials or
-secret-file contents.
+of Determined; capacity information; and the refused pool of a `permission_denied`
+error. Authentication, permission, transport, and response-shape failures are errors
+rather than empty results. Error messages and reports may contain sanitized commands,
+paths, IDs, states, and error classes, but must not include credentials or secret-file
+contents.
 
 A Determined HTTP failure, including a gRPC-gateway error body, appears as
 `<status> <message>`. HTTP 429 and 5xx responses other than 501 are retryable; 501 means
 the master lacks the route. Usage-specific codes are described in
 [Task usage measurements](#task-usage-measurements).
 
+HTTP 403, Determined's permission refusal, has the code `permission_denied` and is not
+retryable. The research-cluster fork 0.42.0 or later checks the resource pool when a task
+is launched and when an experiment or generic task is resumed. When it refuses a pool the
+account may not use, the message is `resource pool '<pool>' is not available to you` and
+`details.resource_pool` names the pool; choose another pool or ask an administrator for
+access. Any other 403 keeps the form `403 <message>`. A 403 whose body is not Determined's
+JSON error, such as an HTTP proxy's page, keeps the code 403.
+
 The service acts only on tasks owned by the authenticated account and checks this
 before acting on a task, so another account's task returns `ownership_mismatch` even when the
 credentials belong to an administrator. Use the owning account's credentials, or ask an
 administrator to act through Determined directly. Determined applies its own permissions
 as well: on the fork 0.40.1 or later with basic authorization, only a task's owner or an
-administrator can kill, cancel, pause, or resume it, and other accounts receive HTTP 403,
-or HTTP 404 for an experiment.
+administrator can kill, cancel, pause, or resume it, and other accounts receive
+`permission_denied` (HTTP 403), or HTTP 404 for an experiment.

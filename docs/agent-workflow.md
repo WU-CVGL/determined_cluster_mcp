@@ -69,7 +69,7 @@ A transfer copies directory contents and does not delete extra destination files
 
 Use `compute_resources(slots, pool)` when choosing resources, answering a capacity question, or investigating a capacity rejection. Positive slots check schedulable agent slots; zero slots check auxiliary-container capacity. The result is a snapshot, not a reservation. With `allow_queue: false`, `compute_launch` performs this admission check before submitting, so a separate capacity query is not required for every launch.
 
-Keep `allow_queue: false` unless the user explicitly wants the task to wait in a queue. If capacity is unavailable or unknown, report that result. Do not silently switch pools, change the slot count, or enable queuing.
+Keep `allow_queue: false` unless the user explicitly wants the task to wait in a queue. If capacity is unavailable or unknown, or the pool is not present or not available to you, report that result; a `permission_denied` error that names a pool means the account may not use it. Do not silently switch pools, change the slot count, or enable queuing.
 
 ## Plan, review, and launch once
 
@@ -89,7 +89,7 @@ Create a request with a meaningful `name` (at most 128 characters) and `descript
 }
 ```
 
-Call `compute_plan(request)` and inspect the resolved kind, image, pool, mounts, working directory, output directory, resource fields, and advisories. Planning validates and renders locally; it does not prove that remote files, permissions, credentials, or live capacity are valid.
+Call `compute_plan(request)` and inspect the resolved kind, image, pool, mounts, working directory, output directory, resource fields, and advisories. Planning validates and renders locally; it does not prove that remote files, permissions, credentials, pool access, or live capacity are valid.
 
 Call `compute_launch(request)` once. It returns the task's `kind` and `id`, Determined's own task ID: a UUID for a command, shell, or generic task and an integer for an experiment. Every later tool takes this pair. The MCP keeps no record of the launch, so write the kind, ID, name, and `submission_marker` into your own work record. Every call is a new submission: calling `compute_launch` again with the same request starts a second task.
 

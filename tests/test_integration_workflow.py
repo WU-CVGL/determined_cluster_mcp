@@ -115,8 +115,67 @@ def test_http_auth_failure_does_not_become_uncertain_submission(monkeypatch):
     with pytest.raises(APIError) as caught:
         service.launch(request())
     assert not isinstance(caught.value, SubmissionUncertainError)
-    assert caught.value.code == 403
+    assert caught.value.code == 'permission_denied'
     assert len(calls) == 1
+
+
+def gateway_denial(message):
+    return response({'error': {'code': 7, 'reason': 'PermissionDenied', 'error': message}}, 403)
+
+
+POOL_DENIED = (
+    'user "alice" may not use resource pool "restricted": the pool is restricted; choose '
+    'another pool or ask an administrator for access (if resources.resource_pool was not set, '
+    '"restricted" is the default pool for this workspace or the cluster)'
+)
+
+
+def test_a_pool_the_account_may_not_use_is_named_on_launch(monkeypatch):
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(url)
+        return gateway_denial('failed to prepare launch params: ' + POOL_DENIED)
+    monkeypatch.setattr(requests, 'post', post)
+    client = DeterminedAPIClient(api_url='https://cluster.example:443', api_token='test-token')
+    service = ComputeService(client, profile())
+
+    # The pool list omits it, so admission refuses before anything is sent.
+    with pytest.raises(APIError) as caught:
+        service.launch(dict(request(), pool='restricted'))
+    assert caught.value.code == 'capacity_unknown'
+    assert str(caught.value) == "resource pool 'restricted' is not present or not available to you"
+    assert calls == []
+
+    with pytest.raises(APIError) as caught:
+        service.launch(dict(request(), pool='restricted', allow_queue=True))
+    assert not isinstance(caught.value, SubmissionUncertainError)
+    assert caught.value.code == 'permission_denied'
+    assert str(caught.value) == "resource pool 'restricted' is not available to you"
+    assert caught.value.details == {'resource_pool': 'restricted'}
+    assert len(calls) == 1
+
+
+def test_resuming_in_a_pool_the_account_may_not_use_names_the_pool(monkeypatch):
+    routes(monkeypatch, {
+        'api/v1/me': ME,
+        'api/v1/experiments/12': {'experiment': {
+            'id': 12, 'userId': 7, 'state': 'STATE_PAUSED', 'resourcePool': 'restricted'}},
+    })
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(url)
+        return gateway_denial(POOL_DENIED)
+    monkeypatch.setattr(requests, 'post', post)
+    client = DeterminedAPIClient(api_url='https://cluster.example:443', api_token='test-token')
+    service = ComputeService(client, profile())
+
+    with pytest.raises(APIError) as caught:
+        service.resume('experiment', 12)
+    assert caught.value.code == 'permission_denied'
+    assert str(caught.value) == "resource pool 'restricted' is not available to you"
+    assert calls == ['https://cluster.example:443/api/v1/experiments/12/activate']
 
 
 def test_timeout_is_unconfirmed_never_reposted_and_found_by_marker(monkeypatch):

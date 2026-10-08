@@ -97,7 +97,7 @@ class ResourceInspector:
             if item["available"] is True and item["resource_pool"] != pool
         ]
         if pool is not None and selected is None:
-            explanation = f"resource pool {pool!r} was not present in the cluster inventory"
+            explanation = f"resource pool {pool!r} is not present or not available to you"
         elif pool is None:
             explanation = "capacity is reported for inventory only; no resource pool was selected"
         else:
@@ -296,11 +296,12 @@ class ResourceInspector:
             else "capacity_unavailable"
         )
         available = selected["available_capacity"] if selected is not None else None
-        message = (
-            f"capacity for resource pool {pool!r} is unknown"
-            if code == "capacity_unknown"
-            else f"resource pool {pool!r} cannot currently fit the request without queueing"
-        )
+        if selected is None:
+            message = f"resource pool {pool!r} is not present or not available to you"
+        elif code == "capacity_unknown":
+            message = f"capacity for resource pool {pool!r} is unknown"
+        else:
+            message = f"resource pool {pool!r} cannot currently fit the request without queueing"
         raise APIError(
             message,
             code=code,

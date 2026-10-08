@@ -78,7 +78,9 @@ Run `compute_resources` for the requested pool and slot count. Zero slots check 
 
 With `allow_queue: false`, unavailable or unknown capacity rejects the launch instead of queuing. Do not silently choose a suggested alternative pool, reduce resources, or set `allow_queue: true`; those changes require an explicit workload decision. Authentication or inventory-shape errors are errors, not evidence that capacity exists.
 
-A resource pool that an administrator created dynamically appears in `compute_resources` only once it is Ready. A Pending or Failed pool is absent: the result reports that the pool was not present in the cluster inventory with unknown availability, and a launch without queuing is rejected with `capacity_unknown`. This MCP does not expose the dynamic-pool administration API, so ask an administrator about the pool's status.
+A resource pool that an administrator created dynamically appears in `compute_resources` only once it is Ready. A Pending or Failed pool is absent: the result reports that the pool is not present or not available to you, with unknown availability, and a launch without queuing is rejected with `capacity_unknown`. This MCP does not expose the dynamic-pool administration API, so ask an administrator about the pool's status.
+
+On the research-cluster fork 0.42.0 or later, an administrator can restrict a pool to some accounts, and the pool list omits a pool that the account may not use, so `compute_resources` and a launch without queuing report it the same way. A launch with `allow_queue: true`, or resuming an experiment or generic task in such a pool, fails with `permission_denied`; its message and `details.resource_pool` name the pool. Choose another pool with the user or ask an administrator for access.
 
 ## Submission outcome is uncertain
 
@@ -110,7 +112,7 @@ An empty `series` list means no data for the window, not an idle task: the task 
 
 The MCP acts only on tasks owned by the authenticated account. `ownership_mismatch` means the task belongs to another account; the service reads the task, then refuses before any further request, even when the credentials belong to an administrator. Use the owning account's credentials, or ask an administrator to act through Determined directly. `ownership_unavailable` means the master did not report a generic task's owner, because it lacks the research-cluster fork's generic task list (WU-CVGL/determined#27); ask an administrator to upgrade the master. On such a master, launching a generic task or listing generic tasks fails with `unsupported`; a launch checks this before anything is created.
 
-Determined applies its own permissions as well. On the fork 0.40.1 or later with basic authorization, only a task's owner or an administrator can kill, cancel, pause, or resume it; other accounts receive HTTP 403, or HTTP 404 `experiment '<id>' not found` for an experiment.
+Determined applies its own permissions as well. On the fork 0.40.1 or later with basic authorization, only a task's owner or an administrator can kill, cancel, pause, or resume it; other accounts receive `permission_denied` (HTTP 403), or HTTP 404 `experiment '<id>' not found` for an experiment.
 
 ## A transfer is partial or different from the preview
 

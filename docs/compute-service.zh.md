@@ -88,7 +88,7 @@ shell_inactivity_seconds: 7200
 auto 模式从不选择 `generic`。显式 `kind` 会保留，所以 overnight command 仍是 command，
 并收到一条提示。其他任何 kind 都会拒绝这四个仅限 generic 的字段。
 
-规划完全离线，不做认证、容量检查、项目创建或任务提交。它返回 `kind`、`name`、
+规划完全离线，不做认证、容量或资源池权限检查、项目创建或任务提交。它返回 `kind`、`name`、
 `description`、`allow_queue`、渲染后的 `config`、`code_revision` 和 `advisories`。省略
 `name` 时，服务会生成名称并添加提示。command 和 shell 把名称放在 description 第一行；
 experiment 和 generic 任务使用原生 name 与 description 字段。顶层显示元数据会覆盖同名的
@@ -211,13 +211,17 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 
 先调用 `compute_plan`，检查解析后的路径、模式、镜像、资源池、slot 和提示。
 `compute_resources` 返回实时快照，不保留资源。正 slot 数检查可调度的 agent slot；零检查辅助
-容器容量。候选资源池只是建议，服务不会自动替换。
+容器容量。候选资源池只是建议，服务不会自动替换。在 research-cluster fork 0.42.0 或更高版本
+上，资源池列表只包含当前账户可以使用的资源池，因此不在其中的资源池会报告为不存在或对你不可用，
+可用性未知。
 
-除非显式设置 `allow_queue: true`，`compute_launch` 会先检查容量，然后把请求提交一次。每次
-调用都是一次新的提交：同一请求提交两次会启动两个任务。成功时返回 `kind`；`id`，即
-Determined 的任务 ID（command、shell 和 generic 任务为 UUID 字符串，experiment 为整数）；
-`name` 和 `description`；创建时报告的 `state`，或 `null`；`submission_marker`；规划的
-`advisories`；对于 shell 还有 `reconnect_command`。请保存 kind 和 ID：服务不会记住它们。
+除非显式设置 `allow_queue: true`，`compute_launch` 会先检查容量，然后把请求提交一次。不在
+当前账户资源池列表中的资源池会使该检查以 `capacity_unknown` 失败；master 拒绝的资源池会以
+`permission_denied` 失败（见[错误](#errors)）。每次调用都是一次新的提交：同一请求提交两次会
+启动两个任务。成功时返回 `kind`；`id`，即 Determined 的任务 ID（command、shell 和 generic
+任务为 UUID 字符串，experiment 为整数）；`name` 和 `description`；创建时报告的 `state`，或
+`null`；`submission_marker`；规划的 `advisories`；对于 shell 还有 `reconnect_command`。请保存
+kind 和 ID：服务不会记住它们。
 
 每次提交都会在提交的配置中加入一个随机的
 `COMPUTE_SUBMISSION_MARKER=determined-compute:<uuid>` 环境变量。服务不保存它。
@@ -506,16 +510,23 @@ MCP 失败使用 `isError: true`；其文本内容是如下形式的紧凑 JSON�
 
 `retryable` 和 `details` 仅在可用时出现，structured content 为 null。安全 details 可包含
 未确认提交的 kind 和提交标记；HTTP 代理代替 Determined 作出应答时的 `source: "proxy"`、
-`status_code` 和 `proxy_error`；以及容量信息。认证、权限、传输和响应结构错误都会返回错误，
-而不是空结果。错误消息和报告可以包含清理后的命令、路径、ID、状态和错误类别，但不能包含
-凭据或 secrets 文件内容。
+`status_code` 和 `proxy_error`；容量信息；以及 `permission_denied` 错误中被拒绝的资源池。
+认证、权限、传输和响应结构错误都会返回错误，而不是空结果。错误消息和报告可以包含清理后的
+命令、路径、ID、状态和错误类别，但不能包含凭据或 secrets 文件内容。
 
 Determined 的 HTTP 失败（包括 gRPC-gateway 错误响应体）显示为 `<status> <message>`。HTTP 429
 以及除 501 之外的 5xx 响应可以重试；501 表示 master 缺少对应路由。用量相关的错误码见
 [任务用量测量](#task-usage-measurements)。
 
+HTTP 403 即 Determined 的权限拒绝，错误码为 `permission_denied`，不可重试。research-cluster
+fork 0.42.0 或更高版本会在提交任务以及恢复 experiment 或 generic 任务时检查资源池。拒绝当前
+账户无权使用的资源池时，消息为 `resource pool '<pool>' is not available to you`，
+`details.resource_pool` 给出该资源池；请选择其他资源池，或请管理员授予权限。其他 403 仍为
+`403 <message>` 形式。响应体不是 Determined JSON 错误的 403（例如 HTTP 代理的页面）错误码仍为
+403。
+
 服务只操作已认证账户拥有的任务，并在操作任务之前检查这一点；因此即使凭据属于管理员，
 其他账户的任务也会返回 `ownership_mismatch`。应使用拥有该任务的账户凭据，或请管理员直接通过
 Determined 操作。Determined 本身也会执行权限检查：在使用 basic authorization 的 fork 0.40.1
-或更高版本上，只有任务所有者或管理员可以终止、取消、暂停或恢复任务，其他账户会收到 HTTP 403
-（experiment 为 HTTP 404）。
+或更高版本上，只有任务所有者或管理员可以终止、取消、暂停或恢复任务，其他账户会收到
+`permission_denied`（HTTP 403；experiment 为 HTTP 404）。
