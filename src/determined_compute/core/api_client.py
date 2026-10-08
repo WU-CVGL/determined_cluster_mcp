@@ -248,18 +248,11 @@ def _error_from_response(response: requests.Response) -> APIError:
         error = error.get("error") or error.get("message") or error.get("reason")
     message = payload.get("message") or error or response.text or getattr(response, "reason", "API request failed")
     # Only Determined's own error body is its permission refusal; another 403 keeps its status.
-    if status == 403 and (gateway or payload.get("message")):
+    determined = gateway or bool(payload.get("message"))
+    if status == 403 and determined:
         denied = _POOL_DENIED.search(str(message))
-        if denied is not None:
-            pool = denied.group(1)
-            return APIError(
-                f"resource pool {pool!r} is not available to you",
-                code="permission_denied",
-                details={"resource_pool": pool},
-            )
-        return APIError(
-            f"{status} {message}", code="permission_denied", details=payload.get("details")
-        )
+        details = {"resource_pool": denied.group(1)} if denied else payload.get("details")
+        return APIError(f"{status} {message}", code="permission_denied", details=details)
     return APIError(
         f"{status} {message}", code=payload.get("code", status), details=payload.get("details"),
         # 501 means the master lacks the route; repeating the request cannot help.

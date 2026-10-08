@@ -738,7 +738,8 @@ def test_a_refused_pool_is_a_permission_error_naming_the_pool(monkeypatch, opera
     error = caught.value
     assert not isinstance(error, SubmissionUncertainError)
     assert error.code == "permission_denied"
-    assert str(error) == "resource pool 'a100' is not available to you"
+    # The master's refusal, word for word: it names the account and how to get access.
+    assert str(error) == f"403 {POOL_DENIED}"
     assert error.details == {"resource_pool": "a100"}
     assert error.retryable is False
     assert len(calls) == 1
@@ -762,6 +763,27 @@ def test_other_permission_errors_keep_the_master_message(monkeypatch, response, 
     assert str(caught.value) == message
     assert caught.value.details is None
     assert caught.value.retryable is False
+
+
+def test_a_resume_refusal_without_the_launch_prefix_is_passed_through(monkeypatch):
+    refusal = POOL_DENIED.removeprefix("failed to prepare launch params: ")
+    monkeypatch.setattr(
+        requests, "post", lambda *a, **k: gateway_error(403, 7, "PermissionDenied", refusal)
+    )
+    with pytest.raises(APIError) as caught:
+        client().unpause_task("experiment", "17")
+    assert caught.value.code == "permission_denied"
+    assert str(caught.value) == f"403 {refusal}"
+    assert caught.value.details == {"resource_pool": "a100"}
+
+
+def test_a_pool_refusal_in_a_plain_message_body_names_the_pool(monkeypatch):
+    monkeypatch.setattr(requests, "post", lambda *a, **k: Response({"message": POOL_DENIED}, 403))
+    with pytest.raises(APIError) as caught:
+        client().launch_task("command", {"entrypoint": ["true"]})
+    assert caught.value.code == "permission_denied"
+    assert str(caught.value) == f"403 {POOL_DENIED}"
+    assert caught.value.details == {"resource_pool": "a100"}
 
 
 def test_a_log_stream_refusal_is_a_permission_error(monkeypatch):

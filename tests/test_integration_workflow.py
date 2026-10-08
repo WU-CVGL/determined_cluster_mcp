@@ -151,7 +151,7 @@ def test_a_pool_the_account_may_not_use_is_named_on_launch(monkeypatch):
         service.launch(dict(request(), pool='restricted', allow_queue=True))
     assert not isinstance(caught.value, SubmissionUncertainError)
     assert caught.value.code == 'permission_denied'
-    assert str(caught.value) == "resource pool 'restricted' is not available to you"
+    assert str(caught.value) == '403 failed to prepare launch params: ' + POOL_DENIED
     assert caught.value.details == {'resource_pool': 'restricted'}
     assert len(calls) == 1
 
@@ -174,7 +174,8 @@ def test_resuming_in_a_pool_the_account_may_not_use_names_the_pool(monkeypatch):
     with pytest.raises(APIError) as caught:
         service.resume('experiment', 12)
     assert caught.value.code == 'permission_denied'
-    assert str(caught.value) == "resource pool 'restricted' is not available to you"
+    assert str(caught.value) == '403 ' + POOL_DENIED
+    assert caught.value.details == {'resource_pool': 'restricted'}
     assert calls == ['https://cluster.example:443/api/v1/experiments/12/activate']
 
 
