@@ -272,6 +272,45 @@ def _profile(tmp_path):
     return profile
 
 
+def test_instructions_say_the_active_state_list_is_paged():
+    # The active list is one page of at most 100 tasks, not every active task.
+    instructions = create_server(FakeService()).instructions
+    assert "states=['STATE_ACTIVE']" in instructions
+    assert "in one call" not in instructions
+    assert "one page at a time; follow pagination.next_offset" in instructions
+
+
+@pytest.mark.parametrize(
+    ("path", "paged", "confirm"),
+    [
+        (
+            "docs/agent-workflow.md",
+            "one page at a time; follow `pagination.next_offset`",
+            "may be paused or stopping rather than ended; confirm a terminal state with "
+            "`compute_status(kind, id)`",
+        ),
+        (
+            "docs/agent-workflow.zh.md",
+            "它按页列出该账户 active 的任务",
+            "可能处于暂停或停止中，而不是已经结束；验收结果前先用 `compute_status(kind, id)` "
+            "确认任务已进入终态",
+        ),
+        (
+            "skills/intensive-compute-runner/SKILL.md",
+            "one page at a time",
+            "may be paused or stopping, so confirm its terminal state with `compute_status`",
+        ),
+    ],
+)
+def test_guidance_does_not_treat_leaving_the_active_list_as_ended(path, paged, confirm):
+    # A paused or stopping task leaves the STATE_ACTIVE list without having ended.
+    text = (Path(__file__).resolve().parents[1] / path).read_text(encoding="utf-8")
+    assert "in one call" not in text
+    assert "一次调用" not in text
+    assert paged in text
+    assert confirm in text
+
+
 def test_stdio_subprocess_initializes_and_calls_offline_plan(tmp_path):
     profile = _profile(tmp_path)
     repo_root = Path(__file__).resolve().parents[1]

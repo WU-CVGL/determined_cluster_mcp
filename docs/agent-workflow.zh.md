@@ -105,7 +105,7 @@ MCP 不接受 `kind: notebook`。
 <a id="monitor-and-accept-the-result"></a>
 ## 跟踪并验收结果
 
-调用 `compute_status(kind, id)`，直到任务进入终态；使用 `compute_logs(kind, id, tail)` 检查进度和最后的消息。用户不再需要运行中的任务时，调用 `compute_cancel(kind, id)`。要一次检查多个 experiment 或 generic 任务，调用 `compute_list(kind, states=["STATE_ACTIVE"])`：一次调用即可列出该账户所有 active 的任务，包括排队中和运行中的。
+调用 `compute_status(kind, id)`，直到任务进入终态；使用 `compute_logs(kind, id, tail)` 检查进度和最后的消息。用户不再需要运行中的任务时，调用 `compute_cancel(kind, id)`。要一次检查多个 experiment 或 generic 任务，调用 `compute_list(kind, states=["STATE_ACTIVE"])`：它按页列出该账户 active 的任务，包括排队中和运行中的；沿 `pagination.next_offset` 查看后续页，直到其为 null。从该列表中消失的任务可能处于暂停或停止中，而不是已经结束；验收结果前先用 `compute_status(kind, id)` 确认任务已进入终态。
 
 需要了解运行中的任务实际使用了多少 CPU、内存和 GPU 时，例如在提议调整资源、取消或重新提交之前确认 GPU 利用率是否接近零或 allocation 是否空闲，调用 `compute_usage(kind, id)`；对于已结束的任务，它报告任务结束前的窗口。该工具只读，并要求 master 启用任务资源集成；`task_resources_disabled` 或 `task_resources_unsupported` 表示无法取得测量值，而不是任务空闲。先检查 `warnings`。null 或缺失值表示没有测量，绝不表示零；空的 `series` 列表表示该窗口没有数据。数值是每 `step` 秒一次的点采样，GPU 指标覆盖整块分配到的设备，可能包含其他进程。除非指定 `trial_id`，experiment 报告其最新 trial。即使 `metrics` 隐藏了 GPU 序列，`gpus` 仍会比较每个 allocation 的各块 GPU：`utilization_spread_percent` 较大、`least_utilized_gpu_uuid` 的均值很低或 `idle_fraction` 较高，都提示存在空闲或掉队的 GPU；`gpu_count` 小于 `requested_slots` 表示返回了序列的 GPU 少于该 allocation 持有的槽位，并不一定表示其余 GPU 未被使用。对于 experiment，`trial.batches_per_second_lower_bound` 是整个生命周期的下界，因为作为分母的挂钟时间还可能计入镜像拉取、启动、初始化以及因重启损失的 allocation 时间（不含调度排队时间和 allocation 之间的暂停间隔）；工作负载不通过 Determined 的 Core API 报告时，`total_batches_processed` 为 0 属于预期。只报告观察结果；更改槽位数或资源池仍需明确的任务决策。参见[任务用量测量](compute-service.zh.md#task-usage-measurements)。
 
