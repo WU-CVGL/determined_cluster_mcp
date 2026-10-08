@@ -140,25 +140,118 @@ def test_zero_gpu_uses_auxiliary_capacity_not_free_gpu_slots():
     assert caught.value.details["available"] == 0
 
 
-def test_fragmented_multigpu_is_rejected_by_default_but_explicit_multinode_fits():
+SPAN_UNKNOWN = (
+    "capacity for resource pool 'gpu' is unknown: this experiment may span agents, which "
+    "this service does not check; set is_single_node: true, or launch with allow_queue=true"
+)
+
+
+def experiment_config(slots, **resources):
+    return {"resources": {"slots_per_trial": slots, "resource_pool": "gpu", **resources}}
+
+
+@pytest.mark.parametrize("extra", [{}, {"is_single_node": None}, {"is_single_node": False}])
+def test_a_multi_agent_experiment_that_fits_no_single_agent_is_unknown(extra):
     pools = [pool(total=4, used=2, agents=2)]
-    agents = [
-        agent("a", slots=2, occupied=1),
-        agent("b", slots=2, occupied=1),
-    ]
+    agents = [agent("a", slots=2, occupied=1), agent("b", slots=2, occupied=1)]
     inspector = ResourceInspector(Client(pools, agents))
-    experiment = {
-        "resources": {"slots_per_trial": 2, "resource_pool": "gpu"}
-    }
 
     with pytest.raises(APIError) as caught:
-        inspector.require_capacity("experiment", experiment)
-    assert caught.value.code == "capacity_unavailable"
+        inspector.require_capacity("experiment", experiment_config(2, **extra))
+    assert caught.value.code == "capacity_unknown"
+    assert caught.value.retryable is False
+    assert str(caught.value) == SPAN_UNKNOWN
     assert caught.value.details["available"] == 1
 
-    experiment["resources"]["is_single_node"] = False
-    admitted = inspector.require_capacity("experiment", experiment)
-    assert admitted["selected_pool"]["available_capacity"] == 2
+
+def test_a_single_node_experiment_that_fits_no_agent_is_unavailable():
+    pools = [pool(total=4, used=2, agents=2)]
+    agents = [agent("a", slots=2, occupied=1), agent("b", slots=2, occupied=1)]
+    inspector = ResourceInspector(Client(pools, agents))
+
+    with pytest.raises(APIError) as caught:
+        inspector.require_capacity("experiment", experiment_config(2, is_single_node=True))
+    assert caught.value.code == "capacity_unavailable"
+    assert caught.value.retryable is True
+    assert caught.value.details["available"] == 1
+
+
+@pytest.mark.parametrize("kind", ["command", "shell", "generic", "experiment"])
+@pytest.mark.parametrize("value", ["yes", 1, [], {}])
+def test_a_non_boolean_is_single_node_is_rejected(kind, value):
+    config = experiment_config(2) if kind == "experiment" else command_config(slots=2)
+    config["resources"]["is_single_node"] = value
+    inspector = ResourceInspector(Client([pool()], [agent()]))
+
+    with pytest.raises(ValueError, match="is_single_node must be a boolean or null"):
+        inspector.require_capacity(kind, config)
+
+
+def test_a_multi_agent_experiment_is_admitted_when_one_agent_has_the_slots():
+    pools = [pool(total=16, agents=2)]
+    agents = [agent("a", slots=8), agent("b", slots=8)]
+    inspector = ResourceInspector(Client(pools, agents))
+
+    admitted = inspector.require_capacity("experiment", experiment_config(8))
+    assert admitted["admitted"] is True
+    assert admitted["selected_pool"]["available_capacity"] == 8
+    assert admitted["selected_pool"]["capacity_kind"] == "slots_single_agent"
+
+    # Free slots are never summed across agents.
+    with pytest.raises(APIError) as caught:
+        inspector.require_capacity("experiment", experiment_config(16))
+    assert caught.value.code == "capacity_unknown"
+    assert str(caught.value) == SPAN_UNKNOWN
+    assert caught.value.details["available"] == 8
+
+    with pytest.raises(APIError) as caught:
+        inspector.require_capacity("experiment", experiment_config(16, is_single_node=True))
+    assert caught.value.code == "capacity_unavailable"
+
+
+@pytest.mark.parametrize("kind", ["command", "shell", "generic"])
+def test_single_agent_kinds_never_span_agents(kind):
+    pools = [pool(total=16, agents=2)]
+    agents = [agent("a", slots=8), agent("b", slots=8)]
+    inspector = ResourceInspector(Client(pools, agents))
+
+    with pytest.raises(APIError) as caught:
+        inspector.require_capacity(kind, command_config(slots=16, is_single_node=False))
+    assert caught.value.code == "capacity_unavailable"
+    assert caught.value.details["available"] == 8
+
+
+def test_a_one_slot_experiment_uses_the_single_agent_rule():
+    inspector = ResourceInspector(
+        Client([pool(total=2, used=2)], [agent(slots=2, occupied=2)])
+    )
+
+    with pytest.raises(APIError) as caught:
+        inspector.require_capacity("experiment", experiment_config(1, is_single_node=False))
+    assert caught.value.code == "capacity_unavailable"
+
+
+def test_a_multi_agent_experiment_keeps_an_unknown_pool_cause():
+    inspector = ResourceInspector(Client([pool(total=7, agents=2)], [agent("a", slots=8)]))
+
+    with pytest.raises(APIError) as caught:
+        inspector.require_capacity("experiment", experiment_config(2))
+    assert caught.value.code == "capacity_unknown"
+    assert "pool reports 7 slot(s) on 2 agent(s)" in str(caught.value)
+
+
+def test_resources_report_one_agent_free_slots_only():
+    pools = [pool(total=16, used=4, agents=2)]
+    agents = [agent("a", slots=8), agent("b", slots=8, occupied=4)]
+    report = ResourceInspector(Client(pools, agents)).resources(slots=12, pool="gpu")
+    selected = report["selected_pool"]
+
+    assert report["single_node"] is True
+    assert report["available"] is False
+    assert selected["capacity_kind"] == "slots_single_agent"
+    assert selected["available_capacity"] == 8
+    assert selected["max_single_agent_free_slots"] == 8
+    assert "aggregate_schedulable_free_slots" not in selected
 
 
 def test_draining_disabled_and_allocated_slots_are_not_free():
