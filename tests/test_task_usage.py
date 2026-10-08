@@ -654,9 +654,9 @@ def at(stamp):
         # Long-running and measured across the trailing window.
         (TASK_START, None, [(TASK_START, None)],
          [series("cpu_cores", [[NOW - 3600 + i * 15, 0.5] for i in range(241)])], False),
-        # Started inside the window and measured from the end of the default delay.
+        # Started inside the window: its first, unmapped minutes are inside it.
         (at(NOW - 1800), None, [(at(NOW - 1800), None)],
-         [series("cpu_cores", [[NOW - 1500, 0.5], [NOW, 0.5]])], False),
+         [series("cpu_cores", [[NOW - 1500, 0.5], [NOW, 0.5]])], True),
         # Young: running for two minutes.
         (at(NOW - 120), None, [(at(NOW - 120), None)],
          [series("cpu_cores", [[NOW, 0.5]])], True),
@@ -669,9 +669,16 @@ def at(stamp):
         # A resumed allocation inside the window has no samples yet.
         (TASK_START, None, [(TASK_START, at(NOW - 1800)), (at(NOW - 1200), None)],
          [series("cpu_cores", [[NOW - 3600, 0.5], [NOW - 1800, 0.5]])], True),
+        # Guards the overlap filter: an allocation that ended before the window does not count.
+        # Sequential allocations cannot reach this branch, so the timeline overlaps on purpose.
+        (TASK_START, None, [(at(NOW - 3700), at(NOW - 3650)), (TASK_START, None)],
+         [series("cpu_cores", [[NOW - 3600 + i * 15, 0.5] for i in range(241)],
+                 allocation=f"{CMD}.2")], False),
+        # An allocation without a start time is dated from the young task's start.
+        (at(NOW - 120), None, [(None, None)], [series("cpu_cores", [[NOW, 0.5]])], True),
     ],
-    ids=["long-running", "measured-from-start", "young", "short", "late-first-sample",
-         "resumed-unmeasured"],
+    ids=["long-running", "started-inside-window", "young", "short", "late-first-sample",
+         "resumed-unmeasured", "ended-before-window", "unstarted-allocation-young-task"],
 )
 def test_advisory_names_the_delay_only_when_it_can_explain_missing_data(
     tmp_path, profile, task_start, task_end, allocations, returned, named

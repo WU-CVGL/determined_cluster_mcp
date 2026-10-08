@@ -75,7 +75,7 @@ MCP 不接受 `kind: notebook`。
 
 需要选择资源、回答容量问题或排查容量拒绝时，调用 `compute_resources(slots, pool)`。正槽位数检查可调度的 agent slot，零槽位检查辅助容器容量。结果只是快照，不是资源预留。`allow_queue: false` 时，`compute_launch` 会在提交前执行这项准入检查，因此不必在每次提交前单独查询容量。
 
-除非用户明确要求等待，否则保持 `allow_queue: false`。容量不足或无法确定，或资源池不存在或对你不可用时，报告该结果；指明某个资源池的 `permission_denied` 错误表示当前账户无权使用该资源池。不要擅自切换资源池、改变槽位数或开启排队。以 `capacity_unknown` 或 `capacity_unavailable` 被拒绝的提交没有提交任何任务。不要循环重新提交；报告该结果，或请用户决定使用 `allow_queue: true` 或其他资源池。`compute_status` 返回 `queue` 字段时，对排队中的任务引用其中的 `jobs_ahead`。在 research-cluster fork 0.41.1 或更高版本上，排队中的任务在 master 重启后仍保持排队。
+除非用户明确要求等待，否则保持 `allow_queue: false`。容量不足或无法确定，或资源池不存在或对你不可用时，报告该结果；指明某个资源池的 `permission_denied` 错误表示当前账户无权使用该资源池。不要擅自切换资源池、改变槽位数或开启排队。以 `capacity_unknown` 或 `capacity_unavailable` 被拒绝的提交没有提交任何任务。不要循环重新提交；报告该结果，或请用户决定使用 `allow_queue: true` 或其他资源池。在 research-cluster fork 0.41.1 或更高版本上，排队中的任务在 master 重启后仍保持排队。
 
 <a id="plan-review-and-launch-once"></a>
 ## 规划、审核并只提交一次

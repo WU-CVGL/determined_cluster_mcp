@@ -1098,13 +1098,6 @@ class ComputeService:
         """Whether the task-mapping delay can explain missing data in the window."""
         if not returned:
             return True
-        first: Dict[Optional[str], int] = {}
-        for item in returned:
-            stamps = [stamp for stamp, value in item["samples"] if value is not None]
-            if stamps:
-                key = item["labels"]["allocation_id"]
-                first[key] = min(first.get(key, stamps[0]), *stamps)
-        delay = _USAGE_MAPPING_DELAY_SECONDS
         for item in selected:
             began = _lenient_unix_seconds(item["start_time"])
             if began is None:
@@ -1114,12 +1107,8 @@ class ComputeService:
                 ended = end
             if began is None or began > end or ended < start:
                 continue
-            # A young or short allocation, or unmapped minutes inside the window with no
-            # sample once the default delay has passed.
-            if ended - began < delay:
-                return True
-            earliest = first.get(item["allocation_id"])
-            if began + delay > start and (earliest is None or earliest > began + delay):
+            # The allocation's unmapped first minutes fall inside the window.
+            if began + _USAGE_MAPPING_DELAY_SECONDS > start:
                 return True
         return False
 

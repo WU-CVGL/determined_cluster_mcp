@@ -457,9 +457,8 @@ Determined agent 为该 `gpu_uuid` 报告的型号名称；非 GPU 序列或设�
 Determined 只在 allocation 运行满 master 的任务映射延迟（`observability.task_mapping_delay`，
 默认 5 分钟）之后才把测量值归属到任务，因此每个 allocation 的最初几分钟，以及在此之前就结束的
 allocation，都没有数据，`allocation_active` 也不例外；使用更长的窗口也无法补回这些数据。
-只有当这一延迟可以解释缺失的数据时，`advisory` 才会说明这一点：没有返回任何序列、窗口内某个
-allocation 运行（或到目前为止运行）不足 5 分钟，或某个 allocation 的最初 5 分钟落入窗口，
-而这段时间结束时仍没有样本。
+只有当这一延迟可以解释缺失的数据时，`advisory` 才会说明这一点：没有返回任何序列，或某个
+allocation 的最初 5 分钟落入窗口。
 没有返回任何测量值时，`explanation` 也会说明。
 未指定 `trial_id` 且 experiment 有多个 trial 时，`explanation` 会说明 trial 总数以及报告的是
 哪一个。

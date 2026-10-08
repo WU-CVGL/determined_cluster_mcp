@@ -521,8 +521,7 @@ minutes by default), so the first minutes of each allocation, and any allocation
 ended sooner, have no data, `allocation_active` included; a longer window does not recover
 them.
 `advisory` says so only when the delay can explain missing data: no series was returned,
-an allocation in the window ran (or has run so far) for less than 5 minutes, or an
-allocation whose first 5 minutes reach into the window has no sample by their end.
+or an allocation's first 5 minutes fall inside the window.
 `explanation` says so when no measurements were returned. When
 `trial_id` is omitted and the experiment has several trials, `explanation` states how
 many exist and which one is reported.
