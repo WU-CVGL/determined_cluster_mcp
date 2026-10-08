@@ -75,7 +75,7 @@ MCP 不接受 `kind: notebook`。
 
 需要选择资源、回答容量问题或排查容量拒绝时，调用 `compute_resources(slots, pool)`。正槽位数检查可调度的 agent slot，零槽位检查辅助容器容量。结果只是快照，不是资源预留。`allow_queue: false` 时，`compute_launch` 会在提交前执行这项准入检查，因此不必在每次提交前单独查询容量。
 
-除非用户明确要求等待，否则保持 `allow_queue: false`。容量不足或无法确定时，报告该结果。不要擅自切换资源池、改变槽位数或开启排队。
+除非用户明确要求等待，否则保持 `allow_queue: false`。容量不足或无法确定，或资源池不存在或对你不可用时，报告该结果；指明某个资源池的 `permission_denied` 错误表示当前账户无权使用该资源池。不要擅自切换资源池、改变槽位数或开启排队。
 
 <a id="plan-review-and-launch-once"></a>
 ## 规划、审核并只提交一次
@@ -96,7 +96,7 @@ MCP 不接受 `kind: notebook`。
 }
 ```
 
-调用 `compute_plan(request)`，检查解析后的任务类型、镜像、资源池、挂载、工作目录、输出目录、资源字段和提示信息。规划只在本地验证并渲染配置，不能证明远端文件、权限、凭据或实时容量有效。
+调用 `compute_plan(request)`，检查解析后的任务类型、镜像、资源池、挂载、工作目录、输出目录、资源字段和提示信息。规划只在本地验证并渲染配置，不能证明远端文件、权限、凭据、资源池访问权限或实时容量有效。
 
 调用一次 `compute_launch(request)`。它返回任务的 `kind` 和 `id`，即 Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，experiment 为整数。之后的所有工具都使用这一对值。MCP 不保存这次提交的记录，所以请把 kind、ID、名称和 `submission_marker` 写入自己的工作记录。每次调用都是一次新的提交：用同一请求再次调用 `compute_launch` 会启动第二个任务。
 

@@ -34,6 +34,8 @@ For a short single-GPU task already authorized to run locally, read [local works
 
 If `name` or `description` is rejected as too long with `invalid_request`, shorten it and submit the corrected request; that validation happens before submission.
 
+A `permission_denied` error that names a resource pool means the account may not use that pool; report it and leave choosing another pool, or asking an administrator for access, to the user.
+
 For `submission_uncertain`, do not launch again automatically. Search with `compute_list(kind, marker=...)` using the returned `submission_marker`. An empty result does not prove failure; report an unresolved or ambiguous result and leave resubmission to the user. See [unconfirmed submissions](../../docs/troubleshooting.md#submission-outcome-is-uncertain).
 
 Stop and report authentication or deployment-configuration errors without reading credential values or changing the secrets file or MCP configuration; see [authentication fails](../../docs/troubleshooting.md#authentication-fails). They do not authorize a local fallback.

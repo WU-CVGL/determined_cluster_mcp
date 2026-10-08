@@ -93,6 +93,24 @@ def test_missing_statistics_are_unknown_not_zero():
     assert report["selected_pool"]["available"] is None
 
 
+def test_a_pool_missing_from_the_list_is_not_present_or_not_available():
+    # The pool list holds only the pools the account may use.
+    inspector = ResourceInspector(Client([pool()], [agent()]))
+
+    report = inspector.resources(pool="restricted")
+    assert report["selected_pool"] is None
+    assert report["available"] is None
+    assert report["explanation"] == (
+        "resource pool 'restricted' is not present or not available to you"
+    )
+    with pytest.raises(APIError) as caught:
+        inspector.require_capacity("command", command_config(pool_name="restricted"))
+    assert caught.value.code == "capacity_unknown"
+    assert str(caught.value) == "resource pool 'restricted' is not present or not available to you"
+    assert caught.value.details["resource_pool"] == "restricted"
+    assert caught.value.details["candidate_pools"] == ["gpu"]
+
+
 def test_authentication_error_propagates_unchanged():
     failure = APIError("unauthorized", code=401)
     inspector = ResourceInspector(Client([], [], error=failure))

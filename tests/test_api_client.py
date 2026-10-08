@@ -155,7 +155,7 @@ def test_api_error_fields_and_mutation_uncertainty(monkeypatch):
     monkeypatch.setattr(requests, "get", lambda *a, **k: Response({"message": "no"}, 403))
     with pytest.raises(APIError) as caught:
         client().get_task("command", "c1")
-    assert caught.value.code == 403
+    assert caught.value.code == "permission_denied"
     assert caught.value.retryable is False
 
     monkeypatch.setattr(requests, "post", lambda *a, **k: Response({"message": "proxy"}, 502))
@@ -701,6 +701,65 @@ def test_gateway_error_body_message_and_retryability(monkeypatch, status, retrya
     assert str(caught.value) == f"{status} task 'x' not found"
     assert caught.value.code == status
     assert caught.value.retryable is retryable
+
+
+# The research-cluster fork's refusal of a restricted pool, as the command launch route wraps it.
+POOL_DENIED = (
+    'failed to launch command: user "alice" may not use resource pool "a100": the pool is '
+    "restricted; choose another pool or ask an administrator for access (if "
+    'resources.resource_pool was not set, "a100" is the default pool for this workspace or the '
+    "cluster)"
+)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda api: api.launch_task("command", {"entrypoint": ["true"]}),
+        lambda api: api.launch_task("experiment", {"entrypoint": "true"}),
+        lambda api: api.launch_task("generic", generic_config()),
+        lambda api: api.unpause_task("experiment", "17"),
+        lambda api: api.unpause_task("generic", GENERIC_ID),
+    ],
+    ids=["command", "experiment", "generic", "experiment-resume", "generic-resume"],
+)
+def test_a_refused_pool_is_a_permission_error_naming_the_pool(monkeypatch, operation):
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(url)
+        return gateway_error(403, 7, "PermissionDenied", POOL_DENIED)
+
+    monkeypatch.setattr(requests, "post", post)
+    with pytest.raises(APIError) as caught:
+        operation(client())
+    error = caught.value
+    assert not isinstance(error, SubmissionUncertainError)
+    assert error.code == "permission_denied"
+    assert str(error) == "resource pool 'a100' is not available to you"
+    assert error.details == {"resource_pool": "a100"}
+    assert error.retryable is False
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        (Response({"message": "denied"}, 403), "403 denied"),
+        (
+            gateway_error(403, 7, "PermissionDenied", "user alice may not view workspace 3"),
+            "403 user alice may not view workspace 3",
+        ),
+    ],
+)
+def test_other_permission_errors_keep_the_master_message(monkeypatch, response, message):
+    monkeypatch.setattr(requests, "get", lambda *a, **k: response)
+    with pytest.raises(APIError) as caught:
+        client().get_task("command", "c1")
+    assert caught.value.code == "permission_denied"
+    assert str(caught.value) == message
+    assert caught.value.details is None
+    assert caught.value.retryable is False
 
 
 @pytest.mark.parametrize("enabled", [True, False])

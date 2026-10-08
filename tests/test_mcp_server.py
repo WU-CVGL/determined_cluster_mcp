@@ -396,3 +396,39 @@ def test_a_new_server_process_continues_by_native_id(tmp_path, monkeypatch):
     assert cancel["cancellation_acknowledged"] is True
     assert master.cancelled == [("command", COMMAND_ID)]
     assert list(tmp_path.iterdir()) == []
+
+
+def test_a_refused_pool_reaches_the_client_as_a_permission_error(monkeypatch):
+    import requests
+
+    from determined_compute.compute import ComputeProfile, ComputeService
+    from determined_compute.core.api_client import DeterminedAPIClient
+
+    denial = requests.Response()
+    denial.status_code = 403
+    denial._content = json.dumps({"error": {
+        "code": 7, "reason": "PermissionDenied",
+        "error": 'failed to launch command: user "alice" may not use resource pool "a100": '
+                 "the pool is restricted; choose another pool or ask an administrator for access",
+    }}).encode()
+    monkeypatch.setattr(requests, "post", lambda *args, **kwargs: denial)
+    profile = ComputeProfile.from_dict({
+        "mounts": [{"host_path": "/shared", "container_path": "/shared"}],
+        "defaults": {"image": "image", "pool": "a100"},
+    })
+    service = ComputeService(
+        DeterminedAPIClient(api_url="https://cluster.example", api_token="token"), profile
+    )
+    request = {"name": "probe", "command": "true", "workdir": "/shared/work",
+               "output_dir": "/shared/out", "allow_queue": True}
+
+    async def exercise():
+        async with Client(create_server(service)) as client:
+            return _error(await client.call_tool("compute_launch", {"request": request}))
+
+    assert asyncio.run(asyncio.wait_for(exercise(), timeout=10)) == {
+        "code": "permission_denied",
+        "message": "resource pool 'a100' is not available to you",
+        "retryable": False,
+        "details": {"resource_pool": "a100"},
+    }
