@@ -26,9 +26,9 @@ For a short single-GPU task already authorized to run locally, read [local works
 
 1. Prepare code, dependencies, and outputs on mapped shared storage. Use container paths for `workdir` and `output_dir`. For durable work, stage each revision in its own directory, record it as `code_revision`, and do not sync into that directory afterwards: a restart or resume runs whatever it then holds. If needed, stage files through the [storage workflow](../../docs/shared-storage-access.md), reviewing the transfer preview and secret exclusions. Submit mapped paths without a source archive.
 2. Give the request a meaningful `name` (at most 128 characters) and `description` (at most 2,048). Call `compute_plan(request)` and inspect the resolved kind, image, paths, mounts, pool, and slots. Planning is offline.
-3. Keep `allow_queue: false` unless queueing is authorized. `compute_launch` checks capacity; use `compute_resources` when a capacity decision needs a live snapshot. Do not change the pool, slots, or execution location automatically.
+3. Keep `allow_queue: false` unless queueing is authorized. `compute_launch` checks capacity; use `compute_resources` when a capacity decision needs a live snapshot. Do not change the pool, slots, or execution location automatically. A launch refused for capacity submitted nothing; do not resubmit it in a loop.
 4. Call `compute_launch(request)` once. Every call is a new submission. Keep the returned `kind`, native Determined `id`, and `submission_marker`; the MCP stores no task records and manages only the configured account's tasks.
-5. Follow `compute_status` and `compute_logs`, then check the exit result and expected outputs. Use `compute_usage` when resource measurements are needed; missing values do not mean idle resources. Use `compute_cancel` to stop the intended task.
+5. Follow `compute_status` and `compute_logs`, then check the exit result and expected outputs. Use `compute_usage` when resource measurements are needed; missing values do not mean idle resources, and an allocation's first minutes have no data. Use `compute_cancel` to stop the intended task.
 
 ## Handle failed submissions
 

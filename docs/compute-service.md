@@ -323,7 +323,10 @@ Do not launch again automatically. Whether to submit again is the user's decisio
 checking, for example in the WebUI or with a later search. A duplicate cancelled
 afterwards may already have had effects, such as files it wrote, that cancelling does not
 undo. A definite rejection, such as HTTP 400, 401, or 403, is an ordinary error: nothing
-was submitted.
+was submitted. When the research-cluster fork 0.42.0 or later cannot check whether the
+account may use the requested pool, it answers a launch or resume with HTTP 503 `could not
+check access to resource pool "<pool>": ...; try again`. The service reports that answer as
+`submission_uncertain`, like any other 5xx; check with the marker as above.
 
 A failure before any connection was open (a refused connection, a failed name lookup, a
 connect timeout, or an unreachable HTTP proxy) is a retryable `transport_error`: the
@@ -511,8 +514,13 @@ are per GPU UUID and cover the whole assigned device, which can include other pr
 Inspect `warnings`, such as `rss_unverified` or `gpu_full_device`, before drawing
 conclusions. An empty `series` list means no data for the window, not an idle task; if a
 `metrics` filter removed every returned series, `explanation` names the metrics that
-were returned. When `trial_id` is omitted and the experiment has several trials,
-`explanation` states how many exist and which one is reported.
+were returned. Determined attributes measurements to a task only after its allocation
+has run for the master's task-mapping delay (`observability.task_mapping_delay`, 5
+minutes by default), so the first minutes of each allocation, and any allocation that
+ended sooner, have no data, `allocation_active` included; a longer window does not help.
+`advisory` says so, and so does `explanation` when no measurements were returned. When
+`trial_id` is omitted and the experiment has several trials, `explanation` states how
+many exist and which one is reported.
 
 `gpus` compares the GPUs within each allocation. It has one entry per `allocation_id`
 with GPU utilization or memory series and uses every such series returned for the
@@ -641,10 +649,12 @@ the master lacks the route. Usage-specific codes are described in
 HTTP 403, Determined's permission refusal, has the code `permission_denied` and is not
 retryable. The research-cluster fork 0.42.0 or later checks the resource pool when a task
 is launched and when an experiment or generic task is resumed. When it refuses a pool the
-account may not use, the message is `resource pool '<pool>' is not available to you` and
-`details.resource_pool` names the pool; choose another pool or ask an administrator for
-access. Any other 403 keeps the form `403 <message>`. A 403 whose body is not Determined's
-JSON error, such as an HTTP proxy's page, keeps the code 403.
+account may not use, the message is the master's own refusal in the form `403 <message>`,
+for example `403 failed to prepare launch params: user "<username>" may not use resource
+pool "<pool>": the pool is restricted; choose another pool or ask an administrator for
+access (...)`, and `details.resource_pool` names the pool. Any other 403 keeps the same
+form. A 403 whose body is not Determined's JSON error, such as an HTTP proxy's page, keeps
+the code 403.
 
 The service acts only on tasks owned by the authenticated account and checks this
 before acting on a task, so another account's task returns `ownership_mismatch` even when the

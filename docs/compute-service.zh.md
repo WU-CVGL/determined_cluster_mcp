@@ -291,7 +291,9 @@ Determined 可能创建了任务，也可能没有。服务从不重试这样的
 在已结束的 command 或 shell 结束 24 小时后不再提供它。不要自动再次提交；是否重新提交由用户
 在检查之后决定，例如在 WebUI 中查看，或稍后再次搜索。事后取消的重复任务可能已经产生了取消
 无法撤销的影响，例如已写入的文件。明确的拒绝（例如 HTTP 400、401 或 403）是普通错误：没有
-提交任何任务。
+提交任何任务。research-cluster fork 0.42.0 或更高版本无法检查当前账户能否使用所请求的资源池时，
+会以 HTTP 503 `could not check access to resource pool "<pool>": ...; try again` 应答提交或恢复。
+服务与其他 5xx 一样，把这种应答报告为 `submission_uncertain`；按上文用标记进行检查。
 
 在连接建立之前发生的失败（连接被拒绝、域名解析失败、连接超时或 HTTP 代理不可达）是可重试的
 `transport_error`：请求从未发出，因此没有创建任何任务。HTTP 代理的应答若带有 RFC 9209
@@ -451,6 +453,10 @@ Determined agent 为该 `gpu_uuid` 报告的型号名称；非 GPU 序列或设�
 序列按 GPU UUID 区分，覆盖整块分配到的设备，可能包含其他进程。下结论前先检查 `warnings`，
 例如 `rss_unverified` 或 `gpu_full_device`。空的 `series` 列表表示该窗口没有数据，
 而不是任务空闲；如果 `metrics` 过滤掉了所有返回的序列，`explanation` 会列出实际返回的指标。
+Determined 只在 allocation 运行满 master 的任务映射延迟（`observability.task_mapping_delay`，
+默认 5 分钟）之后才把测量值归属到任务，因此每个 allocation 的最初几分钟，以及在此之前就结束的
+allocation，都没有数据，`allocation_active` 也不例外；使用更长的窗口无济于事。`advisory` 会说明
+这一点；没有返回任何测量值时，`explanation` 也会说明。
 未指定 `trial_id` 且 experiment 有多个 trial 时，`explanation` 会说明 trial 总数以及报告的是
 哪一个。
 
@@ -553,10 +559,11 @@ Determined 的 HTTP 失败（包括 gRPC-gateway 错误响应体）显示为 `<s
 
 HTTP 403 即 Determined 的权限拒绝，错误码为 `permission_denied`，不可重试。research-cluster
 fork 0.42.0 或更高版本会在提交任务以及恢复 experiment 或 generic 任务时检查资源池。拒绝当前
-账户无权使用的资源池时，消息为 `resource pool '<pool>' is not available to you`，
-`details.resource_pool` 给出该资源池；请选择其他资源池，或请管理员授予权限。其他 403 仍为
-`403 <message>` 形式。响应体不是 Determined JSON 错误的 403（例如 HTTP 代理的页面）错误码仍为
-403。
+账户无权使用的资源池时，消息是 master 自己的拒绝原文，形式为 `403 <message>`，例如
+`403 failed to prepare launch params: user "<username>" may not use resource pool "<pool>":
+the pool is restricted; choose another pool or ask an administrator for access (...)`，
+`details.resource_pool` 给出该资源池。其他 403 也是同样的形式。响应体不是 Determined JSON
+错误的 403（例如 HTTP 代理的页面）错误码仍为 403。
 
 服务只操作已认证账户拥有的任务，并在操作任务之前检查这一点；因此即使凭据属于管理员，
 其他账户的任务也会返回 `ownership_mismatch`。应使用拥有该任务的账户凭据，或请管理员直接通过

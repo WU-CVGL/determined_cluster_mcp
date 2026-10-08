@@ -30,6 +30,8 @@ DET_API_TOKEN=replace-with-your-token
 
 Secrets 文件设置了 `DET_MASTER` 时，其凭据只发送给该 master。若报错说明 `--api-url` 或 `DET_MASTER` 指向的 master 与 secrets 文件不同，表示有覆盖项指向了别处：取消该覆盖项，或改用属于该 master 的 secrets 文件。
 
+MCP 在每个进程中只获取一次令牌。修改密码会吊销该账户的会话和令牌，登录令牌在 7 天后过期；发生其中任一情况后，每次调用都以 HTTP 401 失败，直到 secrets 文件中的凭据有效且 MCP 服务已重启，401 的错误消息也会说明这一点。重试无济于事：报告该错误，由用户更新 secrets 文件并重启 MCP。
+
 不要把凭据放进计算 profile、任务请求、任务名称或描述。限制 secrets 文件的访问权限；排查时只检查必需变量名是否存在，不要读取其值。
 
 凭据选定 Determined 账户，MCP 只操作该账户拥有的任务。因此更换凭据会改变 `compute_list` 显示的任务，以及其他工具接受的任务。
@@ -105,7 +107,9 @@ Requests 从 MCP 进程环境读取 `HTTPS_PROXY`、`HTTP_PROXY` 和 `NO_PROXY` 
 <a id="submission-outcome-is-uncertain"></a>
 ## 提交结果不确定
 
-提交请求发出后连接中断或超时、返回 HTTP 5xx、返回重定向（HTTP 3xx，任何变更请求都不会跟随），或响应中没有任务 ID，都可能表示 Determined 已经创建了任务，只是客户端没有收到 ID。此时 `compute_launch` 返回 `submission_uncertain`，错误 details 中包含 `kind` 和 `submission_marker`，且不会重试。在任何连接建立之前发生的失败（例如连接被拒绝或域名解析失败）则是可重试的 `transport_error`：请求没有发出。
+提交请求发出后连接中断或超时、返回 HTTP 5xx、返回重定向（HTTP 3xx，任何变更请求都不会跟随），或响应中没有任务 ID，都可能表示 Determined 已经创建了任务，只是客户端没有收到 ID。此时 `compute_launch` 返回 `submission_uncertain`，错误 details 中包含 `kind` 和 `submission_marker`，且不会重试。在任何连接建立之前发生的失败（例如连接被拒绝或域名解析失败）则是可重试的 `transport_error`：请求没有发出。research-cluster fork 0.42.0 或更高版本无法检查当前账户能否使用所请求的资源池时，会以 HTTP 503 `could not check access to resource pool "<pool>": ...; try again` 应答，服务同样将其报告为 `submission_uncertain`。
+
+发生故障或收到 5xx 之后，在你自己的回合中用 `compute_resources` 检查 master 是否应答；不要启动在 shell 中监视 master 的脚本。
 
 错误 details 带有 `source: "proxy"` 时，作出应答的是本机与 master 之间的 HTTP 代理，而不是 Determined。master 很可能无法访问：检查 API 地址、master 是否在运行，以及其地址是否应加入 `NO_PROXY` 和 `no_proxy`。以这种方式得到应答的提交或其他修改仍属于未确认，因为代理可能在转发请求之后才失败。如果代理在 `Proxy-Status` 头中表明它从未连上 master（例如 `error=dns_error` 或 `error=connection_refused`），则返回带有 `proxy_error` 的可重试 `transport_error`，因为请求没有到达 master。代理应答的识别方式见[未确认的提交](compute-service.zh.md#unconfirmed-launches)。
 
@@ -129,7 +133,7 @@ HTTP 503 表示测量后端繁忙或不可用；每个 master 同时最多运行
 
 `context_unavailable` 非空并不致命。它列出因 Determined API 错误而失败的上下文查询（`resource_pool`、`allocation_details` 或 `gpu_models`）；相关字段为空或 `null`，但返回的测量值仍然有效。需要这些上下文时，可稍后重试。出现传输失败后会跳过其余查询，因此可能同时列出多个名称。`gpu_model` 为 `null` 而 `context_unavailable` 中没有 `gpu_models` 时，可能是 RBAC 对当前账户隐藏了设备 UUID，因而无法匹配型号名称。工作负载不通过 Determined 的 Core API 报告进度（例如普通 bash 入口）或尚未报告时，trial 的 `total_batches_processed` 为 0 属于预期；这不能说明工作负载没有任何进展，应改为根据日志、实测用量和预期产物判断进展。
 
-空的 `series` 列表表示该窗口没有数据，而不是任务空闲：任务可能未在该窗口内运行，或监控系统没有保留其数据。将窗口及其 `anchor` 与 `task_start_time` 和 `allocations` 对照，或使用更长的 `window_seconds`。如果 `samples_omitted` 为 true，应缩短窗口、减少指标或选择一个 allocation。agent 断开期间，任务可能仍保持 `RUNNING` 最多约 150 秒，因为该 fork 默认会等待 agent 重连这么久（`agent_reconnect_wait`）；因此仅凭 `RUNNING` 状态不能证明任务在推进。字段含义和限制见[任务用量测量](compute-service.zh.md#task-usage-measurements)。
+空的 `series` 列表表示该窗口没有数据，而不是任务空闲：任务可能未在该窗口内运行，或监控系统没有保留其数据。Determined 只在 allocation 运行满 master 的任务映射延迟（默认 5 分钟）之后才把测量值归属到任务，因此每个 allocation 的最初几分钟，以及在此之前就结束的 allocation，都没有数据；使用更长的窗口无济于事。将窗口及其 `anchor` 与 `task_start_time` 和 `allocations` 对照。如果 `samples_omitted` 为 true，应缩短窗口、减少指标或选择一个 allocation。agent 断开期间，任务可能仍保持 `RUNNING` 最多约 150 秒，因为该 fork 默认会等待 agent 重连这么久（`agent_reconnect_wait`）；因此仅凭 `RUNNING` 状态不能证明任务在推进。字段含义和限制见[任务用量测量](compute-service.zh.md#task-usage-measurements)。
 
 <a id="a-task-operation-is-refused"></a>
 ## 任务操作被拒绝
