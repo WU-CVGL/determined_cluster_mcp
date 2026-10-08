@@ -27,7 +27,7 @@ DET_API_TOKEN=replace-with-your-token
 
 When the secrets file sets `DET_MASTER`, its credentials go only to that master. An error that `--api-url` or `DET_MASTER` names a different master than the secrets file means an override points elsewhere: unset the override, or use a secrets file for that master.
 
-The MCP obtains its token once per process. A password change revokes the account's sessions and tokens, and a login token expires after 7 days, so after either event every call fails with HTTP 401 until the secrets file holds valid credentials and the MCP server is restarted; the 401 message says so. Retrying does not help: report it, so that the user updates the secrets file and restarts the MCP.
+The MCP obtains its token once per process, from `--api-token`, `DET_API_TOKEN`, or a login with `DET_USERNAME` and `DET_PASSWORD`, and does not log in again. A login token expires after 7 days, and a password change revokes the account's sessions and tokens, so after either event every call fails with HTTP 401; the 401 message says how to recover. If only the login token expired, restarting the MCP logs in again. If the password changed, or an API token expired or was revoked, update it where the MCP reads it (`--api-token` in the MCP arguments, the secrets file, or the environment), then restart the MCP. Retrying does not help: report it, so that the user takes these steps.
 
 Do not put credentials in the compute profile, request, task name, or description. Restrict access to the secrets file and inspect only whether required variable names are present, not their values.
 

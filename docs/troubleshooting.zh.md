@@ -30,7 +30,7 @@ DET_API_TOKEN=replace-with-your-token
 
 Secrets 文件设置了 `DET_MASTER` 时，其凭据只发送给该 master。若报错说明 `--api-url` 或 `DET_MASTER` 指向的 master 与 secrets 文件不同，表示有覆盖项指向了别处：取消该覆盖项，或改用属于该 master 的 secrets 文件。
 
-MCP 在每个进程中只获取一次令牌。修改密码会吊销该账户的会话和令牌，登录令牌在 7 天后过期；发生其中任一情况后，每次调用都以 HTTP 401 失败，直到 secrets 文件中的凭据有效且 MCP 服务已重启，401 的错误消息也会说明这一点。重试无济于事：报告该错误，由用户更新 secrets 文件并重启 MCP。
+MCP 在每个进程中只获取一次令牌，来源是 `--api-token`、`DET_API_TOKEN`，或使用 `DET_USERNAME` 和 `DET_PASSWORD` 登录，之后不会重新登录。登录令牌在 7 天后过期，修改密码会吊销该账户的会话和令牌；发生其中任一情况后，每次调用都以 HTTP 401 失败，401 的错误消息会说明如何恢复。如果只是登录令牌过期，重启 MCP 即可重新登录。如果密码已修改，或 API 令牌已过期或被吊销，先在 MCP 读取它的位置（MCP 参数中的 `--api-token`、secrets 文件或环境）更新，再重启 MCP。重试无济于事：报告该错误，由用户执行这些步骤。
 
 不要把凭据放进计算 profile、任务请求、任务名称或描述。限制 secrets 文件的访问权限；排查时只检查必需变量名是否存在，不要读取其值。
 

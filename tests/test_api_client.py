@@ -787,8 +787,9 @@ def test_a_pool_refusal_in_a_plain_message_body_names_the_pool(monkeypatch):
 
 
 UNAUTHENTICATED_HINT = (
-    "a password change revokes tokens and a login token expires after 7 days; update the "
-    "secrets file and restart the MCP"
+    "a login token expires after 7 days and a password change revokes sessions and tokens; "
+    "restart the MCP to log in again, first updating the password or API token where the MCP "
+    "reads it (--api-token, the secrets file, or the environment) if it is no longer valid"
 )
 
 

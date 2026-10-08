@@ -26,8 +26,9 @@ _YAML_UNSAFE = re.compile("[\x7f-\x9f\u2028\u2029\ufffe\uffff]")
 _POOL_DENIED = re.compile(r'may not use resource pool "([^"\\]{1,256})"')
 # The MCP logs in once per process, so a revoked or expired token fails every later call.
 _UNAUTHENTICATED_HINT = (
-    "a password change revokes tokens and a login token expires after 7 days; update the "
-    "secrets file and restart the MCP"
+    "a login token expires after 7 days and a password change revokes sessions and tokens; "
+    "restart the MCP to log in again, first updating the password or API token where the MCP "
+    "reads it (--api-token, the secrets file, or the environment) if it is no longer valid"
 )
 
 
