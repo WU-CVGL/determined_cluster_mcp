@@ -88,9 +88,22 @@ _USAGE_MAX_RETURNED_SAMPLES = 2880
 # fixed number of trial summary metrics.
 _USAGE_MAX_ALLOCATION_DETAILS = 8
 _USAGE_MAX_SUMMARY_METRICS = 100
+# compute_status reads one page of the task's pool queue and never pages further.
+_QUEUE_LIMIT = 1000
 _USAGE_SUMMARY_STATISTICS = ("count", "sum", "min", "max", "last", "mean")
 # A GPU utilization sample below this percentage counts as idle.
 _GPU_IDLE_PERCENT = 10
+# A master whose observability.task_mapping_delay is nonzero (the fork's default, also when
+# the key is absent; only 0s turns it off) attributes measurements to a task only after the
+# allocation has run that long. The MCP cannot read the setting, so it assumes the default.
+_USAGE_MAPPING_DELAY_SECONDS = 300
+_USAGE_MAPPING_DELAY = (
+    "If the cluster's task-mapping delay is nonzero (5 minutes by default in the Determined "
+    "fork), measurements from the first minutes of each allocation, counted from its start "
+    "including image pull, are not attributed to the task and are never backfilled, so an "
+    "allocation that ended sooner has none; a wider window or an allocation_id can still "
+    "return an earlier allocation's data."
+)
 _USAGE_ADVISORY = (
     "Values are point samples taken every step seconds, so min, max, and mean describe "
     "those samples rather than every moment of the window. A missing value means no "
@@ -756,6 +769,42 @@ class ComputeService:
         if isinstance(marker, str):
             result["submission_marker"] = marker
         result["remote"] = entity
+        result.update(self._queue(entity))
+        return result
+
+    def _queue(self, entity: Mapping[str, Any]) -> Dict[str, Any]:
+        """Find an unended task's job in its pool's queue; ``state`` stays the authority."""
+        result: Dict[str, Any] = {"queue": None, "context_unavailable": []}
+        # Commands and shells report no end time; STATE_TERMINATED is how they end.
+        if (
+            self._remote_text(entity.get("endTime")) is not None
+            or entity.get("state") == "STATE_TERMINATED"
+        ):
+            return result
+        pool, job_id = entity.get("resourcePool"), entity.get("jobId")
+        # An empty pool would query the default pool, where a miss could read as "not queued".
+        if not isinstance(pool, str) or not pool:
+            result["queue_note"] = "task reports no resource pool"
+            return result
+        if not isinstance(job_id, str) or not job_id:
+            result["queue_note"] = "task reports no job ID"
+            return result
+        try:
+            page = self.client.job_queue(pool, _QUEUE_LIMIT)
+        except APIError:
+            result["context_unavailable"] = ["queue"]
+            return result
+        matches = [job for job in page["jobs"] if job["job_id"] == job_id]
+        if len(matches) > 1:
+            result["context_unavailable"] = ["queue"]
+        elif matches:
+            result["queue"] = {key: value for key, value in matches[0].items() if key != "job_id"}
+        elif page["total"] > _QUEUE_LIMIT:
+            result["queue_note"] = f"not among the first {_QUEUE_LIMIT} jobs of pool {pool}"
+        else:
+            result["queue_note"] = (
+                f"not in pool {pool}'s job queue: not yet queued, paused, or just ended"
+            )
         return result
 
     def logs(self, kind: str, task_id: Any, tail: int = 100) -> List[Any]:
@@ -943,6 +992,8 @@ class ComputeService:
                 "not report training progress through Determined's Core API or has not "
                 "reported yet"
             )
+        if not returned:
+            explanation += ". " + _USAGE_MAPPING_DELAY
         result: Dict[str, Any] = {
             "kind": kind,
             "id": self._public_id(kind, remote_id),
@@ -972,7 +1023,11 @@ class ComputeService:
             "context_unavailable": unavailable,
             "explanation": explanation,
             "observed_at": _iso_seconds(now),
-            "advisory": _USAGE_ADVISORY,
+            "advisory": (
+                _USAGE_ADVISORY + " " + _USAGE_MAPPING_DELAY
+                if self._usage_delay_applies(returned, selected, task_start, start, end)
+                else _USAGE_ADVISORY
+            ),
         }
         if len(allocations) > _USAGE_MAX_ALLOCATION_DETAILS:
             result["allocation_details_limit"] = _USAGE_MAX_ALLOCATION_DETAILS
@@ -1071,6 +1126,31 @@ class ComputeService:
                 result.setdefault(group, {})[name] = entry
                 kept += 1
         return result, False
+
+    @staticmethod
+    def _usage_delay_applies(
+        returned: Sequence[Mapping[str, Any]],
+        selected: Sequence[Mapping[str, Any]],
+        task_start: Optional[int],
+        start: int,
+        end: int,
+    ) -> bool:
+        """Whether the task-mapping delay can explain missing data in the window."""
+        if not returned:
+            return True
+        for item in selected:
+            began = _lenient_unix_seconds(item["start_time"])
+            if began is None:
+                began = task_start
+            ended = _lenient_unix_seconds(item["end_time"])
+            if ended is None:
+                ended = end
+            if began is None or began > end or ended < start:
+                continue
+            # The allocation's unmapped first minutes fall inside the window.
+            if began + _USAGE_MAPPING_DELAY_SECONDS > start:
+                return True
+        return False
 
     @staticmethod
     def _usage_series(series: Mapping[str, Any], gpu_models: Mapping[str, str]) -> Dict[str, Any]:
@@ -1199,9 +1279,12 @@ class ComputeService:
         limit: int = 50,
         offset: int = 0,
         marker: Optional[str] = None,
+        states: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """List one page of the account's tasks of one kind, newest first.
 
+        With states, Determined lists only experiments or generic tasks in those states, and
+        every returned task is checked against them.
         With a marker, each task of that page is read once and every task whose stored config
         carries the marker is returned. A marker is a correlation label, not an identity: a
         config copied outside this service carries the same one, so several tasks can match.
@@ -1217,8 +1300,14 @@ class ComputeService:
                 raise ValidationError(
                     "marker must be a submission marker of the form determined-compute:<uuid>"
                 )
+        try:
+            states = DeterminedAPIClient.validate_list_states(kind, states)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
         user = self._account()
-        page = self.client.list_remote_tasks(kind, user_id=user["id"], limit=limit, offset=offset)
+        page = self.client.list_remote_tasks(
+            kind, user_id=user["id"], limit=limit, offset=offset, states=states
+        )
         if not isinstance(page, Mapping) or not isinstance(page.get("tasks"), list):
             raise APIError("Remote task page is malformed", code="invalid_response")
         pagination = page.get("pagination")
@@ -1269,6 +1358,8 @@ class ComputeService:
                 ),
             },
         }
+        if states is not None:
+            result["filters"] = {"states": states}
         if marker is not None:
             result["marker"] = marker
             result["searched"] = len(page["tasks"])
@@ -1372,11 +1463,10 @@ class ComputeService:
     def _summary(cls, kind: str, remote_id: str, entity: Mapping[str, Any]) -> Dict[str, Any]:
         """Whitelisted, display-oriented fields of one remote task."""
         description = cls._remote_text(entity.get("description"))
-        name = cls._remote_text(entity.get("name"), 256) or cls._remote_text(
-            entity.get("displayName"), 256
-        )
+        name = cls._remote_text(entity.get("name"), 256)
         if name is None and description:
-            # Commands and shells carry the name on the first description line.
+            # Commands and shells carry the name on the first description line; their
+            # displayName is the owner's display name, never the task's.
             name = description.splitlines()[0][:256]
         return {
             "kind": kind,

@@ -594,7 +594,6 @@ def test_list_remote_tasks_filters_pages_and_redacts(kind, monkeypatch):
         "userId": "7",
         "username": "alice",
         "name": "native-name",
-        "displayName": "display",
         "description": "safe description",
         "state": "STATE_RUNNING",
         "resourcePool": "gpu",
@@ -606,8 +605,33 @@ def test_list_remote_tasks_filters_pages_and_redacts(kind, monkeypatch):
         "state": "STATE_COMPLETED",
     }
     encoded = json.dumps(result)
-    for forbidden in ("config", "privateKey", "environment", "hyperparameters", "secret"):
+    for forbidden in (
+        "config", "privateKey", "environment", "hyperparameters", "secret", "displayName",
+    ):
         assert forbidden not in encoded
+
+
+@pytest.mark.parametrize("kind", ["command", "shell"])
+@pytest.mark.parametrize("display_name", ["Alice Owner", 7, {"nested": "value"}])
+def test_list_remote_tasks_drops_the_owner_display_name(kind, display_name, monkeypatch):
+    # displayName is the owner's display name; it is neither returned nor validated.
+    item = {"id": "task-id", "userId": 7, "displayName": display_name, "description": "x\ny"}
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda *a, **k: Response(
+            {
+                f"{kind}s": [item],
+                "pagination": {
+                    "limit": 50, "offset": 0, "startIndex": 0, "endIndex": 1, "total": 1,
+                },
+            }
+        ),
+    )
+
+    result = client().list_remote_tasks(kind, user_id="7")
+
+    assert result["tasks"] == [{"id": "task-id", "userId": 7, "description": "x\ny"}]
 
 
 @pytest.mark.parametrize(
@@ -738,7 +762,8 @@ def test_a_refused_pool_is_a_permission_error_naming_the_pool(monkeypatch, opera
     error = caught.value
     assert not isinstance(error, SubmissionUncertainError)
     assert error.code == "permission_denied"
-    assert str(error) == "resource pool 'a100' is not available to you"
+    # The master's refusal, word for word: it names the account and how to get access.
+    assert str(error) == f"403 {POOL_DENIED}"
     assert error.details == {"resource_pool": "a100"}
     assert error.retryable is False
     assert len(calls) == 1
@@ -762,6 +787,78 @@ def test_other_permission_errors_keep_the_master_message(monkeypatch, response, 
     assert str(caught.value) == message
     assert caught.value.details is None
     assert caught.value.retryable is False
+
+
+def test_a_resume_refusal_without_the_launch_prefix_is_passed_through(monkeypatch):
+    refusal = POOL_DENIED.removeprefix("failed to prepare launch params: ")
+    monkeypatch.setattr(
+        requests, "post", lambda *a, **k: gateway_error(403, 7, "PermissionDenied", refusal)
+    )
+    with pytest.raises(APIError) as caught:
+        client().unpause_task("experiment", "17")
+    assert caught.value.code == "permission_denied"
+    assert str(caught.value) == f"403 {refusal}"
+    assert caught.value.details == {"resource_pool": "a100"}
+
+
+def test_a_pool_refusal_in_a_plain_message_body_names_the_pool(monkeypatch):
+    monkeypatch.setattr(requests, "post", lambda *a, **k: Response({"message": POOL_DENIED}, 403))
+    with pytest.raises(APIError) as caught:
+        client().launch_task("command", {"entrypoint": ["true"]})
+    assert caught.value.code == "permission_denied"
+    assert str(caught.value) == f"403 {POOL_DENIED}"
+    assert caught.value.details == {"resource_pool": "a100"}
+
+
+UNAUTHENTICATED_HINT = (
+    "a login token expires after 7 days and a password change revokes sessions and tokens; "
+    "restart the MCP to log in again, first updating the password or API token where the MCP "
+    "reads it (--api-token, the secrets file, or the environment) if it is no longer valid"
+)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        gateway_error(401, 16, "Unauthenticated", "invalid credentials"),
+        Response({"message": "invalid credentials"}, 401),
+    ],
+    ids=["gateway", "message"],
+)
+def test_an_authentication_failure_says_how_to_recover(monkeypatch, response):
+    monkeypatch.setattr(requests, "get", lambda *a, **k: response)
+    with pytest.raises(APIError) as caught:
+        client().get_task("command", "c1")
+    assert str(caught.value) == f"401 invalid credentials; {UNAUTHENTICATED_HINT}"
+    assert caught.value.code == 401
+    assert caught.value.retryable is False
+
+
+def test_a_refused_login_says_how_to_recover(monkeypatch, tmp_path, clean_env):
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("DET_MASTER=master:8080\nDET_USERNAME=user\nDET_PASSWORD=do-not-echo\n")
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(url)
+        return gateway_error(401, 16, "Unauthenticated", "invalid credentials")
+
+    monkeypatch.setattr(requests, "post", post)
+    with pytest.raises(APIError) as caught:
+        DeterminedAPIClient(secrets_path=secrets)
+    assert str(caught.value) == f"401 invalid credentials; {UNAUTHENTICATED_HINT}"
+    assert "do-not-echo" not in str(caught.value)
+    assert calls == ["http://master:8080/api/v1/auth/login"]
+
+
+@pytest.mark.parametrize("status", [400, 403, 404, 500])
+def test_other_errors_carry_no_authentication_hint(monkeypatch, status):
+    monkeypatch.setattr(
+        requests, "get", lambda *a, **k: gateway_error(status, 3, "Other", "invalid credentials")
+    )
+    with pytest.raises(APIError) as caught:
+        client().get_task("command", "c1")
+    assert UNAUTHENTICATED_HINT not in str(caught.value)
 
 
 def test_a_log_stream_refusal_is_a_permission_error(monkeypatch):
@@ -1560,3 +1657,347 @@ def test_a_mutation_names_a_tls_or_proxy_failure_and_keeps_its_classification(mo
         assert str(error) == f"Could not connect to Determined; the request was not sent: {phrase}"
         assert (error.code, error.retryable) == ("transport_error", True)
     assert error.details == {"endpoint": "api/v1/commands"}
+
+
+# Listing by state
+
+EXPERIMENT_FILTER_STATES = [
+    "STATE_ACTIVE", "STATE_PAUSED", "STATE_STOPPING_COMPLETED", "STATE_STOPPING_CANCELED",
+    "STATE_STOPPING_ERROR", "STATE_STOPPING_KILLED", "STATE_COMPLETED", "STATE_CANCELED",
+    "STATE_ERROR", "STATE_DELETING", "STATE_DELETE_FAILED",
+]
+GENERIC_FILTER_STATES = [
+    "STATE_ACTIVE", "STATE_PAUSED", "STATE_STOPPING_PAUSED", "STATE_STOPPING_CANCELED",
+    "STATE_STOPPING_COMPLETED", "STATE_STOPPING_ERROR", "STATE_CANCELED", "STATE_COMPLETED",
+    "STATE_ERROR",
+]
+
+
+def listing(collection_key, items, total=None):
+    count = len(items)
+    return Response({
+        collection_key: items,
+        "pagination": {
+            "limit": 50, "offset": 0, "startIndex": 0, "endIndex": count,
+            "total": count if total is None else total,
+        },
+    })
+
+
+def test_experiment_states_are_sent_as_repeated_parameters(monkeypatch):
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs.get("params")))
+        return listing("experiments", [
+            {"id": 3, "state": "STATE_PAUSED"}, {"id": 2, "state": "STATE_COMPLETED"},
+        ], total=9)
+
+    monkeypatch.setattr(requests, "get", get)
+    page = client().list_remote_tasks(
+        "experiment", user_id="7", states=["STATE_PAUSED", "STATE_COMPLETED"]
+    )
+
+    params = {
+        "userIds": [7], "limit": 50, "offset": 0, "orderBy": "ORDER_BY_DESC",
+        "sortBy": "SORT_BY_START_TIME", "states": ["STATE_PAUSED", "STATE_COMPLETED"],
+    }
+    assert calls == [("http://master:8080/api/v1/experiments", params)]
+    prepared = requests.Request("GET", calls[0][0], params=calls[0][1]).prepare()
+    assert "states=STATE_PAUSED&states=STATE_COMPLETED" in prepared.url
+    assert page["pagination"]["total"] == 9
+    assert [task["state"] for task in page["tasks"]] == ["STATE_PAUSED", "STATE_COMPLETED"]
+
+
+@pytest.mark.parametrize("state", EXPERIMENT_FILTER_STATES)
+def test_every_stored_experiment_state_is_a_filter(monkeypatch, state):
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append(kwargs.get("params")["states"])
+        return listing("experiments", [{"id": 1, "state": state}])
+
+    monkeypatch.setattr(requests, "get", get)
+    page = client().list_remote_tasks("experiment", user_id="7", states=[state])
+    assert calls == [[state]]
+    assert page["tasks"] == [{"id": 1, "state": state}]
+
+
+def test_active_experiment_filter_accepts_the_displayed_active_states(monkeypatch):
+    displayed = ["STATE_QUEUED", "STATE_PULLING", "STATE_STARTING", "STATE_RUNNING", "STATE_ACTIVE"]
+    items = [{"id": index + 1, "state": state} for index, state in enumerate(displayed)]
+    monkeypatch.setattr(requests, "get", lambda *a, **k: listing("experiments", items))
+    page = client().list_remote_tasks("experiment", user_id="7", states=["STATE_ACTIVE"])
+    assert [task["state"] for task in page["tasks"]] == displayed
+
+
+@pytest.mark.parametrize("state", GENERIC_FILTER_STATES)
+def test_generic_states_map_to_the_generic_task_enum(monkeypatch, state):
+    calls = []
+    generic_state = "GENERIC_TASK_STATE_" + state[len("STATE_"):]
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs.get("params")))
+        return listing("tasks", [{"taskId": GENERIC_ID, "userId": 7, "state": generic_state}])
+
+    monkeypatch.setattr(requests, "get", get)
+    page = client().list_remote_tasks("generic", user_id="7", states=[state])
+    assert calls == [(
+        "http://master:8080/api/v1/generic-tasks",
+        {"userIds": [7], "limit": 50, "offset": 0, "states": [generic_state]},
+    )]
+    assert page["tasks"] == [{"id": GENERIC_ID, "userId": 7, "state": state}]
+
+
+def test_generic_states_keep_their_order_when_mapped(monkeypatch):
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append(kwargs.get("params")["states"])
+        return listing("tasks", [])
+
+    monkeypatch.setattr(requests, "get", get)
+    page = client().list_remote_tasks(
+        "generic", user_id="7", states=["STATE_COMPLETED", "STATE_STOPPING_PAUSED"]
+    )
+    assert calls == [["GENERIC_TASK_STATE_COMPLETED", "GENERIC_TASK_STATE_STOPPING_PAUSED"]]
+    assert page["tasks"] == [] and page["pagination"]["total"] == 0
+
+
+@pytest.mark.parametrize(
+    ("kind", "states", "item"),
+    [
+        # The master ignored the filter and returned another state.
+        ("experiment", ["STATE_COMPLETED"], {"id": 1, "state": "STATE_ERROR"}),
+        # A displayed active state passes only a STATE_ACTIVE filter.
+        ("experiment", ["STATE_PAUSED"], {"id": 1, "state": "STATE_RUNNING"}),
+        ("experiment", ["STATE_COMPLETED"], {"id": 1}),
+        ("experiment", ["STATE_COMPLETED"], {"id": 1, "state": None}),
+        ("generic", ["STATE_COMPLETED"],
+         {"taskId": GENERIC_ID, "userId": 7, "state": "GENERIC_TASK_STATE_ERROR"}),
+        # A state without the generic prefix cannot be compared and is not a match.
+        ("generic", ["STATE_COMPLETED"],
+         {"taskId": GENERIC_ID, "userId": 7, "state": "STATE_COMPLETED"}),
+        ("generic", ["STATE_COMPLETED"], {"taskId": GENERIC_ID, "userId": 7}),
+        # QUEUED is shown for experiments only; generic tasks have no such state.
+        ("generic", ["STATE_ACTIVE"],
+         {"taskId": GENERIC_ID, "userId": 7, "state": "GENERIC_TASK_STATE_QUEUED"}),
+    ],
+)
+def test_a_listed_state_outside_the_filter_is_an_invalid_response(monkeypatch, kind, states, item):
+    key = "tasks" if kind == "generic" else "experiments"
+    matching = (
+        {"taskId": GENERIC_ID, "userId": 7, "state": "GENERIC_TASK_STATE_" + states[0][6:]}
+        if kind == "generic" else {"id": 2, "state": states[0]}
+    )
+    monkeypatch.setattr(requests, "get", lambda *a, **k: listing(key, [matching, item]))
+    with pytest.raises(APIError) as caught:
+        client().list_remote_tasks(kind, user_id="7", states=states)
+    assert caught.value.code == "invalid_response"
+    assert "state filter" in str(caught.value)
+
+
+def test_an_unfiltered_listing_does_not_check_states(monkeypatch):
+    items = [{"id": 1}, {"id": 2, "state": "X"}]
+    monkeypatch.setattr(requests, "get", lambda *a, **k: listing("experiments", items))
+    page = client().list_remote_tasks("experiment", user_id="7")
+    assert [task.get("state") for task in page["tasks"]] == [None, "X"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "states", "message"),
+    [
+        ("experiment", ["STATE_QUEUED"], "filter with STATE_ACTIVE"),
+        ("experiment", ["STATE_PULLING"], "filter with STATE_ACTIVE"),
+        ("experiment", ["STATE_STARTING"], "filter with STATE_ACTIVE"),
+        ("experiment", ["STATE_RUNNING"], "filter with STATE_ACTIVE"),
+        ("experiment", ["STATE_ACTIVE", "STATE_RUNNING"], "filter with STATE_ACTIVE"),
+        ("experiment", ["STATE_DELETED"], "experiment states must be among"),
+        ("experiment", ["STATE_UNSPECIFIED"], "experiment states must be among"),
+        ("experiment", ["STATE_STOPPING_PAUSED"], "experiment states must be among"),
+        ("experiment", ["state_active"], "experiment states must be among"),
+        ("experiment", ["ACTIVE"], "experiment states must be among"),
+        ("generic", ["STATE_QUEUED"], "generic states must be among"),
+        ("generic", ["STATE_RUNNING"], "generic states must be among"),
+        ("generic", ["STATE_STOPPING_KILLED"], "generic states must be among"),
+        ("generic", ["STATE_DELETING"], "generic states must be among"),
+        ("generic", ["STATE_UNSPECIFIED"], "generic states must be among"),
+        ("generic", ["GENERIC_TASK_STATE_ACTIVE"], "generic states must be among"),
+        ("experiment", [], "non-empty list"),
+        ("experiment", "STATE_ACTIVE", "non-empty list"),
+        ("experiment", ("STATE_ACTIVE",), "non-empty list"),
+        ("generic", [1], "non-empty list"),
+        ("generic", ["STATE_ACTIVE", None], "non-empty list"),
+        ("command", ["STATE_ACTIVE"], "commands cannot be filtered by state"),
+        ("shell", ["STATE_ACTIVE"], "shells cannot be filtered by state"),
+        ("command", [], "commands cannot be filtered by state"),
+    ],
+)
+def test_unsupported_state_filters_are_rejected_before_any_request(
+    monkeypatch, kind, states, message
+):
+    def get(*args, **kwargs):
+        raise AssertionError("no request may be sent")
+
+    monkeypatch.setattr(requests, "get", get)
+    with pytest.raises(ValueError, match=message):
+        client().list_remote_tasks(kind, user_id="7", states=states)
+
+
+def queue_job(job_id, **overrides):
+    job = {
+        "jobId": job_id, "type": "TYPE_EXPERIMENT", "username": "alice", "userId": 7,
+        "resourcePool": "gpu", "summary": {"state": "STATE_SCHEDULED", "jobsAhead": 0},
+        "requestedSlots": 2, "allocatedSlots": 2, "name": "train", "entityId": "11",
+        "placement": [{"agentId": "agent-1", "deviceIds": [0, 3]}],
+    }
+    job.update(overrides)
+    return {"full": job}
+
+
+def test_generic_task_takes_job_id_and_pool_from_the_list_without_a_config_pool(monkeypatch):
+    submitted = generic_config()
+    del submitted["resources"]["resource_pool"]
+    responses = {
+        f"/api/v1/tasks/{GENERIC_ID}": Response({"task": {
+            "taskId": GENERIC_ID, "taskType": "TASK_TYPE_GENERIC",
+            "taskState": "GENERIC_TASK_STATE_ACTIVE", "startTime": "2026-10-01T00:00:00Z",
+        }}),
+        f"/api/v1/tasks/{GENERIC_ID}/config": Response({"config": json.dumps(submitted)}),
+        "/api/v1/generic-tasks": Response({
+            "tasks": [{
+                "taskId": GENERIC_ID, "jobId": "job-9", "userId": 7, "username": "alice",
+                "name": "eval-shard", "state": "GENERIC_TASK_STATE_ACTIVE",
+                "resourcePool": "default-pool",
+            }],
+            "pagination": {"limit": 0, "offset": 0, "startIndex": 0, "endIndex": 1, "total": 1},
+        }),
+    }
+    requested = []
+
+    def get(url, **kwargs):
+        requested.append(url)
+        return responses[url.removeprefix("http://master:8080")]
+
+    monkeypatch.setattr(requests, "get", get)
+    task = client().get_task("generic", GENERIC_ID)
+
+    assert task["jobId"] == "job-9"
+    assert task["resourcePool"] == "default-pool"
+    assert len(requested) == 3
+
+    # The config's pool, when set, wins over the listed one.
+    submitted["resources"]["resource_pool"] = "gpu"
+    responses[f"/api/v1/tasks/{GENERIC_ID}/config"] = Response({"config": json.dumps(submitted)})
+    assert client().get_task("generic", GENERIC_ID)["resourcePool"] == "gpu"
+
+
+def test_job_queue_sends_the_pool_and_limit_and_keeps_full_entries(monkeypatch):
+    requested = []
+    payload = {
+        "jobs": [
+            queue_job("job-1"),
+            {"limited": {
+                "jobId": "job-2", "type": "TYPE_COMMAND", "resourcePool": "gpu",
+                "summary": {"state": "STATE_QUEUED", "jobsAhead": 1},
+                "requestedSlots": 1, "allocatedSlots": 0,
+            }},
+            queue_job(
+                "job-3", summary={"state": "STATE_QUEUED", "jobsAhead": 3},
+                allocatedSlots=0, placement=[],
+            ),
+        ],
+        "pagination": {"offset": 0, "limit": 1000, "startIndex": 0, "endIndex": 3, "total": 3},
+    }
+
+    def get(url, **kwargs):
+        requested.append((url, kwargs.get("params")))
+        return Response(payload)
+
+    monkeypatch.setattr(requests, "get", get)
+    page = client().job_queue("gpu", 1000)
+
+    assert requested == [
+        ("http://master:8080/api/v1/job-queues-v2", {"resourcePool": "gpu", "limit": 1000})
+    ]
+    assert page == {
+        "total": 3,
+        "jobs": [
+            {
+                "job_id": "job-1", "resource_pool": "gpu", "state": "STATE_SCHEDULED",
+                "jobs_ahead": 0, "requested_slots": 2, "allocated_slots": 2,
+                "placement": [{"agent_id": "agent-1", "device_ids": [0, 3]}],
+            },
+            {
+                "job_id": "job-3", "resource_pool": "gpu", "state": "STATE_QUEUED",
+                "jobs_ahead": 3, "requested_slots": 2, "allocated_slots": 0, "placement": [],
+            },
+        ],
+    }
+
+
+def test_job_queue_reports_missing_placement_as_null(monkeypatch):
+    job = queue_job("job-1")
+    del job["full"]["placement"]
+    monkeypatch.setattr(
+        requests, "get",
+        lambda *a, **k: Response({"jobs": [job], "pagination": {"total": 1}}),
+    )
+    assert client().job_queue("gpu")["jobs"][0]["placement"] is None
+
+
+def test_job_queue_reads_the_fair_share_jobs_ahead_as_null(monkeypatch):
+    # A fair-share pool does not rank jobs; the master reports jobsAhead -1 for each.
+    job = queue_job("job-1", summary={"state": "STATE_QUEUED", "jobsAhead": -1},
+                    allocatedSlots=0, placement=[])
+    monkeypatch.setattr(
+        requests, "get",
+        lambda *a, **k: Response({"jobs": [job], "pagination": {"total": 1}}),
+    )
+    assert client().job_queue("gpu")["jobs"] == [{
+        "job_id": "job-1", "resource_pool": "gpu", "state": "STATE_QUEUED",
+        "jobs_ahead": None, "requested_slots": 2, "allocated_slots": 0, "placement": [],
+    }]
+
+
+@pytest.mark.parametrize("pool", ["", None, 3])
+def test_job_queue_never_queries_without_a_pool(monkeypatch, pool):
+    def get(*args, **kwargs):
+        raise AssertionError("no request without a pool")
+
+    monkeypatch.setattr(requests, "get", get)
+    with pytest.raises(ValueError):
+        client().job_queue(pool)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"jobs": []},
+        {"jobs": {}, "pagination": {"total": 0}},
+        {"jobs": [], "pagination": {"total": "1"}},
+        {"jobs": [{}], "pagination": {"total": 1}},
+        {"jobs": [{"full": {}, "limited": {}}], "pagination": {"total": 1}},
+        {"jobs": [{"full": None}], "pagination": {"total": 1}},
+        {"jobs": [queue_job("")], "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", summary={"state": "STATE_QUEUED"})],
+         "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", summary={"state": "STATE_QUEUED", "jobsAhead": -2})],
+         "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", summary={"state": "STATE_QUEUED", "jobsAhead": -1.0})],
+         "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", summary={"state": "STATE_QUEUED", "jobsAhead": True})],
+         "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", requestedSlots=True)], "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", allocatedSlots=-1)], "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", placement=None)], "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", placement=[{"agentId": "a", "deviceIds": ["0"]}])],
+         "pagination": {"total": 1}},
+        {"jobs": [queue_job("job-1", placement=["agent"])], "pagination": {"total": 1}},
+    ],
+)
+def test_job_queue_rejects_a_malformed_response(monkeypatch, payload):
+    monkeypatch.setattr(requests, "get", lambda *a, **k: Response(payload))
+    with pytest.raises(APIError) as caught:
+        client().job_queue("gpu")
+    assert caught.value.code == "invalid_response"

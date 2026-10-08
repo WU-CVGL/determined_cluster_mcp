@@ -24,6 +24,12 @@ _YAML_UNSAFE = re.compile("[\x7f-\x9f\u2028\u2029\ufffe\uffff]")
 # How the research-cluster fork refuses a resource pool the user may not use; the launch
 # routes prefix it with their own context.
 _POOL_DENIED = re.compile(r'may not use resource pool "([^"\\]{1,256})"')
+# The MCP logs in once per process, so a revoked or expired token fails every later call.
+_UNAUTHENTICATED_HINT = (
+    "a login token expires after 7 days and a password change revokes sessions and tokens; "
+    "restart the MCP to log in again, first updating the password or API token where the MCP "
+    "reads it (--api-token, the secrets file, or the environment) if it is no longer valid"
+)
 
 
 class APIError(RuntimeError):
@@ -248,20 +254,16 @@ def _error_from_response(response: requests.Response) -> APIError:
         error = error.get("error") or error.get("message") or error.get("reason")
     message = payload.get("message") or error or response.text or getattr(response, "reason", "API request failed")
     # Only Determined's own error body is its permission refusal; another 403 keeps its status.
-    if status == 403 and (gateway or payload.get("message")):
+    determined = gateway or bool(payload.get("message"))
+    if status == 403 and determined:
         denied = _POOL_DENIED.search(str(message))
-        if denied is not None:
-            pool = denied.group(1)
-            return APIError(
-                f"resource pool {pool!r} is not available to you",
-                code="permission_denied",
-                details={"resource_pool": pool},
-            )
-        return APIError(
-            f"{status} {message}", code="permission_denied", details=payload.get("details")
-        )
+        details = {"resource_pool": denied.group(1)} if denied else payload.get("details")
+        return APIError(f"{status} {message}", code="permission_denied", details=details)
+    text = f"{status} {message}"
+    if status == 401 and determined:
+        text = f"{text}; {_UNAUTHENTICATED_HINT}"
     return APIError(
-        f"{status} {message}", code=payload.get("code", status), details=payload.get("details"),
+        text, code=payload.get("code", status), details=payload.get("details"),
         # 501 means the master lacks the route; repeating the request cannot help.
         retryable=status == 429 or (status >= 500 and status != 501),
     )
@@ -348,6 +350,23 @@ def _login_for_token(api_url: str, username: str, password: str, verify_ssl: boo
 # (WU-CVGL/determined#27) accepts them.
 _GENERIC_METADATA_FIELDS = ("name", "description")
 _GENERIC_STATE_PREFIX = "GENERIC_TASK_STATE_"
+# States a list can be filtered by: the values the master stores. Managed experiments are
+# stored as ACTIVE and listed as QUEUED, PULLING, STARTING or RUNNING (DET-9567); the master
+# answers a filter on those with an error or no rows.
+_EXPERIMENT_FILTER_STATES = (
+    "STATE_ACTIVE", "STATE_PAUSED",
+    "STATE_STOPPING_COMPLETED", "STATE_STOPPING_CANCELED", "STATE_STOPPING_ERROR",
+    "STATE_STOPPING_KILLED", "STATE_COMPLETED", "STATE_CANCELED", "STATE_ERROR",
+    "STATE_DELETING", "STATE_DELETE_FAILED",
+)
+_EXPERIMENT_ACTIVE_DISPLAY_STATES = (
+    "STATE_QUEUED", "STATE_PULLING", "STATE_STARTING", "STATE_RUNNING",
+)
+_GENERIC_FILTER_STATES = (
+    "STATE_ACTIVE", "STATE_PAUSED",
+    "STATE_STOPPING_PAUSED", "STATE_STOPPING_CANCELED", "STATE_STOPPING_COMPLETED",
+    "STATE_STOPPING_ERROR", "STATE_CANCELED", "STATE_COMPLETED", "STATE_ERROR",
+)
 
 
 class DeterminedAPIClient:
@@ -360,7 +379,6 @@ class DeterminedAPIClient:
         "userId",
         "username",
         "name",
-        "displayName",
         "description",
         "state",
         "resourcePool",
@@ -566,6 +584,34 @@ class DeterminedAPIClient:
             raise APIError("Current-user response is malformed", code="invalid_response")
         return {"id": user_id, "username": username.strip()}
 
+    @staticmethod
+    def validate_list_states(kind: str, states: Any) -> Optional[List[str]]:
+        """Check a list's state filter; return it unchanged, or None for no filter."""
+        if states is None:
+            return None
+        if kind in {"command", "shell"}:
+            raise ValueError(
+                f"{kind}s cannot be filtered by state: Determined's {kind} list has no state "
+                "filter; list without states"
+            )
+        if (
+            not isinstance(states, list)
+            or not states
+            or not all(isinstance(state, str) for state in states)
+        ):
+            raise ValueError("states must be a non-empty list of state names")
+        allowed = _GENERIC_FILTER_STATES if kind == "generic" else _EXPERIMENT_FILTER_STATES
+        for state in states:
+            if state in allowed:
+                continue
+            if kind == "experiment" and state in _EXPERIMENT_ACTIVE_DISPLAY_STATES:
+                raise ValueError(
+                    "filter with STATE_ACTIVE; the list shows active experiments as QUEUED, "
+                    "PULLING, STARTING or RUNNING"
+                )
+            raise ValueError(f"{kind} states must be among: " + ", ".join(allowed))
+        return list(states)
+
     def list_remote_tasks(
         self,
         kind: str,
@@ -573,6 +619,7 @@ class DeterminedAPIClient:
         user_id: str,
         limit: int = 50,
         offset: int = 0,
+        states: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         if kind not in self._LISTABLE_KINDS:
             raise ValueError("kind must be one of: command, shell, generic, experiment")
@@ -581,11 +628,17 @@ class DeterminedAPIClient:
             raise ValueError("limit must be an integer between 1 and 100")
         if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
             raise ValueError("offset must be a non-negative integer")
+        states = self.validate_list_states(kind, states)
         if kind == "generic":
             # The generic task list is always newest first.
-            response = self._generic_task_list(
-                {"userIds": [int(normalized_user_id)], "limit": limit, "offset": offset}
-            )
+            params: Dict[str, Any] = {
+                "userIds": [int(normalized_user_id)], "limit": limit, "offset": offset,
+            }
+            if states is not None:
+                params["states"] = [
+                    _GENERIC_STATE_PREFIX + state[len("STATE_"):] for state in states
+                ]
+            response = self._generic_task_list(params)
             collection = response.get("tasks")
             if isinstance(collection, list):
                 collection = [
@@ -593,19 +646,22 @@ class DeterminedAPIClient:
                     for item in collection
                 ]
         else:
-            response = self._get(
-                f"api/v1/{kind}s",
-                params={
-                    "userIds": [int(normalized_user_id)],
-                    "limit": limit,
-                    "offset": offset,
-                    "orderBy": "ORDER_BY_DESC",
-                    "sortBy": "SORT_BY_START_TIME",
-                },
-            )
+            params = {
+                "userIds": [int(normalized_user_id)],
+                "limit": limit,
+                "offset": offset,
+                "orderBy": "ORDER_BY_DESC",
+                "sortBy": "SORT_BY_START_TIME",
+            }
+            if states is not None:
+                params["states"] = list(states)
+            response = self._get(f"api/v1/{kind}s", params=params)
             collection = response.get(f"{kind}s")
         if not isinstance(collection, list):
             raise APIError("Remote-task response is malformed", code="invalid_response")
+        accepted = set(states or ())
+        if kind == "experiment" and "STATE_ACTIVE" in accepted:
+            accepted.update(_EXPERIMENT_ACTIVE_DISPLAY_STATES)
         tasks: List[Dict[str, Any]] = []
         for item in collection:
             if not isinstance(item, Mapping):
@@ -622,6 +678,14 @@ class DeterminedAPIClient:
                 if not valid:
                     raise APIError("Remote-task response is malformed", code="invalid_response")
                 summary[key] = value
+            if states is not None and summary.get("state") not in accepted:
+                # The master ignores a parameter it does not apply, so an unfiltered list
+                # would otherwise read as a filtered one.
+                raise APIError(
+                    "A listed task's state is outside the requested states; the master may "
+                    "not have applied the state filter",
+                    code="invalid_response",
+                )
             tasks.append(summary)
         pagination = response.get("pagination")
         if not isinstance(pagination, Mapping):
@@ -847,6 +911,7 @@ class DeterminedAPIClient:
         """Map a listed generic task to the fields of other kinds' remote entities."""
         summary: Dict[str, Any] = {
             "id": item.get("taskId"),
+            "jobId": item.get("jobId") or None,
             "userId": item.get("userId"),
             "username": item.get("username"),
             "name": item.get("name"),
@@ -906,9 +971,12 @@ class DeterminedAPIClient:
             for item in listed:
                 if isinstance(item, Mapping) and item.get("taskId") == task_id:
                     summary = self._generic_summary(item)
-                    for field in ("userId", "username", "name"):
+                    for field in ("userId", "username", "name", "jobId"):
                         if field in summary:
                             entity[field] = summary[field]
+                    # The task record has no pool; the config's pool, when set, wins.
+                    if "resourcePool" not in entity and "resourcePool" in summary:
+                        entity["resourcePool"] = summary["resourcePool"]
         return entity
 
     def get_task(self, kind: str, task_id: str) -> Dict[str, Any]:
@@ -1177,6 +1245,76 @@ class DeterminedAPIClient:
                 ):
                     models[uuid_text] = brand[:256]
         return models
+
+    def job_queue(self, pool: str, limit: int = 1000) -> Dict[str, Any]:
+        """Return the jobs among the first ``limit`` of one pool's queue shown in full.
+
+        Entries the account may see only in limited form are skipped. ``placement`` is
+        ``None`` when the master does not report it (before the fork 0.42.0).
+        """
+        if not isinstance(pool, str) or not pool:
+            # An empty pool would quietly query the default pool.
+            raise ValueError("pool must be a non-empty string")
+        response = self._get("api/v1/job-queues-v2", params={"resourcePool": pool, "limit": limit})
+        malformed = APIError("Job-queue response is malformed", code="invalid_response")
+
+        def count(value: Any) -> bool:
+            return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+        entries, pagination = response.get("jobs"), response.get("pagination")
+        if (
+            not isinstance(entries, list)
+            or not isinstance(pagination, Mapping)
+            or not count(pagination.get("total"))
+        ):
+            raise malformed
+        jobs: List[Dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, Mapping) or len(entry) != 1:
+                raise malformed
+            if "limited" in entry:
+                continue
+            job = entry.get("full")
+            summary = job.get("summary") if isinstance(job, Mapping) else None
+            jobs_ahead = summary.get("jobsAhead") if isinstance(summary, Mapping) else None
+            if (
+                not isinstance(summary, Mapping)
+                or not isinstance(job.get("jobId"), str)
+                or not job["jobId"]
+                or not isinstance(job.get("resourcePool"), str)
+                or not isinstance(summary.get("state"), str)
+                # A scheduler that does not rank jobs (fair share) reports -1.
+                or not (count(jobs_ahead) or (jobs_ahead == -1 and type(jobs_ahead) is int))
+                or not count(job.get("requestedSlots"))
+                or not count(job.get("allocatedSlots"))
+            ):
+                raise malformed
+            placement: Optional[List[Dict[str, Any]]] = None
+            if "placement" in job:
+                if not isinstance(job["placement"], list):
+                    raise malformed
+                placement = []
+                for item in job["placement"]:
+                    if (
+                        not isinstance(item, Mapping)
+                        or not isinstance(item.get("agentId"), str)
+                        or not isinstance(item.get("deviceIds"), list)
+                        or not all(count(device) for device in item["deviceIds"])
+                    ):
+                        raise malformed
+                    placement.append(
+                        {"agent_id": item["agentId"], "device_ids": list(item["deviceIds"])}
+                    )
+            jobs.append({
+                "job_id": job["jobId"],
+                "resource_pool": job["resourcePool"],
+                "state": summary["state"],
+                "jobs_ahead": None if jobs_ahead == -1 else jobs_ahead,
+                "requested_slots": job["requestedSlots"],
+                "allocated_slots": job["allocatedSlots"],
+                "placement": placement,
+            })
+        return {"jobs": jobs, "total": pagination["total"]}
 
     def get_task_resources(
         self,

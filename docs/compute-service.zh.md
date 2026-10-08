@@ -227,13 +227,13 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 | --- | --- | --- |
 | `compute_plan` | `request` | 离线规范化的规划；不访问集群 |
 | `compute_launch` | `request` | 提交一次；返回 `kind`、`id`、`name`、`description`、`state`、`submission_marker`、`advisories`，以及可能存在的 `warnings` |
-| `compute_status` | `kind`、`id` | 任务摘要、提交标记和清理后的远端实体 |
+| `compute_status` | `kind`、`id` | 任务摘要、提交标记、清理后的远端实体，以及任务在其资源池作业队列中的位置 |
 | `compute_logs` | `kind`、`id`，可选 `tail=200` | 最新远端日志按时间正序排列的列表 |
 | `compute_usage` | `kind`、`id`，可选 `window_seconds=3600`、`allocation_id`、`trial_id`、`metrics`、`include_samples=false` | 一个任务实测 CPU、内存和 GPU 用量的只读摘要 |
 | `compute_cancel` | `kind`、`id` | 任务摘要、远端取消响应和 `cancellation_acknowledged` |
 | `compute_pause` | `kind`、`id` | experiment 和 generic 任务：任务摘要、远端响应和 `pause_acknowledged` |
 | `compute_resume` | `kind`、`id` | experiment 和 generic 任务：任务摘要、远端响应和 `resume_acknowledged` |
-| `compute_list` | `kind`，可选 `limit=50`、`offset=0`、`marker` | 当前账户的一页任务，最新的在前；指定 `marker` 时返回该页中配置带有该标记的任务 |
+| `compute_list` | `kind`，可选 `limit=50`、`offset=0`、`marker`、`states` | 当前账户的一页任务，最新的在前；指定 `states` 时只列出处于这些状态的 experiment 或 generic 任务；指定 `marker` 时返回该页中配置带有该标记的任务 |
 | `compute_resources` | 可选 `slots=1`、`pool` | 当前调度容量和候选资源池 |
 | `storage_check` | `path` | 映射容器路径的访问情况 |
 | `storage_sync` | `local_dir`、`shared_dir`，可选 `dry_run=true` | 预览或把本地目录内容复制到共享存储 |
@@ -300,7 +300,10 @@ Determined 可能创建了任务，也可能没有。服务从不重试这样的
 在已结束的 command 或 shell 结束 24 小时后不再提供它。不要自动再次提交；是否重新提交由用户
 在检查之后决定，例如在 WebUI 中查看，或稍后再次搜索。事后取消的重复任务可能已经产生了取消
 无法撤销的影响，例如已写入的文件。明确的拒绝（例如 HTTP 400、401 或 403）是普通错误：没有
-提交任何任务。
+提交任何任务。research-cluster fork 0.42.0 或更高版本无法检查当前账户能否使用所请求的资源池时，
+会以 HTTP 503 `could not check access to resource pool "<pool>": ...; try again` 应答提交或恢复。
+服务与其他 5xx 一样，把这种应答报告为 `submission_uncertain`；提交按上文用标记检查，恢复则用
+`compute_status` 检查。
 
 在连接建立之前发生的失败（连接被拒绝、域名解析失败、连接超时或 HTTP 代理不可达）是可重试的
 `transport_error`：请求从未发出，因此没有创建任何任务。HTTP 代理的应答若带有 RFC 9209
@@ -345,8 +348,9 @@ HTTP 404。
 任务配置带有提交标记时还会返回 `submission_marker`，并在 `remote` 中包含清理后的实体。对于
 generic 任务，该实体合并任务记录（`GET /api/v1/tasks/{id}`）和提交时的配置
 （`GET /api/v1/tasks/{id}/config`，其中环境变量已脱敏），并从该配置补充 `resourcePool`、
-`name` 和 `description`。其 `taskState` 去掉 `GENERIC_TASK_STATE_` 前缀、改用与 experiment
-相同的 `STATE_` 前缀后写入 `state`：
+`name` 和 `description`；`jobId`（以及配置未设置时的 `resourcePool`）来自 generic 任务列表项。
+其 `taskState` 去掉 `GENERIC_TASK_STATE_` 前缀、改用与 experiment 相同的 `STATE_` 前缀后写入
+`state`：
 
 | `state` | 含义 |
 | --- | --- |
@@ -359,6 +363,25 @@ generic 任务，该实体合并任务记录（`GET /api/v1/tasks/{id}`）和提
 | `STATE_CANCELED` | 终态：已终止 |
 
 实体的 `allocations` 列出任务的每次运行；恢复过的任务每次运行各有一个 allocation。
+
+对于尚未结束的任务，`compute_status` 在所有权检查之后还会读取其资源池作业队列的一页
+（`GET /api/v1/job-queues-v2`，带任务的 `resourcePool` 和 `limit=1000`），并把任务自己的
+作业作为 `queue` 返回：
+
+| 字段 | 含义 |
+| --- | --- |
+| `resource_pool` | 作业所在队列的资源池 |
+| `state` | 调度器状态：`STATE_QUEUED`、`STATE_SCHEDULED` 或 `STATE_SCHEDULED_BACKFILLED` |
+| `jobs_ahead` | 作业在资源池队列中的位置：调度器排在它之前的作业数，可能包括已在运行的作业。它不是等待时间的预测；资源池的调度器不为作业排序（fair share）时为 `null` |
+| `requested_slots`、`allocated_slots` | 作业请求和持有的槽位数 |
+| `placement` | `{agent_id, device_ids}` 列表，作业在哪个 agent 上持有槽位就有一项；`device_ids` 是该 agent 的槽位 device ID，升序排列；只有 NVIDIA GPU 槽位的 device ID 才与该 agent 所在节点上 `nvidia-smi` 的编号一致。排队中或零槽位的作业为 `[]`；早于 research-cluster fork 0.42.0 的 master 为 `null` |
+
+有结束时间的任务已结束；command 和 shell 不报告结束时间，状态为 `STATE_TERMINATED` 时即已结束。
+已结束的任务得到 `queue: null`，不发送请求。找不到作业时，`queue` 为 `null`，并由
+`queue_note` 说明原因：任务没有报告资源池或作业 ID，此时不发送请求；作业不在该资源池的
+队列中，因为它尚未入队、已暂停或刚刚结束；或者资源池有超过 1000 个作业，而该作业不在前
+1000 个之中。查询失败时返回 `queue: null` 和 `context_unavailable: ["queue"]`；这绝不表示
+任务没有排队，`state` 仍是权威状态。该查询不翻页、不轮询，也不返回其他作业。
 
 `compute_logs` 要求 `tail` 为正数。command、shell 和 generic 任务的日志来自相应 task log
 API，恢复过的 generic 任务日志包含每次运行；experiment 日志来自数值最大的 trial ID，该 trial
@@ -460,6 +483,14 @@ Determined agent 为该 `gpu_uuid` 报告的型号名称；非 GPU 序列或设�
 序列按 GPU UUID 区分，覆盖整块分配到的设备，可能包含其他进程。下结论前先检查 `warnings`，
 例如 `rss_unverified` 或 `gpu_full_device`。空的 `series` 列表表示该窗口没有数据，
 而不是任务空闲；如果 `metrics` 过滤掉了所有返回的序列，`explanation` 会列出实际返回的指标。
+MCP 无法读取集群的任务映射延迟（`observability.task_mapping_delay`，该 fork 默认 5 分钟；
+只有设为 `0s` 才会关闭）。如果该延迟不为 0，每个 allocation 最初几分钟（从 allocation
+开始计时，包括镜像拉取）的测量值不会归属到任务，之后也不会回填，因此在此之前就结束的
+allocation 没有数据，`allocation_active` 也不例外；扩大窗口或指定 `allocation_id` 仍可能
+返回较早 allocation 已有的数据。
+只有当这一延迟可以解释缺失的数据时，`advisory` 才会说明这一点：没有返回任何序列，或某个
+allocation 的最初 5 分钟落入窗口。
+没有返回任何测量值时，`explanation` 也会说明。
 未指定 `trial_id` 且 experiment 有多个 trial 时，`explanation` 会说明 trial 总数以及报告的是
 哪一个。
 
@@ -521,7 +552,7 @@ task 或指定的 trial ID 不存在或无权访问时返回 HTTP 404。参见
 <a id="list-tasks-and-find-a-submission"></a>
 ### 列出任务并查找提交
 
-`compute_list(kind, limit=50, offset=0, marker=None)` 列出已认证账户拥有的任务，按开始时间
+`compute_list(kind, limit=50, offset=0, marker=None, states=None)` 列出已认证账户拥有的任务，按开始时间
 从新到旧排列。`limit` 必须在 1 到 100 之间，`offset` 必须是非负数。结果包含 `kind`、
 `account`（`id` 和 `username`）、`tasks`，以及含 `offset`、`limit`、`total` 和
 `next_offset` 的 `pagination`；最后一页的 `next_offset` 为 `null`。每个任务包含
@@ -531,6 +562,28 @@ task 或指定的 trial ID 不存在或无权访问时返回 HTTP 404。参见
 
 generic 任务通过 Determined 的 generic 任务列表列出，这需要带有 WU-CVGL/determined#27 的
 master；较旧的 master 返回 `unsupported`。
+
+`states` 是非空的状态名列表，Determined 按这些状态过滤列表，所以 `pagination.total` 是过滤后的
+总数；结果以 `filters: {"states": [...]}` 重复给出该过滤条件。它只适用于 experiment 和 generic
+任务：Determined 的 command 和 shell 列表没有状态过滤，所以 `kind` 为 `command` 或 `shell` 时
+指定 `states` 会返回 `invalid_request`。接受的名称是 Determined 存储的状态：
+
+| `kind` | 接受的 `states` |
+| --- | --- |
+| `experiment` | `STATE_ACTIVE`、`STATE_PAUSED`、`STATE_STOPPING_COMPLETED`、`STATE_STOPPING_CANCELED`、`STATE_STOPPING_ERROR`、`STATE_STOPPING_KILLED`、`STATE_COMPLETED`、`STATE_CANCELED`、`STATE_ERROR`、`STATE_DELETING`、`STATE_DELETE_FAILED` |
+| `generic` | `STATE_ACTIVE`、`STATE_PAUSED`、`STATE_STOPPING_PAUSED`、`STATE_STOPPING_CANCELED`、`STATE_STOPPING_COMPLETED`、`STATE_STOPPING_ERROR`、`STATE_CANCELED`、`STATE_COMPLETED`、`STATE_ERROR` |
+
+Determined 把运行中或等待中的 experiment 存储为 active，在列表中显示为 `STATE_QUEUED`、
+`STATE_PULLING`、`STATE_STARTING` 或 `STATE_RUNNING`。按这四个名称之一过滤会失败或匹配不到任何
+任务，所以返回 `invalid_request`：请用 `STATE_ACTIVE` 过滤，它会返回这四种状态的任务。其他名称
+（例如 `STATE_DELETED`）同样返回 `invalid_request`；被拒绝的过滤条件不会发送任何请求。
+Determined 会忽略它没有应用的过滤条件而不是拒绝它，所以服务会把每个返回任务的状态与所请求的
+状态比对，对 experiment 而言，上述四种显示的 active 状态算作 `STATE_ACTIVE`；超出范围的任务
+返回 `invalid_response` 错误，而不是把未过滤的一页当作已过滤的结果。`states` 过滤的是列表本身。
+`marker` 和 `states` 可以同时使用：标记搜索覆盖过滤后列表的所选页，每个返回的任务显示的是
+它自身详情读取时的状态，可能比过滤时匹配的状态更新，例如列出时为 active、读取时已经完成；
+该状态不会再与 `states` 比对。要跟踪一批 experiment 或 generic 任务，按页调用
+`compute_list(kind, states=[...])`；要跟踪单个任务，调用 `compute_status(kind, id)`。
 
 `marker` 是形如 `determined-compute:<uuid>` 的提交标记，来自 `compute_launch` 的返回值或
 未确认提交的错误。列表条目不含配置，因此服务会从新到旧读取所选页中的每个任务（command、shell
@@ -562,10 +615,11 @@ Determined 的 HTTP 失败（包括 gRPC-gateway 错误响应体）显示为 `<s
 
 HTTP 403 即 Determined 的权限拒绝，错误码为 `permission_denied`，不可重试。research-cluster
 fork 0.42.0 或更高版本会在提交任务以及恢复 experiment 或 generic 任务时检查资源池。拒绝当前
-账户无权使用的资源池时，消息为 `resource pool '<pool>' is not available to you`，
-`details.resource_pool` 给出该资源池；请选择其他资源池，或请管理员授予权限。其他 403 仍为
-`403 <message>` 形式。响应体不是 Determined JSON 错误的 403（例如 HTTP 代理的页面）错误码仍为
-403。
+账户无权使用的资源池时，消息是 master 自己的拒绝原文，形式为 `403 <message>`，例如
+`403 failed to prepare launch params: user "<username>" may not use resource pool "<pool>":
+the pool is restricted; choose another pool or ask an administrator for access (...)`，
+`details.resource_pool` 给出该资源池。其他 403 也是同样的形式。响应体不是 Determined JSON
+错误的 403（例如 HTTP 代理的页面）错误码仍为 403。
 
 服务只操作已认证账户拥有的任务，并在操作任务之前检查这一点；因此即使凭据属于管理员，
 其他账户的任务也会返回 `ownership_mismatch`。应使用拥有该任务的账户凭据，或请管理员直接通过
