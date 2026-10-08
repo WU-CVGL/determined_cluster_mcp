@@ -75,7 +75,7 @@ MCP 不接受 `kind: notebook`。
 
 需要选择资源、回答容量问题或排查容量拒绝时，调用 `compute_resources(slots, pool)`。正槽位数检查可调度的 agent slot，零槽位检查辅助容器容量。结果只是快照，不是资源预留。`allow_queue: false` 时，`compute_launch` 会在提交前执行这项准入检查，因此不必在每次提交前单独查询容量。
 
-对于多 GPU 数据并行任务，让用户选择 `prefer_gpu_topology`：`"strong"`（全部 GPU 在同一 agent 的同一 NUMA 节点上；等待到有这样的节点空闲）或 `"soft"`（从不因此等待；GPU 可能跨 NUMA 节点）。用 `compute_resources(slots=N, pool=P, prefer_gpu_topology=...)` 和请求中的同一个值检查。`max_numa_node_free_slots` 是当前能放下的最大 `"strong"` 任务，`max_numa_node_slots` 是 master 接受的最大值。N 更大时，向用户提出 `"soft"`、更少 GPU 或其他资源池；不要自行切换。`"strong"` experiment 的每个 trial 分别需要同一 NUMA 节点上的 N 个空闲 GPU；多个 trial 可以共用一个节点。以资源池的默认优先级提交 `"strong"` 任务：未开启抢占时，一个等待中的任务会挡住所有需要 slot 的低优先级任务。
+对于多 GPU 数据并行任务，`prefer_gpu_topology` 可取 `"strong"`（全部 GPU 在同一 agent 的同一 NUMA 节点上；等待到有这样的节点空闲）或 `"soft"`（不会为等待更好的 GPU 拓扑而额外排队；GPU 可能跨 NUMA 节点）；不设置表示没有偏好。用户明确提出拓扑要求时照做；否则保持默认，即没有偏好。向 `compute_resources(slots=N, pool=P, prefer_gpu_topology=...)` 和 `compute_launch` 传入同一个值。只有当拓扑决定任务能否运行且用户意图不明确时，才询问用户。`max_numa_node_free_slots` 是当前能放下的最大 `"strong"` 任务，`max_numa_node_slots` 是 master 接受的最大值。N 更大时，向用户报告拒绝信息给出的选项（更少 GPU、其他资源池，或在某个 agent 有 N 个 slot 时改用 `"soft"`）；不要自行切换。`"strong"` experiment 的每个 trial 分别需要同一 NUMA 节点上的 N 个空闲 GPU；多个 trial 可以共用一个节点。以资源池的默认优先级提交 `"strong"` 任务：未开启抢占时，一个等待中的任务会挡住所有需要 slot 的低优先级任务。
 
 除非用户明确要求等待，否则保持 `allow_queue: false`。容量不足或无法确定，或资源池不存在或对你不可用时，报告该结果；指明某个资源池的 `permission_denied` 错误表示当前账户无权使用该资源池。不要擅自切换资源池、改变槽位数或开启排队。
 

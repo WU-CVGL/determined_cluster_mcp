@@ -1075,10 +1075,11 @@ def test_topology_advisories_have_fixed_text(profile, command_request):
     )
     assert "gpu_topology_soft" not in strong_text
     assert soft_text["gpu_topology_soft"] == (
-        "soft never waits and never guarantees one NUMA node: on the chosen agent it prefers "
-        "the best-connected free GPUs (fewer in error, then P2P/NVLink and NUMA locality), "
-        "and in some pools it prefers an agent where one NUMA node holds the task. It has no "
-        "effect when the task spans several agents."
+        "soft does not queue extra to wait for a better GPU topology and never guarantees one "
+        "NUMA node: on the chosen agent it prefers the best-connected free GPUs (fewer in "
+        "error, then P2P/NVLink and NUMA locality), and in some pools it prefers an agent "
+        "where one NUMA node holds the task. It has no effect when the task spans several "
+        "agents."
     )
     assert "gpu_topology_strong" not in soft_text
 
