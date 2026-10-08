@@ -1199,9 +1199,12 @@ class ComputeService:
         limit: int = 50,
         offset: int = 0,
         marker: Optional[str] = None,
+        states: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """List one page of the account's tasks of one kind, newest first.
 
+        With states, Determined lists only experiments or generic tasks in those states, and
+        every returned task is checked against them.
         With a marker, each task of that page is read once and every task whose stored config
         carries the marker is returned. A marker is a correlation label, not an identity: a
         config copied outside this service carries the same one, so several tasks can match.
@@ -1217,8 +1220,14 @@ class ComputeService:
                 raise ValidationError(
                     "marker must be a submission marker of the form determined-compute:<uuid>"
                 )
+        try:
+            states = DeterminedAPIClient.validate_list_states(kind, states)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
         user = self._account()
-        page = self.client.list_remote_tasks(kind, user_id=user["id"], limit=limit, offset=offset)
+        page = self.client.list_remote_tasks(
+            kind, user_id=user["id"], limit=limit, offset=offset, states=states
+        )
         if not isinstance(page, Mapping) or not isinstance(page.get("tasks"), list):
             raise APIError("Remote task page is malformed", code="invalid_response")
         pagination = page.get("pagination")
@@ -1269,6 +1278,8 @@ class ComputeService:
                 ),
             },
         }
+        if states is not None:
+            result["filters"] = {"states": states}
         if marker is not None:
             result["marker"] = marker
             result["searched"] = len(page["tasks"])

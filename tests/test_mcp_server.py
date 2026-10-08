@@ -76,8 +76,8 @@ class FakeService:
         self.calls.append(("resume", kind, task_id))
         return {"kind": kind, "id": task_id, "resume_acknowledged": True}
 
-    def list_tasks(self, kind, limit=50, offset=0, marker=None):
-        self.calls.append(("list", kind, limit, offset, marker))
+    def list_tasks(self, kind, limit=50, offset=0, marker=None, states=None):
+        self.calls.append(("list", kind, limit, offset, marker, states))
         return {"kind": kind, "tasks": [{"id": COMMAND_ID}]}
 
 
@@ -117,6 +117,8 @@ def test_real_sdk_client_lists_tools_and_passes_native_ids():
             assert list_schema["properties"]["limit"]["default"] == 50
             assert list_schema["properties"]["offset"]["default"] == 0
             assert list_schema["properties"]["marker"]["default"] is None
+            assert list_schema["properties"]["states"]["default"] is None
+            assert "STATE_ACTIVE" in tools["compute_list"].description
             assert tools["compute_list"].annotations.read_only_hint is True
             assert tools["compute_list"].annotations.open_world_hint is True
             usage_schema = tools["compute_usage"].input_schema
@@ -165,6 +167,9 @@ def test_real_sdk_client_lists_tools_and_passes_native_ids():
                 "compute_list", {"kind": "command", "limit": 7, "offset": 2, "marker": MARKER}
             )
             assert _structured(listed_tasks)["tasks"] == [{"id": COMMAND_ID}]
+            await client.call_tool(
+                "compute_list", {"kind": "experiment", "states": ["STATE_ACTIVE", "STATE_PAUSED"]}
+            )
         assert ("launch", {"command": "true"}) in service.calls
         assert ("pause", "experiment", 12) in service.calls
         assert ("resume", "experiment", "12") in service.calls
@@ -174,7 +179,10 @@ def test_real_sdk_client_lists_tools_and_passes_native_ids():
             "usage", "experiment", 12, 900, "a.1", 4, ["cpu_cores", "gpu_power_watts"], True
         ) in service.calls
         assert ("cancel", "command", COMMAND_ID) in service.calls
-        assert ("list", "command", 7, 2, MARKER) in service.calls
+        assert ("list", "command", 7, 2, MARKER, None) in service.calls
+        assert (
+            "list", "experiment", 50, 0, None, ["STATE_ACTIVE", "STATE_PAUSED"]
+        ) in service.calls
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=10))
 
