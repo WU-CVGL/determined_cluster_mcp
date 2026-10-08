@@ -539,8 +539,11 @@ Determined 把运行中或等待中的 experiment 存储为 active，在列表�
 （例如 `STATE_DELETED`）同样返回 `invalid_request`；被拒绝的过滤条件不会发送任何请求。
 Determined 会忽略它没有应用的过滤条件而不是拒绝它，所以服务会把每个返回任务的状态与所请求的
 状态比对，对 experiment 而言，上述四种显示的 active 状态算作 `STATE_ACTIVE`；超出范围的任务
-返回 `invalid_response` 错误，而不是把未过滤的一页当作已过滤的结果。`marker` 和 `states` 可以
-同时使用：标记搜索覆盖过滤后列表的所选页。
+返回 `invalid_response` 错误，而不是把未过滤的一页当作已过滤的结果。`states` 过滤的是列表本身。
+`marker` 和 `states` 可以同时使用：标记搜索覆盖过滤后列表的所选页，每个返回的任务显示的是
+它自身详情读取时的状态，可能比过滤时匹配的状态更新，例如列出时为 active、读取时已经完成；
+该状态不会再与 `states` 比对。要跟踪一批 experiment 或 generic 任务，按页调用
+`compute_list(kind, states=[...])`；要跟踪单个任务，调用 `compute_status(kind, id)`。
 
 `marker` 是形如 `determined-compute:<uuid>` 的提交标记，来自 `compute_launch` 的返回值或
 未确认提交的错误。列表条目不含配置，因此服务会从新到旧读取所选页中的每个任务（command、shell

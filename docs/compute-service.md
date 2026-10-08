@@ -622,8 +622,12 @@ those four names would fail or match nothing, so it is `invalid_request`: filter
 filter it does not apply instead of refusing it, so the service checks the state of every
 returned task against the requested states, counting the four listed active states as
 `STATE_ACTIVE` for experiments; a task outside them is an `invalid_response` error, not an
-unfiltered page shown as a filtered one. `marker` and `states` combine: the marker search
-covers the selected page of the filtered list.
+unfiltered page shown as a filtered one. `states` filters the list itself. `marker` and
+`states` combine: the marker search covers the selected page of the filtered list, and each
+returned task shows the state from its own detail read, which can be newer than the state the
+filter matched, such as a task listed as active that has completed by then; that state is not
+checked against `states` again. To follow a batch of experiments or generic tasks, page
+through `compute_list(kind, states=[...])`; to follow one task, call `compute_status(kind, id)`.
 
 `marker` is a submission marker of the form `determined-compute:<uuid>`, as returned by
 `compute_launch` or by an unconfirmed launch. List entries do not contain the config, so
