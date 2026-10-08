@@ -91,14 +91,16 @@ _USAGE_MAX_SUMMARY_METRICS = 100
 _USAGE_SUMMARY_STATISTICS = ("count", "sum", "min", "max", "last", "mean")
 # A GPU utilization sample below this percentage counts as idle.
 _GPU_IDLE_PERCENT = 10
-# Determined attributes measurements to a task only after its allocation has run for the
-# master's observability.task_mapping_delay (default below).
+# A master with observability.task_mapping_delay attributes measurements to a task only after
+# the allocation has run that long. The MCP cannot read the setting, so it assumes the
+# fork's default below.
 _USAGE_MAPPING_DELAY_SECONDS = 300
 _USAGE_MAPPING_DELAY = (
-    "Determined attributes measurements to a task only after its allocation has run for the "
-    "master's task-mapping delay (5 minutes by default), so the first minutes of each "
-    "allocation, and any allocation that ended sooner, have no data; a longer window does "
-    "not help."
+    "If the cluster sets a task-mapping delay (5 minutes by default in the Determined fork), "
+    "measurements from the first minutes of each allocation, counted from its start including "
+    "image pull, are not attributed to the task and are never backfilled, so an allocation "
+    "that ended sooner has none; a wider window or an allocation_id can still return an "
+    "earlier allocation's data."
 )
 _USAGE_ADVISORY = (
     "Values are point samples taken every step seconds, so min, max, and mean describe "

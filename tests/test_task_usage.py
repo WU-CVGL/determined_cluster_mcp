@@ -589,10 +589,11 @@ def test_filter_that_removes_every_series_names_the_returned_metrics(tmp_path, p
 
 
 MAPPING_DELAY = (
-    "Determined attributes measurements to a task only after its allocation has run for the "
-    "master's task-mapping delay (5 minutes by default), so the first minutes of each "
-    "allocation, and any allocation that ended sooner, have no data; a longer window does "
-    "not help."
+    "If the cluster sets a task-mapping delay (5 minutes by default in the Determined fork), "
+    "measurements from the first minutes of each allocation, counted from its start including "
+    "image pull, are not attributed to the task and are never backfilled, so an allocation "
+    "that ended sooner has none; a wider window or an allocation_id can still return an "
+    "earlier allocation's data."
 )
 
 

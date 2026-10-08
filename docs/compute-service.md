@@ -515,11 +515,12 @@ are per GPU UUID and cover the whole assigned device, which can include other pr
 Inspect `warnings`, such as `rss_unverified` or `gpu_full_device`, before drawing
 conclusions. An empty `series` list means no data for the window, not an idle task; if a
 `metrics` filter removed every returned series, `explanation` names the metrics that
-were returned. Determined attributes measurements to a task only after its allocation
-has run for the master's task-mapping delay (`observability.task_mapping_delay`, 5
-minutes by default), so the first minutes of each allocation, and any allocation that
-ended sooner, have no data, `allocation_active` included; a longer window does not recover
-them.
+were returned. The MCP cannot read the cluster's task-mapping delay
+(`observability.task_mapping_delay`, 5 minutes by default in the fork). If the cluster
+sets one, measurements from the first minutes of each allocation, counted from allocation
+start including image pull, are not attributed to the task and are never backfilled, so an
+allocation that ended sooner has none, `allocation_active` included; a wider window or an
+`allocation_id` can still return an earlier allocation's data.
 `advisory` says so only when the delay can explain missing data: no series was returned,
 or an allocation's first 5 minutes fall inside the window.
 `explanation` says so when no measurements were returned. When
