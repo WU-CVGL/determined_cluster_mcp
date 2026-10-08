@@ -1180,15 +1180,27 @@ def test_a_pool_reports_the_sorted_distinct_gpu_models_of_its_agents():
     assert report["selected_pool"]["gpu_models"] == ["Model A", "Model B", "Model C"]
 
 
-def test_a_cpu_pool_and_a_pool_without_agents_report_no_gpu_models():
+def test_a_cpu_pool_reports_no_gpu_models():
     cpu = cpu_agent("cpu-agent", slots=1)
     cpu["resourcePools"] = ["cpu"]
     cpu["slots"]["0"]["device"]["brand"] = "Some CPU x 64 cores"
-    pools = [pool("cpu", total=1), pool("empty", total=0, agents=0), pool()]
+    pools = [pool("cpu", total=1), pool()]
     by_name, _report = pool_report(pools, [cpu, gpu_agent()])
 
     assert by_name["cpu"]["gpu_models"] == []
-    assert by_name["empty"]["gpu_models"] == []
+    assert by_name["gpu"]["gpu_models"] == ["Model A"]
+
+
+@pytest.mark.parametrize("slot_type", ["TYPE_CUDA", "TYPE_CPU"])
+def test_a_pool_without_agents_reports_unknown_gpu_models(slot_type):
+    # With no agent connected nothing reports the pool's GPUs, so [] would pass a GPU pool
+    # off as a CPU pool.
+    empty = {**pool("empty", total=0, agents=0), "slotType": slot_type}
+    by_name, _report = pool_report([empty, pool()], [gpu_agent()])
+
+    assert by_name["empty"]["gpu_models"] is None
+    # The capacity verdict is still known: no slot is free.
+    assert by_name["empty"]["available"] is False
     assert by_name["gpu"]["gpu_models"] == ["Model A"]
 
 

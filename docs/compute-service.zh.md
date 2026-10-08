@@ -250,10 +250,12 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 可用性未知。
 
 `pools` 和 `selected_pool` 中的每个资源池还带有来自同样两次读取的两项事实。`description` 是
-管理员写的资源池说明，常给出 agent 的 CPU 和内存，去掉首尾空白并截断到 4,096 个字符；资源池没有
-说明时为 `null`。`gpu_models` 按排序、去重列出 Determined 为该资源池各 agent 的 GPU slot 报告的
-型号名，包括正在使用、已禁用或正在 drain 的 slot。没有 GPU slot 时为 `[]`；agent 列表与资源池
-不一致，或某个 slot 的设备或 GPU 型号无法读取时为 `null`。这两项都不影响准入。
+管理员填写的自由文本资源池说明，原样传递：去掉首尾空白并截断到 4,096 个字符；资源池没有说明时为
+`null`。只有管理员写明时才包含 agent 的硬件信息。`gpu_models` 按排序、去重列出 Determined 为该
+资源池各 agent 的每个 GPU slot 报告的设备 brand（CUDA 上是 GPU 型号名；ROCm 上 Determined 报告的
+是显卡厂商，无法区分显卡型号），包括正在使用、已禁用或正在 drain 的 slot。资源池当前连接的 agent
+没有 GPU slot 时为 `[]`；资源池没有 agent、agent 列表与资源池不一致，或某个 slot 的设备或 GPU
+brand 无法读取时为 `null`。这两项都不影响准入。
 
 准入按资源池自身的方式计算 slot：已 drain 或已禁用的 slot，以及已禁用 agent 的所有 slot，都不算
 容量；正在 drain 的 slot 或 agent 只计入仍有容器占用的 slot。command、shell、generic 任务以及

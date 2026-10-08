@@ -274,12 +274,15 @@ use, so a requested pool missing from it is reported as not present or not avail
 you, with unknown availability.
 
 Each pool in `pools` and `selected_pool` also carries two facts from the same two reads.
-`description` is the operator-written pool description, which often gives the agents' CPU
-and memory, trimmed and truncated to 4,096 characters, or `null` when the pool has none.
-`gpu_models` lists, sorted and without duplicates, the model names that Determined reports
-for the GPU slots of the pool's agents, busy, disabled, or draining slots included. It is
-`[]` when no slot is a GPU, and `null` when the agent list does not match the pool or a
-slot's device or GPU model is unreadable. Neither fact changes admission.
+`description` is the operator's free-text pool description, passed through: trimmed,
+truncated to 4,096 characters, or `null` when the pool has none. It states the agents'
+hardware only if the operator wrote it there. `gpu_models` lists, sorted and without
+duplicates, the device brand Determined reports for each GPU slot of the pool's agents (the
+GPU product name on CUDA; on ROCm, Determined reports the card vendor, which does not tell
+card classes apart), busy, disabled, or draining slots included. It is `[]` when the pool's
+connected agents have no GPU slot, and `null` when the pool has no agents, the agent list
+does not match the pool, or a slot's device or GPU brand is unreadable. Neither fact changes
+admission.
 
 Admission counts slots as the pool does: a drained or disabled slot, and every slot of a
 disabled agent, is not capacity, and a draining slot or agent counts only the slots that

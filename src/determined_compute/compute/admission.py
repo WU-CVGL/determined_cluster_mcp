@@ -64,6 +64,7 @@ def _gpu_models(
 
     Every slot of every agent counts, whatever its state. The list is empty only when no slot
     is a GPU, and None when a slot's device type, or a GPU slot's model name, is unreadable.
+    The caller passes the agents of a pool that has some; a pool without agents is unknown.
     """
 
     models = set()
@@ -374,8 +375,9 @@ class ResourceInspector:
             "resource_pool": name,
             "description": _pool_description(raw.get("description")),
             # Read from the agents only when they match the pool, so a partial list never
-            # passes for the pool's models.
-            "gpu_models": _gpu_models(members) if agent_data_known else None,
+            # passes for the pool's models, and unknown for a pool without agents, whose
+            # GPUs nothing reports.
+            "gpu_models": _gpu_models(members) if agent_data_known and members else None,
             "slot_type": slot_type,
             "num_agents": num_agents,
             "total_slots": total,
