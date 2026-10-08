@@ -24,6 +24,11 @@ _YAML_UNSAFE = re.compile("[\x7f-\x9f\u2028\u2029\ufffe\uffff]")
 # How the research-cluster fork refuses a resource pool the user may not use; the launch
 # routes prefix it with their own context.
 _POOL_DENIED = re.compile(r'may not use resource pool "([^"\\]{1,256})"')
+# The MCP logs in once per process, so a revoked or expired token fails every later call.
+_UNAUTHENTICATED_HINT = (
+    "a password change revokes tokens and a login token expires after 7 days; update the "
+    "secrets file and restart the MCP"
+)
 
 
 class APIError(RuntimeError):
@@ -253,8 +258,11 @@ def _error_from_response(response: requests.Response) -> APIError:
         denied = _POOL_DENIED.search(str(message))
         details = {"resource_pool": denied.group(1)} if denied else payload.get("details")
         return APIError(f"{status} {message}", code="permission_denied", details=details)
+    text = f"{status} {message}"
+    if status == 401 and determined:
+        text = f"{text}; {_UNAUTHENTICATED_HINT}"
     return APIError(
-        f"{status} {message}", code=payload.get("code", status), details=payload.get("details"),
+        text, code=payload.get("code", status), details=payload.get("details"),
         # 501 means the master lacks the route; repeating the request cannot help.
         retryable=status == 429 or (status >= 500 and status != 501),
     )

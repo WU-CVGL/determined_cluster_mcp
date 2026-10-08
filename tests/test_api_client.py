@@ -786,6 +786,56 @@ def test_a_pool_refusal_in_a_plain_message_body_names_the_pool(monkeypatch):
     assert caught.value.details == {"resource_pool": "a100"}
 
 
+UNAUTHENTICATED_HINT = (
+    "a password change revokes tokens and a login token expires after 7 days; update the "
+    "secrets file and restart the MCP"
+)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        gateway_error(401, 16, "Unauthenticated", "invalid credentials"),
+        Response({"message": "invalid credentials"}, 401),
+    ],
+    ids=["gateway", "message"],
+)
+def test_an_authentication_failure_says_how_to_recover(monkeypatch, response):
+    monkeypatch.setattr(requests, "get", lambda *a, **k: response)
+    with pytest.raises(APIError) as caught:
+        client().get_task("command", "c1")
+    assert str(caught.value) == f"401 invalid credentials; {UNAUTHENTICATED_HINT}"
+    assert caught.value.code == 401
+    assert caught.value.retryable is False
+
+
+def test_a_refused_login_says_how_to_recover(monkeypatch, tmp_path, clean_env):
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("DET_MASTER=master:8080\nDET_USERNAME=user\nDET_PASSWORD=do-not-echo\n")
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(url)
+        return gateway_error(401, 16, "Unauthenticated", "invalid credentials")
+
+    monkeypatch.setattr(requests, "post", post)
+    with pytest.raises(APIError) as caught:
+        DeterminedAPIClient(secrets_path=secrets)
+    assert str(caught.value) == f"401 invalid credentials; {UNAUTHENTICATED_HINT}"
+    assert "do-not-echo" not in str(caught.value)
+    assert calls == ["http://master:8080/api/v1/auth/login"]
+
+
+@pytest.mark.parametrize("status", [400, 403, 404, 500])
+def test_other_errors_carry_no_authentication_hint(monkeypatch, status):
+    monkeypatch.setattr(
+        requests, "get", lambda *a, **k: gateway_error(status, 3, "Other", "invalid credentials")
+    )
+    with pytest.raises(APIError) as caught:
+        client().get_task("command", "c1")
+    assert UNAUTHENTICATED_HINT not in str(caught.value)
+
+
 def test_a_log_stream_refusal_is_a_permission_error(monkeypatch):
     # A stream that fails before its first record answers HTTP 403 with a stream error body.
     refusal = {"grpcCode": 7, "httpCode": 403, "message": "denied", "httpStatus": "Forbidden"}
