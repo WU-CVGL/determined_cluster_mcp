@@ -13,6 +13,15 @@ from determined_compute.core.api_client import APIError
 
 
 _STATISTICS_MISSING = "complete per-agent slot capacity statistics are missing"
+# The values of prefer_gpu_topology the fork accepts; false and null are off.
+_GPU_TOPOLOGY_PREFERENCES = ("soft", "strong")
+# The fork's unknown reason of an agent that has not reported its GPU topology since the master
+# started (fork 0.42.0). The master lets a "strong" task wait for such an agent.
+_TOPOLOGY_PENDING = "not reported since the master started"
+_STATIC_POOL = "RESOURCE_POOL_TYPE_STATIC"
+_CUDA = "TYPE_CUDA"
+# Classes of an agent's GPU topology for a "strong" request.
+_KNOWN, _NONE, _PENDING, _HIDDEN, _MALFORMED = "known", "none", "pending", "hidden", "malformed"
 
 
 def _observed_at() -> str:
@@ -37,19 +46,129 @@ def _slots(value: Any) -> Optional[List[Mapping[str, Any]]]:
     return entries
 
 
+def _valid_preference(value: Any) -> bool:
+    return value is None or value is False or (
+        isinstance(value, str) and value in _GPU_TOPOLOGY_PREFERENCES
+    )
+
+
+def _no_numa_nodes(pool: str) -> str:
+    # The master's own reasons for refusing a "strong" request (errStrongNoNUMANodes and
+    # errStrongNoNUMANodeHolds), with the pool name as it writes it.
+    return f"no agent in pool {pool} reports NUMA nodes; use soft"
+
+
+def _no_numa_node_holds(pool: str, slots: int) -> str:
+    return f"no NUMA node in pool {pool} has {slots} slots; use soft"
+
+
+def _numa_layout(
+    agent: Mapping[str, Any], entries: List[Mapping[str, Any]]
+) -> Tuple[str, Dict[int, int], Dict[int, int], str]:
+    """Classify an agent's GPU topology and count its CUDA slots by NUMA node.
+
+    Returns the class, the slots per node in any state, the free slots per node, and the
+    agent's unknown reason. A slot counts toward a node only when the topology gives it a node
+    of 0 or more, as the scheduler's numaNodeOf reads it; a slot is free when it is enabled, not
+    draining, and holds no container, on an enabled agent that is not draining.
+    """
+
+    cuda: List[Mapping[str, Any]] = []
+    for slot in entries:
+        device = slot.get("device")
+        if not isinstance(device, Mapping) or not isinstance(device.get("type"), str):
+            return _MALFORMED, {}, {}, ""
+        if device["type"] == _CUDA:
+            cuda.append(slot)
+    if not cuda:
+        return _NONE, {}, {}, ""
+    topology = agent.get("gpuTopology")
+    ids = [_nonnegative_int(slot["device"].get("id")) for slot in cuda]
+    if not isinstance(topology, Mapping) or any(item is None for item in ids):
+        # Without the sensitive-agent permission the master drops the topology and sets every
+        # device id to -1.
+        return _HIDDEN, {}, {}, ""
+    if len(set(ids)) != len(ids):
+        return _MALFORMED, {}, {}, ""
+    reason = topology.get("unknownReason")
+    if not isinstance(reason, str):
+        return _MALFORMED, {}, {}, ""
+    if reason == _TOPOLOGY_PENDING:
+        return _PENDING, {}, {}, reason
+    if reason:
+        return _NONE, {}, {}, reason
+    gpus = topology.get("gpus")
+    if not isinstance(gpus, list):
+        return _MALFORMED, {}, {}, ""
+    node_of: Dict[int, int] = {}
+    for entry in gpus:
+        if not isinstance(entry, Mapping):
+            return _MALFORMED, {}, {}, ""
+        excluded = entry.get("excluded", False)
+        if not isinstance(excluded, bool):
+            return _MALFORMED, {}, {}, ""
+        if excluded:
+            # An excluded GPU is never a slot.
+            continue
+        device_id = _nonnegative_int(entry.get("deviceId"))
+        node = entry.get("numaNode")
+        if (
+            device_id is None
+            or device_id in node_of
+            or isinstance(node, bool)
+            or not isinstance(node, int)
+        ):
+            return _MALFORMED, {}, {}, ""
+        node_of[device_id] = node
+    if set(node_of) != set(ids):
+        return _MALFORMED, {}, {}, ""
+    schedulable = agent.get("enabled", True) and not agent.get("draining", False)
+    total: Dict[int, int] = {}
+    free: Dict[int, int] = {}
+    for slot, device_id in zip(cuda, ids):
+        node = node_of[device_id]
+        if node < 0:
+            continue
+        total[node] = total.get(node, 0) + 1
+        if (
+            schedulable
+            and slot.get("enabled", True)
+            and not slot.get("draining", False)
+            and slot.get("container") is None
+        ):
+            free[node] = free.get(node, 0) + 1
+    return _KNOWN, total, free, ""
+
+
 class ResourceInspector:
     """Inspect current capacity through the Determined read-only APIs."""
 
     def __init__(self, client: Any) -> None:
         self.client = client
 
-    def resources(self, slots: int = 1, pool: Optional[str] = None) -> Dict[str, Any]:
+    def resources(
+        self,
+        slots: int = 1,
+        pool: Optional[str] = None,
+        prefer_gpu_topology: Any = None,
+    ) -> Dict[str, Any]:
         """Return conservative, per-pool capacity for a request on one agent."""
 
         self._validate_request(slots, pool)
-        return self._resources(slots=slots, pool=pool)
+        if not _valid_preference(prefer_gpu_topology):
+            raise ValueError('prefer_gpu_topology must be "soft", "strong", false, or null')
+        report, _refusals = self._resources(
+            slots=slots, pool=pool, preference=prefer_gpu_topology
+        )
+        return report
 
-    def _resources(self, *, slots: int, pool: Optional[str]) -> Dict[str, Any]:
+    def _resources(
+        self, *, slots: int, pool: Optional[str], preference: Any
+    ) -> Tuple[Dict[str, Any], Dict[str, str]]:
+        """Return the report and, by pool, the master's reason for refusing the request."""
+
+        # "strong" takes effect from 2 slots, as in the scheduler's strongTopology.
+        strong = preference == "strong" and slots >= 2
         # Agents first: a slot taken before or between the two reads then shows as a
         # used-slot mismatch, not as a free slot.
         agents_value = self.client._get("api/v1/agents", params={"limit": 0})
@@ -68,11 +187,14 @@ class ResourceInspector:
                 },
             )
 
-        assessments = [
-            self._assess_pool(item, agents, slots=slots)
-            for item in pools
-            if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-        ]
+        assessments = []
+        refusals: Dict[str, str] = {}
+        for item in pools:
+            if isinstance(item, Mapping) and isinstance(item.get("name"), str):
+                assessment, refusal = self._assess_pool(item, agents, slots=slots, strong=strong)
+                assessments.append(assessment)
+                if refusal is not None:
+                    refusals[assessment["resource_pool"]] = refusal
         candidate_names = sorted(
             item["resource_pool"] for item in assessments if item["available"] is True
         )
@@ -109,6 +231,7 @@ class ResourceInspector:
             "observed_at": _observed_at(),
             "requested_slots": slots,
             "requested_pool": pool,
+            "prefer_gpu_topology": preference,
             "single_node": True,
             "available": available,
             "selected_pool": selected,
@@ -121,7 +244,7 @@ class ResourceInspector:
                 "Alternative pools are suggestions and image/workload compatibility "
                 "was not checked."
             ),
-        }
+        }, refusals
 
     @staticmethod
     def _validate_request(slots: Any, pool: Any) -> None:
@@ -136,7 +259,10 @@ class ResourceInspector:
         agents: List[Any],
         *,
         slots: int,
-    ) -> Dict[str, Any]:
+        strong: bool = False,
+    ) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Assess one pool; also return the master's reason for refusing the request, if any."""
+
         name = str(raw["name"])
         total = _nonnegative_int(raw.get("slotsAvailable"))
         used = _nonnegative_int(raw.get("slotsUsed"))
@@ -144,8 +270,12 @@ class ResourceInspector:
         slot_type = raw.get("slotType")
         aux_capacity = _nonnegative_int(raw.get("auxContainerCapacity"))
         aux_running = _nonnegative_int(raw.get("auxContainersRunning"))
-        per_agent, holding, agent_problem = self._agent_free(name, agents, num_agents, total)
+        per_agent, holding, members, agent_problem = self._agent_free(
+            name, agents, num_agents, total
+        )
         agent_data_known = agent_problem is None
+        refusal: Optional[str] = None
+        numa: Dict[str, Any] = {}
 
         if slots == 0:
             capacity_kind = "aux_containers"
@@ -173,6 +303,7 @@ class ResourceInspector:
                 and isinstance(slot_type, str)
                 and bool(slot_type)
             )
+            complete = known
             problem = agent_problem
             if known and slots >= 2 and used != holding:
                 # The pool's used count is the slots holding containers (numUsedSlots).
@@ -181,7 +312,18 @@ class ResourceInspector:
                     f"used slots ({used}) differ from slots holding containers ({holding}); "
                     "a task may be starting or stopping"
                 )
-            if known:
+            if strong:
+                capacity_kind = "slots_one_numa_node"
+                available, available_capacity, explanation, refusal, numa = self._assess_strong(
+                    name,
+                    static=raw.get("type") == _STATIC_POOL,
+                    members=members,
+                    slots=slots,
+                    complete=complete,
+                    known=known,
+                    problem=problem or _STATISTICS_MISSING,
+                )
+            elif known:
                 available_capacity = max(per_agent.values(), default=0)
                 available = available_capacity >= slots
                 explanation = (
@@ -217,7 +359,97 @@ class ResourceInspector:
             "available_capacity": available_capacity,
             "available": available,
             "explanation": explanation,
+            **numa,
+        }, refusal
+
+    @staticmethod
+    def _assess_strong(
+        name: str,
+        *,
+        static: bool,
+        members: List[Tuple[str, Mapping[str, Any], List[Mapping[str, Any]]]],
+        slots: int,
+        complete: bool,
+        known: bool,
+        problem: str,
+    ) -> Tuple[Optional[bool], Optional[int], str, Optional[str], Dict[str, Any]]:
+        """Assess a "strong" request: all slots on one NUMA node of one agent.
+
+        ``complete`` says the agent list matches the pool, and ``known`` that the used slots
+        match as well. Returns the verdict, the largest "strong" task that fits now, the
+        explanation, the master's reason for refusing the request (or None), and the pool's
+        NUMA fields.
+        """
+
+        refusal: Optional[str] = None
+        if complete and static:
+            # The master refuses a request larger than every agent at submit, from slot counts
+            # alone (ValidateResources), whatever the topology or the slots in use.
+            largest = max((len(entries) for _id, _agent, entries in members), default=0)
+            if largest < slots:
+                refusal = (
+                    _no_numa_node_holds(name, slots) if members else _no_numa_nodes(name)
+                )
+
+        layouts = [
+            (agent_id, *_numa_layout(agent, entries)) for agent_id, agent, entries in members
+        ] if complete else []
+        unreadable = next(
+            (item for item in layouts if item[1] in (_HIDDEN, _MALFORMED)), None
+        )
+        pending = any(item[1] == _PENDING for item in layouts)
+        readable = known and unreadable is None
+        known_layouts = [item for item in layouts if item[1] == _KNOWN]
+        max_free = max(
+            (max(free.values(), default=0) for _id, _cls, _total, free, _r in known_layouts),
+            default=0,
+        )
+        max_total = max(
+            (max(total.values(), default=0) for _id, _cls, total, _free, _r in known_layouts),
+            default=0,
+        )
+        numa = {
+            "max_numa_node_free_slots": max_free if readable else None,
+            "max_numa_node_slots": max_total if readable and not pending else None,
         }
+        notes = []
+        for agent_id, cls, _total, _free, reason in layouts:
+            if cls == _PENDING:
+                notes.append(f"agent {agent_id} has not reported GPU topology ({reason!r})")
+            elif cls == _NONE and reason:
+                notes.append(f"agent {agent_id} reports no NUMA nodes ({reason!r})")
+            elif cls == _NONE:
+                notes.append(f"agent {agent_id} has no CUDA slots")
+        capacity = numa["max_numa_node_free_slots"]
+
+        def explained(text: str) -> str:
+            return "; ".join([text, *notes])
+
+        if refusal is not None:
+            return False, capacity, explained(refusal), refusal, numa
+        if not known:
+            return None, None, problem, None, numa
+        if unreadable is not None:
+            agent_id, cls = unreadable[0], unreadable[1]
+            cause = (
+                f"GPU topology of agent {agent_id} is not visible to this account"
+                if cls == _HIDDEN
+                else f"GPU topology of agent {agent_id} is inconsistent with its slots"
+            )
+            return None, None, cause, None, numa
+        summary = (
+            f"{max_free} GPU(s) are currently free on one NUMA node of one schedulable "
+            f"agent; {slots} requested"
+        )
+        if max_free >= slots:
+            return True, max_free, explained(summary), None, numa
+        if static and not pending and max_total < slots:
+            # The master refuses the request once every agent has reported its topology
+            # (strongCannotFit); disabled and draining slots count toward a node.
+            nodes = any(total for _id, _cls, total, _free, _r in known_layouts)
+            refusal = _no_numa_node_holds(name, slots) if nodes else _no_numa_nodes(name)
+            return False, max_free, explained(refusal), refusal, numa
+        return False, max_free, explained(summary), None, numa
 
     @staticmethod
     def _agent_free(
@@ -225,10 +457,16 @@ class ResourceInspector:
         agents: List[Any],
         expected_agents: Optional[int],
         expected_slots: Optional[int],
-    ) -> Tuple[Dict[str, int], int, Optional[str]]:
-        """Return each agent's free slots and the counted slots holding a container.
+    ) -> Tuple[
+        Dict[str, int],
+        int,
+        List[Tuple[str, Mapping[str, Any], List[Mapping[str, Any]]]],
+        Optional[str],
+    ]:
+        """Return each agent's free slots, the counted slots holding a container, and the
+        pool's agents with their slot entries.
 
-        The third value says why the agent list does not match the pool, or is None.
+        The last value says why the agent list does not match the pool, or is None.
 
         Slots are counted the way the pool counts them (numSlots in the scheduler's agent
         state): a slot counts when it takes new work, or when it is draining and still holds a
@@ -237,7 +475,7 @@ class ResourceInspector:
         """
 
         if expected_agents is None or expected_slots is None:
-            return {}, 0, _STATISTICS_MISSING
+            return {}, 0, [], _STATISTICS_MISSING
         matching: List[Mapping[str, Any]] = []
         for item in agents:
             if not isinstance(item, Mapping):
@@ -247,6 +485,7 @@ class ResourceInspector:
                 matching.append(item)
 
         result: Dict[str, int] = {}
+        members: List[Tuple[str, Mapping[str, Any], List[Mapping[str, Any]]]] = []
         counted_slots = 0
         holding = 0
         for agent in matching:
@@ -262,7 +501,7 @@ class ResourceInspector:
                 or not isinstance(enabled, bool)
                 or not isinstance(draining, bool)
             ):
-                return {}, 0, _STATISTICS_MISSING
+                return {}, 0, [], _STATISTICS_MISSING
             counted = 0
             counted_busy = 0
             free = 0
@@ -270,7 +509,7 @@ class ResourceInspector:
                 slot_enabled = slot.get("enabled", True)
                 slot_draining = slot.get("draining", False)
                 if not isinstance(slot_enabled, bool) or not isinstance(slot_draining, bool):
-                    return {}, 0, _STATISTICS_MISSING
+                    return {}, 0, [], _STATISTICS_MISSING
                 busy = slot.get("container") is not None
                 if (slot_enabled and not slot_draining) or (slot_draining and busy):
                     counted += 1
@@ -283,13 +522,14 @@ class ResourceInspector:
                 counted_slots += counted
             holding += counted_busy
             result[agent_id] = free if enabled and not draining else 0
+            members.append((agent_id, agent, entries))
         if len(matching) != expected_agents or counted_slots != expected_slots:
-            return {}, 0, (
+            return {}, 0, [], (
                 f"pool reports {expected_slots} slot(s) on {expected_agents} agent(s); "
                 f"the agent list gives {counted_slots} counted slot(s) on "
                 f"{len(matching)} agent(s)"
             )
-        return result, holding, None
+        return result, holding, members, None
 
     def require_capacity(self, kind: str, config: Mapping[str, Any]) -> Dict[str, Any]:
         """Require current capacity for the config's exact selected pool."""
@@ -310,21 +550,41 @@ class ResourceInspector:
         is_single_node = resources.get("is_single_node")
         if is_single_node is not None and not isinstance(is_single_node, bool):
             raise ValueError("config.resources.is_single_node must be a boolean or null")
+        preference = resources.get("prefer_gpu_topology")
+        if not _valid_preference(preference):
+            raise ValueError(
+                'config.resources.prefer_gpu_topology must be "soft", "strong", false, or null'
+            )
+        strong = preference == "strong" and slots >= 2
         # A trial is multi-agent unless is_single_node is true (absent or null included). The
         # scheduler tries one agent first; spanning agents is not modelled, so a trial that
-        # fits on no single agent has unknown capacity.
-        may_span_agents = kind == "experiment" and slots >= 2 and is_single_node is not True
-        report = self._resources(slots=slots, pool=pool)
+        # fits on no single agent has unknown capacity. "strong" always uses one agent.
+        may_span_agents = (
+            kind == "experiment" and slots >= 2 and is_single_node is not True and not strong
+        )
+        report, refusals = self._resources(slots=slots, pool=pool, preference=preference)
         selected = report["selected_pool"]
         if selected is not None and selected["available"] is True:
             return {**report, "admitted": True}
 
         available = selected["available_capacity"] if selected is not None else None
         code = "capacity_unknown"
+        retryable = False
         if selected is None:
             message = f"resource pool {pool!r} is not present or not available to you"
+        elif pool in refusals:
+            # The master refuses this request with the pool's current agents.
+            code = "capacity_unavailable"
+            message = refusals[pool]
         elif selected["available"] is None:
             message = f"capacity for resource pool {pool!r} is unknown: {selected['explanation']}"
+        elif strong:
+            code = "capacity_unavailable"
+            retryable = True
+            message = (
+                f"no schedulable agent in pool {pool!r} has {slots} free GPUs on one NUMA "
+                f"node now (most on one node: {available}); a \"strong\" task would wait"
+            )
         elif may_span_agents:
             message = (
                 f"capacity for resource pool {pool!r} is unknown: this experiment may span "
@@ -333,6 +593,7 @@ class ResourceInspector:
             )
         else:
             code = "capacity_unavailable"
+            retryable = True
             message = f"resource pool {pool!r} cannot currently fit the request without queueing"
         raise APIError(
             message,
@@ -343,7 +604,7 @@ class ResourceInspector:
                 "available": available,
                 "candidate_pools": report["candidate_pools"],
             },
-            retryable=code == "capacity_unavailable",
+            retryable=retryable,
         )
 
 
