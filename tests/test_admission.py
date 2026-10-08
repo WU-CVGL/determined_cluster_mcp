@@ -985,13 +985,13 @@ def test_cpu_agents_next_to_a_known_cuda_agent(slots, retryable, message):
 
 
 def test_a_static_pool_without_agents_refuses_strong():
-    # T16
+    # T16: ValidateResources gives errStrongNoNUMANodes for a static pool without agents.
     inspector = ResourceInspector(Client([pool(total=0, agents=0)], []))
 
     error = refused(inspector, strong_config(2))
     assert error.code == "capacity_unavailable"
     assert error.retryable is False
-    assert str(error) == no_agent_holds(2)
+    assert str(error) == NO_NODES
     assert error.details["available"] == 0
 
 
