@@ -445,7 +445,7 @@ def test_a_refused_pool_reaches_the_client_as_a_permission_error(monkeypatch):
 
     assert asyncio.run(asyncio.wait_for(exercise(), timeout=10)) == {
         "code": "permission_denied",
-        "message": "resource pool 'a100' is not available to you",
+        "message": f"403 {refusal}",
         "retryable": False,
         "details": {"resource_pool": "a100"},
     }

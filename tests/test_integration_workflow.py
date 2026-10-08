@@ -151,7 +151,7 @@ def test_a_pool_the_account_may_not_use_is_named_on_launch(monkeypatch):
         service.launch(dict(request(), pool='restricted', allow_queue=True))
     assert not isinstance(caught.value, SubmissionUncertainError)
     assert caught.value.code == 'permission_denied'
-    assert str(caught.value) == "resource pool 'restricted' is not available to you"
+    assert str(caught.value) == '403 failed to prepare launch params: ' + POOL_DENIED
     assert caught.value.details == {'resource_pool': 'restricted'}
     assert len(calls) == 1
 
@@ -174,7 +174,62 @@ def test_resuming_in_a_pool_the_account_may_not_use_names_the_pool(monkeypatch):
     with pytest.raises(APIError) as caught:
         service.resume('experiment', 12)
     assert caught.value.code == 'permission_denied'
-    assert str(caught.value) == "resource pool 'restricted' is not available to you"
+    assert str(caught.value) == '403 ' + POOL_DENIED
+    assert caught.value.details == {'resource_pool': 'restricted'}
+    assert calls == ['https://cluster.example:443/api/v1/experiments/12/activate']
+
+
+# The research-cluster fork answers 503 when it cannot read a pool's access rules.
+POOL_CHECK_FAILED = (
+    'could not check access to resource pool "restricted": connection refused; try again'
+)
+
+
+def pool_check_failure():
+    return response({'error': {'code': 14, 'reason': 'Unavailable', 'error': POOL_CHECK_FAILED}},
+                    503)
+
+
+def test_a_failed_pool_check_on_launch_is_unconfirmed_and_carries_the_marker(monkeypatch):
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(url)
+        return pool_check_failure()
+    monkeypatch.setattr(requests, 'post', post)
+    client = DeterminedAPIClient(api_url='https://cluster.example:443', api_token='test-token')
+    service = ComputeService(client, profile())
+
+    with pytest.raises(SubmissionUncertainError) as caught:
+        service.launch(dict(request(), pool='restricted', allow_queue=True))
+    assert caught.value.code == 'submission_uncertain'
+    assert caught.value.details['kind'] == 'command'
+    assert caught.value.details['submission_marker'].startswith('determined-compute:')
+    assert len(calls) == 1
+
+
+def test_a_failed_pool_check_on_resume_is_unconfirmed_without_a_marker(monkeypatch):
+    # A resume has no submission marker: compute_status, not compute_list, checks it.
+    routes(monkeypatch, {
+        'api/v1/me': ME,
+        'api/v1/experiments/12': {'experiment': {
+            'id': 12, 'userId': 7, 'state': 'STATE_PAUSED', 'resourcePool': 'restricted'}},
+    })
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(url)
+        return pool_check_failure()
+    monkeypatch.setattr(requests, 'post', post)
+    client = DeterminedAPIClient(api_url='https://cluster.example:443', api_token='test-token')
+    service = ComputeService(client, profile())
+
+    with pytest.raises(SubmissionUncertainError) as caught:
+        service.resume('experiment', 12)
+    assert caught.value.code == 'submission_uncertain'
+    assert 'submission_marker' not in caught.value.details
+    assert caught.value.details['status_code'] == 503
+    assert POOL_CHECK_FAILED in caught.value.details['error']
     assert calls == ['https://cluster.example:443/api/v1/experiments/12/activate']
 
 

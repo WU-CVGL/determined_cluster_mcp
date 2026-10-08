@@ -93,6 +93,17 @@ _QUEUE_LIMIT = 1000
 _USAGE_SUMMARY_STATISTICS = ("count", "sum", "min", "max", "last", "mean")
 # A GPU utilization sample below this percentage counts as idle.
 _GPU_IDLE_PERCENT = 10
+# A master whose observability.task_mapping_delay is nonzero (the fork's default, also when
+# the key is absent; only 0s turns it off) attributes measurements to a task only after the
+# allocation has run that long. The MCP cannot read the setting, so it assumes the default.
+_USAGE_MAPPING_DELAY_SECONDS = 300
+_USAGE_MAPPING_DELAY = (
+    "If the cluster's task-mapping delay is nonzero (5 minutes by default in the Determined "
+    "fork), measurements from the first minutes of each allocation, counted from its start "
+    "including image pull, are not attributed to the task and are never backfilled, so an "
+    "allocation that ended sooner has none; a wider window or an allocation_id can still "
+    "return an earlier allocation's data."
+)
 _USAGE_ADVISORY = (
     "Values are point samples taken every step seconds, so min, max, and mean describe "
     "those samples rather than every moment of the window. A missing value means no "
@@ -981,6 +992,8 @@ class ComputeService:
                 "not report training progress through Determined's Core API or has not "
                 "reported yet"
             )
+        if not returned:
+            explanation += ". " + _USAGE_MAPPING_DELAY
         result: Dict[str, Any] = {
             "kind": kind,
             "id": self._public_id(kind, remote_id),
@@ -1010,7 +1023,11 @@ class ComputeService:
             "context_unavailable": unavailable,
             "explanation": explanation,
             "observed_at": _iso_seconds(now),
-            "advisory": _USAGE_ADVISORY,
+            "advisory": (
+                _USAGE_ADVISORY + " " + _USAGE_MAPPING_DELAY
+                if self._usage_delay_applies(returned, selected, task_start, start, end)
+                else _USAGE_ADVISORY
+            ),
         }
         if len(allocations) > _USAGE_MAX_ALLOCATION_DETAILS:
             result["allocation_details_limit"] = _USAGE_MAX_ALLOCATION_DETAILS
@@ -1109,6 +1126,31 @@ class ComputeService:
                 result.setdefault(group, {})[name] = entry
                 kept += 1
         return result, False
+
+    @staticmethod
+    def _usage_delay_applies(
+        returned: Sequence[Mapping[str, Any]],
+        selected: Sequence[Mapping[str, Any]],
+        task_start: Optional[int],
+        start: int,
+        end: int,
+    ) -> bool:
+        """Whether the task-mapping delay can explain missing data in the window."""
+        if not returned:
+            return True
+        for item in selected:
+            began = _lenient_unix_seconds(item["start_time"])
+            if began is None:
+                began = task_start
+            ended = _lenient_unix_seconds(item["end_time"])
+            if ended is None:
+                ended = end
+            if began is None or began > end or ended < start:
+                continue
+            # The allocation's unmapped first minutes fall inside the window.
+            if began + _USAGE_MAPPING_DELAY_SECONDS > start:
+                return True
+        return False
 
     @staticmethod
     def _usage_series(series: Mapping[str, Any], gpu_models: Mapping[str, str]) -> Dict[str, Any]:

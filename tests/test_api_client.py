@@ -762,7 +762,8 @@ def test_a_refused_pool_is_a_permission_error_naming_the_pool(monkeypatch, opera
     error = caught.value
     assert not isinstance(error, SubmissionUncertainError)
     assert error.code == "permission_denied"
-    assert str(error) == "resource pool 'a100' is not available to you"
+    # The master's refusal, word for word: it names the account and how to get access.
+    assert str(error) == f"403 {POOL_DENIED}"
     assert error.details == {"resource_pool": "a100"}
     assert error.retryable is False
     assert len(calls) == 1
@@ -786,6 +787,78 @@ def test_other_permission_errors_keep_the_master_message(monkeypatch, response, 
     assert str(caught.value) == message
     assert caught.value.details is None
     assert caught.value.retryable is False
+
+
+def test_a_resume_refusal_without_the_launch_prefix_is_passed_through(monkeypatch):
+    refusal = POOL_DENIED.removeprefix("failed to prepare launch params: ")
+    monkeypatch.setattr(
+        requests, "post", lambda *a, **k: gateway_error(403, 7, "PermissionDenied", refusal)
+    )
+    with pytest.raises(APIError) as caught:
+        client().unpause_task("experiment", "17")
+    assert caught.value.code == "permission_denied"
+    assert str(caught.value) == f"403 {refusal}"
+    assert caught.value.details == {"resource_pool": "a100"}
+
+
+def test_a_pool_refusal_in_a_plain_message_body_names_the_pool(monkeypatch):
+    monkeypatch.setattr(requests, "post", lambda *a, **k: Response({"message": POOL_DENIED}, 403))
+    with pytest.raises(APIError) as caught:
+        client().launch_task("command", {"entrypoint": ["true"]})
+    assert caught.value.code == "permission_denied"
+    assert str(caught.value) == f"403 {POOL_DENIED}"
+    assert caught.value.details == {"resource_pool": "a100"}
+
+
+UNAUTHENTICATED_HINT = (
+    "a login token expires after 7 days and a password change revokes sessions and tokens; "
+    "restart the MCP to log in again, first updating the password or API token where the MCP "
+    "reads it (--api-token, the secrets file, or the environment) if it is no longer valid"
+)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        gateway_error(401, 16, "Unauthenticated", "invalid credentials"),
+        Response({"message": "invalid credentials"}, 401),
+    ],
+    ids=["gateway", "message"],
+)
+def test_an_authentication_failure_says_how_to_recover(monkeypatch, response):
+    monkeypatch.setattr(requests, "get", lambda *a, **k: response)
+    with pytest.raises(APIError) as caught:
+        client().get_task("command", "c1")
+    assert str(caught.value) == f"401 invalid credentials; {UNAUTHENTICATED_HINT}"
+    assert caught.value.code == 401
+    assert caught.value.retryable is False
+
+
+def test_a_refused_login_says_how_to_recover(monkeypatch, tmp_path, clean_env):
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("DET_MASTER=master:8080\nDET_USERNAME=user\nDET_PASSWORD=do-not-echo\n")
+    calls = []
+
+    def post(url, **kwargs):
+        calls.append(url)
+        return gateway_error(401, 16, "Unauthenticated", "invalid credentials")
+
+    monkeypatch.setattr(requests, "post", post)
+    with pytest.raises(APIError) as caught:
+        DeterminedAPIClient(secrets_path=secrets)
+    assert str(caught.value) == f"401 invalid credentials; {UNAUTHENTICATED_HINT}"
+    assert "do-not-echo" not in str(caught.value)
+    assert calls == ["http://master:8080/api/v1/auth/login"]
+
+
+@pytest.mark.parametrize("status", [400, 403, 404, 500])
+def test_other_errors_carry_no_authentication_hint(monkeypatch, status):
+    monkeypatch.setattr(
+        requests, "get", lambda *a, **k: gateway_error(status, 3, "Other", "invalid credentials")
+    )
+    with pytest.raises(APIError) as caught:
+        client().get_task("command", "c1")
+    assert UNAUTHENTICATED_HINT not in str(caught.value)
 
 
 def test_a_log_stream_refusal_is_a_permission_error(monkeypatch):

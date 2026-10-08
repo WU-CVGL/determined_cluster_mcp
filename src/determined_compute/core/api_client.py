@@ -24,6 +24,12 @@ _YAML_UNSAFE = re.compile("[\x7f-\x9f\u2028\u2029\ufffe\uffff]")
 # How the research-cluster fork refuses a resource pool the user may not use; the launch
 # routes prefix it with their own context.
 _POOL_DENIED = re.compile(r'may not use resource pool "([^"\\]{1,256})"')
+# The MCP logs in once per process, so a revoked or expired token fails every later call.
+_UNAUTHENTICATED_HINT = (
+    "a login token expires after 7 days and a password change revokes sessions and tokens; "
+    "restart the MCP to log in again, first updating the password or API token where the MCP "
+    "reads it (--api-token, the secrets file, or the environment) if it is no longer valid"
+)
 
 
 class APIError(RuntimeError):
@@ -248,20 +254,16 @@ def _error_from_response(response: requests.Response) -> APIError:
         error = error.get("error") or error.get("message") or error.get("reason")
     message = payload.get("message") or error or response.text or getattr(response, "reason", "API request failed")
     # Only Determined's own error body is its permission refusal; another 403 keeps its status.
-    if status == 403 and (gateway or payload.get("message")):
+    determined = gateway or bool(payload.get("message"))
+    if status == 403 and determined:
         denied = _POOL_DENIED.search(str(message))
-        if denied is not None:
-            pool = denied.group(1)
-            return APIError(
-                f"resource pool {pool!r} is not available to you",
-                code="permission_denied",
-                details={"resource_pool": pool},
-            )
-        return APIError(
-            f"{status} {message}", code="permission_denied", details=payload.get("details")
-        )
+        details = {"resource_pool": denied.group(1)} if denied else payload.get("details")
+        return APIError(f"{status} {message}", code="permission_denied", details=details)
+    text = f"{status} {message}"
+    if status == 401 and determined:
+        text = f"{text}; {_UNAUTHENTICATED_HINT}"
     return APIError(
-        f"{status} {message}", code=payload.get("code", status), details=payload.get("details"),
+        text, code=payload.get("code", status), details=payload.get("details"),
         # 501 means the master lacks the route; repeating the request cannot help.
         retryable=status == 429 or (status >= 500 and status != 501),
     )
