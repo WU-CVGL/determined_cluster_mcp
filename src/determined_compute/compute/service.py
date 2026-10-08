@@ -1372,11 +1372,10 @@ class ComputeService:
     def _summary(cls, kind: str, remote_id: str, entity: Mapping[str, Any]) -> Dict[str, Any]:
         """Whitelisted, display-oriented fields of one remote task."""
         description = cls._remote_text(entity.get("description"))
-        name = cls._remote_text(entity.get("name"), 256) or cls._remote_text(
-            entity.get("displayName"), 256
-        )
+        name = cls._remote_text(entity.get("name"), 256)
         if name is None and description:
-            # Commands and shells carry the name on the first description line.
+            # Commands and shells carry the name on the first description line; their
+            # displayName is the owner's display name, never the task's.
             name = description.splitlines()[0][:256]
         return {
             "kind": kind,

@@ -360,7 +360,6 @@ class DeterminedAPIClient:
         "userId",
         "username",
         "name",
-        "displayName",
         "description",
         "state",
         "resourcePool",
