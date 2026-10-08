@@ -183,6 +183,18 @@ def test_a_job_beyond_the_first_page_is_not_reported_as_not_queued(profile):
     assert result["queue_note"] == "not among the first 1000 jobs of pool gpu"
 
 
+def test_a_pool_with_exactly_one_page_of_jobs_reports_not_queued(profile):
+    client = FakeClient(entity(), jobs=[queued("job-other")], total=1000)
+
+    result = status(profile, client)
+
+    assert result["queue"] is None
+    assert result["queue_note"] == (
+        "not in pool gpu's job queue: not yet queued, paused, or just ended"
+    )
+    assert result["context_unavailable"] == []
+
+
 @pytest.mark.parametrize(
     "error",
     [

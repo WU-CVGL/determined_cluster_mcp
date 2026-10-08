@@ -142,8 +142,10 @@ def create_server(
     async def compute_status(kind: str, id: Union[int, str]) -> dict[str, Any]:
         """Return the current state of one of the account's tasks by kind and Determined id.
 
-        For a task without an end time, queue is its job in the pool's queue (state,
+        For a task that has not ended, queue is its job in the pool's queue (state,
         jobs_ahead, slots, placement), or null with queue_note or context_unavailable.
+        An ended task (end time set, or a command or shell in STATE_TERMINATED) gets
+        queue: null.
         """
 
         return await call(service.status, kind, id)
