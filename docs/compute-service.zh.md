@@ -251,7 +251,7 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 
 准入按资源池自身的方式计算 slot：已 drain 或已禁用的 slot，以及已禁用 agent 的所有 slot，都不算
 容量；正在 drain 的 slot 或 agent 只计入仍有容器占用的 slot。command、shell、generic 任务以及
-设置了 `is_single_node: true` 的 experiment 需要一个可调度 agent 有所需数量的空闲 slot。请求 2 个
+设置了 `is_single_node: true` 的 experiment 需要一个可调度 agent 有所需数量的空闲 slot。请求 1 个
 及以上 slot 时，如果资源池的已用 slot 数与有容器占用的 slot 数不同，说明有任务正在启动或停止，
 容量为未知。`slots_per_trial` 为 2 或以上且未设置 `is_single_node: true` 的 experiment 可能跨
 agent 运行，准入不检查这种情况：只要有一个 agent 有足够空闲 slot 就放行，否则为
