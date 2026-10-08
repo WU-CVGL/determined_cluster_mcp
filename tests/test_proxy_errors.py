@@ -111,6 +111,14 @@ def test_a_proxy_answer_to_a_read_is_a_labelled_retryable_error(monkeypatch):
     assert "HTTP proxy, not Determined" in str(caught.value)
 
 
+def test_a_proxy_refusal_is_no_determined_permission_error(monkeypatch):
+    answer(monkeypatch, RawResponse(403, "<html>Forbidden</html>", {"Via": "1.1 squid"}))
+    with pytest.raises(APIError) as caught:
+        client().get_task("command", "c1")
+    assert caught.value.code == 403 and caught.value.retryable is False
+    assert str(caught.value) == "403 <html>Forbidden</html>"
+
+
 @pytest.mark.parametrize(
     ("body", "headers"),
     [

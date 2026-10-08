@@ -404,23 +404,32 @@ def test_a_refused_pool_reaches_the_client_as_a_permission_error(monkeypatch):
     from determined_compute.compute import ComputeProfile, ComputeService
     from determined_compute.core.api_client import DeterminedAPIClient
 
+    refusal = (
+        'failed to prepare launch params: user "alice" may not use resource pool "a100": the pool '
+        "is restricted; choose another pool or ask an administrator for access"
+    )
     denial = requests.Response()
     denial.status_code = 403
-    denial._content = json.dumps({"error": {
-        "code": 7, "reason": "PermissionDenied",
-        "error": 'failed to launch command: user "alice" may not use resource pool "a100": '
-                 "the pool is restricted; choose another pool or ask an administrator for access",
-    }}).encode()
+    denial._content = json.dumps(
+        {"error": {"code": 7, "reason": "PermissionDenied", "error": refusal}}
+    ).encode()
     monkeypatch.setattr(requests, "post", lambda *args, **kwargs: denial)
-    profile = ComputeProfile.from_dict({
-        "mounts": [{"host_path": "/shared", "container_path": "/shared"}],
-        "defaults": {"image": "image", "pool": "a100"},
-    })
+    profile = ComputeProfile.from_dict(
+        {
+            "mounts": [{"host_path": "/shared", "container_path": "/shared"}],
+            "defaults": {"image": "image", "pool": "a100"},
+        }
+    )
     service = ComputeService(
         DeterminedAPIClient(api_url="https://cluster.example", api_token="token"), profile
     )
-    request = {"name": "probe", "command": "true", "workdir": "/shared/work",
-               "output_dir": "/shared/out", "allow_queue": True}
+    request = {
+        "name": "probe",
+        "command": "true",
+        "workdir": "/shared/work",
+        "output_dir": "/shared/out",
+        "allow_queue": True,
+    }
 
     async def exercise():
         async with Client(create_server(service)) as client:

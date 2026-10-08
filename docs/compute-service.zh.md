@@ -522,7 +522,8 @@ HTTP 403 即 Determined 的权限拒绝，错误码为 `permission_denied`，不
 fork 0.42.0 或更高版本会在提交任务以及恢复 experiment 或 generic 任务时检查资源池。拒绝当前
 账户无权使用的资源池时，消息为 `resource pool '<pool>' is not available to you`，
 `details.resource_pool` 给出该资源池；请选择其他资源池，或请管理员授予权限。其他 403 仍为
-`403 <message>` 形式。
+`403 <message>` 形式。响应体不是 Determined JSON 错误的 403（例如 HTTP 代理的页面）错误码仍为
+403。
 
 服务只操作已认证账户拥有的任务，并在操作任务之前检查这一点；因此即使凭据属于管理员，
 其他账户的任务也会返回 `ownership_mismatch`。应使用拥有该任务的账户凭据，或请管理员直接通过

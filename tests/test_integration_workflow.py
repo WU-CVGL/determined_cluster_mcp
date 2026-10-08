@@ -135,7 +135,7 @@ def test_a_pool_the_account_may_not_use_is_named_on_launch(monkeypatch):
 
     def post(url, **kwargs):
         calls.append(url)
-        return gateway_denial('failed to launch command: ' + POOL_DENIED)
+        return gateway_denial('failed to prepare launch params: ' + POOL_DENIED)
     monkeypatch.setattr(requests, 'post', post)
     client = DeterminedAPIClient(api_url='https://cluster.example:443', api_token='test-token')
     service = ComputeService(client, profile())

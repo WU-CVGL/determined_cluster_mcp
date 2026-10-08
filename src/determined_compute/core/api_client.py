@@ -20,8 +20,6 @@ from determined_compute.utils.secrets import load_secrets
 ErrorCode = Union[int, str, None]
 # Characters that YAML reads as line breaks, or refuses as unprintable, inside a quoted string.
 _YAML_UNSAFE = re.compile("[\x7f-\x9f\u2028\u2029\ufffe\uffff]")
-# gRPC PermissionDenied, which the gateway answers with HTTP 403.
-_GRPC_PERMISSION_DENIED = 7
 # How the research-cluster fork refuses a resource pool the user may not use; the launch
 # routes prefix it with their own context.
 _POOL_DENIED = re.compile(r'may not use resource pool "([^"\\]{1,256})"')
@@ -242,19 +240,21 @@ def _error_from_response(response: requests.Response) -> APIError:
     if not isinstance(payload, dict):
         payload = {}
     error = payload.get("error")
-    grpc_code = None
-    if isinstance(error, dict):
-        # The gRPC gateway nests its message: {"error": {"code", "reason", "error"}}.
-        grpc_code = error.get("code")
+    gateway = isinstance(error, dict)
+    if gateway:
+        # The gRPC gateway nests its message: {"error": {"code", "reason", "error"}}, or
+        # {"error": {"grpcCode", "httpCode", "message"}} on a stream.
         error = error.get("error") or error.get("message") or error.get("reason")
     message = payload.get("message") or error or response.text or getattr(response, "reason", "API request failed")
-    if status == 403 or grpc_code == _GRPC_PERMISSION_DENIED:
+    # Only Determined's own error body is its permission refusal; another 403 keeps its status.
+    if status == 403 and (gateway or payload.get("message")):
         denied = _POOL_DENIED.search(str(message))
         if denied is not None:
             pool = denied.group(1)
             return APIError(
                 f"resource pool {pool!r} is not available to you",
-                code="permission_denied", details={"resource_pool": pool},
+                code="permission_denied",
+                details={"resource_pool": pool},
             )
         return APIError(
             f"{status} {message}", code="permission_denied", details=payload.get("details")

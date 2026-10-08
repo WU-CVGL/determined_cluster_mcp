@@ -705,7 +705,7 @@ def test_gateway_error_body_message_and_retryability(monkeypatch, status, retrya
 
 # The research-cluster fork's refusal of a restricted pool, as the command launch route wraps it.
 POOL_DENIED = (
-    'failed to launch command: user "alice" may not use resource pool "a100": the pool is '
+    'failed to prepare launch params: user "alice" may not use resource pool "a100": the pool is '
     "restricted; choose another pool or ask an administrator for access (if "
     'resources.resource_pool was not set, "a100" is the default pool for this workspace or the '
     "cluster)"
@@ -759,6 +759,17 @@ def test_other_permission_errors_keep_the_master_message(monkeypatch, response, 
     assert caught.value.code == "permission_denied"
     assert str(caught.value) == message
     assert caught.value.details is None
+    assert caught.value.retryable is False
+
+
+def test_a_log_stream_refusal_is_a_permission_error(monkeypatch):
+    # A stream that fails before its first record answers HTTP 403 with a stream error body.
+    refusal = {"grpcCode": 7, "httpCode": 403, "message": "denied", "httpStatus": "Forbidden"}
+    monkeypatch.setattr(requests, "get", lambda *a, **k: Response({"error": refusal}, 403))
+    with pytest.raises(APIError) as caught:
+        client().task_logs("generic", GENERIC_ID)
+    assert caught.value.code == "permission_denied"
+    assert str(caught.value) == "403 denied"
     assert caught.value.retryable is False
 
 

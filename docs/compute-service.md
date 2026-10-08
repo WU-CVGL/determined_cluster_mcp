@@ -607,7 +607,8 @@ retryable. The research-cluster fork 0.42.0 or later checks the resource pool wh
 is launched and when an experiment or generic task is resumed. When it refuses a pool the
 account may not use, the message is `resource pool '<pool>' is not available to you` and
 `details.resource_pool` names the pool; choose another pool or ask an administrator for
-access. Any other 403 keeps the form `403 <message>`.
+access. Any other 403 keeps the form `403 <message>`. A 403 whose body is not Determined's
+JSON error, such as an HTTP proxy's page, keeps the code 403.
 
 The service acts only on tasks owned by the authenticated account and checks this
 before acting on a task, so another account's task returns `ownership_mismatch` even when the
