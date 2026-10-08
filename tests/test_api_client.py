@@ -594,7 +594,6 @@ def test_list_remote_tasks_filters_pages_and_redacts(kind, monkeypatch):
         "userId": "7",
         "username": "alice",
         "name": "native-name",
-        "displayName": "display",
         "description": "safe description",
         "state": "STATE_RUNNING",
         "resourcePool": "gpu",
@@ -606,8 +605,33 @@ def test_list_remote_tasks_filters_pages_and_redacts(kind, monkeypatch):
         "state": "STATE_COMPLETED",
     }
     encoded = json.dumps(result)
-    for forbidden in ("config", "privateKey", "environment", "hyperparameters", "secret"):
+    for forbidden in (
+        "config", "privateKey", "environment", "hyperparameters", "secret", "displayName",
+    ):
         assert forbidden not in encoded
+
+
+@pytest.mark.parametrize("kind", ["command", "shell"])
+@pytest.mark.parametrize("display_name", ["Alice Owner", 7, {"nested": "value"}])
+def test_list_remote_tasks_drops_the_owner_display_name(kind, display_name, monkeypatch):
+    # displayName is the owner's display name; it is neither returned nor validated.
+    item = {"id": "task-id", "userId": 7, "displayName": display_name, "description": "x\ny"}
+    monkeypatch.setattr(
+        requests,
+        "get",
+        lambda *a, **k: Response(
+            {
+                f"{kind}s": [item],
+                "pagination": {
+                    "limit": 50, "offset": 0, "startIndex": 0, "endIndex": 1, "total": 1,
+                },
+            }
+        ),
+    )
+
+    result = client().list_remote_tasks(kind, user_id="7")
+
+    assert result["tasks"] == [{"id": "task-id", "userId": 7, "description": "x\ny"}]
 
 
 @pytest.mark.parametrize(
