@@ -588,6 +588,61 @@ def test_filter_that_removes_every_series_names_the_returned_metrics(tmp_path, p
     assert "allocation_active, cpu_cores" in result["explanation"]
 
 
+MAPPING_DELAY = (
+    "Determined attributes measurements to a task only after its allocation has run for the "
+    "master's task-mapping delay (5 minutes by default), so the first minutes of each "
+    "allocation, and any allocation that ended sooner, have no data; a longer window does "
+    "not help."
+)
+
+
+def test_no_measurements_name_the_task_mapping_delay(tmp_path, profile):
+    service, client, task = launched(tmp_path, profile)
+
+    result = service.usage(task["kind"], task["id"])
+
+    assert result["series"] == []
+    assert result["explanation"] == (
+        "No measurements were returned; the task may not have run in this window, or "
+        "monitoring retained no data for it. " + MAPPING_DELAY
+    )
+    assert result["advisory"].endswith(" " + MAPPING_DELAY)
+
+
+def test_the_task_mapping_delay_ends_an_explanation_with_other_clauses(tmp_path, profile):
+    service, client, task = launched(tmp_path, profile)
+    client.task_info[CMD] = {
+        "task_id": CMD, "start_time": TASK_START, "end_time": "2027-01-15T07:00:00Z",
+        "allocations": [allocation(f"{CMD}.1", "2027-01-15T03:00:00", "2027-01-15T04:00:00")],
+    }
+
+    explanation = service.usage(task["kind"], task["id"])["explanation"]
+
+    assert "no selected allocation is running. " + MAPPING_DELAY in explanation
+    assert explanation.endswith(MAPPING_DELAY)
+    assert explanation.count(MAPPING_DELAY) == 1
+
+
+@pytest.mark.parametrize(
+    ("returned", "metrics"),
+    [
+        # Measured series: the task was mapped.
+        ([series("cpu_cores", [[NOW, 0.5]])], None),
+        # A metrics filter hid every returned series, which still shows the task was mapped.
+        ([series("cpu_cores", [[NOW, 0.5]])], ["gpu_utilization_percent"]),
+    ],
+    ids=["measured", "filtered"],
+)
+def test_returned_measurements_do_not_name_the_delay(tmp_path, profile, returned, metrics):
+    service, client, task = launched(tmp_path, profile)
+    client.series = returned
+
+    result = service.usage(task["kind"], task["id"], metrics=metrics)
+
+    assert MAPPING_DELAY not in result["explanation"]
+    assert MAPPING_DELAY in result["advisory"]
+
+
 def test_experiment_usage_through_real_client_wire_format(tmp_path, profile, monkeypatch):
     import json
 

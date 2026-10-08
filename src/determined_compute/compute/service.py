@@ -91,6 +91,14 @@ _USAGE_MAX_SUMMARY_METRICS = 100
 _USAGE_SUMMARY_STATISTICS = ("count", "sum", "min", "max", "last", "mean")
 # A GPU utilization sample below this percentage counts as idle.
 _GPU_IDLE_PERCENT = 10
+# Determined attributes measurements to a task only after its allocation has run for the
+# master's observability.task_mapping_delay.
+_USAGE_MAPPING_DELAY = (
+    "Determined attributes measurements to a task only after its allocation has run for the "
+    "master's task-mapping delay (5 minutes by default), so the first minutes of each "
+    "allocation, and any allocation that ended sooner, have no data; a longer window does "
+    "not help."
+)
 _USAGE_ADVISORY = (
     "Values are point samples taken every step seconds, so min, max, and mean describe "
     "those samples rather than every moment of the window. A missing value means no "
@@ -98,7 +106,7 @@ _USAGE_ADVISORY = (
     "include other processes. allocation_active above zero means the allocation was running. "
     f"idle_fraction is the share of GPU utilization samples below {_GPU_IDLE_PERCENT}%, and "
     "p50 and p95 are nearest-rank percentiles of the available samples. "
-    "Coverage depends on the cluster's monitoring retention."
+    "Coverage depends on the cluster's monitoring retention. " + _USAGE_MAPPING_DELAY
 )
 _TIMESTAMP = re.compile(
     r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})?"
@@ -943,6 +951,8 @@ class ComputeService:
                 "not report training progress through Determined's Core API or has not "
                 "reported yet"
             )
+        if not returned:
+            explanation += ". " + _USAGE_MAPPING_DELAY
         result: Dict[str, Any] = {
             "kind": kind,
             "id": self._public_id(kind, remote_id),
