@@ -39,6 +39,7 @@ _REQUEST_FIELDS = {
     "output_dir",
     "slots",
     "pool",
+    "prefer_gpu_topology",
     "image",
     "code_revision",
     "experiment_config",
@@ -50,6 +51,8 @@ _REQUEST_FIELDS = {
 # Request fields that only a generic task accepts.
 _GENERIC_FIELDS = ("parent", "inherit_context", "pausable", "preemption_timeout")
 _TASK_KINDS = {"command", "shell", "experiment", "generic"}
+# The fork's prefer_gpu_topology values that take effect; false and null are off.
+_GPU_TOPOLOGY_PREFERENCES = ("soft", "strong")
 _NAME_MAX_LENGTH = 128
 _DESCRIPTION_MAX_LENGTH = 2048
 _SUBMISSION_MARKER_VARIABLE = "COMPUTE_SUBMISSION_MARKER"
@@ -322,6 +325,18 @@ class ComputeService:
         pool = request.get("pool", self.profile.default_pool)
         image = request.get("image", self.profile.default_image)
         _required_text(pool, "pool")
+        preference = request.get("prefer_gpu_topology")
+        if not (
+            preference is None
+            or preference is False
+            or (isinstance(preference, str) and preference in _GPU_TOPOLOGY_PREFERENCES)
+        ):
+            raise ValidationError(
+                'prefer_gpu_topology must be "soft", "strong", false, or null'
+            )
+        # The fork treats a preference as off below 2 slots, so it is sent only from 2 slots up,
+        # and false is never sent.
+        topology = preference if isinstance(preference, str) and slots >= 2 else None
         _required_text(image, "image")
         code_revision = request.get("code_revision")
         if code_revision is not None and not isinstance(code_revision, str):
@@ -364,6 +379,7 @@ class ComputeService:
                 output_dir,
                 slots,
                 pool,
+                topology,
                 image,
                 code_revision,
             )
@@ -377,6 +393,7 @@ class ComputeService:
                 output_dir,
                 slots,
                 pool,
+                topology,
                 image,
                 code_revision,
             )
@@ -410,6 +427,43 @@ class ComputeService:
                         "paused one runs the command again from the start in a new "
                         "container. Make the command skip completed outputs and resume or "
                         "clean up partial ones."
+                    ),
+                }
+            )
+        if isinstance(preference, str) and topology is None:
+            advisories.append(
+                {
+                    "code": "gpu_topology_ignored",
+                    "message": (
+                        "prefer_gpu_topology affects only tasks with 2 or more slots; it was "
+                        "not sent."
+                    ),
+                }
+            )
+        elif topology == "strong":
+            advisories.append(
+                {
+                    "code": "gpu_topology_strong",
+                    "message": (
+                        f"strong takes all {slots} GPUs from one NUMA node of one agent; "
+                        "is_single_node has no effect. Without allow_queue it launches only if "
+                        "such a node is free now; with allow_queue=true, and when resumed, it "
+                        "waits without a time limit. Each experiment trial separately needs "
+                        f"{slots} free GPUs on one NUMA node; trials can share a node."
+                    ),
+                }
+            )
+        elif topology == "soft":
+            advisories.append(
+                {
+                    "code": "gpu_topology_soft",
+                    "message": (
+                        "soft does not queue extra to wait for a better GPU topology and never "
+                        "guarantees one NUMA node: on the chosen agent it prefers the "
+                        "best-connected free GPUs (fewer in error, then P2P/NVLink and NUMA "
+                        "locality), and in some pools it prefers an agent "
+                        "where one NUMA node holds the task. It has no effect when the task "
+                        "spans several agents."
                     ),
                 }
             )
@@ -477,6 +531,7 @@ class ComputeService:
         output_dir: str,
         slots: int,
         pool: str,
+        topology: Optional[str],
         image: str,
         code_revision: Optional[str],
     ) -> Dict[str, Any]:
@@ -486,11 +541,14 @@ class ComputeService:
         ]
         if code_revision is not None:
             variables.append(f"COMPUTE_CODE_REVISION={code_revision}")
+        resources: Dict[str, Any] = {
+            ("slots_per_trial" if kind == "experiment" else "slots"): slots,
+            "resource_pool": pool,
+        }
+        if topology is not None:
+            resources["prefer_gpu_topology"] = topology
         return {
-            "resources": {
-                ("slots_per_trial" if kind == "experiment" else "slots"): slots,
-                "resource_pool": pool,
-            },
+            "resources": resources,
             "environment": {
                 "image": image,
                 "environment_variables": variables,
@@ -508,11 +566,12 @@ class ComputeService:
         output_dir: str,
         slots: int,
         pool: str,
+        topology: Optional[str],
         image: str,
         code_revision: Optional[str],
     ) -> Dict[str, Any]:
         config = self._base_config(
-            kind, workdir, output_dir, slots, pool, image, code_revision
+            kind, workdir, output_dir, slots, pool, topology, image, code_revision
         )
         if kind == "generic":
             # Generic tasks have native display fields; masters without them are
@@ -549,6 +608,7 @@ class ComputeService:
         output_dir: str,
         slots: int,
         pool: str,
+        topology: Optional[str],
         image: str,
         code_revision: Optional[str],
     ) -> Dict[str, Any]:
@@ -588,8 +648,12 @@ class ComputeService:
         resources = config.get("resources", {})
         if not isinstance(resources, Mapping):
             raise ValidationError("experiment_config.resources must be an object")
+        if "prefer_gpu_topology" in resources:
+            raise ValidationError("set prefer_gpu_topology at the top level")
         resources = copy.deepcopy(dict(resources))
         resources.update({"slots_per_trial": slots, "resource_pool": pool})
+        if topology is not None:
+            resources["prefer_gpu_topology"] = topology
         config["resources"] = resources
 
         environment = config.get("environment", {})

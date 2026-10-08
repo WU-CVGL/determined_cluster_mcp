@@ -449,3 +449,46 @@ def test_a_refused_pool_reaches_the_client_as_a_permission_error(monkeypatch):
         "retryable": False,
         "details": {"resource_pool": "a100"},
     }
+
+
+class _FakeInspector:
+    def __init__(self):
+        self.calls = []
+
+    def resources(self, slots, pool, prefer_gpu_topology):
+        self.calls.append((slots, pool, prefer_gpu_topology))
+        return {"requested_slots": slots, "prefer_gpu_topology": prefer_gpu_topology}
+
+
+def test_compute_resources_takes_the_requests_gpu_topology_values():
+    inspector = _FakeInspector()
+
+    async def exercise():
+        server = create_server(FakeService(), resource_inspector=inspector)
+        async with Client(server) as client:
+            tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+            schema = tools["compute_resources"].input_schema
+            preference = schema["properties"]["prefer_gpu_topology"]
+            assert preference["default"] is None
+            assert preference["anyOf"] == [
+                {"enum": ["soft", "strong", False]}, {"type": "null"},
+            ]
+            assert "prefer_gpu_topology" in tools["compute_plan"].description
+            default = await client.call_tool("compute_resources", {"slots": 2})
+            for value in ("soft", "strong", False, None):
+                result = await client.call_tool(
+                    "compute_resources", {"slots": 4, "prefer_gpu_topology": value}
+                )
+                assert result.is_error is False
+            for value in ("Soft", True, 1, 0, 0.0, "off"):
+                result = await client.call_tool(
+                    "compute_resources", {"slots": 4, "prefer_gpu_topology": value}
+                )
+                assert result.is_error is True
+            return default
+
+    default = asyncio.run(asyncio.wait_for(exercise(), timeout=10))
+    assert default.is_error is False
+    assert inspector.calls == [
+        (2, None, None), (4, None, "soft"), (4, None, "strong"), (4, None, False), (4, None, None),
+    ]

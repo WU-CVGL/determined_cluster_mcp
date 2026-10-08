@@ -78,6 +78,7 @@ does not enforce an idle timeout.
 | `workdir` | absolute container path | Working directory under a writable configured mount |
 | `output_dir` | absolute container path | Output directory under a writable configured mount |
 | `slots` | non-negative integer | Requested slots; defaults to the profile value |
+| `prefer_gpu_topology` | `"soft"`, `"strong"`, `false`, or null | GPU placement for 2 or more slots; requires the research-cluster fork 0.42.0 or later. `"strong"` takes all GPUs from one NUMA node of one agent and waits until one has them free; `"soft"` does not queue extra to wait for a better GPU topology, never guarantees one NUMA node, and prefers the best-connected free GPUs of the chosen agent. Sent only with 2 or more slots and `"soft"` or `"strong"`. An experiment sets it here, not in `experiment_config.resources` |
 | `pool`, `image` | string | Optional overrides of profile defaults |
 | `code_revision` | string or null | Caller-provided revision or content identifier |
 | `experiment_config` | object | Extra experiment configuration; requires experiment mode |
@@ -257,7 +258,7 @@ positive integer for an experiment, which can also be passed as a numeric string
 | `compute_pause` | `kind`, `id` | Experiments and generic tasks: task summary, remote response, and `pause_acknowledged` |
 | `compute_resume` | `kind`, `id` | Experiments and generic tasks: task summary, remote response, and `resume_acknowledged` |
 | `compute_list` | `kind`, optional `limit=50`, `offset=0`, `marker`, `states` | One page of the account's tasks, newest first; with `states`, only experiments or generic tasks in those states; with `marker`, the tasks on that page whose config carries it |
-| `compute_resources` | optional `slots=1`, `pool` | Current scheduler capacity and candidate pools |
+| `compute_resources` | optional `slots=1`, `pool`, `prefer_gpu_topology` | Current scheduler capacity and candidate pools. With `"strong"` and 2 or more slots, each pool adds `max_numa_node_free_slots` (largest `"strong"` task that fits now) and `max_numa_node_slots` (largest the master accepts with the current agents) |
 | `storage_check` | `path` | Access information for a mapped container path |
 | `storage_sync` | `local_dir`, `shared_dir`, optional `dry_run=true` | Preview or copy local directory contents to shared storage |
 | `storage_fetch` | `shared_dir`, `local_dir`, optional `dry_run=true` | Preview or copy shared directory contents locally |
@@ -282,6 +283,19 @@ more `slots_per_trial` and without `is_single_node: true` may span agents, which
 does not check: it is admitted when one agent has the free slots and is otherwise
 `capacity_unknown`, so set `is_single_node: true` when it fits on one agent, or use
 `allow_queue: true` when the user agrees to wait.
+
+With `prefer_gpu_topology: "strong"` and 2 or more slots, every kind, an experiment
+included, needs one schedulable agent with N free GPUs on one NUMA node of that agent;
+`"soft"` is checked like no preference. For `"strong"`, capacity is also unknown when an
+agent's GPU topology is not visible to the account or does not match its slots. A
+`"strong"` request that the master refuses with the pool's current agents, static or
+provisioned, fails with `capacity_unavailable` and `retryable: false`: when no agent has N
+slots, the request needs fewer slots or another pool; when an agent has N slots but no NUMA
+node does, `"soft"` may fit. A pool that is not static and has no agents yet waits for them.
+With 0 or 1 slot the preference has no effect: it is not sent, and the
+plan carries the advisory `gpu_topology_ignored`. Admission does not see waiting tasks: a
+higher-priority task waiting for a NUMA node can keep an admitted lower-priority task
+queued.
 
 `compute_launch` checks capacity unless `allow_queue` is explicitly true, then submits
 the request once. A pool missing from the account's pool list fails that check with
@@ -470,6 +484,10 @@ and HTTP 409 while another pause, resume, or kill is in progress; these are ordi
 errors that carry the master's reason. An older master reports the same refusals as
 server errors, which arrive as `submission_uncertain` errors whose message includes the
 master's reason; check `compute_status` before repeating the call.
+
+Resuming does not check capacity: the task queues until it fits, and with
+`prefer_gpu_topology: "strong"` it waits, without a time limit, until one NUMA node has its
+slots free.
 
 For a running shell, use the sanitized `reconnectCommand`, currently
 `det shell show_ssh_command <id>`, which `compute_launch` also returns as

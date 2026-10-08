@@ -12,11 +12,23 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence, Union
+from typing import Annotated, Any, Callable, Literal, Optional, Sequence, Union
 
 from determined_compute.compute import ComputeError, ComputeProfile, ComputeService
 from determined_compute.core.api_client import APIError as ClientAPIError
 from determined_compute.core.api_client import DeterminedAPIClient
+
+try:  # pydantic ships with the optional mcp extra; tool annotations need it only then.
+    from pydantic import BeforeValidator
+except ImportError:  # pragma: no cover - exercised without the optional extra
+    BeforeValidator = None
+
+
+def _exact_preference(value: Any) -> Any:
+    # Lax validation would turn 0 and 0.0 into False; the request accepts only the bool.
+    if value is None or value is False or isinstance(value, str):
+        return value
+    raise ValueError('prefer_gpu_topology must be "soft", "strong", false, or null')
 
 
 class _LazyClient:
@@ -86,6 +98,8 @@ def create_server(
             "Choose a meaningful request.name and request.description for each launch. "
             "Use compute_resources for capacity questions. Launch checks capacity unless "
             "queuing is explicitly authorized with allow_queue=true. "
+            "For multi-GPU work, pass the same prefer_gpu_topology to compute_resources and "
+            "the request. "
             "Keep code and data on shared mounts; use storage_check/sync/fetch for file access. "
             "Plan before launch. Every launch is a new submission: the server keeps no task "
             "records, so keep the returned kind and id, which are Determined's own task ID. "
@@ -122,7 +136,8 @@ def create_server(
     async def compute_plan(request: dict[str, Any]) -> dict[str, Any]:
         """Render a request offline. Include name, description, command, workdir and output_dir.
 
-        Optional kind, slots, pool, image and allow_queue control execution; paths use container mounts.
+        Optional kind, slots, pool, prefer_gpu_topology, image and allow_queue control execution;
+        paths use container mounts.
         """
 
         return await call(service.plan, request)
@@ -230,9 +245,19 @@ def create_server(
         @server.tool(annotations=ToolAnnotations(
             read_only_hint=True, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
         ))
-        async def compute_resources(slots: int = 1, pool: Optional[str] = None) -> dict[str, Any]:
-            """Inspect current scheduler capacity; slots=0 checks auxiliary capacity, not free GPUs."""
-            return await call(resource_inspector.resources, slots, pool)
+        async def compute_resources(
+            slots: int = 1,
+            pool: Optional[str] = None,
+            prefer_gpu_topology: Annotated[
+                Optional[Literal["soft", "strong", False]], BeforeValidator(_exact_preference)
+            ] = None,
+        ) -> dict[str, Any]:
+            """Inspect current scheduler capacity; slots=0 checks auxiliary capacity, not free GPUs.
+
+            Pass the request's prefer_gpu_topology; with "strong" and 2 or more slots each pool
+            adds max_numa_node_free_slots and max_numa_node_slots.
+            """
+            return await call(resource_inspector.resources, slots, pool, prefer_gpu_topology)
 
     if storage_service is not None:
 
