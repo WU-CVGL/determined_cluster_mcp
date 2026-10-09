@@ -169,8 +169,8 @@ URL 和凭据：此时忽略环境中的 `DET_API_TOKEN`、`DET_USERNAME` 和 `D
 选定的 master。凭据应放在现有凭据提供方或 secrets 文件中，不要写入配置、工具参数或报告。
 
 除[shell 访问](#shell-access)外，服务自身不写入任何文件。shell 访问会在 `--shell-access-dir` 或
-`DETERMINED_COMPUTE_SHELL_ACCESS` 选定的目录中写入所连接 shell 的密钥文件、生成的 `ssh_config` 和
-`ssh-mcp.toml`，以及一个锁文件；还会为 OpenSSH 多路复用 socket 创建一个私有目录：该目录下的
+`DETERMINED_COMPUTE_SHELL_ACCESS` 选定的目录中写入所连接 shell 的密钥文件、生成的 `ssh_config`、
+`ssh_hosts` 和 `ssh-mcp.toml` 文件，以及一个锁文件；还会为 OpenSSH 多路复用 socket 创建一个私有目录：该目录下的
 `cm/`，若该路径过长，则为 `$XDG_RUNTIME_DIR/determined-compute` 或 `~/.ssh/det-cm`。
 升级后应重启所有 MCP 进程，使其加载当前的工具集。
 
@@ -533,7 +533,8 @@ MCP server（例如来自第二个客户端会话的 server）连接时会以 `s
 | --- | --- |
 | `<shell id>/key` | shell 的私钥，权限 0600 |
 | `<shell id>/known_hosts` | `[127.0.0.1]:<port>` 和 shell 的公钥 |
-| `ssh_config` | OpenSSH 配置，本 server 的每条已打开隧道各对应一个 `Host` 块；没有已打开的隧道时删除 |
+| `ssh_config` | 供 `ssh -F` 使用的 OpenSSH 配置，本 server 的每条已打开隧道各对应一个 `Host` 块，最后一个块使没有隧道的别名立即失败；没有已打开的隧道时删除 |
+| `ssh_hosts` | 相同的隧道块，但不含最后那个块，供在 `~/.ssh/config` 中 `Include`；没有已打开的隧道时删除 |
 | `ssh-mcp.toml` | ssh-mcp 配置，本 server 的每条已打开隧道各对应一个 profile；没有已打开的隧道时删除 |
 | `cm/` | 多路复用 socket，仅在该目录的路径足够短时使用 |
 | `.lock` | 使该目录只由一个 server 使用的锁 |
@@ -556,11 +557,12 @@ MCP server（例如来自第二个客户端会话的 server）连接时会以 `s
 之间不变。这也使用户可以一次性允许它，例如使用 Claude Code 权限规则
 `Bash(ssh -F /home/me/.cache/determined-compute/shell-access/ssh_config det-*)`。在
 `~/.ssh/config` 靠前、任何 `Host` 或 `Match` 行之前加入一次
-`Include /home/me/.cache/determined-compute/shell-access/ssh_config` 后，`ssh det-4ed328fa` 也可
+`Include /home/me/.cache/determined-compute/shell-access/ssh_hosts` 后，`ssh det-4ed328fa` 也可
 使用，VS Code Remote-SSH 等 IDE 也会列出这些别名。OpenSSH 对每个选项采用它找到的第一个值，因此位于
 `Host` 或 `Match` 行之后的 `Include` 只作用于该块，而 `~/.ssh/config` 中更靠前的设置优先于生成的
-设置。server 从不编辑 `~/.ssh/config`。没有已打开隧道的别名会立即因连接 `127.0.0.1` 端口 1 被拒绝而
-失败，而不会被当作主机名去解析。
+设置。server 从不编辑 `~/.ssh/config`。通过 `ssh_command` 使用时，没有已打开隧道的别名会立即因连接
+`127.0.0.1` 端口 1 被拒绝而失败，而不会被当作主机名去解析。`ssh_hosts` 不含这个兜底块：若它在
+`~/.ssh/config` 中最先被包含，就会优先于你自己那些名称形如别名的主机。
 
 Unix socket 路径最多约 104 字节，因此 socket 放在以下目录中第一个路径不超过 42 字节、由本用户拥有且
 权限为 0700、并且不含控制字符或 `${` 的目录：shell 访问目录下的 `cm/`、`$XDG_RUNTIME_DIR/determined-compute`，以及 `~/.ssh/det-cm`

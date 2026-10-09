@@ -291,6 +291,7 @@ def test_ssh_config_lists_open_tunnels_and_goes_with_the_last(access, tmp_path):
     assert "Host det-5b9c2f3e\n" not in Path(first["ssh_config_path"]).read_text()
     access.disconnect(OTHER_SHELL_ID)
     assert not os.path.exists(first["ssh_config_path"])
+    assert not Path(first["ssh_config_path"]).with_name("ssh_hosts").exists()
 
 
 def test_the_control_directory_falls_back_in_order(client, tmp_path, monkeypatch):
@@ -496,6 +497,28 @@ def test_an_alias_without_a_tunnel_fails_at_once_without_a_lookup(access):
     # A real tunnel's block comes first, so the fallback changes nothing for it.
     printed = _resolved(result)
     assert f"port {result['port']}" in printed and "hostname 127.0.0.1" in printed
+
+
+@pytest.mark.skipif(shutil.which("ssh") is None, reason="ssh is not installed")
+def test_including_ssh_hosts_leaves_the_users_own_hosts_alone(access, tmp_path):
+    result = access.connect(SHELL_ID)
+    hosts = Path(result["ssh_config_path"]).with_name("ssh_hosts")
+    assert _mode(hosts) == 0o600
+    assert "Port 1\n" not in hosts.read_text()
+    user_config = tmp_path / "user_config"
+    user_config.write_text(
+        f'Include "{hosts}"\n\nHost det-abcdef12\n  HostName real.example\n  Port 2222\n'
+    )
+
+    def resolve(alias):
+        return subprocess.run(
+            ["ssh", "-G", "-F", str(user_config), alias], check=True, capture_output=True, text=True
+        ).stdout.splitlines()
+
+    own = resolve("det-abcdef12")
+    assert "hostname real.example" in own and "port 2222" in own
+    tunnel = resolve(result["ssh_alias"])
+    assert "hostname 127.0.0.1" in tunnel and f"port {result['port']}" in tunnel
 
 
 def test_a_reused_connect_returns_no_static_advisories(access):
@@ -906,6 +929,7 @@ def test_a_failed_config_rewrite_on_disconnect_drops_the_config(access, tmp_path
     assert access.disconnect(SHELL_ID)["disconnected"] is True
     directory = tmp_path / "access"
     assert not (directory / SSH_MCP_CONFIG).exists()
+    assert not (directory / "ssh_config").exists() and not (directory / "ssh_hosts").exists()
     assert not (directory / f".{SSH_MCP_CONFIG}.tmp").exists()
     assert not (directory / SHELL_ID).exists()
 

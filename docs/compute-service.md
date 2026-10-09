@@ -191,8 +191,8 @@ existing provider or secrets file rather than the profile, tool arguments, or re
 
 The server writes no files of its own except for [shell access](#shell-access). In the
 directory that `--shell-access-dir` or `DETERMINED_COMPUTE_SHELL_ACCESS` selects, it writes
-key files for the shells it connects, a generated `ssh_config` and `ssh-mcp.toml`, and a
-lock file. It also creates one private directory for OpenSSH multiplexing sockets: that
+key files for the shells it connects, generated `ssh_config`, `ssh_hosts`, and
+`ssh-mcp.toml` files, and a lock file. It also creates one private directory for OpenSSH multiplexing sockets: that
 directory's `cm/`, or, when that path is too long, `$XDG_RUNTIME_DIR/determined-compute`
 or `~/.ssh/det-cm`. After an upgrade,
 restart every MCP process so that it loads the current tool set.
@@ -612,7 +612,8 @@ lock again, or fails if another server holds it. The directory holds:
 | --- | --- |
 | `<shell id>/key` | The shell's private key, mode 0600 |
 | `<shell id>/known_hosts` | `[127.0.0.1]:<port>` and the shell's public key |
-| `ssh_config` | OpenSSH config with one `Host` block per open tunnel of this server; removed when none is open |
+| `ssh_config` | OpenSSH config for `ssh -F`, with one `Host` block per open tunnel of this server and a last block that makes an alias without a tunnel fail at once; removed when none is open |
+| `ssh_hosts` | The same tunnel blocks without that last block, to `Include` from `~/.ssh/config`; removed when none is open |
 | `ssh-mcp.toml` | ssh-mcp config with one profile per open tunnel of this server; removed when none is open |
 | `cm/` | Multiplexing sockets, used only when the directory's path is short enough |
 | `.lock` | The lock that keeps the directory to one server |
@@ -636,13 +637,15 @@ The alias stays the same while the tunnel is open, and the config is rewritten w
 tunnel opens or closes, so the command for a shell does not change between calls. That
 also lets the user allow it once, for example with the Claude Code permission rule
 `Bash(ssh -F /home/me/.cache/determined-compute/shell-access/ssh_config det-*)`. With
-`Include /home/me/.cache/determined-compute/shell-access/ssh_config` added once near the
+`Include /home/me/.cache/determined-compute/shell-access/ssh_hosts` added once near the
 top of `~/.ssh/config`, before any `Host` or `Match` line, `ssh det-4ed328fa` works too,
 and IDEs such as VS Code Remote-SSH list the aliases. OpenSSH uses the first value it
 finds for each option, so an `Include` after a `Host` or `Match` line applies only to that
 block, and settings earlier in `~/.ssh/config` take precedence over the generated ones.
-The server never edits `~/.ssh/config`. An alias without an open tunnel fails at once
-with a refused connection to `127.0.0.1` port 1, rather than being looked up as a host.
+The server never edits `~/.ssh/config`. Through `ssh_command`, an alias without an open
+tunnel fails at once with a refused connection to `127.0.0.1` port 1, rather than being
+looked up as a host. `ssh_hosts` leaves that fallback out: included first in
+`~/.ssh/config`, it would take precedence over your own hosts with alias-shaped names.
 
 A Unix socket path holds about 104 bytes, so the sockets go to the first of these
 directories whose path has at most 42 bytes, that this user owns with mode 0700, and that

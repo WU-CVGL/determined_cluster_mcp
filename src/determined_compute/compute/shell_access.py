@@ -35,6 +35,9 @@ from .models import APIError, ConflictError, ValidationError
 LOOPBACK = "127.0.0.1"
 SSH_MCP_CONFIG = "ssh-mcp.toml"
 SSH_CONFIG = "ssh_config"
+# The tunnel blocks alone, for an Include from ~/.ssh/config: the stale-alias fallback in
+# ssh_config would otherwise override the user's own hosts that match its patterns.
+SSH_HOSTS = "ssh_hosts"
 _LOCK = ".lock"
 # The only files a shell's subdirectory holds; nothing else is ever deleted.
 _SHELL_FILES = frozenset({"key", "known_hosts"})
@@ -427,10 +430,11 @@ def _remove_shell_directory(directory: Path) -> None:
     os.rmdir(directory)
 
 
-# Last in ssh_config: an alias whose tunnel is gone fails at once on a refused local port,
-# instead of being looked up as a host name with OpenSSH's defaults. Tunnel blocks come
-# first and OpenSSH keeps the first value of each option, so they are unaffected; the
-# patterns match only alias-shaped names, so an Include of this file changes no other host.
+# Last in ssh_config, the file for ssh -F: an alias whose tunnel is gone fails at once on a
+# refused local port, instead of being looked up as a host name with OpenSSH's defaults.
+# Tunnel blocks come first and OpenSSH keeps the first value of each option, so they are
+# unaffected. ssh_hosts, the file to Include, leaves it out: there it would take precedence
+# over the user's own hosts whose names match these patterns.
 _UNKNOWN_ALIAS_BLOCK = (
     "Host det-???????? det-????????-????-????-????-????????????\n"
     "  HostName 127.0.0.1\n"
@@ -722,17 +726,14 @@ class ShellAccess:
         )
         records = [self._tunnels[shell_id].record for shell_id in sorted(self._tunnels)]
         if not records:
-            self._replace_private(self.directory / SSH_CONFIG, None)
-            self._replace_private(self.directory / SSH_MCP_CONFIG, None)
+            for name in (SSH_CONFIG, SSH_HOSTS, SSH_MCP_CONFIG):
+                self._replace_private(self.directory / name, None)
             return
         control_directory = self._control_directory()
+        blocks = [ssh_config_block(record, control_directory) for record in records]
+        self._replace_private(self.directory / SSH_HOSTS, "\n".join([header] + blocks))
         self._replace_private(
-            self.directory / SSH_CONFIG,
-            "\n".join(
-                [header]
-                + [ssh_config_block(record, control_directory) for record in records]
-                + [_UNKNOWN_ALIAS_BLOCK]
-            ),
+            self.directory / SSH_CONFIG, "\n".join([header] + blocks + [_UNKNOWN_ALIAS_BLOCK])
         )
         self._replace_private(
             self.directory / SSH_MCP_CONFIG,
@@ -1032,7 +1033,7 @@ class ShellAccess:
             self._write_configs()
         except OSError:
             # The tunnel is gone; a config that still listed it would mislead its clients.
-            for name in (SSH_CONFIG, SSH_MCP_CONFIG):
+            for name in (SSH_CONFIG, SSH_HOSTS, SSH_MCP_CONFIG):
                 with suppress(OSError):
                     (self.directory / name).unlink()
         return True
