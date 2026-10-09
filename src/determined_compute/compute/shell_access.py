@@ -380,9 +380,12 @@ class _Tunnel:
         self.thread = threading.Thread(
             target=server.serve_forever, name=f"shell-tunnel-{shell_id[:8]}", daemon=True
         )
-        # The identity of the key and known_hosts files as written.
+        # The identity and content of the key and known_hosts files as written. An inode
+        # number alone can be handed to another server's file once this one is deleted; that
+        # server's known_hosts names its own port, so its content cannot match.
         self.files = {
-            name: self._identity(directory / name) for name in sorted(_SHELL_FILES)
+            name: (self._identity(directory / name), self._content(directory / name))
+            for name in sorted(_SHELL_FILES)
         }
 
     @staticmethod
@@ -393,11 +396,21 @@ class _Tunnel:
             return None
         return (status.st_dev, status.st_ino) if stat.S_ISREG(status.st_mode) else None
 
+    @staticmethod
+    def _content(path: Path) -> Optional[bytes]:
+        try:
+            return path.read_bytes()
+        except OSError:
+            return None
+
     def files_unchanged(self) -> bool:
         """Whether the shell's files are still the ones this tunnel wrote."""
         return all(
-            identity is not None and self._identity(self.directory / name) == identity
-            for name, identity in self.files.items()
+            identity is not None
+            and content is not None
+            and self._identity(self.directory / name) == identity
+            and self._content(self.directory / name) == content
+            for name, (identity, content) in self.files.items()
         )
 
     def stop(self) -> None:
