@@ -161,7 +161,7 @@ Determined 本身也会执行权限检查。在使用 basic authorization 的 fo
 - 探测错误 `WebSocketProxyException: failed CONNECT via proxy status: <status>` 来自为 master 选定的 HTTP 代理：407 表示它要求其他凭据（在代理 URL 中设置），403 或 405 表示它不允许对 master 端口的 `CONNECT`。TLS 错误和其他代理失败的原因与 API 相同；见[TLS 证书验证失败](#tls-certificate-verification-fails)和[通过代理无法访问 master](#the-master-is-unreachable-through-a-proxy)。
 - `port_unavailable`：请求的 `local_port` 已被其他程序占用。省略该参数即可获得一个空闲端口。
 - `shell_access_conflict`，且消息说另一个 determined-compute-mcp 进程正在使用该 shell 访问目录：另一个 MCP 服务（例如来自另一个客户端会话的服务）正在使用它。为每个服务分别指定各自的 `--shell-access-dir` 或 `DETERMINED_COMPUTE_SHELL_ACCESS`。
-- `shell_access_conflict`，且消息说本 server 有已打开的隧道时 shell 访问目录被删除或被接管：该目录或其锁文件被删除，其他 server 现在可能正在使用它。对本 server 已打开的隧道调用 `compute_shell_disconnect`（不会改动该目录中的文件），或重启 server；然后再连接。
+- `shell_access_conflict`，且消息说本 server 有已打开的隧道时 shell 访问目录被删除或被接管：该目录被删除，或其锁文件被删除且其他 server 锁定了新的锁文件。对本 server 已打开的隧道调用 `compute_shell_disconnect`（不会改动该目录中的文件），或重启 server；然后再连接。
 - `shell_access_conflict`，且消息说该 shell 已有隧道：隧道已在另一个端口上打开。使用该隧道，或先调用 `compute_shell_disconnect`，再以另一个 `local_port` 连接。
 - `shell_access_conflict`，且消息说某个目录已存在但不是 shell 访问目录：以该 shell 的 ID 命名的目录中有 shell 访问文件以外的内容。删除该目录，或使用专用的 shell 访问目录。
 - ssh-mcp 因找不到配置文件而启动失败，或不认识该 profile：该文件只在有隧道打开时存在，而 ssh-mcp 只在启动时读取它，因此请在 `compute_shell_connect` 之后启动或重新连接 ssh-mcp。检查注册时是否写成 `--config=<ssh_mcp.config_path>`（带 `=`）：ssh-mcp 会忽略以空格分隔的值。

@@ -649,6 +649,29 @@ def test_a_failed_config_rewrite_on_disconnect_drops_the_config(access, tmp_path
     assert [profile["name"] for profile in profiles] == [f"det-shell-{OTHER_SHELL_ID}"]
 
 
+def test_a_removed_lock_file_without_another_server_is_locked_again(access, tmp_path):
+    directory = tmp_path / "access"
+    access.connect(SHELL_ID)
+    access.connect(OTHER_SHELL_ID)
+    (directory / ".lock").unlink()
+    assert access.connect(SHELL_ID)["reused"] is True
+    assert (directory / ".lock").exists()
+    # The new lock file is held: another server cannot take the directory.
+    other = ShellAccess(access.service, directory, Opener())
+    try:
+        with pytest.raises(APIError) as caught:
+            other.connect(SHELL_ID)
+        assert "another determined-compute-mcp process" in str(caught.value)
+    finally:
+        other.close_all()
+    assert access.disconnect(SHELL_ID)["disconnected"] is True
+    assert not (directory / SHELL_ID).exists()
+    profiles = _config(directory / SSH_MCP_CONFIG)["profiles"]
+    assert [profile["name"] for profile in profiles] == [f"det-shell-{OTHER_SHELL_ID}"]
+    access.close_all()
+    assert sorted(path.name for path in directory.iterdir()) == [".lock"]
+
+
 @pytest.mark.parametrize("removed", ["directory", "lock"])
 def test_a_server_that_lost_its_directory_leaves_the_new_owners_files_alone(
     access, client, tmp_path, removed

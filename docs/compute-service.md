@@ -590,8 +590,9 @@ deletes the shell subdirectories and the `ssh-mcp.toml` that an ended process le
 behind; the next connect writes `ssh-mcp.toml` again. A shell subdirectory is one named by
 a shell ID that holds nothing but the regular files `key` and `known_hosts`. Nothing else
 is ever deleted: a connect that finds any other directory under the shell's ID fails with
-`shell_access_conflict`. If the directory or its lock file is deleted while the server
-runs, another server may take the directory over, so this one stops touching its files:
+`shell_access_conflict`. If only the lock file is deleted while the server runs, the
+server locks a new one and carries on, unless another server locked it first. If the
+directory is deleted, or another server took it over, this server stops touching its files:
 while it has open tunnels, connect fails with `shell_access_conflict` and disconnecting
 closes them without deleting anything; once none is open, the next connect takes the
 lock again, or fails if another server holds it. The directory holds:

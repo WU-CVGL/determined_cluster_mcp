@@ -471,8 +471,32 @@ class ShellAccess:
         return held.st_nlink > 0 and (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
 
     def _owns_directory(self) -> bool:
-        """Whether this process still holds the lock on the directory's current lock file."""
-        return self._claim is not None and self._claim_is_current()
+        """Whether this process holds the lock on the directory's current lock file.
+
+        When only the lock file was removed and no other server locked its replacement, this
+        locks it again, so it changes the claim: call it with ``self._lock`` held.
+        """
+        if self._claim is None:
+            return False
+        if self._claim_is_current():
+            return True
+        # A removed directory took the tunnels' files with it: that is not ours to repair.
+        if not all(
+            self._is_shell_directory(tunnel.directory)
+            and all((tunnel.directory / name).is_file() for name in _SHELL_FILES)
+            for tunnel in self._tunnels.values()
+        ):
+            return False
+        try:
+            self._prepare_directory()
+            descriptor = self._try_lock()
+        except (OSError, ValidationError):
+            descriptor = None
+        if descriptor is None:
+            return False
+        os.close(self._claim)
+        self._claim = descriptor
+        return True
 
     def _claim_directory(self) -> None:
         """Take the directory for this process, removing what an ended one left behind."""
