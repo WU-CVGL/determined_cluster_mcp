@@ -292,9 +292,10 @@ def create_server(
 
             wait_seconds (up to 600) waits for the shell to run and its sshd to answer, so no
             status polling is needed. Run commands with ssh_command (ssh -F <config> <alias>)
-            followed by the command; one multiplexed connection serves them all. Also returns
-            an ssh-mcp profile; the private key stays in key_path. Calling it again returns
-            the open tunnel; another local_port needs a disconnect first.
+            followed by the command; when control_path_dir is set, one multiplexed connection
+            serves them all. Also returns the ssh-mcp config path and profile name; the private
+            key stays in key_path. Calling it again returns the open tunnel; another local_port
+            needs a disconnect first.
             """
             return await call(shell_access.connect, id, local_port, wait_seconds)
 

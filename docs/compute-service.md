@@ -189,9 +189,12 @@ and `DET_API_TOKEN` from the environment before the file. `--api-token` replaces
 other token or login and is sent only to the selected master. Keep credentials in the
 existing provider or secrets file rather than the profile, tool arguments, or reports.
 
-The server writes no files of its own except for [shell access](#shell-access): key files
-for the shells it connects and a generated ssh-mcp config, in the directory that
-`--shell-access-dir` or `DETERMINED_COMPUTE_SHELL_ACCESS` selects. After an upgrade,
+The server writes no files of its own except for [shell access](#shell-access). In the
+directory that `--shell-access-dir` or `DETERMINED_COMPUTE_SHELL_ACCESS` selects, it writes
+key files for the shells it connects, a generated `ssh_config` and `ssh-mcp.toml`, and a
+lock file. It also creates one private directory for OpenSSH multiplexing sockets: that
+directory's `cm/`, or, when that path is too long, `$XDG_RUNTIME_DIR/determined-compute`
+or `~/.ssh/det-cm`. After an upgrade,
 restart every MCP process so that it loads the current tool set.
 
 Optional client-side access to mapped storage uses the same profile and a separate
@@ -264,7 +267,7 @@ positive integer for an experiment, which can also be passed as a numeric string
 | `compute_pause` | `kind`, `id` | Experiments and generic tasks: task summary, remote response, and `pause_acknowledged` |
 | `compute_resume` | `kind`, `id` | Experiments and generic tasks: task summary, remote response, and `resume_acknowledged` |
 | `compute_list` | `kind`, optional `limit=50`, `offset=0`, `marker`, `states` | One page of the account's tasks, newest first; with `states`, only experiments or generic tasks in those states; with `marker`, the tasks on that page whose config carries it |
-| `compute_shell_connect` | `id`, optional `local_port` | Opens or returns a local SSH tunnel to one of the account's running shells; see [shell access](#shell-access) |
+| `compute_shell_connect` | `id`, optional `local_port`, `wait_seconds=0` (up to 600) | Opens or returns a local SSH tunnel to one of the account's running shells; see [shell access](#shell-access) |
 | `compute_shell_disconnect` | `id` | Closes that tunnel and deletes the shell's key file; the shell keeps running |
 | `compute_resources` | optional `slots=1`, `pool`, `prefer_gpu_topology` | Current scheduler capacity and candidate pools. With `"strong"` and 2 or more slots, each pool adds `max_numa_node_free_slots` (largest `"strong"` task that fits now) and `max_numa_node_slots` (largest the master accepts with the current agents). Each pool also has `description` and `gpu_models` |
 | `storage_check` | `path` | Access information for a mapped container path |
@@ -556,7 +559,7 @@ The result has these fields:
 | `ssh_command` | `ssh -F <ssh_config_path> <ssh_alias>`: append the command to run in the shell |
 | `ssh_alias` | The shell's `Host` name in the generated `ssh_config`, `det-<first 8 hex digits of the shell ID>`, or `det-<shell id>` when another open tunnel already uses that; it stays the same while the tunnel is open |
 | `ssh_config_path` | Absolute path of the generated OpenSSH config |
-| `control_path_dir` | Directory of the OpenSSH multiplexing sockets, or `null` when no directory is short enough and commands are not multiplexed |
+| `control_path_dir` | Directory of the OpenSSH multiplexing sockets, or `null` on Windows or when no candidate directory is short and private enough, and commands are then not multiplexed |
 | `host`, `port` | Always `127.0.0.1`, and the listening port |
 | `user` | Login user: the agent user that Determined runs the shell as, as for `det shell open` |
 | `key_path`, `known_hosts_path` | Absolute paths of the private key file and of the pinned host-key entry for this port |
@@ -622,8 +625,8 @@ An agent with a local shell tool that the user allows can do this directly; it a
 shells created during the work. The generated `ssh_config` gives each alias the port,
 user, key, and pinned host key, and:
 
-- `BatchMode yes` and `LogLevel ERROR`, so that `ssh` never prompts and its output holds
-  only the command's own output;
+- `BatchMode yes` and `LogLevel ERROR`, so that `ssh` never prompts and prints no
+  informational notices; only its own errors reach stderr;
 - `ServerAliveInterval 30`, so that a dropped tunnel ends the session instead of hanging;
 - `ControlMaster auto`, `ControlPath <control_path_dir>/%C`, and `ControlPersist 10m`:
   the first command opens one SSH connection, and later commands reuse it for 10 minutes
@@ -633,18 +636,24 @@ The alias stays the same while the tunnel is open, and the config is rewritten w
 tunnel opens or closes, so the command for a shell does not change between calls. That
 also lets the user allow it once, for example with the Claude Code permission rule
 `Bash(ssh -F /home/me/.cache/determined-compute/shell-access/ssh_config det-*)`. With
-`Include /home/me/.cache/determined-compute/shell-access/ssh_config` added to
-`~/.ssh/config` once, `ssh det-4ed328fa` works too, and IDEs such as VS Code Remote-SSH
-list the aliases. The server never edits `~/.ssh/config`.
+`Include /home/me/.cache/determined-compute/shell-access/ssh_config` added once near the
+top of `~/.ssh/config`, before any `Host` or `Match` line, `ssh det-4ed328fa` works too,
+and IDEs such as VS Code Remote-SSH list the aliases. OpenSSH uses the first value it
+finds for each option, so an `Include` after a `Host` or `Match` line applies only to that
+block, and settings earlier in `~/.ssh/config` take precedence over the generated ones.
+The server never edits `~/.ssh/config`. An alias without an open tunnel fails at once
+with a refused connection to `127.0.0.1` port 1, rather than being looked up as a host.
 
 A Unix socket path holds about 104 bytes, so the sockets go to the first of these
-directories whose path has at most 42 characters, with mode 0700: the shell-access
+directories whose path has at most 42 bytes, that this user owns with mode 0700, and that
+holds no control character or `${`: the shell-access
 directory's `cm/`, `$XDG_RUNTIME_DIR/determined-compute`, and `~/.ssh/det-cm` (when
 `~/.ssh` exists). When none fits, `control_path_dir` is `null` and each command opens its
-own connection. Disconnecting a shell, cancelling it, or restarting the MCP server ends
+own connection; a chosen directory that was removed is created again. Disconnecting a shell, cancelling it, or restarting the MCP server ends
 its connection, so its multiplexing master exits and removes its socket. Determined's
 sshd keeps OpenSSH's default `MaxSessions` of 10 sessions per connection, so at most 10
-commands run at once through one master. OpenSSH for Windows does not multiplex.
+commands run at once through one master; further commands open their own connections and
+still run. OpenSSH for Windows does not multiplex.
 
 `compute_launch` still returns `reconnect_command`, currently
 `det shell show_ssh_command <id>`, for users of the native CLI. The adapter removes
@@ -672,8 +681,8 @@ supports elicitation.
    Use the absolute path of the configured shell-access directory. ssh-mcp reads only the
    `--flag=value` form: with a space instead of `=`, `--config` has no path and
    `--hostKeyMode` stays at `tofu`.
-2. Launch a shell, wait until `compute_status` reports `STATE_RUNNING`, and call
-   `compute_shell_connect(id)`.
+2. Launch a shell and call `compute_shell_connect(id, wait_seconds=300)`; if `probe.ok`
+   is still `false`, call it again.
 3. Start, restart, or reconnect ssh-mcp (in Claude Code, `/mcp`). The file exists only
    while at least one tunnel is open; until then ssh-mcp exits at startup because its
    `--config` file is missing, and its MCP client shows it as failed, which is expected.

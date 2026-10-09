@@ -122,10 +122,10 @@ MCP 不接受 `kind: notebook`。
 
 计算 MCP 能提交 shell，但不在其中运行命令。`compute_shell_connect` 为 shell 提供一个本地 SSH 端点，供 SSH 客户端使用：
 
-1. 以工作所需的槽位数提交一个 `shell`，并轮询 `compute_status`，直到 `state` 为 `STATE_RUNNING`。
-2. 调用 `compute_shell_connect(id)`。检查 `probe.ok`；`ready` 为 `false` 或探测失败时，sshd 可能仍在启动，稍等片刻后再次调用。
+1. 以工作所需的槽位数提交一个 `shell`。
+2. 调用 `compute_shell_connect(id, wait_seconds=300)`。它会等待 shell 运行且其 sshd 应答，因此无需轮询 `compute_status`。如果 `probe.ok` 仍为 `false`，再次调用；`shell_not_running` 表示 shell 仍在排队或已结束。
 3. 使用返回结果：
-   - 如果你有本地 shell 工具，且用户允许用它运行 SSH 命令，运行 `ssh_command`，并在其后接上要在 shell 中运行的命令。这适用于工作期间连接的每个 shell。
+   - 如果你有本地 shell 工具，且用户允许用它运行 SSH 命令，运行 `ssh_command`，并在其后接上要在 shell 中运行的命令，例如 `ssh -F <ssh_config_path> det-4ed328fa 'python train.py --check'`。该命令在整个会话中保持不变，之后的命令会复用第一条命令的连接，因此保持每条命令简短，并原样复用该命令。这适用于工作期间连接的每个 shell。
    - 如果用户为生成的配置设置了可选的 [ssh-mcp](compute-service.zh.md#use-the-shell-from-ssh-mcp) 服务，每次新增或改变 profile 的 connect 之后都必须启动或重新连接它，而这通常无法由你自己完成：请用户重新连接它，然后以 `ssh_mcp.profile` 中给出的 profile 调用其工具。
    - 否则，把结果中的值交给用户，供其在自己的 SSH 客户端或 IDE 中使用。
 4. 完成后调用 `compute_shell_disconnect(id)`，然后调用 `compute_cancel("shell", id)`，除非用户希望保留该 shell；shell 会一直占用其槽位，直到被取消，或在部署设置了空闲时限时因达到该时限而停止。

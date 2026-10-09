@@ -220,6 +220,12 @@ def test_shell_keys_are_read_unredacted_only_by_their_own_method(monkeypatch):
     assert api.get_shell_keys("s1")["user"] == "root"
     del shell["agentUserGroup"]
     assert api.get_shell_keys("s1")["user"] == "root"
+    shell["agentUserGroup"] = {"user": "x\nMatch exec touch /tmp/pwned"}
+    with pytest.raises(APIError) as caught:
+        api.get_shell_keys("s1")
+    assert caught.value.code == "invalid_response"
+    shell["agentUserGroup"] = {"user": "svc-ci.user$"}
+    assert api.get_shell_keys("s1")["user"] == "svc-ci.user$"
     shell["privateKey"] = ""
     with pytest.raises(APIError) as caught:
         api.get_shell_keys("s1")

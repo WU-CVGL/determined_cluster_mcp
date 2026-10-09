@@ -47,12 +47,16 @@ _PROBE_MAX_BYTES = 4096
 MAX_WAIT_SECONDS = 600
 _WAIT_INTERVAL = 5
 _ENDED_STATES = ("STATE_TERMINATING", "STATE_TERMINATED")
-# A Unix socket path holds about 104 bytes. OpenSSH adds "/" and the 40-character %C hash
-# to the control directory, and a 17-character suffix while it creates the socket.
+# A Unix socket path holds about 104 bytes. OpenSSH adds "/" and the 40-byte %C hash to
+# the control directory, and a 17-byte suffix while it creates the socket; this many bytes
+# are left for the directory.
 _CONTROL_DIRECTORY_MAX = 42
 # How long an idle multiplexing master stays up after its last session.
 _CONTROL_PERSIST = "10m"
 _PLAIN_SSH_WORD = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_.-]*")
+# OpenSSH reads its config line by line and expands ${VAR} in paths, with no escape for
+# either: a value holding one could add directives, such as Match exec, or change a path.
+_SSH_CONFIG_UNSAFE = re.compile(r"[\x00-\x1f\x7f]|\$\{")
 _now = time.monotonic
 _sleep = time.sleep
 # After the SSH client closes, how long to wait for the proxy to answer the close frame.
@@ -104,12 +108,16 @@ def ssh_option_path(path: str) -> str:
     OpenSSH splits an option's value at spaces unless it is double-quoted, reads ``\\``
     escapes inside the quotes, and expands ``%`` tokens in file paths.
     """
+    if _SSH_CONFIG_UNSAFE.search(path):
+        raise ValueError("the path holds a control character or ${, which OpenSSH cannot quote")
     escaped = path.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
     return f'"{escaped}"'
 
 
 def ssh_config_word(value: str) -> str:
     """A value for an ssh_config keyword that expands no % tokens, such as User."""
+    if _SSH_CONFIG_UNSAFE.search(value):
+        raise ValueError("the value holds a control character or ${, which OpenSSH cannot quote")
     if _PLAIN_SSH_WORD.fullmatch(value):
         return value
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -419,6 +427,18 @@ def _remove_shell_directory(directory: Path) -> None:
     os.rmdir(directory)
 
 
+# Last in ssh_config: an alias whose tunnel is gone fails at once on a refused local port,
+# instead of being looked up as a host name with OpenSSH's defaults. Tunnel blocks come
+# first and OpenSSH keeps the first value of each option, so they are unaffected; the
+# patterns match only alias-shaped names, so an Include of this file changes no other host.
+_UNKNOWN_ALIAS_BLOCK = (
+    "Host det-???????? det-????????-????-????-????-????????????\n"
+    "  HostName 127.0.0.1\n"
+    "  Port 1\n"
+    "  BatchMode yes\n"
+)
+
+
 def profile_name(shell_id: str) -> str:
     """The ssh-mcp profile name of a shell's tunnel."""
     return f"det-shell-{shell_id}"
@@ -479,6 +499,11 @@ class ShellAccess:
 
     def _prepare_directory(self) -> Path:
         directory = self.directory
+        if _SSH_CONFIG_UNSAFE.search(str(directory)):
+            raise ValidationError(
+                f"shell access directory {directory!r} holds a control character or ${{, which "
+                "OpenSSH cannot quote in its config; choose a path without them"
+            )
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         status = os.lstat(directory)
         if not os.path.isdir(directory) or os.path.islink(directory):
@@ -626,15 +651,37 @@ class ShellAccess:
         ]
         return "\n".join(lines) + "\n"
 
+    @staticmethod
+    def _usable_control_directory(candidate: Path) -> bool:
+        """Whether ``candidate`` is, or can be made, a private directory short enough."""
+        if (
+            len(os.fsencode(candidate)) > _CONTROL_DIRECTORY_MAX
+            or _SSH_CONFIG_UNSAFE.search(str(candidate))
+        ):
+            return False
+        try:
+            candidate.mkdir(mode=0o700, exist_ok=True)
+            status = os.lstat(candidate)
+        except OSError:
+            return False
+        return (
+            stat.S_ISDIR(status.st_mode)
+            and status.st_uid == os.getuid()
+            and not status.st_mode & 0o077
+        )
+
     def _control_directory(self) -> Optional[Path]:
         """A private directory short enough for OpenSSH's multiplexing sockets, or None.
 
         Tried in order: the shell-access directory's cm/, $XDG_RUNTIME_DIR/determined-compute,
-        and ~/.ssh/det-cm. Only the last component is created, with mode 0700.
+        and ~/.ssh/det-cm. Only the last component is created, with mode 0700. A choice that
+        stopped qualifying, for example because it was removed, is made again.
         """
         if self._control is not None:
-            return self._control[0]
-        chosen: Optional[Path] = None
+            chosen = self._control[0]
+            if chosen is None or self._usable_control_directory(chosen):
+                return chosen
+        chosen = None
         candidates = [self.directory / "cm"]
         runtime = os.environ.get("XDG_RUNTIME_DIR")
         if runtime and os.path.isabs(runtime):
@@ -642,18 +689,7 @@ class ShellAccess:
         candidates.append(Path.home() / ".ssh" / "det-cm")
         # OpenSSH for Windows does not multiplex connections.
         for candidate in candidates if os.name != "nt" else []:
-            if len(str(candidate)) > _CONTROL_DIRECTORY_MAX:
-                continue
-            try:
-                candidate.mkdir(mode=0o700, exist_ok=True)
-                status = os.lstat(candidate)
-            except OSError:
-                continue
-            if (
-                stat.S_ISDIR(status.st_mode)
-                and status.st_uid == os.getuid()
-                and not status.st_mode & 0o077
-            ):
+            if self._usable_control_directory(candidate):
                 chosen = candidate
                 break
         self._control = (chosen,)
@@ -692,7 +728,11 @@ class ShellAccess:
         control_directory = self._control_directory()
         self._replace_private(
             self.directory / SSH_CONFIG,
-            "\n".join([header] + [ssh_config_block(record, control_directory) for record in records]),
+            "\n".join(
+                [header]
+                + [ssh_config_block(record, control_directory) for record in records]
+                + [_UNKNOWN_ALIAS_BLOCK]
+            ),
         )
         self._replace_private(
             self.directory / SSH_MCP_CONFIG,
@@ -781,6 +821,20 @@ class ShellAccess:
             remaining = deadline - _now()
             if probe["ok"] or remaining <= 0:
                 break
+            try:
+                state = self.service._owned("shell", shell_id)[2].get("state")
+            except APIError:
+                break
+            if state != "STATE_RUNNING":
+                if not reused:
+                    # The tunnel was opened by this call for a shell that is gone.
+                    with self._lock:
+                        self._disconnect(remote_id)
+                raise ConflictError(
+                    f"shell {remote_id} is {state or 'in an unknown state'}; it stopped while "
+                    "waiting for its sshd",
+                    code="shell_not_running",
+                )
             _sleep(min(_WAIT_INTERVAL, remaining))
         result = self._result(record, state, ready, reused, control_directory)
         if unavailable:

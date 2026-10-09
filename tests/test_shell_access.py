@@ -427,6 +427,77 @@ def test_wait_seconds_is_validated(access, client, wait):
     assert client.calls == []
 
 
+@pytest.mark.parametrize("user", ["x\nMatch exec touch /tmp/pwned #", "a\rb", "a${HOME}"])
+def test_a_login_user_that_could_inject_ssh_config_is_refused(access, client, tmp_path, user):
+    client.keys = {**client.keys, "user": user}
+    with pytest.raises(ValueError):
+        access.connect(SHELL_ID)
+    directory = tmp_path / "access"
+    assert not (directory / "ssh_config").exists()
+    assert not (directory / SHELL_ID).exists()
+    assert access._tunnels == {}
+
+
+@pytest.mark.parametrize("name", ["a${HOME}b", "a\nb"])
+def test_a_shell_access_directory_openssh_cannot_quote_is_refused(client, tmp_path, name):
+    manager = ShellAccess(_service(client), tmp_path / name, Opener())
+    with pytest.raises(APIError) as caught:
+        manager.connect(SHELL_ID)
+    assert caught.value.code == "invalid_request"
+    assert not (tmp_path / name).exists()
+
+
+def test_the_socket_budget_counts_bytes(client, _private_control_directory):
+    short = Path(tempfile.mkdtemp(prefix="dc", dir="/tmp"))
+    try:
+        # Few characters, but more than 42 bytes once encoded.
+        wide = short / ("目" * 10)
+        assert len(str(wide / "cm")) <= 42 < len(os.fsencode(wide / "cm"))
+        manager = ShellAccess(_service(client), wide, Opener())
+        assert manager.connect(SHELL_ID)["control_path_dir"] == str(
+            _private_control_directory / "determined-compute"
+        )
+        manager.close_all()
+    finally:
+        shutil.rmtree(short, ignore_errors=True)
+
+
+def test_a_removed_control_directory_is_made_again(access):
+    first = access.connect(SHELL_ID)
+    control = Path(first["control_path_dir"])
+    shutil.rmtree(control)
+    again = access.connect(SHELL_ID)
+    assert again["control_path_dir"] == str(control) and control.is_dir()
+    assert _mode(control) == 0o700
+
+
+def test_wait_seconds_stops_when_the_shell_ends_while_sshd_starts(tmp_path, monkeypatch):
+    clock = _Clock(monkeypatch)
+    client = _StartingClient(["STATE_RUNNING", "STATE_RUNNING", "STATE_TERMINATED"], [False] * 10)
+    manager = ShellAccess(_service(client), tmp_path / "access", Opener())
+    with pytest.raises(APIError) as caught:
+        manager.connect(SHELL_ID, wait_seconds=300)
+    assert caught.value.code == "shell_not_running"
+    assert "stopped while waiting" in str(caught.value)
+    assert clock.sleeps == [5]
+    assert manager._tunnels == {} and not (tmp_path / "access" / SHELL_ID).exists()
+
+
+@pytest.mark.skipif(shutil.which("ssh") is None, reason="ssh is not installed")
+def test_an_alias_without_a_tunnel_fails_at_once_without_a_lookup(access):
+    result = access.connect(SHELL_ID)
+    for alias in ("det-deadbeef", f"det-{OTHER_SHELL_ID}"):
+        completed = subprocess.run(
+            ["ssh", "-F", result["ssh_config_path"], alias, "true"],
+            capture_output=True, text=True, timeout=20,
+        )
+        assert completed.returncode == 255
+        assert "127.0.0.1 port 1" in completed.stderr
+    # A real tunnel's block comes first, so the fallback changes nothing for it.
+    printed = _resolved(result)
+    assert f"port {result['port']}" in printed and "hostname 127.0.0.1" in printed
+
+
 def test_a_reused_connect_returns_no_static_advisories(access):
     assert access.connect(SHELL_ID)["advisories"]
     again = access.connect(SHELL_ID)
