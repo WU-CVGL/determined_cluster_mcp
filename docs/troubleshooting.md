@@ -142,7 +142,7 @@ Determined applies its own permissions as well. On the fork 0.40.1 or later with
 
 - `unsupported` with a message about `websocket-client`: reinstall the server with its MCP extra (`python -m pip install -e '.[mcp]'` in the checkout) and restart the MCP process.
 - `unsupported` with a message about a proxy: the environment selects a proxy other than `http://`, such as `socks5://`, for the master. Shell access reaches the master only directly or through an `http://` proxy; list the master in `NO_PROXY` and `no_proxy`, or set an `http://` proxy for it.
-- `shell_not_running`: only a `STATE_RUNNING` shell can be connected. A queued shell is waiting for capacity; an ended one cannot be reopened, so launch a new shell.
+- `shell_not_running`: only a `STATE_RUNNING` shell can be connected. A queued shell is waiting for capacity: pass `wait_seconds`, up to 600, or connect again later. An ended one cannot be reopened, so launch a new shell.
 - `ready: false`, or `probe.ok: false` right after the shell started: sshd is still starting. `compute_logs` shows `Server listening on` once it is up; call `compute_shell_connect` again, which keeps the open tunnel and probes again.
 - A probe error `the WebSocket handshake was refused with HTTP <status>` comes from the master or its shell proxy: 404 or 502 usually means the shell ended or its proxy is not registered yet.
 - A probe error `WebSocketProxyException: failed CONNECT via proxy status: <status>` comes from the HTTP proxy chosen for the master: 407 means it wants other credentials, set in the proxy URL, and 403 or 405 means it does not allow `CONNECT` to the master's port. TLS errors and other proxy failures have the same causes as for the API; see [TLS certificate verification fails](#tls-certificate-verification-fails) and [the master is unreachable through a proxy](#the-master-is-unreachable-through-a-proxy).
@@ -153,6 +153,8 @@ Determined applies its own permissions as well. On the fork 0.40.1 or later with
 - `shell_access_conflict` saying that a directory exists and is not a shell access directory: a directory with the shell's ID as its name holds something other than shell-access files. Remove it, or use a dedicated shell-access directory.
 - ssh-mcp fails to start with its config file not found, or does not know the profile: the file exists only while a tunnel is open, and ssh-mcp reads it only at startup, so start or reconnect ssh-mcp after `compute_shell_connect`. Check that it was registered as `--config=<ssh_mcp.config_path>`, with `=`: ssh-mcp ignores a value separated by a space.
 - ssh-mcp reports a host-key mismatch: its config is older than the tunnel on that port. Restart it so that it reads the current `trustedHostKey`.
+- `ssh` through the alias fails with `mux_client_request_session: session request failed`: more than 10 commands run at once through one multiplexing master, Determined's sshd's limit per connection. Run fewer at once.
+- `control_path_dir` is `null`: no socket directory was short and private enough, so each command opens its own connection. Commands still work; set `XDG_RUNTIME_DIR` to a short private directory, or create `~/.ssh`, and restart the MCP server to multiplex them.
 - An SSH session drops when the determined-compute MCP restarts: tunnels live in that process. Call `compute_shell_connect` again, and restart ssh-mcp, since the port changes.
 
 ## A transfer is partial or different from the preview

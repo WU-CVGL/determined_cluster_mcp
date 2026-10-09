@@ -515,12 +515,15 @@ slots free.
 A shell is a container whose sshd the master serves through its proxy. `det shell open`
 reaches it with an SSH `ProxyCommand` that carries the connection over a WebSocket to
 `<master>/proxy/<shell id>/`. An SSH client that takes only a host and a port, such as an
-SSH MCP server, needs a TCP port instead, which `compute_shell_connect(id, local_port)`
-provides:
+SSH MCP server, needs a TCP port instead, which
+`compute_shell_connect(id, local_port, wait_seconds)` provides:
 
 1. It checks that the account owns the shell and that its state is `STATE_RUNNING`;
    otherwise it fails with `ownership_mismatch` or `shell_not_running` before reading any
-   key.
+   key. With `wait_seconds` (0 to 600, default 0), it checks the shell every 5 seconds
+   until it runs, instead of the caller polling `compute_status`; a shell that ends
+   meanwhile fails at once, and one still not running when the time is up fails with
+   `shell_not_running`.
 2. It reads the shell's key pair from `GET /api/v1/shells/{id}`. Determined generates the
    pair for each shell: sshd accepts the private key for login and uses the same pair as
    its host key. The private key is written only to a `key` file with mode 0600 in the
@@ -534,11 +537,13 @@ provides:
    `CONNECT`; another proxy scheme fails with `unsupported`. With `--verify-ssl`, the CA
    bundle is `REQUESTS_CA_BUNDLE`, else `CURL_CA_BUNDLE`, either a file or a directory,
    else Requests' default bundle.
-4. It writes a `known_hosts` entry for that port and regenerates `ssh-mcp.toml`. If any
-   step fails, it removes what it created and reports the original error.
+4. It writes a `known_hosts` entry for that port and regenerates `ssh_config` and
+   `ssh-mcp.toml`. If any step fails, it removes what it created and reports the original
+   error.
 5. When the shell's allocation reports ready, it opens the proxy once and reads sshd's
-   identification line as `probe`. A banner shows only that sshd answers; logging in is
-   left to the SSH client.
+   identification line as `probe`; with `wait_seconds`, it repeats this every 5 seconds
+   until the probe succeeds or the time is up, and then returns the result either way. A
+   banner shows only that sshd answers; logging in is left to the SSH client.
 
 The result has these fields:
 
@@ -548,13 +553,16 @@ The result has these fields:
 | `ready` | Whether the allocation reports ready, which is when sshd listens; `null` with `context_unavailable: ["ready"]` when that lookup failed |
 | `probe` | `{ok: true, banner}` with sshd's identification line, or `{ok: false, error}`; a refused WebSocket handshake is reported by its HTTP status alone. Not attempted while `ready` is `false` |
 | `reused` | `true` when the tunnel was already open in this process |
+| `ssh_command` | `ssh -F <ssh_config_path> <ssh_alias>`: append the command to run in the shell |
+| `ssh_alias` | The shell's `Host` name in the generated `ssh_config`, `det-<first 8 hex digits of the shell ID>`, or `det-<shell id>` when another open tunnel already uses that; it stays the same while the tunnel is open |
+| `ssh_config_path` | Absolute path of the generated OpenSSH config |
+| `control_path_dir` | Directory of the OpenSSH multiplexing sockets, or `null` when no directory is short enough and commands are not multiplexed |
 | `host`, `port` | Always `127.0.0.1`, and the listening port |
 | `user` | Login user: the agent user that Determined runs the shell as, as for `det shell open` |
 | `key_path`, `known_hosts_path` | Absolute paths of the private key file and of the pinned host-key entry for this port |
 | `host_key_type`, `host_key_fingerprint` | The shell's host key, such as `ssh-ed25519` and `SHA256:...` |
-| `ssh_command` | An OpenSSH command line that logs in with strict host-key checking |
-| `ssh_mcp` | `config_path` of the generated ssh-mcp config, this shell's `profile` name, `det-shell-<shell id>`, and `profile_toml`, the same profile as standalone text |
-| `advisories` | `tunnel_lifetime` and `ssh_mcp_reload` |
+| `ssh_mcp` | `config_path` of the generated ssh-mcp config, and this shell's `profile` name, `det-shell-<shell id>` |
+| `advisories` | `tunnel_lifetime` and `ssh_mcp_reload` when the tunnel opens; empty when `reused` is `true` |
 
 A failed probe does not close the tunnel: sshd may still be starting, and calling
 `compute_shell_connect` again returns the open tunnel with a new probe. A second call
@@ -587,7 +595,7 @@ process; another MCP server, for example one from a second client session, then 
 connect with `shell_access_conflict` and must be given its own `--shell-access-dir`. When
 it takes the lock, and when the server starts while no other server holds it, the server
 deletes the shell subdirectories and the `ssh-mcp.toml` that an ended process left
-behind; the next connect writes `ssh-mcp.toml` again. A shell subdirectory is one named by
+behind, and `ssh_config` with it; the next connect writes both again. A shell subdirectory is one named by
 a shell ID that holds nothing but the regular files `key` and `known_hosts`. Nothing else
 is ever deleted: a connect that finds any other directory under the shell's ID fails with
 `shell_access_conflict`. If only the lock file is deleted while the server runs, the
@@ -601,26 +609,42 @@ lock again, or fails if another server holds it. The directory holds:
 | --- | --- |
 | `<shell id>/key` | The shell's private key, mode 0600 |
 | `<shell id>/known_hosts` | `[127.0.0.1]:<port>` and the shell's public key |
+| `ssh_config` | OpenSSH config with one `Host` block per open tunnel of this server; removed when none is open |
 | `ssh-mcp.toml` | ssh-mcp config with one profile per open tunnel of this server; removed when none is open |
+| `cm/` | Multiplexing sockets, used only when the directory's path is short enough |
 | `.lock` | The lock that keeps the directory to one server |
 
 #### Use the shell from OpenSSH or an IDE
 
-`ssh_command` logs in with OpenSSH; an agent with a local shell tool that the user allows
-can run commands with it directly, which also suits shells created during the work. An
-IDE or other client can use the same values in an SSH config entry, quoting paths that
-contain spaces:
+Run commands as `ssh_command` followed by the command, for example
+`ssh -F ~/.cache/determined-compute/shell-access/ssh_config det-4ed328fa 'nvidia-smi'`.
+An agent with a local shell tool that the user allows can do this directly; it also suits
+shells created during the work. The generated `ssh_config` gives each alias the port,
+user, key, and pinned host key, and:
 
-```text
-Host det-shell
-  HostName 127.0.0.1
-  Port <port>
-  User <user>
-  IdentityFile <key_path>
-  IdentitiesOnly yes
-  UserKnownHostsFile <known_hosts_path>
-  StrictHostKeyChecking yes
-```
+- `BatchMode yes` and `LogLevel ERROR`, so that `ssh` never prompts and its output holds
+  only the command's own output;
+- `ServerAliveInterval 30`, so that a dropped tunnel ends the session instead of hanging;
+- `ControlMaster auto`, `ControlPath <control_path_dir>/%C`, and `ControlPersist 10m`:
+  the first command opens one SSH connection, and later commands reuse it for 10 minutes
+  after the last one ends, without another WebSocket or SSH handshake.
+
+The alias stays the same while the tunnel is open, and the config is rewritten whenever a
+tunnel opens or closes, so the command for a shell does not change between calls. That
+also lets the user allow it once, for example with the Claude Code permission rule
+`Bash(ssh -F /home/me/.cache/determined-compute/shell-access/ssh_config det-*)`. With
+`Include /home/me/.cache/determined-compute/shell-access/ssh_config` added to
+`~/.ssh/config` once, `ssh det-4ed328fa` works too, and IDEs such as VS Code Remote-SSH
+list the aliases. The server never edits `~/.ssh/config`.
+
+A Unix socket path holds about 104 bytes, so the sockets go to the first of these
+directories whose path has at most 42 characters, with mode 0700: the shell-access
+directory's `cm/`, `$XDG_RUNTIME_DIR/determined-compute`, and `~/.ssh/det-cm` (when
+`~/.ssh` exists). When none fits, `control_path_dir` is `null` and each command opens its
+own connection. Disconnecting a shell, cancelling it, or restarting the MCP server ends
+its connection, so its multiplexing master exits and removes its socket. Determined's
+sshd keeps OpenSSH's default `MaxSessions` of 10 sessions per connection, so at most 10
+commands run at once through one master. OpenSSH for Windows does not multiplex.
 
 `compute_launch` still returns `reconnect_command`, currently
 `det shell show_ssh_command <id>`, for users of the native CLI. The adapter removes
@@ -664,7 +688,8 @@ profile in each call. ssh-mcp's own defaults apply to everything else: role `ope
 and approval mode `ask-destructive`, which asks before commands that ssh-mcp classifies as
 destructive. The file is rewritten on every connect and disconnect, so edits to it are
 lost. For other policy
-settings, copy `profile_toml` into your own ssh-mcp config and edit it there. A shell's
+settings, copy the shell's profile from `ssh-mcp.toml` into your own ssh-mcp config and
+edit it there. A shell's
 `keyRef` stays the same, but its port can change each time its tunnel is reopened unless
 you pass the same `local_port`.
 

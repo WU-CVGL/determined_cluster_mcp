@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import re
 import shlex
 import socket
 import socketserver
@@ -33,6 +34,7 @@ from .models import APIError, ConflictError, ValidationError
 
 LOOPBACK = "127.0.0.1"
 SSH_MCP_CONFIG = "ssh-mcp.toml"
+SSH_CONFIG = "ssh_config"
 _LOCK = ".lock"
 # The only files a shell's subdirectory holds; nothing else is ever deleted.
 _SHELL_FILES = frozenset({"key", "known_hosts"})
@@ -40,6 +42,19 @@ _SHELL_FILES = frozenset({"key", "known_hosts"})
 _CONNECT_TIMEOUT = 30
 _PROBE_TIMEOUT = 15
 _PROBE_MAX_BYTES = 4096
+# compute_shell_connect may wait this long for a shell to run and its sshd to answer,
+# checking every _WAIT_INTERVAL seconds.
+MAX_WAIT_SECONDS = 600
+_WAIT_INTERVAL = 5
+_ENDED_STATES = ("STATE_TERMINATING", "STATE_TERMINATED")
+# A Unix socket path holds about 104 bytes. OpenSSH adds "/" and the 40-character %C hash
+# to the control directory, and a 17-character suffix while it creates the socket.
+_CONTROL_DIRECTORY_MAX = 42
+# How long an idle multiplexing master stays up after its last session.
+_CONTROL_PERSIST = "10m"
+_PLAIN_SSH_WORD = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_.-]*")
+_now = time.monotonic
+_sleep = time.sleep
 # After the SSH client closes, how long to wait for the proxy to answer the close frame.
 _CLOSE_TIMEOUT = 10
 _OPCODE_CLOSE = 0x8
@@ -91,6 +106,13 @@ def ssh_option_path(path: str) -> str:
     """
     escaped = path.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
     return f'"{escaped}"'
+
+
+def ssh_config_word(value: str) -> str:
+    """A value for an ssh_config keyword that expands no % tokens, such as User."""
+    if _PLAIN_SSH_WORD.fullmatch(value):
+        return value
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def transport_error(error: BaseException) -> str:
@@ -402,6 +424,33 @@ def profile_name(shell_id: str) -> str:
     return f"det-shell-{shell_id}"
 
 
+def ssh_config_block(record: Dict[str, Any], control_directory: Optional[Path]) -> str:
+    """One OpenSSH ``Host`` block for a tunnel record, multiplexed when a socket fits."""
+    lines = [
+        f"Host {record['alias']}",
+        f"  HostName {LOOPBACK}",
+        f"  Port {int(record['port'])}",
+        f"  User {ssh_config_word(record['user'])}",
+        f"  IdentityFile {ssh_option_path(record['key_path'])}",
+        "  IdentitiesOnly yes",
+        f"  UserKnownHostsFile {ssh_option_path(record['known_hosts_path'])}",
+        "  StrictHostKeyChecking yes",
+        # Never prompt, and keep OpenSSH's own notices out of command output.
+        "  BatchMode yes",
+        "  LogLevel ERROR",
+        "  ServerAliveInterval 30",
+    ]
+    if control_directory is not None:
+        # Every command after the first reuses one SSH connection, and so one WebSocket.
+        escaped = ssh_option_path(str(control_directory))[1:-1]
+        lines += [
+            "  ControlMaster auto",
+            f'  ControlPath "{escaped}/%C"',
+            f"  ControlPersist {_CONTROL_PERSIST}",
+        ]
+    return "\n".join(lines) + "\n"
+
+
 class ShellAccess:
     """Open and close local SSH tunnels to the account's running shells.
 
@@ -423,6 +472,8 @@ class ShellAccess:
         self._tunnels: Dict[str, _Tunnel] = {}
         self._lock = threading.Lock()
         self._claim: Optional[int] = None
+        # The chosen multiplexing socket directory, once chosen; (None,) when none fits.
+        self._control: Optional[Tuple[Optional[Path]]] = None
 
     # The directory.
 
@@ -541,7 +592,7 @@ class ShellAccess:
             if entry.name not in self._tunnels and self._is_shell_directory(entry):
                 with suppress(OSError):
                     _remove_shell_directory(entry)
-        self._write_ssh_mcp_config()
+        self._write_configs()
 
     def sweep(self) -> None:
         """Remove what an ended process left behind, unless a running one uses the directory."""
@@ -575,50 +626,122 @@ class ShellAccess:
         ]
         return "\n".join(lines) + "\n"
 
-    def _write_ssh_mcp_config(self) -> None:
-        """Rewrite the ssh-mcp config for this process's tunnels; remove it when there is none."""
-        path = self.directory / SSH_MCP_CONFIG
-        temporary = self.directory / f".{SSH_MCP_CONFIG}.tmp"
+    def _control_directory(self) -> Optional[Path]:
+        """A private directory short enough for OpenSSH's multiplexing sockets, or None.
+
+        Tried in order: the shell-access directory's cm/, $XDG_RUNTIME_DIR/determined-compute,
+        and ~/.ssh/det-cm. Only the last component is created, with mode 0700.
+        """
+        if self._control is not None:
+            return self._control[0]
+        chosen: Optional[Path] = None
+        candidates = [self.directory / "cm"]
+        runtime = os.environ.get("XDG_RUNTIME_DIR")
+        if runtime and os.path.isabs(runtime):
+            candidates.append(Path(runtime) / "determined-compute")
+        candidates.append(Path.home() / ".ssh" / "det-cm")
+        # OpenSSH for Windows does not multiplex connections.
+        for candidate in candidates if os.name != "nt" else []:
+            if len(str(candidate)) > _CONTROL_DIRECTORY_MAX:
+                continue
+            try:
+                candidate.mkdir(mode=0o700, exist_ok=True)
+                status = os.lstat(candidate)
+            except OSError:
+                continue
+            if (
+                stat.S_ISDIR(status.st_mode)
+                and status.st_uid == os.getuid()
+                and not status.st_mode & 0o077
+            ):
+                chosen = candidate
+                break
+        self._control = (chosen,)
+        return chosen
+
+    @staticmethod
+    def _replace_private(path: Path, text: Optional[str]) -> None:
+        """Write ``path`` atomically with mode 0600, or remove it when ``text`` is None."""
+        temporary = path.with_name(f".{path.name}.tmp")
         with suppress(FileNotFoundError):
             temporary.unlink()
-        if not self._tunnels:
+        if text is None:
             with suppress(FileNotFoundError):
                 path.unlink()
             return
-        parts = [
-            "# Written by determined-compute-mcp for its open shell tunnels and rewritten on\n"
-            "# every compute_shell_connect and compute_shell_disconnect; edits are lost.\n",
-        ]
-        parts.extend(
-            self.profile_toml(profile_name(shell_id), self._tunnels[shell_id].record)
-            for shell_id in sorted(self._tunnels)
-        )
         try:
-            _write_private(temporary, "\n".join(parts))
+            _write_private(temporary, text)
             os.replace(temporary, path)
         except BaseException:
             with suppress(OSError):
                 temporary.unlink()
             raise
 
+    def _write_configs(self) -> None:
+        """Rewrite ssh_config and ssh-mcp.toml for this process's tunnels; remove them when
+        there is none."""
+        header = (
+            "# Written by determined-compute-mcp for its open shell tunnels and rewritten on\n"
+            "# every compute_shell_connect and compute_shell_disconnect; edits are lost.\n"
+        )
+        records = [self._tunnels[shell_id].record for shell_id in sorted(self._tunnels)]
+        if not records:
+            self._replace_private(self.directory / SSH_CONFIG, None)
+            self._replace_private(self.directory / SSH_MCP_CONFIG, None)
+            return
+        control_directory = self._control_directory()
+        self._replace_private(
+            self.directory / SSH_CONFIG,
+            "\n".join([header] + [ssh_config_block(record, control_directory) for record in records]),
+        )
+        self._replace_private(
+            self.directory / SSH_MCP_CONFIG,
+            "\n".join([header] + [
+                self.profile_toml(profile_name(record["shell_id"]), record) for record in records
+            ]),
+        )
+
     # Tool operations.
 
-    def connect(self, shell_id: Any, local_port: Any = None) -> Dict[str, Any]:
-        """Open, or return, the local tunnel to one of the account's running shells."""
+    def connect(
+        self, shell_id: Any, local_port: Any = None, wait_seconds: Any = 0
+    ) -> Dict[str, Any]:
+        """Open, or return, the local tunnel to one of the account's running shells.
+
+        With wait_seconds, wait up to that long for the shell to run and for its sshd to
+        answer the probe, checking every few seconds.
+        """
         if local_port is not None and (
             isinstance(local_port, bool)
             or not isinstance(local_port, int)
             or not 1024 <= local_port <= 65535
         ):
             raise ValidationError("local_port must be an integer from 1024 to 65535")
-        kind, remote_id, entity = self.service._owned("shell", shell_id)
-        state = entity.get("state")
-        if state != "STATE_RUNNING":
-            raise ConflictError(
-                f"shell {remote_id} is {state or 'in an unknown state'}; only a running shell "
-                "can be connected (check compute_status)",
-                code="shell_not_running",
-            )
+        if (
+            isinstance(wait_seconds, bool)
+            or not isinstance(wait_seconds, int)
+            or not 0 <= wait_seconds <= MAX_WAIT_SECONDS
+        ):
+            raise ValidationError(f"wait_seconds must be an integer from 0 to {MAX_WAIT_SECONDS}")
+        deadline = _now() + wait_seconds
+        while True:
+            kind, remote_id, entity = self.service._owned("shell", shell_id)
+            state = entity.get("state")
+            if state == "STATE_RUNNING":
+                break
+            remaining = deadline - _now()
+            if state in _ENDED_STATES or remaining <= 0:
+                waited = f" after waiting {wait_seconds} s" if wait_seconds else ""
+                hint = "" if state in _ENDED_STATES else (
+                    "; pass wait_seconds to wait for it" if not wait_seconds
+                    else "; connect again to keep waiting"
+                )
+                raise ConflictError(
+                    f"shell {remote_id} is {state or 'in an unknown state'}{waited}; only a "
+                    f"running shell can be connected{hint}",
+                    code="shell_not_running",
+                )
+            _sleep(min(_WAIT_INTERVAL, remaining))
         client = self.service.client
         open_websocket = self._opener(client)
         with self._lock:
@@ -645,17 +768,24 @@ class ShellAccess:
             else:
                 # The config derives from the open tunnels; restore it if a failed write on
                 # disconnect removed it.
-                self._write_ssh_mcp_config()
+                self._write_configs()
             record = dict(tunnel.record)
-        ready, unavailable = self._ready(client, remote_id)
-        result = self._result(record, state, ready, reused)
+            control_directory = self._control_directory()
+        while True:
+            ready, unavailable = self._ready(client, remote_id)
+            probe = (
+                self._probe(open_websocket, remote_id)
+                if ready is not False
+                else {"ok": False, "error": "the shell is not ready yet; sshd has not started"}
+            )
+            remaining = deadline - _now()
+            if probe["ok"] or remaining <= 0:
+                break
+            _sleep(min(_WAIT_INTERVAL, remaining))
+        result = self._result(record, state, ready, reused, control_directory)
         if unavailable:
             result["context_unavailable"] = unavailable
-        result["probe"] = (
-            self._probe(open_websocket, remote_id)
-            if ready is not False
-            else {"ok": False, "error": "the shell is not ready yet; sshd has not started"}
-        )
+        result["probe"] = probe
         return result
 
     def _open(
@@ -698,6 +828,7 @@ class ShellAccess:
             _write_private(known_hosts, f"[{LOOPBACK}]:{port} {keys['public_key']}\n")
             record = {
                 "shell_id": remote_id,
+                "alias": self._alias(remote_id),
                 "port": port,
                 "user": keys["user"],
                 "key_path": str(key_path),
@@ -707,7 +838,7 @@ class ShellAccess:
             }
             tunnel = _Tunnel(remote_id, directory, server, record)
             self._tunnels[remote_id] = tunnel
-            self._write_ssh_mcp_config()
+            self._write_configs()
             tunnel.thread.start()
         except BaseException:
             self._tunnels.pop(remote_id, None)
@@ -717,9 +848,15 @@ class ShellAccess:
             with suppress(OSError):
                 _remove_shell_directory(directory)
             with suppress(OSError):
-                self._write_ssh_mcp_config()
+                self._write_configs()
             raise
         return tunnel
+
+    def _alias(self, remote_id: str) -> str:
+        """det-<first 8 hex of the ID>, or the full ID when an open tunnel already uses that."""
+        short = f"det-{remote_id[:8]}"
+        taken = {tunnel.record["alias"] for tunnel in self._tunnels.values()}
+        return short if short not in taken else f"det-{remote_id}"
 
     def _ready(self, client: Any, remote_id: str) -> Tuple[Optional[bool], List[str]]:
         """Whether sshd is up, as det shell open decides it: the allocation is ready."""
@@ -768,19 +905,16 @@ class ShellAccess:
         return {"ok": True, "banner": line[:255].decode("ascii", "replace")}
 
     def _result(
-        self, record: Dict[str, Any], state: Any, ready: Optional[bool], reused: bool
+        self,
+        record: Dict[str, Any],
+        state: Any,
+        ready: Optional[bool],
+        reused: bool,
+        control_directory: Optional[Path],
     ) -> Dict[str, Any]:
-        name = profile_name(record["shell_id"])
-        user, port = record["user"], record["port"]
-        ssh_command = shlex.join([
-            "ssh", "-p", str(port),
-            "-o", f"IdentityFile={ssh_option_path(record['key_path'])}",
-            "-o", "IdentitiesOnly=yes",
-            "-o", "StrictHostKeyChecking=yes",
-            "-o", f"UserKnownHostsFile={ssh_option_path(record['known_hosts_path'])}",
-            f"{user}@{LOOPBACK}",
-        ])
-        advisories = [
+        ssh_config = self.directory / SSH_CONFIG
+        # Static guidance only when a tunnel opens; a reused connect repeats none of it.
+        advisories = [] if reused else [
             {
                 "code": "tunnel_lifetime",
                 "message": (
@@ -804,18 +938,20 @@ class ShellAccess:
             "state": state,
             "ready": ready,
             "reused": reused,
+            "ssh_command": shlex.join(["ssh", "-F", str(ssh_config), record["alias"]]),
+            "ssh_alias": record["alias"],
+            "ssh_config_path": str(ssh_config),
+            "control_path_dir": str(control_directory) if control_directory else None,
             "host": LOOPBACK,
-            "port": port,
-            "user": user,
+            "port": record["port"],
+            "user": record["user"],
             "key_path": record["key_path"],
             "known_hosts_path": record["known_hosts_path"],
             "host_key_type": record["host_key_type"],
             "host_key_fingerprint": record["host_key_fingerprint"],
-            "ssh_command": ssh_command,
             "ssh_mcp": {
                 "config_path": str(self.directory / SSH_MCP_CONFIG),
-                "profile": name,
-                "profile_toml": self.profile_toml(name, record),
+                "profile": profile_name(record["shell_id"]),
             },
             "advisories": advisories,
         }
@@ -839,11 +975,12 @@ class ShellAccess:
         with suppress(OSError):
             _remove_shell_directory(tunnel.directory)
         try:
-            self._write_ssh_mcp_config()
+            self._write_configs()
         except OSError:
-            # The tunnel is gone; a config that still listed it would mislead ssh-mcp.
-            with suppress(OSError):
-                (self.directory / SSH_MCP_CONFIG).unlink()
+            # The tunnel is gone; a config that still listed it would mislead its clients.
+            for name in (SSH_CONFIG, SSH_MCP_CONFIG):
+                with suppress(OSError):
+                    (self.directory / name).unlink()
         return True
 
     def close_all(self) -> None:
@@ -856,11 +993,14 @@ class ShellAccess:
 
 
 __all__ = [
+    "MAX_WAIT_SECONDS",
     "ShellAccess",
     "abort_websocket",
     "host_key_fingerprint",
     "profile_name",
     "relay",
+    "ssh_config_block",
+    "ssh_config_word",
     "ssh_option_path",
     "toml_string",
     "transport_error",

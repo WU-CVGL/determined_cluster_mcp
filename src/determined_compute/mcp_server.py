@@ -122,10 +122,11 @@ def create_server(
             "continues from its trials' latest checkpoints, a resumed generic task reruns its "
             "command from the start. "
             "compute_shell_connect opens local SSH access to a running shell (127.0.0.1, a "
-            "port, a key file, and a pinned host key): run its ssh_command where a local shell "
-            "tool is allowed, or use an SSH MCP server such as ssh-mcp, which must be started "
-            "or reconnected after a profile is added, removed, or changed; disconnect when "
-            "done. "
+            "port, a key file, and a pinned host key); pass wait_seconds instead of polling a "
+            "starting shell. Run commands as its ssh_command followed by the command where a "
+            "local shell tool is allowed, or use an SSH MCP server such as ssh-mcp, which "
+            "must be started or reconnected after a profile is added, removed, or changed; "
+            "disconnect when done. "
             "Credentials belong in local configuration, never in tool arguments."
         ),
     )
@@ -284,15 +285,18 @@ def create_server(
         @server.tool(annotations=ToolAnnotations(
             read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
         ))
-        async def compute_shell_connect(id: str, local_port: Optional[int] = None) -> dict[str, Any]:
+        async def compute_shell_connect(
+            id: str, local_port: Optional[int] = None, wait_seconds: int = 0
+        ) -> dict[str, Any]:
             """Open local SSH access to one of the account's running shells.
 
-            Listens on 127.0.0.1 (local_port, or a free port) and relays to the shell through
-            the master. Returns port, user, key_path, host_key_fingerprint, ssh_command, and an
-            ssh-mcp profile in a generated config; the private key stays in key_path. Calling
-            it again returns the open tunnel; another local_port needs a disconnect first.
+            wait_seconds (up to 600) waits for the shell to run and its sshd to answer, so no
+            status polling is needed. Run commands with ssh_command (ssh -F <config> <alias>)
+            followed by the command; one multiplexed connection serves them all. Also returns
+            an ssh-mcp profile; the private key stays in key_path. Calling it again returns
+            the open tunnel; another local_port needs a disconnect first.
             """
-            return await call(shell_access.connect, id, local_port)
+            return await call(shell_access.connect, id, local_port, wait_seconds)
 
         @server.tool(annotations=ToolAnnotations(
             read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False,

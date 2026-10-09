@@ -194,8 +194,8 @@ class FakeShellAccess:
     def __init__(self) -> None:
         self.calls = []
 
-    def connect(self, shell_id, local_port):
-        self.calls.append(("connect", shell_id, local_port))
+    def connect(self, shell_id, local_port, wait_seconds):
+        self.calls.append(("connect", shell_id, local_port, wait_seconds))
         if shell_id == "busy":
             from determined_compute.compute import ConflictError
 
@@ -215,6 +215,7 @@ def test_shell_access_tools_connect_disconnect_and_close_on_cancel():
             connect = tools["compute_shell_connect"]
             assert connect.input_schema["required"] == ["id"]
             assert connect.input_schema["properties"]["local_port"]["default"] is None
+            assert connect.input_schema["properties"]["wait_seconds"]["default"] == 0
             assert connect.annotations.read_only_hint is False
             assert connect.annotations.destructive_hint is False
             assert tools["compute_shell_disconnect"].input_schema["required"] == ["id"]
@@ -223,7 +224,7 @@ def test_shell_access_tools_connect_disconnect_and_close_on_cancel():
             opened = await client.call_tool("compute_shell_connect", {"id": COMMAND_ID})
             assert _structured(opened)["port"] == 40123
             await client.call_tool(
-                "compute_shell_connect", {"id": COMMAND_ID, "local_port": 2222}
+                "compute_shell_connect", {"id": COMMAND_ID, "local_port": 2222, "wait_seconds": 60}
             )
             refused = await client.call_tool("compute_shell_connect", {"id": "busy"})
             assert _error(refused)["code"] == "port_unavailable"
@@ -237,9 +238,9 @@ def test_shell_access_tools_connect_disconnect_and_close_on_cancel():
             )
             assert "shell_access_closed" not in _structured(command)
         assert shell_access.calls == [
-            ("connect", COMMAND_ID, None),
-            ("connect", COMMAND_ID, 2222),
-            ("connect", "busy", None),
+            ("connect", COMMAND_ID, None, 0),
+            ("connect", COMMAND_ID, 2222, 60),
+            ("connect", "busy", None, 0),
             ("disconnect", COMMAND_ID),
             ("disconnect", COMMAND_ID),
         ]

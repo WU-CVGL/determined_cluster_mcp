@@ -17,11 +17,12 @@ import ssl
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from pathlib import Path
 
 import pytest
-from pathlib import Path
 
 from determined_compute.compute import ComputeProfile, ComputeService, ShellAccess
 from determined_compute.compute import shell_access as module
@@ -59,6 +60,17 @@ PROXY_VARIABLES = (
 def _no_proxy_environment(monkeypatch):
     for name in PROXY_VARIABLES:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _private_control_directory(monkeypatch, tmp_path):
+    """Keep multiplexing sockets in a short temporary directory, never the real ~/.ssh."""
+    runtime = tempfile.mkdtemp(prefix="dc", dir="/tmp" if os.path.isdir("/tmp") else None)
+    os.chmod(runtime, 0o700)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", runtime)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    yield Path(runtime)
+    shutil.rmtree(runtime, ignore_errors=True)
 
 
 class FakeWebSocket:
@@ -220,22 +232,206 @@ def test_toml_string_escapes_quotes_backslashes_and_controls():
 
 
 @pytest.mark.skipif(shutil.which("ssh") is None, reason="ssh is not installed")
-def test_ssh_command_paths_survive_openssh_option_parsing(access, tmp_path):
+def _resolved(result):
+    """What OpenSSH makes of the generated config for the result's alias."""
+    arguments = shlex.split(result["ssh_command"])
+    printed = subprocess.run(
+        [arguments[0], "-G", *arguments[1:]], check=True, capture_output=True, text=True,
+    ).stdout.splitlines()
+    return printed
+
+
+@pytest.mark.skipif(shutil.which("ssh") is None, reason="ssh is not installed")
+def test_ssh_config_paths_survive_openssh_parsing(access, tmp_path, _private_control_directory):
     odd = tmp_path / 'with space "quote" 100%'
     manager = ShellAccess(access.service, odd / "access", Opener())
     try:
         result = manager.connect(SHELL_ID)
-        arguments = shlex.split(result["ssh_command"])
-        printed = subprocess.run(
-            [arguments[0], "-G", "-F", "/dev/null", *arguments[1:]],
-            check=True, capture_output=True, text=True,
-        ).stdout.splitlines()
+        printed = _resolved(result)
         assert f"userknownhostsfile {result['known_hosts_path']}" in printed
         # ssh -G prints IdentityFile before it expands % tokens.
         assert f"identityfile {result['key_path'].replace('%', '%%')}" in printed
         assert ssh_option_path('a b"c\\%') == '"a b\\"c\\\\%%"'
     finally:
         manager.close_all()
+
+
+@pytest.mark.skipif(shutil.which("ssh") is None, reason="ssh is not installed")
+def test_ssh_config_gives_the_alias_everything_it_needs(access, _private_control_directory):
+    result = access.connect(SHELL_ID)
+    assert result["ssh_alias"] == "det-5b9c2f3e"
+    assert result["ssh_command"] == shlex.join(["ssh", "-F", result["ssh_config_path"], "det-5b9c2f3e"])
+    assert _mode(result["ssh_config_path"]) == 0o600
+    control = _private_control_directory / "determined-compute"
+    assert result["control_path_dir"] == str(control)
+    assert _mode(control) == 0o700
+    printed = _resolved(result)
+    for line in (
+        "hostname 127.0.0.1", f"port {result['port']}", "user alice",
+        f"identityfile {result['key_path']}", "identitiesonly yes",
+        f"userknownhostsfile {result['known_hosts_path']}", "stricthostkeychecking true",
+        "batchmode yes", "loglevel ERROR", "serveraliveinterval 30",
+        "controlmaster auto", "controlpersist 600",
+    ):
+        assert line in printed, line
+    control_path = next(line for line in printed if line.startswith("controlpath "))
+    assert control_path.startswith(f"controlpath {control}/") and len(control_path.split(" ", 1)[1]) < 104 - 17
+    assert "fixture-private-key-material" not in Path(result["ssh_config_path"]).read_text()
+
+
+def test_ssh_config_lists_open_tunnels_and_goes_with_the_last(access, tmp_path):
+    first = access.connect(SHELL_ID)
+    second = access.connect(OTHER_SHELL_ID)
+    # Both IDs start with 5b9c2f3e: the second alias uses the full ID, and keeps it.
+    assert second["ssh_alias"] == f"det-{OTHER_SHELL_ID}"
+    text = Path(first["ssh_config_path"]).read_text()
+    assert "Host det-5b9c2f3e\n" in text and f"Host det-{OTHER_SHELL_ID}\n" in text
+    access.disconnect(SHELL_ID)
+    assert access.connect(OTHER_SHELL_ID)["ssh_alias"] == f"det-{OTHER_SHELL_ID}"
+    assert "Host det-5b9c2f3e\n" not in Path(first["ssh_config_path"]).read_text()
+    access.disconnect(OTHER_SHELL_ID)
+    assert not os.path.exists(first["ssh_config_path"])
+
+
+def test_the_control_directory_falls_back_in_order(client, tmp_path, monkeypatch):
+    short = Path(tempfile.mkdtemp(prefix="dc", dir="/tmp"))
+    try:
+        # A short shell-access directory holds its own sockets.
+        manager = ShellAccess(_service(client), short / "a", Opener())
+        assert manager.connect(SHELL_ID)["control_path_dir"] == str(short / "a" / "cm")
+        manager.close_all()
+        # Without a usable runtime directory, ~/.ssh/det-cm, if ~/.ssh exists and fits.
+        monkeypatch.setenv("XDG_RUNTIME_DIR", "/nonexistent-runtime")
+        monkeypatch.setenv("HOME", str(short / "h"))
+        (short / "h" / ".ssh").mkdir(parents=True)
+        manager = ShellAccess(_service(client), tmp_path / "long" / "access", Opener())
+        assert manager.connect(SHELL_ID)["control_path_dir"] == str(short / "h" / ".ssh" / "det-cm")
+        manager.close_all()
+        # Nothing fits: no multiplexing, and the config says nothing about it.
+        monkeypatch.setenv("HOME", str(tmp_path / "home-without-ssh"))
+        manager = ShellAccess(_service(client), tmp_path / "long2" / "access", Opener())
+        result = manager.connect(SHELL_ID)
+        assert result["control_path_dir"] is None
+        assert "Control" not in Path(result["ssh_config_path"]).read_text()
+        manager.close_all()
+    finally:
+        shutil.rmtree(short, ignore_errors=True)
+
+
+def test_a_control_directory_open_to_others_is_not_used(client, monkeypatch, _private_control_directory):
+    shared = _private_control_directory / "determined-compute"
+    shared.mkdir(mode=0o700)
+    os.chmod(shared, 0o755)
+    manager = ShellAccess(_service(client), Path("/nonexistent-but-long-enough-to-skip") / "x" / "access", Opener())
+    try:
+        assert manager._control_directory() is None
+    finally:
+        manager.close_all()
+
+
+class _Clock:
+    def __init__(self, monkeypatch):
+        self.now = 1000.0
+        self.sleeps = []
+        monkeypatch.setattr(module, "_now", lambda: self.now)
+        monkeypatch.setattr(module, "_sleep", self.sleep)
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class _StartingClient(FakeClient):
+    def __init__(self, states, readiness=()):
+        super().__init__()
+        self.states = list(states)
+        self.readiness = list(readiness)
+
+    def get_task(self, kind, remote_id):
+        if len(self.states) > 1:
+            self.state = self.states.pop(0)
+        else:
+            self.state = self.states[0]
+        return super().get_task(kind, remote_id)
+
+    def get_task_info(self, task_id):
+        if self.readiness:
+            self.ready = self.readiness.pop(0)
+        return super().get_task_info(task_id)
+
+
+def test_wait_seconds_waits_for_the_shell_and_its_sshd(tmp_path, monkeypatch):
+    clock = _Clock(monkeypatch)
+    client = _StartingClient(
+        ["STATE_QUEUED", "STATE_PULLING", "STATE_STARTING", "STATE_RUNNING"], [False, False, True]
+    )
+    opener = Opener()
+    manager = ShellAccess(_service(client), tmp_path / "access", opener)
+    try:
+        result = manager.connect(SHELL_ID, wait_seconds=120)
+    finally:
+        manager.close_all()
+    assert result["ready"] is True and result["probe"]["ok"] is True
+    assert clock.sleeps == [5, 5, 5, 5, 5]
+    assert len(opener.opened) == 1
+
+
+def test_wait_seconds_reports_a_shell_that_ended_at_once(tmp_path, monkeypatch):
+    clock = _Clock(monkeypatch)
+    client = _StartingClient(["STATE_QUEUED", "STATE_TERMINATED"])
+    manager = ShellAccess(_service(client), tmp_path / "access", Opener())
+    with pytest.raises(APIError) as caught:
+        manager.connect(SHELL_ID, wait_seconds=300)
+    assert caught.value.code == "shell_not_running"
+    assert "STATE_TERMINATED" in str(caught.value)
+    assert clock.sleeps == [5]
+
+
+def test_wait_seconds_runs_out_while_queued(tmp_path, monkeypatch):
+    clock = _Clock(monkeypatch)
+    client = _StartingClient(["STATE_QUEUED"])
+    manager = ShellAccess(_service(client), tmp_path / "access", Opener())
+    with pytest.raises(APIError) as caught:
+        manager.connect(SHELL_ID, wait_seconds=12)
+    assert caught.value.code == "shell_not_running"
+    assert "after waiting 12 s" in str(caught.value) and "connect again" in str(caught.value)
+    assert clock.sleeps == [5, 5, 2]
+    assert not (tmp_path / "access").exists()
+
+
+def test_wait_seconds_returns_the_tunnel_when_sshd_is_still_starting(tmp_path, monkeypatch):
+    clock = _Clock(monkeypatch)
+    client = _StartingClient(["STATE_RUNNING"], [False] * 10)
+    manager = ShellAccess(_service(client), tmp_path / "access", Opener())
+    try:
+        result = manager.connect(SHELL_ID, wait_seconds=8)
+        assert result["ready"] is False and result["probe"]["ok"] is False
+        assert clock.sleeps == [5, 3]
+        assert os.path.exists(result["key_path"])
+    finally:
+        manager.close_all()
+
+
+def test_without_wait_seconds_a_queued_shell_says_how_to_wait(access, client):
+    client.state = "STATE_QUEUED"
+    with pytest.raises(APIError) as caught:
+        access.connect(SHELL_ID)
+    assert "pass wait_seconds" in str(caught.value)
+
+
+@pytest.mark.parametrize("wait", [-1, 601, True, "5", 1.5])
+def test_wait_seconds_is_validated(access, client, wait):
+    with pytest.raises(APIError) as caught:
+        access.connect(SHELL_ID, wait_seconds=wait)
+    assert caught.value.code == "invalid_request"
+    assert client.calls == []
+
+
+def test_a_reused_connect_returns_no_static_advisories(access):
+    assert access.connect(SHELL_ID)["advisories"]
+    again = access.connect(SHELL_ID)
+    assert again["reused"] is True and again["advisories"] == []
+    assert "profile_toml" not in again["ssh_mcp"]
 
 
 def test_handshake_errors_keep_only_the_status():
@@ -286,8 +482,9 @@ def test_connect_writes_private_key_and_relays_to_the_shell(access, client, open
     assert (directory / SHELL_ID / "known_hosts").read_text() == (
         f"[127.0.0.1]:{port} {PUBLIC_KEY}\n"
     )
-    assert "StrictHostKeyChecking=yes" in result["ssh_command"]
-    assert result["ssh_command"].endswith("alice@127.0.0.1")
+    assert result["ssh_command"] == shlex.join(
+        ["ssh", "-F", str(directory / "ssh_config"), "det-5b9c2f3e"]
+    )
     assert {advisory["code"] for advisory in result["advisories"]} == {
         "tunnel_lifetime", "ssh_mcp_reload",
     }
@@ -328,10 +525,10 @@ def test_generated_ssh_mcp_config_uses_only_its_schema_keys(access, tmp_path):
     assert _mode(path) == 0o600
     assert "fixture-private-key-material" not in path.read_text()
     config = _config(path)
-    snippet = pytest.importorskip("tomllib").loads(result["ssh_mcp"]["profile_toml"])
+    assert "profile_toml" not in result["ssh_mcp"]
     # No defaultProfile: a caller names the profile it means.
     assert "defaults" not in config
-    assert config["profiles"] == snippet["profiles"] == [{
+    assert config["profiles"] == [{
         "name": name,
         "host": "127.0.0.1",
         "port": result["port"],
@@ -1133,24 +1330,52 @@ def test_openssh_logs_in_through_the_relay_and_a_real_websocket(sshd, client, tm
         "public_key": sshd["public_key"],
         "user": getpass.getuser(),
     }
-    # A path with a space checks the quoting of the generated command for real.
-    manager = ShellAccess(_service(client), tmp_path / "access dir", None)
+    relayed = []
+
+    def counting(c):
+        open_websocket = websocket_opener(c)
+
+        def opened(shell_id, timeout):
+            if timeout is None:
+                relayed.append(shell_id)
+            return open_websocket(shell_id, timeout)
+
+        return opened
+
+    # A path with a space checks the quoting of the generated config for real.
+    manager = ShellAccess(_service(client), tmp_path / "access dir", counting)
     try:
-        result = manager.connect(SHELL_ID)
+        result = manager.connect(SHELL_ID, wait_seconds=30)
         assert result["probe"]["ok"] is True, result["probe"]
         assert result["probe"]["banner"].startswith("SSH-2.0-")
+        assert result["control_path_dir"] is not None
+        ssh = shlex.split(result["ssh_command"])
         payload = os.urandom(1 << 20)
-        arguments = shlex.split(result["ssh_command"])
         completed = subprocess.run(
-            [arguments[0], "-F", "/dev/null", "-o", "BatchMode=yes", *arguments[1:],
-             "id -un && sha256sum"],
-            input=payload, capture_output=True, timeout=60,
+            ssh + ["id -un && sha256sum"], input=payload, capture_output=True, timeout=60,
         )
         assert completed.returncode == 0, completed.stderr.decode()
         user, digest = completed.stdout.decode().split("\n", 1)
         assert user == getpass.getuser()
         assert digest.split()[0] == hashlib.sha256(payload).hexdigest()
+        # Later commands share the master: nothing but their own output, one relayed connection.
+        for index in range(4):
+            completed = subprocess.run(ssh + [f"echo run{index}"], capture_output=True, timeout=60)
+            assert (completed.returncode, completed.stdout, completed.stderr) == (
+                0, f"run{index}\n".encode(), b""
+            )
+        assert relayed == [SHELL_ID]
+        check = subprocess.run(ssh[:-1] + ["-O", "check", ssh[-1]], capture_output=True, text=True)
+        assert "Master running" in check.stderr
         assert set(proxy.authorizations) == {"Bearer fixture-token"}
+        # Disconnecting drops the relayed connection, so the master ends with it.
+        manager.disconnect(SHELL_ID)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and subprocess.run(
+            ssh[:-1] + ["-O", "check", ssh[-1]], capture_output=True
+        ).returncode == 0:
+            time.sleep(0.1)
+        assert not any(Path(result["control_path_dir"]).iterdir())
     finally:
         manager.close_all()
         proxy.close()
