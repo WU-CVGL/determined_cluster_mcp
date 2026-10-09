@@ -150,6 +150,19 @@ MCP 只操作已认证账户拥有的任务。`ownership_mismatch` 表示任务�
 
 Determined 本身也会执行权限检查。在使用 basic authorization 的 fork 0.40.1 或更高版本上，只有任务所有者或管理员可以终止、取消、暂停或恢复任务；其他账户会收到 `permission_denied`（HTTP 403），experiment 则返回 HTTP 404 `experiment '<id>' not found`。
 
+<a id="shell-access-fails"></a>
+## Shell 访问失败
+
+- `unsupported`，且消息提及 `websocket-client`：带 MCP extra 重新安装服务（在检出目录中运行 `python -m pip install -e '.[mcp]'`），然后重启 MCP 进程。
+- `shell_not_running`：只能连接处于 `STATE_RUNNING` 的 shell。排队中的 shell 正在等待容量；已结束的 shell 无法重新打开，应提交新的 shell。
+- shell 刚启动后出现 `ready: false` 或 `probe.ok: false`：sshd 仍在启动。sshd 就绪后，`compute_logs` 会显示 `Server listening on`；再次调用 `compute_shell_connect`，它会保留已打开的隧道并重新探测。
+- 指明 HTTP 状态的探测错误来自 master 的代理：404 或 502 通常表示 shell 已结束，或其代理尚未注册。TLS 错误和代理失败的原因与 API 相同；见[TLS 证书验证失败](#tls-certificate-verification-fails)和[通过代理无法访问 master](#the-master-is-unreachable-through-a-proxy)。HTTP 代理必须允许对 master 端口的 `CONNECT`，否则必须把 master 同时列入 `no_proxy` 和 `NO_PROXY`。
+- `port_unavailable`：请求的 `local_port` 已被其他程序占用。省略该参数即可获得一个空闲端口。
+- `shell_access_conflict`：另一个共用 shell 访问目录的 determined-compute MCP 进程（例如来自另一个客户端会话的进程）持有该 shell 的隧道。请在那里使用或断开它。
+- ssh-mcp 因找不到配置文件而启动失败，或不认识该 profile：该文件只在有隧道打开时存在，而 ssh-mcp 只在启动时读取它，因此请在 `compute_shell_connect` 之后启动或重新连接 ssh-mcp。检查注册时是否写成 `--config=<ssh_mcp.config_path>`（带 `=`）：ssh-mcp 会忽略以空格分隔的值。
+- ssh-mcp 报告主机密钥不匹配：其配置比该端口上的隧道旧。重启 ssh-mcp，使其读取当前的 `trustedHostKey`。
+- determined-compute MCP 重启时 SSH 会话断开：隧道存在于该进程中。再次调用 `compute_shell_connect`，并重启 ssh-mcp，因为端口会改变。
+
 <a id="a-transfer-is-partial-or-different-from-the-preview"></a>
 ## 传输不完整或与预览不同
 

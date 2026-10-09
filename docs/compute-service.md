@@ -544,12 +544,12 @@ The result has these fields:
 | `probe` | `{ok: true, banner}` with sshd's identification line, or `{ok: false, error}`; not attempted while `ready` is `false` |
 | `reused` | `true` when the tunnel was already open in this process |
 | `host`, `port` | Always `127.0.0.1`, and the listening port |
-| `user` | Login user: the account's agent user, else `root`, as for `det shell open` |
+| `user` | Login user: the agent user that Determined runs the shell as, as for `det shell open` |
 | `key_path`, `known_hosts_path` | Private key file and the pinned host-key entry for this port |
 | `host_key_type`, `host_key_fingerprint` | The shell's host key, such as `ssh-ed25519` and `SHA256:...` |
 | `ssh_command` | An OpenSSH command line that logs in with strict host-key checking |
 | `ssh_mcp` | `config_path` of the generated ssh-mcp config, this shell's `profile` name, and `profile_toml`, the same profile as standalone text |
-| `advisories` | `tunnel_lifetime`, `ssh_mcp_reload`, and, for a root login, `root_login` |
+| `advisories` | `tunnel_lifetime` and `ssh_mcp_reload` |
 
 A failed probe does not close the tunnel: sshd may still be starting, and calling
 `compute_shell_connect` again returns the open tunnel with a new probe. A second call
@@ -559,7 +559,7 @@ stops the listener, closes open connections, and deletes the shell's key directo
 without contacting the master; `compute_cancel` of a shell does the same.
 
 Tunnels belong to the MCP process that opened them. They stop when it exits, and the next
-start deletes key directories that ended processes left behind. While another MCP
+start on the same host deletes the shell subdirectories that ended processes left behind. While another MCP
 process that is still running holds a shell's tunnel, connecting that shell fails with
 `shell_access_conflict`; use or disconnect it there. The tunnel listens on the loopback
 interface only. Other local processes can connect to the port, but they reach only
@@ -567,23 +567,27 @@ sshd, which still requires the private key, and the pinned host key verifies the
 end to end. sshd allows TCP forwarding, so `ssh -L` through the tunnel can reach a port
 inside the container.
 
-The login user is `root` unless an administrator linked the account to an agent user.
-Treat an agent's commands in the shell like any other root access to the container and its
-mounts: SSH MCP servers such as ssh-mcp advise against root accounts, so keep their
-approval gate on.
+The login user is the agent user that an administrator configured for the account or
+workspace (its agent user group). An agent's commands in the shell act on the container
+and its mounts with that user's permissions, so keep the SSH MCP server's approval gate on.
 
 #### Shell-access directory
 
 The directory defaults to `~/.cache/determined-compute/shell-access`; `--shell-access-dir`
-or `DETERMINED_COMPUTE_SHELL_ACCESS` selects another. It is created with mode 0700 on the
-first connect, group and world permissions are removed from an existing one, and a
-directory that is a symbolic link or belongs to another user is refused. It holds:
+or `DETERMINED_COMPUTE_SHELL_ACCESS` selects another, which should be a dedicated
+directory. It is created with mode 0700 on the first connect; an existing directory that
+other users can access, that is a symbolic link, or that belongs to another user is
+refused and left unchanged. The startup cleanup deletes only shell subdirectories: those
+named by a shell ID that hold nothing but the files below. Records carry the host name;
+records of another host are never deleted or listed, but MCP servers on different hosts,
+such as with a shared home directory, should still use separate directories, because each
+rewrites `ssh-mcp.toml` with its own host's tunnels. It holds:
 
 | Path | Content |
 | --- | --- |
 | `<shell id>/key` | The shell's private key, mode 0600 |
 | `<shell id>/known_hosts` | `[127.0.0.1]:<port>` and the shell's public key |
-| `<shell id>/tunnel.json` | The tunnel record: process ID, port, user, paths, and host-key fingerprint |
+| `<shell id>/tunnel.json` | The tunnel record: host, process ID, port, user, paths, and host-key fingerprint |
 | `ssh-mcp.toml` | ssh-mcp config with one profile per open tunnel of every running MCP process that shares the directory; removed when none is open |
 
 #### Use the shell from ssh-mcp
@@ -597,16 +601,19 @@ SSH, with command classification, approval, and audit logging. It needs Node.js.
 
    ```bash
    claude mcp add --transport stdio ssh-mcp -- \
-     ssh-mcp --config /home/me/.cache/determined-compute/shell-access/ssh-mcp.toml \
-     --hostKeyMode strict
+     ssh-mcp --config=/home/me/.cache/determined-compute/shell-access/ssh-mcp.toml \
+     --hostKeyMode=strict
    ```
 
-   Use the absolute path of the configured shell-access directory.
+   Use the absolute path of the configured shell-access directory. ssh-mcp reads only the
+   `--flag=value` form: with a space instead of `=`, `--config` has no path and
+   `--hostKeyMode` stays at `tofu`.
 2. Launch a shell, wait until `compute_status` reports `STATE_RUNNING`, and call
    `compute_shell_connect(id)`.
-3. Restart or reconnect ssh-mcp (in Claude Code, `/mcp`): it reads its config only when
-   it starts. Before the first connect the file does not exist, so ssh-mcp starts
-   unconfigured and refuses tool calls.
+3. Start, restart, or reconnect ssh-mcp (in Claude Code, `/mcp`): it reads its config only
+   when it starts. The file exists only while at least one tunnel is open; until then
+   ssh-mcp exits at startup because its `--config` file is missing, and its MCP client
+   shows it as failed, which is expected.
 4. Call ssh-mcp's tools, such as `open-session` and `run-command`, with the profile
    named in `ssh_mcp.profile`.
 5. When done, call `compute_shell_disconnect(id)`, and `compute_cancel("shell", id)` to

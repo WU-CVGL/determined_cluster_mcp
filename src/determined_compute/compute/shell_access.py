@@ -23,6 +23,7 @@ import socketserver
 import ssl
 import sys
 import threading
+import uuid
 from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +36,8 @@ LOOPBACK = "127.0.0.1"
 SSH_MCP_CONFIG = "ssh-mcp.toml"
 _RECORD = "tunnel.json"
 _LOCK = ".lock"
+# The only files a shell's subdirectory holds; the sweep deletes nothing else.
+_SHELL_FILES = frozenset({"key", "known_hosts", _RECORD})
 # How long a WebSocket may take to open, and the probe to read the sshd banner.
 _CONNECT_TIMEOUT = 30
 _PROBE_TIMEOUT = 15
@@ -112,6 +115,8 @@ def websocket_opener(client: Any) -> OpenWebSocket:
             sslopt=sslopt,
             timeout=_CONNECT_TIMEOUT if timeout is None else timeout,
             enable_multithread=True,
+            # A followed redirect would resend the bearer token to its target.
+            redirect_limit=0,
         )
         connection.settimeout(timeout)
         return connection
@@ -119,8 +124,23 @@ def websocket_opener(client: Any) -> OpenWebSocket:
     return open_websocket
 
 
+def abort_websocket(ws: Any) -> None:
+    """Close a WebSocket at once, waking a thread blocked in ``ws.recv_data()``.
+
+    ``ws.shutdown()`` only closes the socket, which does not wake a blocked receive on
+    Linux; shutting the socket down first does.
+    """
+    sock = getattr(ws, "sock", None)
+    if sock is not None:
+        with suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+    with suppress(Exception):
+        ws.shutdown()
+
+
 def relay(connection: socket.socket, ws: Any) -> None:
     """Copy bytes both ways between a TCP connection and a WebSocket until either closes."""
+    finished = threading.Event()
 
     def upstream() -> None:
         try:
@@ -130,13 +150,16 @@ def relay(connection: socket.socket, ws: Any) -> None:
                     break
                 ws.send_binary(data)
         except Exception:
-            with suppress(Exception):
-                ws.shutdown()
+            abort_websocket(ws)
             return
         # The SSH client is done: ask the proxy to close, and wait a bounded time for it.
-        with suppress(Exception):
-            ws.settimeout(_CLOSE_TIMEOUT)
+        try:
             ws.send_close()
+        except Exception:
+            abort_websocket(ws)
+            return
+        if not finished.wait(_CLOSE_TIMEOUT):
+            abort_websocket(ws)
 
     sender = threading.Thread(target=upstream, name="shell-relay-upstream", daemon=True)
     sender.start()
@@ -150,10 +173,10 @@ def relay(connection: socket.socket, ws: Any) -> None:
     except Exception:
         pass
     finally:
+        finished.set()
         with suppress(OSError):
             connection.shutdown(socket.SHUT_RDWR)
-        with suppress(Exception):
-            ws.shutdown()
+        abort_websocket(ws)
         sender.join(timeout=_CLOSE_TIMEOUT)
 
 
@@ -162,8 +185,9 @@ class _RelayHandler(socketserver.BaseRequestHandler):
 
     def handle(self) -> None:
         ws = self.server.open_websocket()
-        with self.server.tracking(self.request, ws):
-            relay(self.request, ws)
+        with self.server.tracking(self.request, ws) as admitted:
+            if admitted:
+                relay(self.request, ws)
 
 
 class _RelayServer(socketserver.ThreadingTCPServer):
@@ -175,26 +199,33 @@ class _RelayServer(socketserver.ThreadingTCPServer):
         self.open_websocket = open_websocket
         self._active: Dict[int, Tuple[socket.socket, Any]] = {}
         self._active_lock = threading.Lock()
+        self._closing = False
         super().__init__((LOOPBACK, port), _RelayHandler)
 
     @contextmanager
-    def tracking(self, connection: socket.socket, ws: Any) -> Iterator[None]:
+    def tracking(self, connection: socket.socket, ws: Any) -> Iterator[bool]:
+        """Register a relayed connection; yield False when the tunnel is already closing."""
         with self._active_lock:
-            self._active[id(connection)] = (connection, ws)
+            admitted = not self._closing
+            if admitted:
+                self._active[id(connection)] = (connection, ws)
+        if not admitted:
+            # The WebSocket opened while the tunnel stopped; drop_connections missed it.
+            abort_websocket(ws)
         try:
-            yield
+            yield admitted
         finally:
             with self._active_lock:
                 self._active.pop(id(connection), None)
 
     def drop_connections(self) -> None:
         with self._active_lock:
+            self._closing = True
             active = list(self._active.values())
         for connection, ws in active:
             with suppress(OSError):
                 connection.shutdown(socket.SHUT_RDWR)
-            with suppress(Exception):
-                ws.shutdown()
+            abort_websocket(ws)
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         # stdout carries MCP frames; one line on stderr, without a traceback.
@@ -204,6 +235,11 @@ class _RelayServer(socketserver.ThreadingTCPServer):
             f"{type(error).__name__}: {error}",
             file=sys.stderr,
         )
+
+
+def _held_elsewhere(record: Dict[str, Any]) -> bool:
+    """Whether a record belongs to another host, whose processes cannot be checked here."""
+    return record.get("host") not in (None, socket.gethostname())
 
 
 def _pid_alive(pid: Any) -> bool:
@@ -273,8 +309,12 @@ class ShellAccess:
             raise ValidationError(f"shell access directory {directory} is not a directory")
         if hasattr(os, "getuid") and status.st_uid != os.getuid():
             raise ValidationError(f"shell access directory {directory} belongs to another user")
-        if status.st_mode & 0o077:
-            os.chmod(directory, 0o700)
+        if os.name != "nt" and status.st_mode & 0o077:
+            # Never loosen or tighten a directory the user named; ask for a private one.
+            raise ValidationError(
+                f"shell access directory {directory} is accessible to other users; use a "
+                "dedicated directory with mode 0700"
+            )
         return directory
 
     @contextmanager
@@ -292,18 +332,31 @@ class ShellAccess:
         finally:
             os.close(descriptor)
 
+    @staticmethod
+    def _is_shell_directory(entry: Path) -> bool:
+        """Whether ``entry`` is a shell's subdirectory: named by its UUID, holding only our files."""
+        try:
+            if entry.is_symlink() or not entry.is_dir() or str(uuid.UUID(entry.name)) != entry.name:
+                return False
+            return {child.name for child in entry.iterdir()} <= _SHELL_FILES
+        except (ValueError, OSError):
+            return False
+
     def _records(self) -> List[Dict[str, Any]]:
-        """Records of the tunnels that live processes hold, this one included."""
+        """Records of the tunnels that live processes on this host hold, this one included."""
         records = []
         for entry in sorted(self.directory.iterdir()):
             path = entry / _RECORD
-            if not entry.is_dir() or entry.is_symlink() or not path.is_file():
+            if not self._is_shell_directory(entry) or not path.is_file():
                 continue
             try:
                 record = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            if not isinstance(record, dict) or not _pid_alive(record.get("pid")):
+            if not isinstance(record, dict) or record.get("shell_id") != entry.name:
+                continue
+            # Another host's 127.0.0.1 ports are unreachable from here.
+            if _held_elsewhere(record) or not _pid_alive(record.get("pid")):
                 continue
             if record["pid"] == os.getpid() and record.get("shell_id") not in self._tunnels:
                 continue
@@ -317,13 +370,17 @@ class ShellAccess:
         self._prepare_directory()
         with self._directory_lock():
             for entry in self.directory.iterdir():
-                if not entry.is_dir() or entry.is_symlink():
+                if not self._is_shell_directory(entry):
                     continue
                 try:
                     record = json.loads((entry / _RECORD).read_text(encoding="utf-8"))
-                    pid = record.get("pid") if isinstance(record, dict) else None
                 except (OSError, ValueError):
-                    pid = None
+                    record = None
+                if not isinstance(record, dict):
+                    record = {}
+                if _held_elsewhere(record):
+                    continue
+                pid = record.get("pid")
                 ours = pid == os.getpid() and entry.name in self._tunnels
                 if not ours and (pid == os.getpid() or not _pid_alive(pid)):
                     shutil.rmtree(entry, ignore_errors=True)
@@ -442,10 +499,15 @@ class ShellAccess:
                 held = json.loads((directory / _RECORD).read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 held = None
-            if isinstance(held, dict) and held.get("pid") != os.getpid() and _pid_alive(held.get("pid")):
+            if isinstance(held, dict) and (
+                _held_elsewhere(held)
+                or (held.get("pid") != os.getpid() and _pid_alive(held.get("pid")))
+            ):
+                where = f"on host {held.get('host')} " if _held_elsewhere(held) else ""
                 raise ConflictError(
-                    f"another determined-compute-mcp process (pid {held.get('pid')}) holds this "
-                    f"shell's tunnel on {LOOPBACK}:{held.get('port')}; use or disconnect it there",
+                    f"another determined-compute-mcp process {where}(pid {held.get('pid')}) "
+                    f"holds this shell's tunnel on {LOOPBACK}:{held.get('port')}; use or "
+                    "disconnect it there",
                     code="shell_access_conflict",
                 )
             shutil.rmtree(directory, ignore_errors=True)
@@ -467,6 +529,7 @@ class ShellAccess:
             known_hosts = directory / "known_hosts"
             _write_private(known_hosts, f"[{LOOPBACK}]:{port} {keys['public_key']}\n")
             record = {
+                "host": socket.gethostname(),
                 "pid": os.getpid(),
                 "shell_id": remote_id,
                 "port": port,
@@ -502,12 +565,15 @@ class ShellAccess:
         try:
             ws = open_websocket(remote_id, _PROBE_TIMEOUT)
             opcode, data = ws.recv_data()
+            # A line that is no SSH identification makes sshd close its side now, rather than
+            # hold an unauthenticated connection for its LoginGraceTime.
+            with suppress(Exception):
+                ws.send_binary(b"probe\r\n")
         except Exception as exc:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:512]}
         finally:
             if ws is not None:
-                with suppress(Exception):
-                    ws.shutdown()
+                abort_websocket(ws)
         line = b"" if opcode == _OPCODE_CLOSE else bytes(data or b"").split(b"\n", 1)[0].rstrip(b"\r")
         if not line.startswith(b"SSH-"):
             return {"ok": False, "error": "the shell's proxy did not answer with an SSH banner"}
@@ -544,16 +610,6 @@ class ShellAccess:
                 ),
             },
         ]
-        if user == "root":
-            advisories.append({
-                "code": "root_login",
-                "message": (
-                    "The shell logs in as root, because the account has no agent user group. "
-                    "ssh-mcp advises against root accounts: keep its approval gate on "
-                    "(approvalMode ask-destructive or stricter, never auto), or ask an "
-                    "administrator to link the account to an agent user."
-                ),
-            })
         return {
             "kind": "shell",
             "id": record["shell_id"],

@@ -1019,7 +1019,7 @@ class DeterminedAPIClient:
             "id": str(entity["id"]),
             "private_key": private_key,
             "public_key": public_key.strip(),
-            # det shell open logs in as the agent user group's user, else root.
+            # The agent user Determined runs the shell as, which det shell open logs in as.
             "user": user if isinstance(user, str) and user else "root",
         }
 

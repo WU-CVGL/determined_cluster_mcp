@@ -31,7 +31,7 @@
 根据工作内容选择任务类型。以下四种类型由简到繁排列：
 
 - `command` 在容器中运行一次你的命令，命令退出即结束。用于有限的非交互任务，例如评估、转换或构建。
-- `shell` 提供一个可通过 SSH 连接的容器，而不是运行一个命令。用于交互调试和环境检查。
+- `shell` 提供一个可通过 SSH 连接的容器，而不是运行一个命令。用于交互调试和环境检查；见[在 shell 中工作](#work-inside-a-shell)。
 - `generic` 像 `command` 一样运行一次你的命令，并带有名称和子任务；以 `pausable: true` 提交时，还可以暂停以释放其槽位，之后以同一任务 ID 恢复。恢复时会在新容器中从头再次运行命令，失败后也不会自动重启，所以只在任务可安全重跑时才设为可暂停；见[暂停与恢复](#pause-and-resume)。它要求 Determined master 来自带有 WU-CVGL/determined#27 的 research-cluster fork，该版本能列出 generic 任务及其所有者；在较旧的 master 上，提交会在创建任何内容之前以 `unsupported` 失败。`kind: auto` 从不选择它。
 - `experiment` 将你的命令作为一个或多个 trial 运行，并增加 Determined 的实验功能：
   - searcher（在 `experiment_config.searcher` 中设置）：运行单个 trial，或在超参数空间上运行多个 trial（网格、随机，或提前停止较差 trial 的自适应搜索）；
@@ -116,6 +116,20 @@ MCP 不接受 `kind: notebook`。
 提交成功或进入终态本身不等于验收通过。检查进程退出信息和任务开始时定义的成功判据。已经配置存储访问时，使用 `storage_check` 验证预期共享产物；否则使用任务输出或另一项明确的任务内检查。需要本地副本时，先配置存储访问，再调用 `storage_fetch(shared_dir, local_dir, dry_run=true)` 预览，审核后以 `dry_run=false` 执行，并检查取回的结果。
 
 报告任务的 kind 和 ID、最终状态、存在时的退出结果、输出路径，以及实际观察到的产物或指标。绝不包含 token、密码、私钥、cookie 或 secrets 文件内容。
+
+<a id="work-inside-a-shell"></a>
+## 在 shell 中工作
+
+计算 MCP 能提交 shell，但不在其中运行命令。`compute_shell_connect` 为 shell 提供一个本地 SSH 端点，供 SSH 客户端（例如 [ssh-mcp](https://github.com/tufantunc/ssh-mcp) MCP 服务）使用：
+
+1. 以工作所需的槽位数提交一个 `shell`，并轮询 `compute_status`，直到 `state` 为 `STATE_RUNNING`。
+2. 调用 `compute_shell_connect(id)`。检查 `probe.ok`；`ready` 为 `false` 或探测失败时，sshd 可能仍在启动，稍等片刻后再次调用。
+3. 使用返回结果：
+   - 如果 ssh-mcp 已配置为使用生成的配置（见[从 ssh-mcp 使用 shell](compute-service.zh.md#use-the-shell-from-ssh-mcp)），每次 connect 之后都必须重启或重新连接 ssh-mcp。agent 通常无法自行重启 MCP 服务，因此请用户重新连接它，然后使用 `ssh_mcp.profile` 中给出的 profile。
+   - 否则，在用户允许时用 shell 工具运行 `ssh_command`，或把结果中的值交给用户，供其在自己的 SSH 客户端或 IDE 中使用。
+4. 完成后调用 `compute_shell_disconnect(id)`，然后调用 `compute_cancel("shell", id)`，除非用户希望保留该 shell；shell 会一直占用其槽位，直到被取消，或在部署设置了空闲时限时因达到该时限而停止。
+
+shell 以账户的 agent user 登录，在其中运行的任何命令都可能以该用户的权限修改挂载到容器中的共享存储。保持 ssh-mcp 的审批关卡开启，绝不设为 `auto`，并把工作限制在用户要求的范围内。绝不读取或输出密钥文件；用 `key_path` 指代它。
 
 <a id="pause-and-resume"></a>
 ## 暂停与恢复

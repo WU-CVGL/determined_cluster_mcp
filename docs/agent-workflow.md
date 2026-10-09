@@ -120,7 +120,7 @@ The compute MCP launches a shell but does not run commands in it. `compute_shell
    - Otherwise run `ssh_command` with a shell tool, if the user allows that, or give the result's values to the user for their own SSH client or IDE.
 4. When done, call `compute_shell_disconnect(id)`, then `compute_cancel("shell", id)` unless the user wants the shell kept; a shell holds its slots until it is cancelled or, where the deployment sets one, its inactivity limit stops it.
 
-The shell logs in as `root` unless the account is linked to an agent user, and anything run there can change shared storage mounted into the container. Keep ssh-mcp's approval gate on, never `auto`, and keep the work within the user's requested scope. Never read or print the key file; refer to it by `key_path`.
+The shell logs in as the account's agent user, and anything run there can change shared storage mounted into the container with that user's permissions. Keep ssh-mcp's approval gate on, never `auto`, and keep the work within the user's requested scope. Never read or print the key file; refer to it by `key_path`.
 
 ## Pause and resume
 

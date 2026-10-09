@@ -11,21 +11,24 @@
 
 ```mermaid
 flowchart LR
-    U[Any local stdio MCP client] --> M[13 MCP tools]
+    U[Any local stdio MCP client] --> M[15 MCP tools]
     M --> C[ComputeService]
     C --> A[Determined API]
     A --> K[Determined cluster]
     P[compute profile] --> C
     M --> S[shared-storage adapter]
     S --> H[mapped shared storage]
+    M --> T[shell tunnels on 127.0.0.1]
+    X[ssh, ssh-mcp, or an IDE] --> T
+    T --> A
 ```
 
 MCP server 是供一个可信用户使用的本地 stdio 服务。它以凭据选定的 Determined 账户身份运行，
 并且只操作该账户拥有的任务。若要远程暴露服务，需要另行设计带认证的传输层。
 
 `ComputeService` 负责规划和提交请求，并读取和控制该账户的任务：状态、日志、用量测量、
-取消、暂停与恢复以及列表。它不保存任务记录。任务、日志和 experiment 数据都保存在
-Determined 中，每个工具都通过任务的 kind 和 Determined 自身的 ID 指定任务。记录已提交的
+取消、暂停与恢复以及列表。Shell 访问把本地 SSH 连接中继到该账户正在运行的 shell。服务不保存
+任务记录。任务、日志和 experiment 数据都保存在 Determined 中，每个工具都通过任务的 kind 和 Determined 自身的 ID 指定任务。记录已提交的
 工作（例如 `compute_launch` 返回的 ID）是调用方的责任。源码、数据、包、检查点、日志和输出
 应放在映射的共享存储上。
 
@@ -165,7 +168,9 @@ URL 和凭据：此时忽略环境中的 `DET_API_TOKEN`、`DET_USERNAME` 和 `D
 `DET_API_TOKEN` 优先于文件中的 token。`--api-token` 取代其他 token 或登录方式，且只发送给
 选定的 master。凭据应放在现有凭据提供方或 secrets 文件中，不要写入配置、工具参数或报告。
 
-服务自身不写入任何文件。升级后应重启所有 MCP 进程，使其加载当前的工具集。
+除[shell 访问](#shell-access)外，服务自身不写入任何文件：shell 访问会在 `--shell-access-dir` 或
+`DETERMINED_COMPUTE_SHELL_ACCESS` 选定的目录中写入所连接 shell 的密钥文件和生成的 ssh-mcp 配置。
+升级后应重启所有 MCP 进程，使其加载当前的工具集。
 
 客户端访问映射共享存储的可选功能使用同一计算配置和独立的存储配置。参见
 [共享存储访问](shared-storage-access.zh.md)。
@@ -220,7 +225,7 @@ Determined 不再提供的已结束 command 或 shell（结束 24 小时后，�
 <a id="mcp-api"></a>
 ## MCP API
 
-server 提供 13 个工具。`kind` 是 `command`、`shell`、`generic` 或 `experiment`。`id` 是
+server 提供 15 个工具。`kind` 是 `command`、`shell`、`generic` 或 `experiment`。`id` 是
 Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，experiment 为正整数，也可以
 用数字字符串传入。
 
@@ -235,6 +240,8 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 | `compute_pause` | `kind`、`id` | experiment 和 generic 任务：任务摘要、远端响应和 `pause_acknowledged` |
 | `compute_resume` | `kind`、`id` | experiment 和 generic 任务：任务摘要、远端响应和 `resume_acknowledged` |
 | `compute_list` | `kind`，可选 `limit=50`、`offset=0`、`marker`、`states` | 当前账户的一页任务，最新的在前；指定 `states` 时只列出处于这些状态的 experiment 或 generic 任务；指定 `marker` 时返回该页中配置带有该标记的任务 |
+| `compute_shell_connect` | `id`，可选 `local_port` | 为该账户某个正在运行的 shell 打开或返回本地 SSH 隧道；见[shell 访问](#shell-access) |
+| `compute_shell_disconnect` | `id` | 关闭该隧道并删除该 shell 的密钥文件；shell 继续运行 |
 | `compute_resources` | 可选 `slots=1`、`pool`、`prefer_gpu_topology` | 当前调度容量和候选资源池。值为 `"strong"` 且请求 2 个及以上 slot 时，每个资源池会增加 `max_numa_node_free_slots`（当前能放下的最大 `"strong"` 任务）和 `max_numa_node_slots`（master 在当前 agent 下接受的最大值）。每个资源池还有 `description` 和 `gpu_models` |
 | `storage_check` | `path` | 映射容器路径的访问情况 |
 | `storage_sync` | `local_dir`、`shared_dir`，可选 `dry_run=true` | 预览或把本地目录内容复制到共享存储 |
@@ -410,8 +417,10 @@ API，恢复过的 generic 任务日志包含每次运行；experiment 日志来
 `compute_cancel` 对 command 和 shell 使用 task kill endpoint，对 experiment 使用 experiment
 cancel endpoint，对 generic 任务使用 generic task kill endpoint；后者也会终止任务的后代，
 但从不终止其祖先。它返回带 `cancellation_acknowledged: true` 的任务摘要，并把远端响应放在
-`remote` 中；command 或 shell 的响应还会更新 `state`。远端终止并不能单独证明成功，还应检查
-退出信息和预期的共享存储产物。
+`remote` 中；command 或 shell 的响应还会更新 `state`。取消 shell 时还会关闭其
+[shell 访问](#shell-access)隧道，并报告 `shell_access_closed`：关闭了隧道时为 `true`，没有隧道时
+为 `false`，关闭失败时为 `null`。远端终止并不能单独证明成功，还应检查退出信息和预期的共享存储
+产物。
 
 <a id="pause-and-resume"></a>
 ### 暂停与恢复
@@ -439,9 +448,125 @@ HTTP 400，在另一个暂停、恢复或终止进行中时返回 HTTP 409；这
 恢复不检查容量：任务会排队直到能放下；设置 `prefer_gpu_topology: "strong"` 时，它会无时间限制地
 等待，直到某个 NUMA 节点上有足够的空闲 slot。
 
-对于正在运行的 shell，应使用已清理的 `reconnectCommand`，当前为
-`det shell show_ssh_command <id>`，`compute_launch` 也会以 `reconnect_command` 返回它。适配器
-会移除 `privateKey`；不要把私钥材料写入报告。
+<a id="shell-access"></a>
+### Shell 访问
+
+shell 是一个容器，master 通过其代理提供该容器中的 sshd。`det shell open` 通过 SSH
+`ProxyCommand` 连接它，该命令经 WebSocket 把连接传送到 `<master>/proxy/<shell id>/`。只接受
+主机和端口的 SSH 客户端（例如 SSH MCP server）需要的是一个 TCP 端口，由
+`compute_shell_connect(id, local_port)` 提供：
+
+1. 它检查该账户拥有这个 shell，且 shell 的状态为 `STATE_RUNNING`；否则在读取任何密钥之前以
+   `ownership_mismatch` 或 `shell_not_running` 失败。
+2. 它从 `GET /api/v1/shells/{id}` 读取 shell 的密钥对。Determined 为每个 shell 生成这对密钥：
+   sshd 接受用该私钥登录，并把同一对密钥用作自己的主机密钥。私钥只写入 shell 访问目录中该
+   shell 子目录下权限为 0600 的 `key` 文件；任何工具结果都不包含私钥。
+3. 它在 `127.0.0.1` 上监听 `local_port`（1024 到 65535），未指定时监听一个空闲端口，并通过新建
+   的 WebSocket 把每个连接中继到该 shell 的代理。WebSocket 使用 MCP server 的 master URL、token
+   和 TLS 验证设置，以及与 Requests 相同的代理变量（`http://` 用 `http_proxy`，`https://` 用
+   `https_proxy`，以及 `no_proxy`，小写形式优先于大写形式）。开启 `--verify-ssl` 时，CA bundle
+   取 `REQUESTS_CA_BUNDLE`，其次是 `CURL_CA_BUNDLE`，再次是 Requests 的默认 bundle。
+4. 它为该端口写入一条 `known_hosts` 记录，并重新生成 `ssh-mcp.toml`。
+5. shell 的 allocation 报告就绪时，它打开一次代理，并把读到的 sshd 标识行作为 `probe` 返回。
+
+结果包含以下字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `kind`、`id`、`state` | `shell`、该 shell 的 ID 及其状态 |
+| `ready` | allocation 是否报告就绪，即 sshd 是否已在监听；该查询失败时为 `null`，并带有 `context_unavailable: ["ready"]` |
+| `probe` | `{ok: true, banner}`（含 sshd 的标识行）或 `{ok: false, error}`；`ready` 为 `false` 时不尝试 |
+| `reused` | 隧道已在本进程中打开时为 `true` |
+| `host`、`port` | 总是 `127.0.0.1`，以及监听端口 |
+| `user` | 登录用户：Determined 运行该 shell 所用的 agent user，与 `det shell open` 相同 |
+| `key_path`、`known_hosts_path` | 私钥文件，以及该端口固定的主机密钥记录 |
+| `host_key_type`、`host_key_fingerprint` | shell 的主机密钥，例如 `ssh-ed25519` 和 `SHA256:...` |
+| `ssh_command` | 启用严格主机密钥检查登录的 OpenSSH 命令行 |
+| `ssh_mcp` | 生成的 ssh-mcp 配置的 `config_path`、该 shell 的 `profile` 名称，以及 `profile_toml`，即同一 profile 的独立文本 |
+| `advisories` | `tunnel_lifetime` 和 `ssh_mcp_reload` |
+
+探测失败不会关闭隧道：sshd 可能仍在启动，再次调用 `compute_shell_connect` 会返回已打开的隧道并
+重新探测。再次调用会返回已打开的隧道（`reused: true`），除非它请求了不同的 `local_port`，此时
+会替换原隧道。端口被占用时以 `port_unavailable` 失败。`compute_shell_disconnect` 停止监听、关闭
+已打开的连接并删除该 shell 的密钥目录，不访问 master；对 shell 调用 `compute_cancel` 也会这样做。
+
+隧道属于打开它的 MCP 进程。进程退出时隧道随之停止，同一主机上的下次启动会删除已结束进程遗留的 shell 子目录。
+某个 shell 的隧道由另一个仍在运行的 MCP 进程持有时，连接该 shell 会以 `shell_access_conflict`
+失败；请在那个进程中使用或断开它。隧道只在回环接口上监听。其他本地进程可以连接该端口，但只能
+到达 sshd，而 sshd 仍要求私钥；固定的主机密钥则端到端地验证 shell。sshd 允许 TCP 转发，因此
+经隧道的 `ssh -L` 可以访问容器内的端口。
+
+登录用户是管理员为该账户或 workspace 配置的 agent user（其 agent user group）。agent 在 shell 中
+执行的命令以该用户的权限作用于容器及其挂载，因此请保持 SSH MCP server 的审批关卡开启。
+
+<a id="shell-access-directory"></a>
+#### Shell 访问目录
+
+该目录默认为 `~/.cache/determined-compute/shell-access`；可用 `--shell-access-dir` 或
+`DETERMINED_COMPUTE_SHELL_ACCESS` 选择其他目录，该目录应专用于此。首次连接时以权限 0700 创建
+该目录；已存在的目录若可被其他用户访问、是符号链接或属于其他用户，会被拒绝且保持不变。启动时的
+清理只删除 shell 子目录：以 shell ID 命名、且只包含下表文件的目录。记录中带有主机名；其他主机的
+记录既不会被删除也不会被列出，但不同主机上的 MCP server（例如共享 home 目录时）仍应使用各自的
+目录，因为每个 server 都会用本主机的隧道重写 `ssh-mcp.toml`。其中包含：
+
+| 路径 | 内容 |
+| --- | --- |
+| `<shell id>/key` | shell 的私钥，权限 0600 |
+| `<shell id>/known_hosts` | `[127.0.0.1]:<port>` 和 shell 的公钥 |
+| `<shell id>/tunnel.json` | 隧道记录：主机、进程 ID、端口、用户、路径和主机密钥指纹 |
+| `ssh-mcp.toml` | ssh-mcp 配置，共享该目录的所有运行中 MCP 进程的每条已打开隧道各对应一个 profile；没有已打开的隧道时删除 |
+
+<a id="use-the-shell-from-ssh-mcp"></a>
+#### 从 ssh-mcp 使用 shell
+
+[ssh-mcp](https://github.com/tufantunc/ssh-mcp) 是通过 SSH 运行命令的 MCP server，提供命令分类、
+审批和审计日志。它需要 Node.js。
+
+1. 用 `npm install -g ssh-mcp` 安装它，并以生成的配置和严格主机密钥检查注册它；每个生成的
+   profile 都固定了 `trustedHostKey`，因此都满足严格检查。对于 Claude Code：
+
+   ```bash
+   claude mcp add --transport stdio ssh-mcp -- \
+     ssh-mcp --config=/home/me/.cache/determined-compute/shell-access/ssh-mcp.toml \
+     --hostKeyMode=strict
+   ```
+
+   请使用所配置的 shell 访问目录的绝对路径。ssh-mcp 只接受 `--flag=value` 形式：若用空格代替
+   `=`，`--config` 没有路径，`--hostKeyMode` 仍为 `tofu`。
+2. 提交一个 shell，等到 `compute_status` 报告 `STATE_RUNNING`，然后调用
+   `compute_shell_connect(id)`。
+3. 启动、重启或重新连接 ssh-mcp（在 Claude Code 中使用 `/mcp`）：它只在启动时读取配置。该文件
+   只在至少有一条隧道打开时存在；在此之前，ssh-mcp 会因 `--config` 文件不存在而在启动时退出，
+   其 MCP 客户端显示它启动失败，这是预期行为。
+4. 使用 `ssh_mcp.profile` 中给出的 profile 调用 ssh-mcp 的工具，例如 `open-session` 和
+   `run-command`。
+5. 完成后调用 `compute_shell_disconnect(id)`，并调用 `compute_cancel("shell", id)` 释放该 shell
+   的 slot。
+
+每个生成的 profile 包含 `name`、`host`、`port`、`user`、`auth = "key"`、`keyRef`、
+`trustedHostKey` 和 `group = "dev"`；`[defaults]` 把最新的 profile 指定为 `defaultProfile`。其余
+设置都采用 ssh-mcp 自身的默认值：角色 `operator`，审批模式 `ask-destructive`，即执行破坏性命令
+之前先询问。该文件在每次连接和断开时都会重写，因此对它的修改会丢失。如需其他策略设置，把
+`profile_toml` 复制到你自己的 ssh-mcp 配置中再修改，并注意端口和密钥路径在每次连接时都会改变。
+
+<a id="use-the-shell-from-other-ssh-clients"></a>
+#### 从其他 SSH 客户端使用 shell
+
+`ssh_command` 使用 OpenSSH 登录。IDE 或其他客户端可以在 SSH 配置条目中使用相同的值：
+
+```text
+Host det-shell
+  HostName 127.0.0.1
+  Port <port>
+  User <user>
+  IdentityFile <key_path>
+  IdentitiesOnly yes
+  UserKnownHostsFile <known_hosts_path>
+  StrictHostKeyChecking yes
+```
+
+`compute_launch` 仍会返回 `reconnect_command`（当前为 `det shell show_ssh_command <id>`），供原生
+CLI 用户使用。适配器会从每个任务实体中移除 `privateKey`；不要把私钥材料写入报告。
 
 <a id="task-usage-measurements"></a>
 ### 任务用量测量
@@ -625,7 +750,9 @@ MCP 失败使用 `isError: true`；其文本内容是如下形式的紧凑 JSON�
 {"error":{"code":"invalid_request","message":"...","retryable":false,"details":{}}}
 ```
 
-`retryable` 和 `details` 仅在可用时出现，structured content 为 null。安全 details 可包含
+`retryable` 和 `details` 仅在可用时出现，structured content 为 null。
+[Shell 访问](#shell-access)另外使用 `shell_not_running`、`shell_access_conflict`、`port_unavailable`，
+以及缺少 `websocket-client` 包时的 `unsupported`。安全 details 可包含
 未确认提交的 kind 和提交标记；HTTP 代理代替 Determined 作出应答时的 `source: "proxy"`、
 `status_code` 和 `proxy_error`；容量信息；以及 `permission_denied` 错误中被拒绝的资源池。
 认证、权限、传输和响应结构错误都会返回错误，而不是空结果。错误消息和报告可以包含清理后的

@@ -61,10 +61,10 @@ When upgrading from a version with a task database, remove `--db` and `--owner` 
 
 ```bash
 claude mcp add --transport stdio ssh-mcp -- \
-  ssh-mcp --config "$HOME/.cache/determined-compute/shell-access/ssh-mcp.toml" --hostKeyMode strict
+  ssh-mcp --config="$HOME/.cache/determined-compute/shell-access/ssh-mcp.toml" --hostKeyMode=strict
 ```
 
-Restart or reconnect ssh-mcp after each connect, since it reads the config only at startup. Shells log in as `root` unless the account has an agent user, so keep ssh-mcp's approval gate on. See [shell access](docs/compute-service.md#shell-access).
+ssh-mcp takes flags only as `--flag=value`. Start or reconnect it after each connect, since it reads the config only at startup; while no shell is connected the file does not exist and ssh-mcp exits at startup. Shells log in as the account's agent user, and commands run with that user's permissions on the container and its mounts, so keep ssh-mcp's approval gate on. See [shell access](docs/compute-service.md#shell-access).
 
 ## Install the agent skill (optional)
 

@@ -32,7 +32,7 @@ For a short single-GPU task already authorized to run locally, read [local works
 
 ## Work in a shell
 
-To run commands inside a running `shell`, call `compute_shell_connect(id)` and use the returned SSH endpoint through an SSH MCP server such as ssh-mcp (the user must reconnect it after each connect), or `ssh_command` where the user allows it. Retry the connect while `ready` is false or `probe.ok` is false. The shell usually logs in as root: keep the SSH tool's approval on, stay within the requested scope, and never read or print the key file. Afterwards call `compute_shell_disconnect`, then `compute_cancel` unless the user wants the shell kept. See [work inside a shell](../../docs/agent-workflow.md#work-inside-a-shell).
+To run commands inside a running `shell`, call `compute_shell_connect(id)` and use the returned SSH endpoint through an SSH MCP server such as ssh-mcp (the user must reconnect it after each connect), or `ssh_command` where the user allows it. Retry the connect while `ready` is false or `probe.ok` is false. The shell logs in as the account's agent user and can change mounted shared storage: keep the SSH tool's approval on, stay within the requested scope, and never read or print the key file. Afterwards call `compute_shell_disconnect`, then `compute_cancel` unless the user wants the shell kept. See [work inside a shell](../../docs/agent-workflow.md#work-inside-a-shell).
 
 ## Handle failed submissions
 
