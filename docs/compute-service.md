@@ -526,7 +526,8 @@ SSH MCP server, needs a TCP port instead, which
    key. With `wait_seconds` (0 to 600, default 0), it checks the shell every 5 seconds
    until it runs, instead of the caller polling `compute_status`; a shell that ends
    meanwhile fails at once, and one still not running when the time is up fails with
-   `shell_not_running`.
+   `shell_not_running`. A lookup that fails transiently, such as a `transport_error` or an
+   HTTP 429 or 5xx, is retried until the time is up; any other error ends the wait.
 2. It reads the shell's key pair from `GET /api/v1/shells/{id}`. Determined generates the
    pair for each shell: sshd accepts the private key for login and uses the same pair as
    its host key. The private key is written only to a `key` file with mode 0600 in the
@@ -542,17 +543,23 @@ SSH MCP server, needs a TCP port instead, which
    else Requests' default bundle.
 4. It writes a `known_hosts` entry for that port and regenerates `ssh_config` and
    `ssh-mcp.toml`. If any step fails, it removes what it created and reports the original
-   error.
+   error. It writes all three configs before replacing any, so a full disk leaves them as
+   they were; if replacing fails partway, it removes all three rather than leave them
+   disagreeing.
 5. When the shell's allocation reports ready, it opens the proxy once and reads sshd's
    identification line as `probe`; with `wait_seconds`, it repeats this every 5 seconds
-   until the probe succeeds or the time is up, and then returns the result either way. A
-   banner shows only that sshd answers; logging in is left to the SSH client.
+   until the probe succeeds or the time is up, and then returns the result either way.
+   Meanwhile it checks the shell again: a shell that stops fails with `shell_not_running`,
+   another failed lookup that is not transient ends the call with that error, and each
+   closes a tunnel the call opened. Each probe gets no more than the time left, but at least
+   1 second, so the call can overrun `wait_seconds` by about a second plus one API request.
+   A banner shows only that sshd answers; logging in is left to the SSH client.
 
 The result has these fields:
 
 | Field | Meaning |
 | --- | --- |
-| `kind`, `id`, `state` | `shell`, the shell's ID, and its state |
+| `kind`, `id`, `state` | `shell`, the shell's ID, and its state; `state` is `null` with `context_unavailable: ["state"]` when the last check during `wait_seconds` failed |
 | `ready` | Whether the allocation reports ready, which is when sshd listens; `null` with `context_unavailable: ["ready"]` when that lookup failed |
 | `probe` | `{ok: true, banner}` with sshd's identification line, or `{ok: false, error}`; a refused WebSocket handshake is reported by its HTTP status alone. Not attempted while `ready` is `false` |
 | `reused` | `true` when the tunnel was already open in this process |
@@ -657,7 +664,10 @@ own connection; a chosen directory that was removed is created again. Disconnect
 its connection, so its multiplexing master exits and removes its socket. Determined's
 sshd keeps OpenSSH's default `MaxSessions` of 10 sessions per connection, so at most 10
 commands run at once through one master; further commands open their own connections and
-still run. OpenSSH for Windows does not multiplex.
+still run. To run one command on a connection of its own, such as a large transfer or
+when the shared connection misbehaves, add `-S none`:
+`ssh -S none -F <ssh_config_path> <ssh_alias> '<command>'`. It opens a new WebSocket and
+SSH connection for that command alone. OpenSSH for Windows does not multiplex.
 
 `compute_launch` still returns `reconnect_command`, currently
 `det shell show_ssh_command <id>`, for users of the native CLI. The adapter removes

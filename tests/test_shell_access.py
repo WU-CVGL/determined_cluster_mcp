@@ -349,10 +349,10 @@ class _StartingClient(FakeClient):
         self.readiness = list(readiness)
 
     def get_task(self, kind, remote_id):
-        if len(self.states) > 1:
-            self.state = self.states.pop(0)
-        else:
-            self.state = self.states[0]
+        item = self.states.pop(0) if len(self.states) > 1 else self.states[0]
+        if isinstance(item, BaseException):
+            raise item
+        self.state = item
         return super().get_task(kind, remote_id)
 
     def get_task_info(self, task_id):
@@ -411,6 +411,118 @@ def test_wait_seconds_returns_the_tunnel_when_sshd_is_still_starting(tmp_path, m
         assert os.path.exists(result["key_path"])
     finally:
         manager.close_all()
+
+
+def _transient():
+    return APIError("Determined request failed", code="transport_error", retryable=True)
+
+
+def test_wait_seconds_rides_out_transient_lookup_errors_while_queued(tmp_path, monkeypatch):
+    clock = _Clock(monkeypatch)
+    client = _StartingClient([_transient(), "STATE_QUEUED", _transient(), "STATE_RUNNING"])
+    manager = ShellAccess(_service(client), tmp_path / "access", Opener())
+    try:
+        assert manager.connect(SHELL_ID, wait_seconds=60)["probe"]["ok"] is True
+    finally:
+        manager.close_all()
+    assert clock.sleeps == [5, 5, 5]
+
+
+def test_a_definitive_lookup_error_while_queued_is_raised_at_once(tmp_path, monkeypatch):
+    clock = _Clock(monkeypatch)
+    client = _StartingClient([APIError("404 not found", code=404), "STATE_RUNNING"])
+    manager = ShellAccess(_service(client), tmp_path / "access", Opener())
+    with pytest.raises(APIError) as caught:
+        manager.connect(SHELL_ID, wait_seconds=60)
+    assert caught.value.code == 404 and clock.sleeps == []
+
+
+def test_a_definitive_lookup_error_while_sshd_starts_closes_the_new_tunnel(tmp_path, monkeypatch):
+    clock = _Clock(monkeypatch)
+    client = _StartingClient(
+        ["STATE_RUNNING", "STATE_RUNNING", APIError("404 not found", code=404)], [False] * 10
+    )
+    manager = ShellAccess(_service(client), tmp_path / "access", Opener())
+    with pytest.raises(APIError) as caught:
+        manager.connect(SHELL_ID, wait_seconds=300)
+    assert caught.value.code == 404
+    assert clock.sleeps == [5]
+    assert manager._tunnels == {} and not (tmp_path / "access" / SHELL_ID).exists()
+
+
+def test_an_unverifiable_state_is_reported_as_unknown_not_running(tmp_path, monkeypatch):
+    clock = _Clock(monkeypatch)
+    client = _StartingClient(["STATE_RUNNING", "STATE_RUNNING", _transient()], [False] * 10)
+    manager = ShellAccess(_service(client), tmp_path / "access", Opener())
+    try:
+        result = manager.connect(SHELL_ID, wait_seconds=12)
+        assert result["state"] is None
+        assert "state" in result["context_unavailable"]
+        assert result["probe"]["ok"] is False
+        assert os.path.exists(result["key_path"])
+    finally:
+        manager.close_all()
+    assert sum(clock.sleeps) == 12
+
+
+def test_the_probe_gets_no_more_than_the_wait_has_left(tmp_path, monkeypatch):
+    clock = _Clock(monkeypatch)
+    client = _StartingClient(["STATE_RUNNING"])
+    opener = Opener(banner=(b"HTTP/1.1 502 Bad Gateway\r\n",))
+    manager = ShellAccess(_service(client), tmp_path / "access", opener)
+    try:
+        result = manager.connect(SHELL_ID, wait_seconds=8)
+    finally:
+        manager.close_all()
+    assert result["probe"]["ok"] is False
+    # One last probe at the deadline gets the 1-second floor, never the usual 15 seconds.
+    assert [timeout for _, timeout in opener.opened] == [8, 3, 1]
+    assert clock.sleeps == [5, 3]
+
+
+@pytest.mark.parametrize("failing", [".ssh_hosts.tmp", ".ssh_config.tmp", ".ssh-mcp.toml.tmp"])
+def test_a_full_disk_while_adding_a_shell_leaves_every_config_listing_only_the_others(
+    access, tmp_path, monkeypatch, failing
+):
+    access.connect(OTHER_SHELL_ID)
+    directory = tmp_path / "access"
+    before = {name: (directory / name).read_text() for name in ("ssh_hosts", "ssh_config", SSH_MCP_CONFIG)}
+    write, full = module._write_private, []
+
+    def flaky(path, text):
+        # The disk fills at the named file and stays full, the rollback's writes included.
+        if full or path.name == failing:
+            full.append(path.name)
+            raise OSError(errno.ENOSPC, "No space left on device")
+        write(path, text)
+
+    monkeypatch.setattr(module, "_write_private", flaky)
+    with pytest.raises(OSError):
+        access.connect(SHELL_ID)
+    assert {name: (directory / name).read_text() for name in before} == before
+    assert not any(directory.glob(".*.tmp"))
+    assert not (directory / SHELL_ID).exists() and list(access._tunnels) == [OTHER_SHELL_ID]
+
+
+def test_a_failed_rename_leaves_no_configs_that_disagree(access, tmp_path, monkeypatch):
+    access.connect(OTHER_SHELL_ID)
+    directory = tmp_path / "access"
+    replace, calls = os.replace, []
+
+    def flaky(source, target):
+        calls.append(Path(target).name)
+        if len(calls) == 2:
+            raise OSError(errno.EIO, "Input/output error")
+        replace(source, target)
+
+    monkeypatch.setattr(module.os, "replace", flaky)
+    with pytest.raises(OSError):
+        access.connect(SHELL_ID)
+    # The rollback rewrote the configs for the remaining tunnel alone.
+    for name in ("ssh_hosts", "ssh_config", SSH_MCP_CONFIG):
+        text = (directory / name).read_text()
+        assert OTHER_SHELL_ID in text and SHELL_ID not in text
+    assert not any(directory.glob(".*.tmp"))
 
 
 def test_without_wait_seconds_a_queued_shell_says_how_to_wait(access, client):

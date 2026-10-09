@@ -744,22 +744,44 @@ class ShellAccess:
             "# every compute_shell_connect and compute_shell_disconnect; edits are lost.\n"
         )
         records = [self._tunnels[shell_id].record for shell_id in sorted(self._tunnels)]
+        names = (SSH_HOSTS, SSH_CONFIG, SSH_MCP_CONFIG)
         if not records:
-            for name in (SSH_CONFIG, SSH_HOSTS, SSH_MCP_CONFIG):
+            for name in names:
                 self._replace_private(self.directory / name, None)
             return
         control_directory = self._control_directory()
         blocks = [ssh_config_block(record, control_directory) for record in records]
-        self._replace_private(self.directory / SSH_HOSTS, "\n".join([header] + blocks))
-        self._replace_private(
-            self.directory / SSH_CONFIG, "\n".join([header] + blocks + [_UNKNOWN_ALIAS_BLOCK])
-        )
-        self._replace_private(
-            self.directory / SSH_MCP_CONFIG,
-            "\n".join([header] + [
+        contents = {
+            SSH_HOSTS: "\n".join([header] + blocks),
+            SSH_CONFIG: "\n".join([header] + blocks + [_UNKNOWN_ALIAS_BLOCK]),
+            SSH_MCP_CONFIG: "\n".join([header] + [
                 self.profile_toml(profile_name(record["shell_id"]), record) for record in records
             ]),
-        )
+        }
+        # Write every file before replacing any, so that a full disk leaves the three files as
+        # they were, all listing the same tunnels.
+        temporaries = {name: self.directory / f".{name}.tmp" for name in names}
+        try:
+            for name in names:
+                with suppress(FileNotFoundError):
+                    temporaries[name].unlink()
+                _write_private(temporaries[name], contents[name])
+        except BaseException:
+            for temporary in temporaries.values():
+                with suppress(OSError):
+                    temporary.unlink()
+            raise
+        try:
+            for name in names:
+                os.replace(temporaries[name], self.directory / name)
+        except BaseException:
+            # Some files may now be new and others old: remove them all rather than let them
+            # disagree, as a failed rewrite on disconnect does.
+            for name in names:
+                for path in (temporaries[name], self.directory / name):
+                    with suppress(OSError):
+                        path.unlink()
+            raise
 
     # Tool operations.
 
@@ -785,7 +807,15 @@ class ShellAccess:
             raise ValidationError(f"wait_seconds must be an integer from 0 to {MAX_WAIT_SECONDS}")
         deadline = _now() + wait_seconds
         while True:
-            kind, remote_id, entity = self.service._owned("shell", shell_id)
+            try:
+                kind, remote_id, entity = self.service._owned("shell", shell_id)
+            except APIError as exc:
+                # A transient failure, such as a network error, need not end a long wait.
+                remaining = deadline - _now()
+                if not exc.retryable or remaining <= 0:
+                    raise
+                _sleep(min(_WAIT_INTERVAL, remaining))
+                continue
             state = entity.get("state")
             if state == "STATE_RUNNING":
                 break
@@ -831,10 +861,16 @@ class ShellAccess:
                 self._write_configs()
             record = dict(tunnel.record)
             control_directory = self._control_directory()
+        state_unknown = False
         while True:
             ready, unavailable = self._ready(client, remote_id)
+            # Without wait_seconds the probe gets its usual time; with it, no more than is left.
+            probe_timeout = (
+                _PROBE_TIMEOUT if not wait_seconds
+                else max(1.0, min(_PROBE_TIMEOUT, deadline - _now()))
+            )
             probe = (
-                self._probe(open_websocket, remote_id)
+                self._probe(open_websocket, remote_id, probe_timeout)
                 if ready is not False
                 else {"ok": False, "error": "the shell is not ready yet; sshd has not started"}
             )
@@ -843,8 +879,18 @@ class ShellAccess:
                 break
             try:
                 state = self.service._owned("shell", shell_id)[2].get("state")
-            except APIError:
-                break
+                state_unknown = False
+            except APIError as exc:
+                if not exc.retryable:
+                    # The shell can no longer be checked, for example because it is gone or
+                    # the login expired; a tunnel this call opened is not handed back.
+                    if not reused:
+                        with self._lock:
+                            self._disconnect(remote_id)
+                    raise
+                state_unknown = True
+                _sleep(min(_WAIT_INTERVAL, remaining))
+                continue
             if state != "STATE_RUNNING":
                 if not reused:
                     # The tunnel was opened by this call for a shell that is gone.
@@ -856,6 +902,10 @@ class ShellAccess:
                     code="shell_not_running",
                 )
             _sleep(min(_WAIT_INTERVAL, remaining))
+        if state_unknown:
+            # The last check of the shell failed; do not report a state it may have left.
+            state = None
+            unavailable = [*unavailable, "state"]
         result = self._result(record, state, ready, reused, control_directory)
         if unavailable:
             result["context_unavailable"] = unavailable
@@ -944,16 +994,18 @@ class ShellAccess:
         ), []
 
     @staticmethod
-    def _probe(open_websocket: OpenWebSocket, remote_id: str) -> Dict[str, Any]:
+    def _probe(
+        open_websocket: OpenWebSocket, remote_id: str, timeout: float = _PROBE_TIMEOUT
+    ) -> Dict[str, Any]:
         """Open the shell's proxy once and read sshd's identification line.
 
         A banner shows only that sshd answers; logging in is left to the SSH client.
         """
-        deadline = time.monotonic() + _PROBE_TIMEOUT
+        deadline = time.monotonic() + timeout
         ws = None
         received = b""
         try:
-            ws = open_websocket(remote_id, _PROBE_TIMEOUT)
+            ws = open_websocket(remote_id, timeout)
             # The proxy may split the line across WebSocket messages.
             while b"\n" not in received and len(received) < _PROBE_MAX_BYTES:
                 remaining = deadline - time.monotonic()

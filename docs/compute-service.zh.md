@@ -461,7 +461,8 @@ shell 是一个容器，master 通过其代理提供该容器中的 sshd。`det 
 1. 它检查该账户拥有这个 shell，且 shell 的状态为 `STATE_RUNNING`；否则在读取任何密钥之前以
    `ownership_mismatch` 或 `shell_not_running` 失败。指定 `wait_seconds`（0 到 600，默认 0）时，
    它每 5 秒检查一次 shell，直到其运行，调用方无需轮询 `compute_status`；期间结束的 shell 立即
-   失败，时间用完时仍未运行的 shell 以 `shell_not_running` 失败。
+   失败，时间用完时仍未运行的 shell 以 `shell_not_running` 失败。暂时性的查询失败（例如
+   `transport_error`，或 HTTP 429、5xx）会一直重试到时间用完；其他错误会结束等待。
 2. 它从 `GET /api/v1/shells/{id}` 读取 shell 的密钥对。Determined 为每个 shell 生成这对密钥：
    sshd 接受用该私钥登录，并把同一对密钥用作自己的主机密钥。私钥只写入 shell 访问目录中该
    shell 子目录下权限为 0600 的 `key` 文件；任何工具结果都不包含私钥。
@@ -473,16 +474,20 @@ shell 是一个容器，master 通过其代理提供该容器中的 sshd。`det 
    `--verify-ssl` 时，CA bundle 取 `REQUESTS_CA_BUNDLE`，其次是 `CURL_CA_BUNDLE`（文件或目录均
    可），再次是 Requests 的默认 bundle。
 4. 它为该端口写入一条 `known_hosts` 记录，并重新生成 `ssh_config` 和 `ssh-mcp.toml`。任何一步
-   失败时，它会删除已创建的内容并报告原始错误。
+   失败时，它会删除已创建的内容并报告原始错误。它先写好全部三个配置，再逐个替换，因此磁盘
+   写满时三个文件保持原样；若替换中途失败，它会删除全部三个文件，而不是让它们彼此不一致。
 5. shell 的 allocation 报告就绪时，它打开一次代理，并把读到的 sshd 标识行作为 `probe` 返回；指定
    `wait_seconds` 时，它每 5 秒重复一次，直到探测成功或时间用完，然后无论结果如何都返回。
+   期间它会再次检查 shell：停止的 shell 以 `shell_not_running` 失败，其他非暂时性的查询失败会以
+   该错误结束调用，两种情况都会关闭本次调用打开的隧道。每次探测所用时间不超过剩余时间，但至少
+   1 秒，因此调用可能比 `wait_seconds` 多出约 1 秒加一次 API 请求的时间。
    标识行只表明 sshd 有应答；登录交给 SSH 客户端完成。
 
 结果包含以下字段：
 
 | 字段 | 含义 |
 | --- | --- |
-| `kind`、`id`、`state` | `shell`、该 shell 的 ID 及其状态 |
+| `kind`、`id`、`state` | `shell`、该 shell 的 ID 及其状态；`wait_seconds` 期间最后一次检查失败时，`state` 为 `null`，并带有 `context_unavailable: ["state"]` |
 | `ready` | allocation 是否报告就绪，即 sshd 是否已在监听；该查询失败时为 `null`，并带有 `context_unavailable: ["ready"]` |
 | `probe` | `{ok: true, banner}`（含 sshd 的标识行）或 `{ok: false, error}`；被拒绝的 WebSocket 握手只以其 HTTP 状态报告。`ready` 为 `false` 时不尝试 |
 | `reused` | 隧道已在本进程中打开时为 `true` |
@@ -570,7 +575,9 @@ Unix socket 路径最多约 104 字节，因此 socket 放在以下目录中第�
 （`~/.ssh` 存在时）。都不满足时，`control_path_dir` 为 `null`，每条命令各自打开连接；已选定的目录被删除时会重新创建。断开 shell、
 取消 shell 或重启 MCP server 会结束其连接，因此其多路复用 master 会退出并删除其 socket。
 Determined 的 sshd 保留 OpenSSH 默认的 `MaxSessions`，即每个连接 10 个会话，因此经由一个 master
-最多同时运行 10 条命令；更多的命令会各自打开连接，仍会运行。OpenSSH for Windows 不支持多路复用。
+最多同时运行 10 条命令；更多的命令会各自打开连接，仍会运行。若要让某条命令使用自己的连接，例如大量传输数据，或共享
+连接工作异常时，加上 `-S none`：`ssh -S none -F <ssh_config_path> <ssh_alias> '<command>'`。它只为
+这条命令新建一个 WebSocket 和 SSH 连接。OpenSSH for Windows 不支持多路复用。
 
 `compute_launch` 仍会返回 `reconnect_command`（当前为 `det shell show_ssh_command <id>`），供原生
 CLI 用户使用。适配器会从每个任务实体中移除 `privateKey`；不要把私钥材料写入报告。
