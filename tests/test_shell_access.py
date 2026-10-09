@@ -504,6 +504,7 @@ def test_a_failed_creation_leaves_nothing_and_the_next_connect_works(
     directory = tmp_path / "access"
     assert not (directory / SHELL_ID).exists()
     assert not (directory / SSH_MCP_CONFIG).exists()
+    assert not (directory / f".{SSH_MCP_CONFIG}.tmp").exists()
     assert access._tunnels == {}
 
     monkeypatch.setattr(module, "_write_private", write)
@@ -588,6 +589,67 @@ def test_connect_never_deletes_a_foreign_directory_named_by_the_shell(access, cl
     assert caught.value.code == "shell_access_conflict"
     assert (directory / SHELL_ID / "notes.txt").read_text() == "keep"
     assert access._tunnels == {}
+
+
+@pytest.mark.parametrize("name", ["key", "known_hosts"])
+def test_a_shell_named_directory_holding_a_subdirectory_is_never_deleted(access, tmp_path, name):
+    directory = tmp_path / "access"
+    directory.mkdir(mode=0o700)
+    (directory / SHELL_ID / name).mkdir(parents=True)
+    (directory / SHELL_ID / name / "thesis.tex").write_text("keep")
+    access.sweep()
+    assert (directory / SHELL_ID / name / "thesis.tex").read_text() == "keep"
+    with pytest.raises(APIError) as caught:
+        access.connect(SHELL_ID)
+    assert caught.value.code == "shell_access_conflict"
+    assert (directory / SHELL_ID / name / "thesis.tex").read_text() == "keep"
+
+
+def test_a_deleted_directory_is_claimed_again_so_it_is_never_shared(access, client, tmp_path):
+    directory = tmp_path / "access"
+    access.connect(SHELL_ID)
+    access.disconnect(SHELL_ID)
+    for entry in directory.iterdir():
+        entry.unlink()
+    directory.rmdir()
+    other = ShellAccess(_service(client), directory, Opener())
+    try:
+        other.connect(OTHER_SHELL_ID)
+        with pytest.raises(APIError) as caught:
+            access.connect(SHELL_ID)
+        assert caught.value.code == "shell_access_conflict"
+        assert (directory / OTHER_SHELL_ID / "key").exists()
+    finally:
+        other.close_all()
+    # Once the other server is gone, this one takes the directory again.
+    assert access.connect(SHELL_ID)["reused"] is False
+
+
+def test_a_failed_config_rewrite_on_disconnect_drops_the_config(access, tmp_path, monkeypatch):
+    access.connect(SHELL_ID)
+    access.connect(OTHER_SHELL_ID)
+
+    def failing(path, text):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(module, "_write_private", failing)
+    assert access.disconnect(SHELL_ID)["disconnected"] is True
+    directory = tmp_path / "access"
+    assert not (directory / SSH_MCP_CONFIG).exists()
+    assert not (directory / f".{SSH_MCP_CONFIG}.tmp").exists()
+    assert not (directory / SHELL_ID).exists()
+
+
+def test_direct_connections_disable_nagle_and_keep_alive():
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+        connection = module._direct_socket("127.0.0.1", listener.getsockname()[1], None, 5)
+        try:
+            assert connection.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
+            assert connection.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
+            if hasattr(socket, "TCP_KEEPIDLE"):
+                assert connection.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE) == 30
+        finally:
+            connection.close()
 
 
 def test_connect_replaces_a_stale_shell_directory(access, tmp_path):

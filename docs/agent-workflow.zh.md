@@ -120,16 +120,17 @@ MCP 不接受 `kind: notebook`。
 <a id="work-inside-a-shell"></a>
 ## 在 shell 中工作
 
-计算 MCP 能提交 shell，但不在其中运行命令。`compute_shell_connect` 为 shell 提供一个本地 SSH 端点，供 SSH 客户端（例如 [ssh-mcp](https://github.com/tufantunc/ssh-mcp) MCP 服务）使用：
+计算 MCP 能提交 shell，但不在其中运行命令。`compute_shell_connect` 为 shell 提供一个本地 SSH 端点，供 SSH 客户端使用：
 
 1. 以工作所需的槽位数提交一个 `shell`，并轮询 `compute_status`，直到 `state` 为 `STATE_RUNNING`。
 2. 调用 `compute_shell_connect(id)`。检查 `probe.ok`；`ready` 为 `false` 或探测失败时，sshd 可能仍在启动，稍等片刻后再次调用。
 3. 使用返回结果：
-   - 如果 ssh-mcp 已配置为使用生成的配置（见[从 ssh-mcp 使用 shell](compute-service.zh.md#use-the-shell-from-ssh-mcp)），每次 connect 之后都必须重启或重新连接 ssh-mcp。agent 通常无法自行重启 MCP 服务，因此请用户重新连接它，然后使用 `ssh_mcp.profile` 中给出的 profile。
-   - 否则，在用户允许时用 shell 工具运行 `ssh_command`，或把结果中的值交给用户，供其在自己的 SSH 客户端或 IDE 中使用。
+   - 如果你有本地 shell 工具，且用户允许用它运行 SSH 命令，运行 `ssh_command`，并在其后接上要在 shell 中运行的命令。这适用于工作期间连接的每个 shell。
+   - 如果用户为生成的配置设置了可选的 [ssh-mcp](compute-service.zh.md#use-the-shell-from-ssh-mcp) 服务，每次 connect 之后都必须启动或重新连接它，而这通常无法由你自己完成：请用户重新连接它，然后以 `ssh_mcp.profile` 中给出的 profile 调用其工具。
+   - 否则，把结果中的值交给用户，供其在自己的 SSH 客户端或 IDE 中使用。
 4. 完成后调用 `compute_shell_disconnect(id)`，然后调用 `compute_cancel("shell", id)`，除非用户希望保留该 shell；shell 会一直占用其槽位，直到被取消，或在部署设置了空闲时限时因达到该时限而停止。
 
-shell 以账户的 agent user 登录，在其中运行的任何命令都可能以该用户的权限修改挂载到容器中的共享存储。保持 ssh-mcp 的审批关卡开启，绝不设为 `auto`，并把工作限制在用户要求的范围内。绝不读取或输出密钥文件；用 `key_path` 指代它。
+shell 以账户的 agent user 登录，在其中运行的任何命令都可能以该用户的权限修改挂载到容器中的共享存储。把工作限制在用户要求的范围内，并保持 ssh-mcp 的审批关卡开启，绝不设为 `auto`。绝不读取或输出密钥文件；用 `key_path` 指代它。
 
 <a id="pause-and-resume"></a>
 ## 暂停与恢复

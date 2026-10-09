@@ -154,11 +154,15 @@ Determined 本身也会执行权限检查。在使用 basic authorization 的 fo
 ## Shell 访问失败
 
 - `unsupported`，且消息提及 `websocket-client`：带 MCP extra 重新安装服务（在检出目录中运行 `python -m pip install -e '.[mcp]'`），然后重启 MCP 进程。
+- `unsupported`，且消息提及代理：环境为 master 选择了 `http://` 以外的代理，例如 `socks5://`。shell 访问只能直接或通过 `http://` 代理访问 master；把 master 同时列入 `NO_PROXY` 和 `no_proxy`，或为它设置一个 `http://` 代理。
 - `shell_not_running`：只能连接处于 `STATE_RUNNING` 的 shell。排队中的 shell 正在等待容量；已结束的 shell 无法重新打开，应提交新的 shell。
 - shell 刚启动后出现 `ready: false` 或 `probe.ok: false`：sshd 仍在启动。sshd 就绪后，`compute_logs` 会显示 `Server listening on`；再次调用 `compute_shell_connect`，它会保留已打开的隧道并重新探测。
-- 指明 HTTP 状态的探测错误来自 master 的代理：404 或 502 通常表示 shell 已结束，或其代理尚未注册。TLS 错误和代理失败的原因与 API 相同；见[TLS 证书验证失败](#tls-certificate-verification-fails)和[通过代理无法访问 master](#the-master-is-unreachable-through-a-proxy)。HTTP 代理必须允许对 master 端口的 `CONNECT`，否则必须把 master 同时列入 `no_proxy` 和 `NO_PROXY`。
+- 探测错误 `the WebSocket handshake was refused with HTTP <status>` 来自 master 或其 shell 代理：404 或 502 通常表示 shell 已结束，或其代理尚未注册。
+- 探测错误 `WebSocketProxyException: failed CONNECT via proxy status: <status>` 来自为 master 选定的 HTTP 代理：407 表示它要求其他凭据（在代理 URL 中设置），403 或 405 表示它不允许对 master 端口的 `CONNECT`。TLS 错误和其他代理失败的原因与 API 相同；见[TLS 证书验证失败](#tls-certificate-verification-fails)和[通过代理无法访问 master](#the-master-is-unreachable-through-a-proxy)。
 - `port_unavailable`：请求的 `local_port` 已被其他程序占用。省略该参数即可获得一个空闲端口。
-- `shell_access_conflict`：另一个共用 shell 访问目录的 determined-compute MCP 进程（例如来自另一个客户端会话的进程）持有该 shell 的隧道。请在那里使用或断开它。
+- `shell_access_conflict`，且消息说另一个 determined-compute-mcp 进程正在使用该 shell 访问目录：另一个 MCP 服务（例如来自另一个客户端会话的服务）正在使用它。为每个服务分别指定各自的 `--shell-access-dir` 或 `DETERMINED_COMPUTE_SHELL_ACCESS`。
+- `shell_access_conflict`，且消息说该 shell 已有隧道：隧道已在另一个端口上打开。使用该隧道，或先调用 `compute_shell_disconnect`，再以另一个 `local_port` 连接。
+- `shell_access_conflict`，且消息说某个目录已存在但不是 shell 访问目录：以该 shell 的 ID 命名的目录中有 shell 访问文件以外的内容。删除该目录，或使用专用的 shell 访问目录。
 - ssh-mcp 因找不到配置文件而启动失败，或不认识该 profile：该文件只在有隧道打开时存在，而 ssh-mcp 只在启动时读取它，因此请在 `compute_shell_connect` 之后启动或重新连接 ssh-mcp。检查注册时是否写成 `--config=<ssh_mcp.config_path>`（带 `=`）：ssh-mcp 会忽略以空格分隔的值。
 - ssh-mcp 报告主机密钥不匹配：其配置比该端口上的隧道旧。重启 ssh-mcp，使其读取当前的 `trustedHostKey`。
 - determined-compute MCP 重启时 SSH 会话断开：隧道存在于该进程中。再次调用 `compute_shell_connect`，并重启 ssh-mcp，因为端口会改变。

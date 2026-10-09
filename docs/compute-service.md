@@ -586,10 +586,12 @@ One MCP server uses a directory at a time. The first connect locks it for the li
 process; another MCP server, for example one from a second client session, then fails to
 connect with `shell_access_conflict` and must be given its own `--shell-access-dir`. When
 it takes the lock, and when the server starts while no other server holds it, the server
-deletes the shell subdirectories that an ended process left behind and rewrites
-`ssh-mcp.toml`. A shell subdirectory is one named by a shell ID that holds nothing but the
-files below; anything else is never deleted, and a connect that finds such a directory
-under the shell's ID fails with `shell_access_conflict`. The directory holds:
+deletes the shell subdirectories and the `ssh-mcp.toml` that an ended process left
+behind; the next connect writes `ssh-mcp.toml` again. A shell subdirectory is one named by
+a shell ID that holds nothing but the regular files `key` and `known_hosts`. Nothing else
+is ever deleted: a connect that finds any other directory under the shell's ID fails with
+`shell_access_conflict`. If the directory or its lock file is deleted while the server
+runs, the next connect takes the lock again. The directory holds:
 
 | Path | Content |
 | --- | --- |
@@ -656,9 +658,10 @@ Each generated profile has `name`, `host`, `port`, `user`, `auth = "key"`, `keyR
 `trustedHostKey`, and `group = "dev"`; the config sets no `defaultProfile`, so name the
 profile in each call. ssh-mcp's own defaults apply to everything else: role `operator`,
 and approval mode `ask-destructive`, which asks before destructive commands. The file is
-rewritten on every connect and disconnect, so edits to it are lost. For other policy
-settings, copy `profile_toml` into your own ssh-mcp config and edit it there,
-remembering that the port and key path change on every connect.
+rewritten whenever a tunnel is opened or closed, so edits to it are lost. For other policy
+settings, copy `profile_toml` into your own ssh-mcp config and edit it there. A shell's
+`keyRef` stays the same, but its port can change each time its tunnel is reopened unless
+you pass the same `local_port`.
 
 ### Task usage measurements
 

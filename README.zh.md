@@ -3,7 +3,7 @@
 
 [English](README.md) | [简体中文](README.zh.md)
 
-通过本地 stdio MCP 服务运行 Determined command、shell、generic 任务和 experiment，暂停和恢复 experiment 与 generic 任务，并可从 [ssh-mcp](https://github.com/tufantunc/ssh-mcp) 等 SSH MCP 服务、OpenSSH 或 IDE 经 SSH 访问运行中的 shell。代码、数据、检查点和输出都保存在映射的共享存储中。任何能启动本地 stdio 服务的 MCP 客户端都可以使用本服务，并使用自己的模型。
+通过本地 stdio MCP 服务运行 Determined command、shell、generic 任务和 experiment，暂停和恢复 experiment 与 generic 任务，并可从 OpenSSH、IDE 或 [ssh-mcp](https://github.com/tufantunc/ssh-mcp) 等 SSH MCP 服务经 SSH 访问运行中的 shell。代码、数据、检查点和输出都保存在映射的共享存储中。任何能启动本地 stdio 服务的 MCP 客户端都可以使用本服务，并使用自己的模型。
 
 <a id="install"></a>
 ## 安装
@@ -59,17 +59,17 @@ HTTPS 为可选项：设置 `DET_MASTER=https://determined.example.org`，在 MC
 
 从带任务数据库的版本升级时，请从 client 配置中删除 `--db` 和 `--owner`，并从计算配置中删除 `cluster_identity`；旧的数据库文件可以删除。参见[升级](docs/compute-service.zh.md#upgrading-from-a-version-with-a-task-database)。
 
-<a id="connect-an-ssh-mcp-server-to-shells-optional"></a>
-## 将 SSH MCP 服务接入 shell（可选）
+<a id="reach-shells-over-ssh-optional"></a>
+## 经 SSH 访问 shell（可选）
 
-`compute_shell_connect` 为该账户的一个运行中 shell 打开本地 SSH 端点，并将对应的 profile 写入生成的 [ssh-mcp](https://github.com/tufantunc/ssh-mcp) 配置，使 agent 能在该 shell 中执行命令。使用前先安装 ssh-mcp（`npm install -g ssh-mcp`），再用该配置注册它：
+`compute_shell_connect` 为该账户的一个运行中 shell 打开本地 SSH 端点，并返回供 OpenSSH 使用的 `ssh_command`，使 agent 或 IDE 能在该 shell 中工作。它还会将对应的 profile 写入为可选的 [ssh-mcp](https://github.com/tufantunc/ssh-mcp) 服务生成的配置中；每次 connect 之后都必须启动或重新连接该服务：
 
 ```bash
 claude mcp add --transport stdio ssh-mcp -- \
   ssh-mcp --config="$HOME/.cache/determined-compute/shell-access/ssh-mcp.toml" --hostKeyMode=strict
 ```
 
-ssh-mcp 只接受 `--flag=value` 形式的参数。它只在启动时读取配置，因此每次 connect 之后都要启动或重新连接 ssh-mcp；没有已连接的 shell 时该文件不存在，ssh-mcp 会在启动时退出。shell 以账户的 agent user 登录，命令以该用户的权限作用于容器及其挂载，因此应保持 ssh-mcp 的审批关卡开启。参见[shell 访问](docs/compute-service.zh.md#shell-access)。
+参见[shell 访问](docs/compute-service.zh.md#shell-access)。
 
 <a id="install-the-agent-skill-optional"></a>
 ## 安装 agent skill（可选）

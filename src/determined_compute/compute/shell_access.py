@@ -16,10 +16,10 @@ import base64
 import hashlib
 import os
 import shlex
-import shutil
 import socket
 import socketserver
 import ssl
+import stat
 import sys
 import threading
 import time
@@ -142,13 +142,30 @@ def _proxy_for(url: str) -> Optional[str]:
     return requests.utils.select_proxy(url, requests.utils.get_environ_proxies(url))
 
 
+# What websocket-client sets on the sockets it opens itself: no Nagle delay for keystrokes,
+# and keepalives so that a middlebox does not drop an idle session.
+_SOCKET_OPTIONS = tuple(
+    (level, getattr(socket, name), value)
+    for level, name, value in (
+        (socket.IPPROTO_TCP, "TCP_NODELAY", 1),
+        (socket.SOL_SOCKET, "SO_KEEPALIVE", 1),
+        (socket.IPPROTO_TCP, "TCP_KEEPIDLE", 30),
+        (socket.IPPROTO_TCP, "TCP_KEEPINTVL", 10),
+        (socket.IPPROTO_TCP, "TCP_KEEPCNT", 3),
+    )
+    if hasattr(socket, name)
+)
+
+
 def _direct_socket(
     host: str, port: int, context: Optional[ssl.SSLContext], timeout: float
 ) -> socket.socket:
     connection = socket.create_connection((host, port), timeout=timeout)
-    if context is None:
-        return connection
     try:
+        for option in _SOCKET_OPTIONS:
+            connection.setsockopt(*option)
+        if context is None:
+            return connection
         return context.wrap_socket(connection, server_hostname=host)
     except BaseException:
         connection.close()
@@ -366,7 +383,16 @@ class _Tunnel:
             self.server.shutdown()
         self.server.server_close()
         self.server.drop_connections()
-        shutil.rmtree(self.directory, ignore_errors=True)
+        with suppress(OSError):
+            _remove_shell_directory(self.directory)
+
+
+def _remove_shell_directory(directory: Path) -> None:
+    """Delete a shell's subdirectory without recursing: anything unexpected makes it fail."""
+    for name in _SHELL_FILES:
+        with suppress(FileNotFoundError):
+            os.unlink(directory / name)
+    os.rmdir(directory)
 
 
 def profile_name(shell_id: str) -> str:
@@ -416,22 +442,40 @@ class ShellAccess:
 
     def _try_lock(self) -> Optional[int]:
         """Take the directory's lock without waiting; None when another process holds it."""
-        descriptor = os.open(self.directory / _LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(self.directory / _LOCK, flags, 0o600)
         try:
-            import fcntl
-        except ImportError:  # pragma: no cover - Windows has no advisory lock here
-            return descriptor
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                import fcntl
+            except ImportError:  # pragma: no cover - Windows
+                import msvcrt
+
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+            else:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             os.close(descriptor)
             return None
         return descriptor
 
+    def _claim_is_current(self) -> bool:
+        """Whether the held lock is still the directory's lock file, not a deleted one."""
+        try:
+            held = os.fstat(self._claim)
+            current = os.lstat(self.directory / _LOCK)
+        except (OSError, TypeError):
+            return False
+        return held.st_nlink > 0 and (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+
     def _claim_directory(self) -> None:
         """Take the directory for this process, removing what an ended one left behind."""
         if self._claim is not None:
-            return
+            if self._claim_is_current():
+                return
+            # The directory or its lock file was removed under this process: claim it again,
+            # so that no second server can share it.
+            self._release_directory()
         self._prepare_directory()
         descriptor = self._try_lock()
         if descriptor is None:
@@ -454,15 +498,19 @@ class ShellAccess:
         try:
             if entry.is_symlink() or not entry.is_dir() or str(uuid.UUID(entry.name)) != entry.name:
                 return False
-            return {child.name for child in entry.iterdir()} <= _SHELL_FILES
+            return all(
+                child.name in _SHELL_FILES and stat.S_ISREG(child.lstat().st_mode)
+                for child in entry.iterdir()
+            )
         except (ValueError, OSError):
             return False
 
     def _clean(self) -> None:
-        """Delete shell subdirectories without a tunnel here, and rewrite the ssh-mcp config."""
+        """Delete shell subdirectories without a tunnel here; write or remove the ssh-mcp config."""
         for entry in self.directory.iterdir():
             if entry.name not in self._tunnels and self._is_shell_directory(entry):
-                shutil.rmtree(entry, ignore_errors=True)
+                with suppress(OSError):
+                    _remove_shell_directory(entry)
         self._write_ssh_mcp_config()
 
     def sweep(self) -> None:
@@ -500,6 +548,9 @@ class ShellAccess:
     def _write_ssh_mcp_config(self) -> None:
         """Rewrite the ssh-mcp config for this process's tunnels; remove it when there is none."""
         path = self.directory / SSH_MCP_CONFIG
+        temporary = self.directory / f".{SSH_MCP_CONFIG}.tmp"
+        with suppress(FileNotFoundError):
+            temporary.unlink()
         if not self._tunnels:
             with suppress(FileNotFoundError):
                 path.unlink()
@@ -512,11 +563,13 @@ class ShellAccess:
             self.profile_toml(profile_name(shell_id), self._tunnels[shell_id].record)
             for shell_id in sorted(self._tunnels)
         )
-        temporary = self.directory / f".{SSH_MCP_CONFIG}.tmp"
-        with suppress(FileNotFoundError):
-            temporary.unlink()
-        _write_private(temporary, "\n".join(parts))
-        os.replace(temporary, path)
+        try:
+            _write_private(temporary, "\n".join(parts))
+            os.replace(temporary, path)
+        except BaseException:
+            with suppress(OSError):
+                temporary.unlink()
+            raise
 
     # Tool operations.
 
@@ -584,7 +637,7 @@ class ShellAccess:
                 )
             # A shell subdirectory without a tunnel: this process holds the lock, so an
             # ended process left it behind.
-            shutil.rmtree(directory)
+            _remove_shell_directory(directory)
         directory.mkdir(mode=0o700)
         server: Optional[_RelayServer] = None
         try:
@@ -619,7 +672,8 @@ class ShellAccess:
             if server is not None:
                 # serve_forever has not started, so only the socket needs closing.
                 server.server_close()
-            shutil.rmtree(directory, ignore_errors=True)
+            with suppress(OSError):
+                _remove_shell_directory(directory)
             with suppress(OSError):
                 self._write_ssh_mcp_config()
             raise
@@ -735,7 +789,12 @@ class ShellAccess:
         if tunnel is None:
             return False
         tunnel.stop()
-        self._write_ssh_mcp_config()
+        try:
+            self._write_ssh_mcp_config()
+        except OSError:
+            # The tunnel is gone; a config that still listed it would mislead ssh-mcp.
+            with suppress(OSError):
+                (self.directory / SSH_MCP_CONFIG).unlink()
         return True
 
     def close_all(self) -> None:
