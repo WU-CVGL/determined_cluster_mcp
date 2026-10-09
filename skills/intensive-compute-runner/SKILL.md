@@ -30,6 +30,10 @@ For a short single-GPU task already authorized to run locally, read [local works
 4. Call `compute_launch(request)` once. Every call is a new submission. Keep the returned `kind`, native Determined `id`, and `submission_marker`; the MCP stores no task records and manages only the configured account's tasks.
 5. Follow `compute_status` and `compute_logs` until the task reaches a terminal state; `compute_list(kind, states=["STATE_ACTIVE"])` shows which experiments or generic tasks are still queued or running, one page at a time, but a task that leaves that list may be paused or stopping, so confirm its terminal state with `compute_status` before you check the exit result and expected outputs. While the task has not ended, `compute_status.queue` gives the queue position `jobs_ahead` (not a wait-time prediction) and, once scheduled, the agents and slot device IDs in `placement`; a null `queue` does not mean the task is not queued. Use `compute_usage` when resource measurements are needed; missing values do not mean idle resources, and an allocation's first minutes may have no data. Use `compute_cancel` to stop the intended task.
 
+## Work in a shell
+
+To run commands inside a running `shell`, call `compute_shell_connect(id)` and run the returned `ssh_command` with a local shell tool where the user allows it; an SSH MCP server such as ssh-mcp is optional and must be reconnected by the user after each connect that adds or changes a profile. Retry the connect while `ready` is false or `probe.ok` is false. The shell logs in as the account's agent user and can change mounted shared storage: keep the SSH tool's approval on, stay within the requested scope, and never read or print the key file. Afterwards call `compute_shell_disconnect`, then `compute_cancel` unless the user wants the shell kept. See [work inside a shell](../../docs/agent-workflow.md#work-inside-a-shell).
+
 ## Handle failed submissions
 
 If `name` or `description` is rejected as too long with `invalid_request`, shorten it and submit the corrected request; that validation happens before submission.
