@@ -999,6 +999,30 @@ class DeterminedAPIClient:
             entity["config"] = self._redact_secrets(dict(config))
         return self._safe_shell(entity) if kind == "shell" else entity
 
+    def get_shell_keys(self, shell_id: str) -> Dict[str, str]:
+        """Return a shell's SSH key pair and login user, unredacted.
+
+        The private key authenticates to the shell's sshd, whose host key is the same pair.
+        It is for the shell-access tunnel only: callers write it to a private file and keep
+        it out of every tool result.
+        """
+        entity = self._entity(self._get(f"api/v1/shells/{quote(shell_id, safe='')}"), "shell")
+        private_key, public_key = entity.get("privateKey"), entity.get("publicKey")
+        if not (
+            isinstance(private_key, str) and private_key.strip()
+            and isinstance(public_key, str) and public_key.strip()
+        ):
+            raise APIError("Determined did not return the shell's SSH keys", code="invalid_response")
+        group = entity.get("agentUserGroup")
+        user = group.get("user") if isinstance(group, Mapping) else None
+        return {
+            "id": str(entity["id"]),
+            "private_key": private_key,
+            "public_key": public_key.strip(),
+            # det shell open logs in as the agent user group's user, else root.
+            "user": user if isinstance(user, str) and user else "root",
+        }
+
     def task_logs(self, kind: str, task_id: str, tail: int = 100) -> List[Dict[str, Any]]:
         kind = self._kind(kind)
         if tail < 0:

@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh.md)
 
-Run Determined commands, shells, generic tasks, and experiments through a local stdio MCP server, and pause and resume experiments and generic tasks. Code, data, checkpoints, and outputs stay on mapped shared storage. Any MCP client that can start a local stdio server can use the service with its own model.
+Run Determined commands, shells, generic tasks, and experiments through a local stdio MCP server, pause and resume experiments and generic tasks, and reach running shells over SSH from an SSH MCP server such as [ssh-mcp](https://github.com/tufantunc/ssh-mcp), OpenSSH, or an IDE. Code, data, checkpoints, and outputs stay on mapped shared storage. Any MCP client that can start a local stdio server can use the service with its own model.
 
 ## Install
 
@@ -55,6 +55,17 @@ The credentials select the Determined account. The server acts only on that acco
 
 When upgrading from a version with a task database, remove `--db` and `--owner` from the client configuration and `cluster_identity` from the profile; old database files can be deleted. See [upgrading](docs/compute-service.md#upgrading-from-a-version-with-a-task-database).
 
+## Connect an SSH MCP server to shells (optional)
+
+`compute_shell_connect` opens a local SSH endpoint for one of the account's running shells and writes a matching profile into a generated [ssh-mcp](https://github.com/tufantunc/ssh-mcp) config, so an agent can run commands inside the shell. To use it, install ssh-mcp (`npm install -g ssh-mcp`) and register it with that config:
+
+```bash
+claude mcp add --transport stdio ssh-mcp -- \
+  ssh-mcp --config "$HOME/.cache/determined-compute/shell-access/ssh-mcp.toml" --hostKeyMode strict
+```
+
+Restart or reconnect ssh-mcp after each connect, since it reads the config only at startup. Shells log in as `root` unless the account has an agent user, so keep ssh-mcp's approval gate on. See [shell access](docs/compute-service.md#shell-access).
+
 ## Install the agent skill (optional)
 
 The MCP tools work without it. The `intensive-compute-runner` skill adds task guidance for agents that load skills, such as Codex and Claude Code. From the repository root, link the skill directory into the agent's skills directory:
@@ -74,6 +85,6 @@ Start a new agent session to load it. A link keeps the skill current after `git 
 ## Documentation
 
 - [Agent workflow](docs/agent-workflow.md): prepare, plan, launch, monitor, and accept work
-- [Compute service reference](docs/compute-service.md): profiles, requests, tools, usage measurements, task identity and ownership, and unconfirmed launches
+- [Compute service reference](docs/compute-service.md): profiles, requests, tools, usage measurements, shell access, task identity and ownership, and unconfirmed launches
 - [Shared storage access](docs/shared-storage-access.md): local mounts, SSH, dry runs, and transfers
-- [Troubleshooting](docs/troubleshooting.md): startup, authentication, TLS, proxies, paths, capacity, unconfirmed launches, usage measurements, and refused task operations
+- [Troubleshooting](docs/troubleshooting.md): startup, authentication, TLS, proxies, paths, capacity, unconfirmed launches, usage measurements, refused task operations, and shell access

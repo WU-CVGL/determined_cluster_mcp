@@ -138,6 +138,18 @@ The MCP acts only on tasks owned by the authenticated account. `ownership_mismat
 
 Determined applies its own permissions as well. On the fork 0.40.1 or later with basic authorization, only a task's owner or an administrator can kill, cancel, pause, or resume it; other accounts receive `permission_denied` (HTTP 403), or HTTP 404 `experiment '<id>' not found` for an experiment.
 
+## Shell access fails
+
+- `unsupported` with a message about `websocket-client`: reinstall the server with its MCP extra (`python -m pip install -e '.[mcp]'` in the checkout) and restart the MCP process.
+- `shell_not_running`: only a `STATE_RUNNING` shell can be connected. A queued shell is waiting for capacity; an ended one cannot be reopened, so launch a new shell.
+- `ready: false`, or `probe.ok: false` right after the shell started: sshd is still starting. `compute_logs` shows `Server listening on` once it is up; call `compute_shell_connect` again, which keeps the open tunnel and probes again.
+- A probe error that names an HTTP status comes from the master's proxy: 404 or 502 usually means the shell ended or its proxy is not registered yet. TLS errors and proxy failures have the same causes as for the API; see [TLS certificate verification fails](#tls-certificate-verification-fails) and [the master is unreachable through a proxy](#the-master-is-unreachable-through-a-proxy). An HTTP proxy must allow `CONNECT` to the master's port, or the master must be listed in `no_proxy` and `NO_PROXY`.
+- `port_unavailable`: another program uses the requested `local_port`. Omit it to get a free port.
+- `shell_access_conflict`: another determined-compute MCP process that shares the shell-access directory, such as one from another client session, holds this shell's tunnel. Use or disconnect it there.
+- ssh-mcp refuses tool calls as unconfigured, or does not know the profile: restart or reconnect ssh-mcp after `compute_shell_connect`, since it reads its config only at startup, and check that its `--config` is the `ssh_mcp.config_path` from the result.
+- ssh-mcp reports a host-key mismatch: its config is older than the tunnel on that port. Restart it so that it reads the current `trustedHostKey`.
+- An SSH session drops when the determined-compute MCP restarts: tunnels live in that process. Call `compute_shell_connect` again, and restart ssh-mcp, since the port changes.
+
 ## A transfer is partial or different from the preview
 
 Transfers never add `--delete`, so unrelated destination files remain. Normal rsync behavior can still replace same-named destination files. A failed executed transfer can leave a partial destination; rsync exit code 23 specifically reports that some files or attributes were not transferred.
