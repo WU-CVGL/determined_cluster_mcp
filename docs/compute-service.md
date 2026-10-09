@@ -552,7 +552,10 @@ SSH MCP server, needs a TCP port instead, which
    Meanwhile it checks the shell again: a shell that stops fails with `shell_not_running`,
    another failed lookup that is not transient ends the call with that error, and each
    closes a tunnel the call opened. Each probe gets no more than the time left, but at least
-   1 second, so the call can overrun `wait_seconds` by about a second plus one API request.
+   1 second, and no wait starts after the deadline. The call can still overrun
+   `wait_seconds` by the API requests in flight when the time runs out, each limited by the
+   client's request timeout (up to three when the shell starts running just then), plus
+   that probe.
    A banner shows only that sshd answers; logging in is left to the SSH client.
 
 The result has these fields:

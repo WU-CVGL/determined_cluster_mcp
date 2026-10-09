@@ -902,6 +902,10 @@ class ShellAccess:
                             self._disconnect(remote_id)
                     raise
                 state_unknown = True
+                # The lookup may have taken a while: never sleep past the deadline.
+                remaining = deadline - _now()
+                if remaining <= 0:
+                    break
                 _sleep(min(_WAIT_INTERVAL, remaining))
                 continue
             if state != "STATE_RUNNING":
@@ -914,6 +918,9 @@ class ShellAccess:
                     "waiting for its sshd",
                     code="shell_not_running",
                 )
+            remaining = deadline - _now()
+            if remaining <= 0:
+                break
             _sleep(min(_WAIT_INTERVAL, remaining))
         if state_unknown:
             # The last check of the shell failed; do not report a state it may have left.

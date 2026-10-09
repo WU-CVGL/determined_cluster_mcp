@@ -465,6 +465,26 @@ def test_an_unverifiable_state_is_reported_as_unknown_not_running(tmp_path, monk
     assert sum(clock.sleeps) == 12
 
 
+def test_no_wait_starts_after_a_slow_lookup_passes_the_deadline(tmp_path, monkeypatch):
+    clock = _Clock(monkeypatch)
+
+    class SlowClient(_StartingClient):
+        def get_task(self, kind, remote_id):
+            result = super().get_task(kind, remote_id)
+            if self.calls.count(("get_task", kind, remote_id)) == 2:
+                clock.now += 30  # the recheck takes as long as the client's timeout
+            return result
+
+    client = SlowClient(["STATE_RUNNING"], [False] * 10)
+    manager = ShellAccess(_service(client), tmp_path / "access", Opener())
+    try:
+        result = manager.connect(SHELL_ID, wait_seconds=10)
+    finally:
+        manager.close_all()
+    assert result["probe"]["ok"] is False
+    assert clock.sleeps == []
+
+
 def test_the_probe_gets_no_more_than_the_wait_has_left(tmp_path, monkeypatch):
     clock = _Clock(monkeypatch)
     client = _StartingClient(["STATE_RUNNING"])
