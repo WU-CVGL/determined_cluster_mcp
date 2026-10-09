@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh.md)
 
-Run Determined commands, shells, generic tasks, and experiments through a local stdio MCP server, pause and resume experiments and generic tasks, and reach running shells over SSH from an SSH MCP server such as [ssh-mcp](https://github.com/tufantunc/ssh-mcp), OpenSSH, or an IDE. Code, data, checkpoints, and outputs stay on mapped shared storage. Any MCP client that can start a local stdio server can use the service with its own model.
+Run Determined commands, shells, generic tasks, and experiments through a local stdio MCP server, pause and resume experiments and generic tasks, and reach running shells over SSH from OpenSSH, an IDE, or an SSH MCP server such as [ssh-mcp](https://github.com/tufantunc/ssh-mcp). Code, data, checkpoints, and outputs stay on mapped shared storage. Any MCP client that can start a local stdio server can use the service with its own model.
 
 ## Install
 
@@ -55,16 +55,16 @@ The credentials select the Determined account. The server acts only on that acco
 
 When upgrading from a version with a task database, remove `--db` and `--owner` from the client configuration and `cluster_identity` from the profile; old database files can be deleted. See [upgrading](docs/compute-service.md#upgrading-from-a-version-with-a-task-database).
 
-## Connect an SSH MCP server to shells (optional)
+## Reach shells over SSH (optional)
 
-`compute_shell_connect` opens a local SSH endpoint for one of the account's running shells and writes a matching profile into a generated [ssh-mcp](https://github.com/tufantunc/ssh-mcp) config, so an agent can run commands inside the shell. To use it, install ssh-mcp (`npm install -g ssh-mcp`) and register it with that config:
+`compute_shell_connect` opens a local SSH endpoint for one of the account's running shells and returns an `ssh_command` for OpenSSH, so an agent or an IDE can work inside the shell. It also writes a matching profile into a generated config for the optional [ssh-mcp](https://github.com/tufantunc/ssh-mcp) server, which must be started or reconnected after each connect:
 
 ```bash
 claude mcp add --transport stdio ssh-mcp -- \
   ssh-mcp --config="$HOME/.cache/determined-compute/shell-access/ssh-mcp.toml" --hostKeyMode=strict
 ```
 
-ssh-mcp takes flags only as `--flag=value`. Start or reconnect it after each connect, since it reads the config only at startup; while no shell is connected the file does not exist and ssh-mcp exits at startup. Shells log in as the account's agent user, and commands run with that user's permissions on the container and its mounts, so keep ssh-mcp's approval gate on. See [shell access](docs/compute-service.md#shell-access).
+See [shell access](docs/compute-service.md#shell-access).
 
 ## Install the agent skill (optional)
 

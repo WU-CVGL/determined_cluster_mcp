@@ -122,9 +122,9 @@ def create_server(
             "continues from its trials' latest checkpoints, a resumed generic task reruns its "
             "command from the start. "
             "compute_shell_connect opens local SSH access to a running shell (127.0.0.1, a "
-            "port, a key file, and a pinned host key) for ssh, an SSH MCP server such as "
-            "ssh-mcp, or an IDE; restart ssh-mcp after connecting so it reads the new profile, "
-            "and disconnect when done. "
+            "port, a key file, and a pinned host key): run its ssh_command where a local shell "
+            "tool is allowed, or use an SSH MCP server such as ssh-mcp, which must be started "
+            "or reconnected after each connect; disconnect when done. "
             "Credentials belong in local configuration, never in tool arguments."
         ),
     )
@@ -289,7 +289,7 @@ def create_server(
             Listens on 127.0.0.1 (local_port, or a free port) and relays to the shell through
             the master. Returns port, user, key_path, host_key_fingerprint, ssh_command, and an
             ssh-mcp profile in a generated config; the private key stays in key_path. Calling
-            it again returns the open tunnel.
+            it again returns the open tunnel; another local_port needs a disconnect first.
             """
             return await call(shell_access.connect, id, local_port)
 

@@ -111,16 +111,17 @@ Report the task kind and ID, final state, exit result when available, output pat
 
 ## Work inside a shell
 
-The compute MCP launches a shell but does not run commands in it. `compute_shell_connect` gives the shell a local SSH endpoint that an SSH client, such as the [ssh-mcp](https://github.com/tufantunc/ssh-mcp) MCP server, can use:
+The compute MCP launches a shell but does not run commands in it. `compute_shell_connect` gives the shell a local SSH endpoint for an SSH client:
 
 1. Launch a `shell` with the slots the work needs, and poll `compute_status` until `state` is `STATE_RUNNING`.
 2. Call `compute_shell_connect(id)`. Check `probe.ok`; while `ready` is `false` or the probe fails, sshd may still be starting, so call it again after a short wait.
 3. Use the result:
-   - With ssh-mcp configured for the generated config (see [use the shell from ssh-mcp](compute-service.md#use-the-shell-from-ssh-mcp)), ssh-mcp must be restarted or reconnected after each connect. An agent usually cannot restart MCP servers itself, so ask the user to reconnect it, then use the profile named in `ssh_mcp.profile`.
-   - Otherwise run `ssh_command` with a shell tool, if the user allows that, or give the result's values to the user for their own SSH client or IDE.
+   - If you have a local shell tool and the user allows SSH commands with it, run `ssh_command` followed by the command to run in the shell. This works for every shell connected during the work.
+   - If the user set up the optional [ssh-mcp](compute-service.md#use-the-shell-from-ssh-mcp) server for the generated config, it must be started or reconnected after each connect, which you usually cannot do yourself: ask the user to reconnect it, then call its tools with the profile named in `ssh_mcp.profile`.
+   - Otherwise give the result's values to the user for their own SSH client or IDE.
 4. When done, call `compute_shell_disconnect(id)`, then `compute_cancel("shell", id)` unless the user wants the shell kept; a shell holds its slots until it is cancelled or, where the deployment sets one, its inactivity limit stops it.
 
-The shell logs in as the account's agent user, and anything run there can change shared storage mounted into the container with that user's permissions. Keep ssh-mcp's approval gate on, never `auto`, and keep the work within the user's requested scope. Never read or print the key file; refer to it by `key_path`.
+The shell logs in as the account's agent user, and anything run there can change shared storage mounted into the container with that user's permissions. Keep the work within the user's requested scope, and keep ssh-mcp's approval gate on, never `auto`. Never read or print the key file; refer to it by `key_path`.
 
 ## Pause and resume
 

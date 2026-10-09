@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import base64
 import copy
+import errno
+import getpass
+import hashlib
 import json
 import os
 import queue
+import shlex
 import shutil
 import socket
 import ssl
@@ -13,16 +18,20 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 
 import pytest
 
 from determined_compute.compute import ComputeProfile, ComputeService, ShellAccess
+from determined_compute.compute import shell_access as module
 from determined_compute.compute.shell_access import (
     SSH_MCP_CONFIG,
     abort_websocket,
     host_key_fingerprint,
     relay,
+    ssh_option_path,
     toml_string,
+    transport_error,
     websocket_opener,
 )
 from determined_compute.core.api_client import APIError
@@ -38,15 +47,26 @@ PRIVATE_KEY = (
     "-----END OPENSSH PRIVATE KEY-----"
 )
 BANNER = b"SSH-2.0-OpenSSH_9.6 fixture\r\n"
+PROXY_VARIABLES = (
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_proxy_environment(monkeypatch):
+    for name in PROXY_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
 
 
 class FakeWebSocket:
     """A shell proxy that sends the sshd banner, then echoes binary frames."""
 
-    def __init__(self, banner=BANNER) -> None:
+    def __init__(self, banner=(BANNER,)) -> None:
         self.incoming = queue.Queue()
-        if banner:
-            self.incoming.put((0x2, banner))
+        for chunk in banner:
+            self.incoming.put((0x2, chunk))
         self.sent = []
         self.closed = threading.Event()
 
@@ -84,7 +104,7 @@ class FakeClient:
         self.state = "STATE_RUNNING"
         self.owner = "7"
         self.ready = True
-        self.keys_user = "alice"
+        self.keys = {"private_key": PRIVATE_KEY, "public_key": PUBLIC_KEY, "user": "alice"}
 
     def get_current_user(self):
         return copy.deepcopy(self.user)
@@ -95,12 +115,7 @@ class FakeClient:
 
     def get_shell_keys(self, remote_id):
         self.calls.append(("get_shell_keys", remote_id))
-        return {
-            "id": remote_id,
-            "private_key": PRIVATE_KEY,
-            "public_key": PUBLIC_KEY,
-            "user": self.keys_user,
-        }
+        return {"id": remote_id, **self.keys}
 
     def get_task_info(self, task_id):
         self.calls.append(("get_task_info", task_id))
@@ -111,18 +126,27 @@ class FakeClient:
 
 
 class Opener:
-    def __init__(self) -> None:
+    def __init__(self, banner=(BANNER,)) -> None:
+        self.banner = banner
         self.opened = []
         self.sockets = []
 
     def __call__(self, client):
         def open_websocket(shell_id, timeout):
             self.opened.append((shell_id, timeout))
-            ws = FakeWebSocket()
+            ws = FakeWebSocket(self.banner)
             self.sockets.append(ws)
             return ws
 
         return open_websocket
+
+
+def _service(client):
+    profile = ComputeProfile.from_dict({
+        "mounts": [{"host_path": "/shared", "container_path": "/shared"}],
+        "defaults": {"image": "image", "pool": "pool"},
+    })
+    return ComputeService(client, profile)
 
 
 @pytest.fixture
@@ -137,11 +161,7 @@ def opener():
 
 @pytest.fixture
 def access(tmp_path, client, opener):
-    profile = ComputeProfile.from_dict({
-        "mounts": [{"host_path": "/shared", "container_path": "/shared"}],
-        "defaults": {"image": "image", "pool": "pool"},
-    })
-    manager = ShellAccess(ComputeService(client, profile), tmp_path / "access", opener)
+    manager = ShellAccess(_service(client), tmp_path / "access", opener)
     yield manager
     manager.close_all()
 
@@ -160,6 +180,14 @@ def _exchange(port, payload):
         while len(echoed) < len(payload):
             echoed += connection.recv(1024)
         return banner, echoed
+
+
+def _config(path):
+    tomllib = pytest.importorskip("tomllib")
+    return tomllib.loads(path.read_text())
+
+
+# Helpers.
 
 
 def test_fingerprint_matches_openssh():
@@ -190,6 +218,47 @@ def test_toml_string_escapes_quotes_backslashes_and_controls():
         toml_string("\udc80")
 
 
+@pytest.mark.skipif(shutil.which("ssh") is None, reason="ssh is not installed")
+def test_ssh_command_paths_survive_openssh_option_parsing(access, tmp_path):
+    odd = tmp_path / 'with space "quote" 100%'
+    manager = ShellAccess(access.service, odd / "access", Opener())
+    try:
+        result = manager.connect(SHELL_ID)
+        arguments = shlex.split(result["ssh_command"])
+        printed = subprocess.run(
+            [arguments[0], "-G", "-F", "/dev/null", *arguments[1:]],
+            check=True, capture_output=True, text=True,
+        ).stdout.splitlines()
+        assert f"userknownhostsfile {result['known_hosts_path']}" in printed
+        # ssh -G prints IdentityFile before it expands % tokens.
+        assert f"identityfile {result['key_path'].replace('%', '%%')}" in printed
+        assert ssh_option_path('a b"c\\%') == '"a b\\"c\\\\%%"'
+    finally:
+        manager.close_all()
+
+
+def test_handshake_errors_keep_only_the_status():
+    websocket = pytest.importorskip("websocket")
+    refused = websocket.WebSocketBadStatusException(
+        "Handshake status 401 Unauthorized -+-+- {'set-cookie': 'session=SECRET'} -+-+- body",
+        401, "Unauthorized", {"set-cookie": "session=SECRET"}, b"SECRET body",
+    )
+    assert transport_error(refused) == "the WebSocket handshake was refused with HTTP 401"
+    assert transport_error(ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")) == (
+        "ConnectionRefusedError: Connection refused"
+    )
+    assert transport_error(TimeoutError("timed out")) == "TimeoutError: timed out"
+    assert transport_error(websocket.WebSocketException("Redirect to http://x/?token=SECRET")) == (
+        "WebSocketException"
+    )
+    assert transport_error(
+        websocket.WebSocketProxyException("failed CONNECT via proxy status: 407")
+    ) == "WebSocketProxyException: failed CONNECT via proxy status: 407"
+
+
+# Connecting.
+
+
 def test_connect_writes_private_key_and_relays_to_the_shell(access, client, opener, tmp_path):
     result = access.connect(SHELL_ID)
 
@@ -199,6 +268,7 @@ def test_connect_writes_private_key_and_relays_to_the_shell(access, client, open
     assert _mode(directory / SHELL_ID) == 0o700
     assert _mode(key_path) == 0o600
     assert key_path.read_text() == PRIVATE_KEY + "\n"
+    assert sorted(path.name for path in (directory / SHELL_ID).iterdir()) == ["key", "known_hosts"]
     # The private key never leaves the key file.
     assert "fixture-private-key-material" not in json.dumps(result)
 
@@ -216,15 +286,26 @@ def test_connect_writes_private_key_and_relays_to_the_shell(access, client, open
         f"[127.0.0.1]:{port} {PUBLIC_KEY}\n"
     )
     assert "StrictHostKeyChecking=yes" in result["ssh_command"]
-    assert f"UserKnownHostsFile={result['known_hosts_path']}" in result["ssh_command"]
     assert result["ssh_command"].endswith("alice@127.0.0.1")
-    codes = {advisory["code"] for advisory in result["advisories"]}
-    assert codes == {"tunnel_lifetime", "ssh_mcp_reload"}
+    assert {advisory["code"] for advisory in result["advisories"]} == {
+        "tunnel_lifetime", "ssh_mcp_reload",
+    }
 
     banner, echoed = _exchange(port, b"client bytes")
     assert banner == BANNER and echoed == b"client bytes"
     # The probe and the connection each opened the shell's proxy, without a timeout for SSH.
     assert opener.opened == [(SHELL_ID, 15), (SHELL_ID, None)]
+
+
+def test_a_relative_directory_gives_absolute_paths(client, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    manager = ShellAccess(_service(client), "relative-access", Opener())
+    try:
+        result = manager.connect(SHELL_ID)
+    finally:
+        manager.close_all()
+    for path in (result["key_path"], result["known_hosts_path"], result["ssh_mcp"]["config_path"]):
+        assert os.path.isabs(path) and path.startswith(str(tmp_path / "relative-access"))
 
 
 def test_tunnel_listens_on_loopback_only(access):
@@ -240,17 +321,17 @@ def test_tunnel_listens_on_loopback_only(access):
 def test_generated_ssh_mcp_config_uses_only_its_schema_keys(access, tmp_path):
     result = access.connect(SHELL_ID)
     path = tmp_path / "access" / SSH_MCP_CONFIG
+    name = f"det-shell-{SHELL_ID}"
     assert result["ssh_mcp"]["config_path"] == str(path)
-    assert result["ssh_mcp"]["profile"] == "det-shell-5b9c2f3e"
+    assert result["ssh_mcp"]["profile"] == name
     assert _mode(path) == 0o600
-    text = path.read_text()
-    assert "fixture-private-key-material" not in text
-    tomllib = pytest.importorskip("tomllib")
-    config = tomllib.loads(text)
-    snippet = tomllib.loads(result["ssh_mcp"]["profile_toml"])
-    assert config["defaults"] == {"defaultProfile": "det-shell-5b9c2f3e"}
+    assert "fixture-private-key-material" not in path.read_text()
+    config = _config(path)
+    snippet = pytest.importorskip("tomllib").loads(result["ssh_mcp"]["profile_toml"])
+    # No defaultProfile: a caller names the profile it means.
+    assert "defaults" not in config
     assert config["profiles"] == snippet["profiles"] == [{
-        "name": "det-shell-5b9c2f3e",
+        "name": name,
         "host": "127.0.0.1",
         "port": result["port"],
         "user": "alice",
@@ -261,37 +342,37 @@ def test_generated_ssh_mcp_config_uses_only_its_schema_keys(access, tmp_path):
     }]
 
 
-def test_profile_names_widen_when_prefixes_collide(access, tmp_path):
-    access.connect(SHELL_ID)
+def test_profile_names_are_full_shell_ids_and_stay_stable(access, tmp_path):
+    first = access.connect(SHELL_ID)
     second = access.connect(OTHER_SHELL_ID)
+    assert first["ssh_mcp"]["profile"] == f"det-shell-{SHELL_ID}"
     assert second["ssh_mcp"]["profile"] == f"det-shell-{OTHER_SHELL_ID}"
-    tomllib = pytest.importorskip("tomllib")
-    config = tomllib.loads((tmp_path / "access" / SSH_MCP_CONFIG).read_text())
-    assert config["defaults"]["defaultProfile"] == f"det-shell-{OTHER_SHELL_ID}"
-    assert sorted(profile["name"] for profile in config["profiles"]) == [
+    assert sorted(p["name"] for p in _config(tmp_path / "access" / SSH_MCP_CONFIG)["profiles"]) == [
         f"det-shell-{SHELL_ID}", f"det-shell-{OTHER_SHELL_ID}",
     ]
+    access.disconnect(OTHER_SHELL_ID)
+    assert access.connect(SHELL_ID)["ssh_mcp"]["profile"] == f"det-shell-{SHELL_ID}"
 
 
-def test_connect_again_reuses_the_tunnel_and_a_new_port_replaces_it(access, client):
+def test_connect_again_reuses_the_tunnel_and_another_port_is_a_conflict(access, client):
     first = access.connect(SHELL_ID)
     again = access.connect(SHELL_ID)
     assert again["reused"] is True and again["port"] == first["port"]
+    assert access.connect(SHELL_ID, first["port"])["reused"] is True
     assert [call for call in client.calls if call[0] == "get_shell_keys"] == [
         ("get_shell_keys", SHELL_ID)
     ]
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        free_port = probe.getsockname()[1]
-    moved = access.connect(SHELL_ID, free_port)
-    assert moved["reused"] is False and moved["port"] == free_port
-    with pytest.raises(OSError):
-        socket.create_connection(("127.0.0.1", first["port"]), timeout=1).close()
+    other_port = first["port"] + 1 if first["port"] < 65535 else 1024
+    with pytest.raises(APIError) as caught:
+        access.connect(SHELL_ID, other_port)
+    assert caught.value.code == "shell_access_conflict"
+    # The open tunnel is untouched.
+    assert _exchange(first["port"], b"x")[1] == b"x"
 
 
 def test_disconnect_stops_the_tunnel_and_deletes_key_and_config(access, tmp_path):
     result = access.connect(SHELL_ID)
-    banner, _ = _exchange(result["port"], b"x")
+    _exchange(result["port"], b"x")
     assert access.disconnect(SHELL_ID) == {"kind": "shell", "id": SHELL_ID, "disconnected": True}
     assert not (tmp_path / "access" / SHELL_ID).exists()
     assert not (tmp_path / "access" / SSH_MCP_CONFIG).exists()
@@ -300,7 +381,7 @@ def test_disconnect_stops_the_tunnel_and_deletes_key_and_config(access, tmp_path
     assert access.disconnect(SHELL_ID)["disconnected"] is False
 
 
-def test_disconnect_drops_open_connections(access, opener):
+def test_disconnect_drops_open_connections(access):
     result = access.connect(SHELL_ID)
     connection = socket.create_connection(("127.0.0.1", result["port"]), timeout=5)
     try:
@@ -338,32 +419,53 @@ def test_a_shell_that_is_not_ready_is_connected_without_a_probe(access, client, 
     assert opener.opened == []
 
 
-def test_a_failed_probe_is_reported_and_keeps_the_tunnel(tmp_path, client):
-    def failing(_client):
-        def open_websocket(shell_id, timeout):
-            raise ConnectionError("Handshake status 502 Bad Gateway")
-        return open_websocket
-
-    profile = ComputeProfile.from_dict({
-        "mounts": [{"host_path": "/shared", "container_path": "/shared"}],
-        "defaults": {"image": "image", "pool": "pool"},
-    })
-    manager = ShellAccess(ComputeService(client, profile), tmp_path / "access", failing)
+@pytest.mark.parametrize(
+    "banner, expected",
+    [
+        ((b"SS", b"H-2.0-OpenSSH_9.6 fixture\r\n"), {"ok": True, "banner": "SSH-2.0-OpenSSH_9.6 fixture"}),
+        ((b"SSH-", b"2.0-OpenSSH_9.6 fixture\r\n"), {"ok": True, "banner": "SSH-2.0-OpenSSH_9.6 fixture"}),
+        ((b"HTTP/1.1 502\r\n",), {"ok": False, "error": "the shell's proxy did not answer with an SSH banner"}),
+    ],
+)
+def test_the_probe_reads_the_banner_across_messages(client, tmp_path, banner, expected):
+    manager = ShellAccess(_service(client), tmp_path / "access", Opener(banner))
     try:
-        result = manager.connect(SHELL_ID)
-        assert result["probe"] == {
-            "ok": False, "error": "ConnectionError: Handshake status 502 Bad Gateway",
-        }
-        assert (tmp_path / "access" / SHELL_ID / "key").exists()
+        assert manager.connect(SHELL_ID)["probe"] == expected
     finally:
         manager.close_all()
 
 
-def test_the_login_user_is_the_shells_agent_user(access, client):
-    client.keys_user = "bob"
-    result = access.connect(SHELL_ID)
-    assert result["user"] == "bob"
-    assert result["ssh_command"].endswith("bob@127.0.0.1")
+def test_the_probe_makes_sshd_close_its_side(access, opener):
+    access.connect(SHELL_ID)
+    assert opener.sockets[0].sent == [b"probe\r\n"]
+    assert opener.sockets[0].closed.is_set()
+
+
+def test_a_refused_handshake_reports_only_its_status(client, tmp_path, capsys):
+    websocket = pytest.importorskip("websocket")
+
+    def refusing(_client):
+        def open_websocket(shell_id, timeout):
+            raise websocket.WebSocketBadStatusException(
+                "Handshake status 401 -+-+- {'set-cookie': 'session=SECRET'} -+-+- SECRET",
+                401, "Unauthorized", {"set-cookie": "session=SECRET"}, b"SECRET",
+            )
+        return open_websocket
+
+    manager = ShellAccess(_service(client), tmp_path / "access", refusing)
+    try:
+        result = manager.connect(SHELL_ID)
+        assert result["probe"] == {
+            "ok": False, "error": "the WebSocket handshake was refused with HTTP 401",
+        }
+        assert (tmp_path / "access" / SHELL_ID / "key").exists()
+        # A relayed connection fails the same way, and stderr gets the status alone.
+        with socket.create_connection(("127.0.0.1", result["port"]), timeout=5) as connection:
+            assert connection.recv(1) == b""
+        time.sleep(0.2)
+        assert "SECRET" not in capsys.readouterr().err
+    finally:
+        manager.close_all()
 
 
 @pytest.mark.parametrize("port", [True, 0, 80, 65536, "2222"])
@@ -374,64 +476,138 @@ def test_local_port_is_validated(access, client, port):
     assert client.calls == []
 
 
-def test_a_busy_port_is_reported(access):
+def test_a_busy_port_is_reported_and_leaves_nothing(access, tmp_path):
     with socket.socket() as busy:
         busy.bind(("127.0.0.1", 0))
         busy.listen()
         with pytest.raises(APIError) as caught:
             access.connect(SHELL_ID, busy.getsockname()[1])
     assert caught.value.code == "port_unavailable"
+    assert not (tmp_path / "access" / SHELL_ID).exists()
+    assert access._tunnels == {}
 
 
-def _dead_pid():
-    process = subprocess.Popen([sys.executable, "-c", "pass"])
-    process.wait()
-    return process.pid
+@pytest.mark.parametrize("failing", ["known_hosts", SSH_MCP_CONFIG])
+def test_a_failed_creation_leaves_nothing_and_the_next_connect_works(
+    access, tmp_path, monkeypatch, failing
+):
+    write = module._write_private
 
+    def flaky(path, text):
+        if path.name == failing or path.name == f".{failing}.tmp":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        write(path, text)
 
-def _record(directory, shell_id, pid, port=40000, host=None):
-    directory.mkdir(mode=0o700, exist_ok=True)
-    (directory / shell_id).mkdir()
-    (directory / shell_id / "key").write_text("stale")
-    (directory / shell_id / "tunnel.json").write_text(json.dumps({
-        "host": host or socket.gethostname(), "pid": pid, "shell_id": shell_id, "port": port, "user": "alice",
-        "key_path": str(directory / shell_id / "key"), "host_key_type": "ssh-ed25519",
-        "host_key_fingerprint": FINGERPRINT, "connected_at": "2026-10-09T00:00:00+00:00",
-        "known_hosts_path": str(directory / shell_id / "known_hosts"),
-    }))
-
-
-@pytest.mark.skipif(os.name == "nt", reason="process liveness is not checked on Windows")
-def test_sweep_removes_what_ended_processes_left_and_keeps_live_ones(access, tmp_path):
+    monkeypatch.setattr(module, "_write_private", flaky)
+    with pytest.raises(OSError):
+        access.connect(SHELL_ID)
     directory = tmp_path / "access"
-    _record(directory, SHELL_ID, _dead_pid())
-    _record(directory, OTHER_SHELL_ID, os.getppid(), port=40001)
-    access.sweep()
     assert not (directory / SHELL_ID).exists()
-    assert (directory / OTHER_SHELL_ID / "key").exists()
-    tomllib = pytest.importorskip("tomllib")
-    config = tomllib.loads((directory / SSH_MCP_CONFIG).read_text())
-    assert [profile["port"] for profile in config["profiles"]] == [40001]
+    assert not (directory / SSH_MCP_CONFIG).exists()
+    assert access._tunnels == {}
+
+    monkeypatch.setattr(module, "_write_private", write)
+    result = access.connect(SHELL_ID)
+    assert result["reused"] is False
+    assert os.path.exists(result["ssh_mcp"]["config_path"])
+    assert os.path.exists(result["key_path"])
 
 
-@pytest.mark.skipif(os.name == "nt", reason="process liveness is not checked on Windows")
-def test_a_tunnel_held_by_another_live_process_is_not_taken_over(access, client, tmp_path):
+def test_a_failed_config_write_keeps_the_other_tunnels_profiles(access, tmp_path, monkeypatch):
+    access.connect(OTHER_SHELL_ID)
+    write = module._write_private
+
+    def flaky(path, text):
+        if path.name == "known_hosts":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        write(path, text)
+
+    monkeypatch.setattr(module, "_write_private", flaky)
+    with pytest.raises(OSError):
+        access.connect(SHELL_ID)
+    profiles = _config(tmp_path / "access" / SSH_MCP_CONFIG)["profiles"]
+    assert [profile["name"] for profile in profiles] == [f"det-shell-{OTHER_SHELL_ID}"]
+
+
+# The directory.
+
+
+def test_one_process_uses_a_directory(access, client, tmp_path):
+    access.connect(SHELL_ID)
+    other = ShellAccess(_service(client), tmp_path / "access", Opener())
+    try:
+        with pytest.raises(APIError) as caught:
+            other.connect(OTHER_SHELL_ID)
+        assert caught.value.code == "shell_access_conflict"
+        assert "--shell-access-dir" in str(caught.value)
+        # Its startup sweep leaves the directory of a running instance alone.
+        other.sweep()
+        assert (tmp_path / "access" / SHELL_ID / "key").exists()
+        assert (tmp_path / "access" / SSH_MCP_CONFIG).exists()
+    finally:
+        other.close_all()
+    access.close_all()
+    # Released at exit: another instance can take the directory over.
+    replacement = ShellAccess(_service(client), tmp_path / "access", Opener())
+    try:
+        assert replacement.connect(OTHER_SHELL_ID)["reused"] is False
+    finally:
+        replacement.close_all()
+
+
+def test_sweep_and_claim_delete_only_shell_directories(access, tmp_path):
     directory = tmp_path / "access"
-    _record(directory, SHELL_ID, os.getppid())
+    directory.mkdir(mode=0o700)
+    (directory / "project" / "src").mkdir(parents=True)
+    (directory / "project" / "src" / "main.py").write_text("keep")
+    (directory / OTHER_SHELL_ID).mkdir()
+    (directory / OTHER_SHELL_ID / "notes.txt").write_text("keep")
+    (directory / SHELL_ID.upper()).mkdir()
+    (directory / "notes.txt").write_text("keep")
+    stale = directory / "00000000-0000-4000-8000-000000000000"
+    stale.mkdir()
+    (stale / "key").write_text("stale")
+    (directory / SSH_MCP_CONFIG).write_text("stale")
+    access.sweep()
+    assert not stale.exists()
+    assert not (directory / SSH_MCP_CONFIG).exists()
+    assert (directory / "project" / "src" / "main.py").read_text() == "keep"
+    assert (directory / OTHER_SHELL_ID / "notes.txt").exists()
+    assert (directory / SHELL_ID.upper()).exists()
+    assert (directory / "notes.txt").exists()
+
+
+def test_connect_never_deletes_a_foreign_directory_named_by_the_shell(access, client, tmp_path):
+    directory = tmp_path / "access"
+    directory.mkdir(mode=0o700)
+    (directory / SHELL_ID).mkdir()
+    (directory / SHELL_ID / "notes.txt").write_text("keep")
+    access.sweep()
     with pytest.raises(APIError) as caught:
         access.connect(SHELL_ID)
     assert caught.value.code == "shell_access_conflict"
-    assert (directory / SHELL_ID / "key").read_text() == "stale"
+    assert (directory / SHELL_ID / "notes.txt").read_text() == "keep"
+    assert access._tunnels == {}
 
 
-def test_sweep_leaves_a_missing_directory_alone(tmp_path, client):
+def test_connect_replaces_a_stale_shell_directory(access, tmp_path):
+    directory = tmp_path / "access"
+    directory.mkdir(mode=0o700)
+    (directory / SHELL_ID).mkdir()
+    (directory / SHELL_ID / "key").write_text("stale")
+    result = access.connect(SHELL_ID)
+    assert (directory / SHELL_ID / "key").read_text() == PRIVATE_KEY + "\n"
+    assert result["reused"] is False
+
+
+def test_sweep_leaves_a_missing_directory_alone(tmp_path):
     manager = ShellAccess(object(), tmp_path / "absent")
     manager.sweep()
     assert not (tmp_path / "absent").exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permissions")
-def test_a_directory_open_to_other_users_is_refused_unchanged(access, client, tmp_path):
+def test_a_directory_open_to_other_users_is_refused_unchanged(access, tmp_path):
     directory = tmp_path / "access"
     directory.mkdir()
     os.chmod(directory, 0o755)
@@ -442,39 +618,12 @@ def test_a_directory_open_to_other_users_is_refused_unchanged(access, client, tm
     assert list(directory.iterdir()) == []
 
 
-def test_sweep_deletes_only_shell_directories(access, tmp_path):
-    directory = tmp_path / "access"
-    directory.mkdir(mode=0o700)
-    (directory / "project" / "src").mkdir(parents=True)
-    (directory / "project" / "src" / "main.py").write_text("keep")
-    (directory / OTHER_SHELL_ID).mkdir()
-    (directory / OTHER_SHELL_ID / "notes.txt").write_text("keep")
-    (directory / SHELL_ID.upper()).mkdir()
-    (directory / "notes.txt").write_text("keep")
-    _record(directory, SHELL_ID, _dead_pid())
-    access.sweep()
-    assert not (directory / SHELL_ID).exists()
-    assert (directory / "project" / "src" / "main.py").read_text() == "keep"
-    assert (directory / OTHER_SHELL_ID / "notes.txt").exists()
-    assert (directory / SHELL_ID.upper()).exists()
-    assert (directory / "notes.txt").exists()
-
-
-def test_records_of_another_host_are_kept_out_of_config_and_not_taken_over(access, tmp_path):
-    directory = tmp_path / "access"
-    _record(directory, SHELL_ID, _dead_pid(), host="other-host")
-    access.sweep()
-    assert (directory / SHELL_ID / "key").read_text() == "stale"
-    assert not (directory / SSH_MCP_CONFIG).exists()
-    with pytest.raises(APIError) as caught:
-        access.connect(SHELL_ID)
-    assert caught.value.code == "shell_access_conflict"
-    assert "on host other-host (pid" in str(caught.value)
+# The relay.
 
 
 def test_relay_ends_on_close_frame_and_forwards_client_eof():
     left, right = socket.socketpair()
-    ws = FakeWebSocket(banner=b"")
+    ws = FakeWebSocket(banner=())
     worker = threading.Thread(target=relay, args=(right, ws))
     worker.start()
     left.sendall(b"abc")
@@ -490,8 +639,6 @@ def test_relay_ends_on_close_frame_and_forwards_client_eof():
 
 
 def test_relay_ends_when_the_proxy_never_answers_the_close(monkeypatch):
-    import determined_compute.compute.shell_access as module
-
     monkeypatch.setattr(module, "_CLOSE_TIMEOUT", 0.2)
     proxy_side, proxy_peer = socket.socketpair()
 
@@ -542,7 +689,7 @@ def test_abort_wakes_a_receive_blocked_on_the_websocket_socket():
 
 
 def test_a_connection_opened_while_the_tunnel_stops_is_not_relayed(access):
-    result = access.connect(SHELL_ID)
+    access.connect(SHELL_ID)
     server = access._tunnels[SHELL_ID].server
     server.drop_connections()
     late = FakeWebSocket()
@@ -554,54 +701,322 @@ def test_a_connection_opened_while_the_tunnel_stops_is_not_relayed(access):
     right.close()
 
 
-def test_the_probe_makes_sshd_close_its_side(access, opener):
-    access.connect(SHELL_ID)
-    assert opener.sockets[0].sent == [b"probe\r\n"]
-    assert opener.sockets[0].closed.is_set()
+# The WebSocket opener.
 
 
-def test_websocket_opener_targets_the_shell_proxy_with_the_clients_auth(monkeypatch):
-    websocket = pytest.importorskip("websocket")
-    calls = []
+class _Recorder:
+    def __init__(self, monkeypatch):
+        websocket = pytest.importorskip("websocket")
+        self.calls = []
+        self.sockets = []
 
-    class Connection:
-        def settimeout(self, timeout):
-            calls.append(("settimeout", timeout))
+        class Connection:
+            def settimeout(inner, timeout):
+                self.calls.append(("settimeout", timeout))
 
-    def create_connection(url, **options):
-        calls.append((url, options))
-        return Connection()
+        def create_connection(url, **options):
+            self.calls.append((url, options))
+            return Connection()
 
-    monkeypatch.setattr(websocket, "create_connection", create_connection)
+        def direct_socket(host, port, context, timeout):
+            self.sockets.append((host, port, context, timeout))
+            return object()
+
+        monkeypatch.setattr(websocket, "create_connection", create_connection)
+        monkeypatch.setattr(module, "_direct_socket", direct_socket)
+
+
+def test_websocket_opener_targets_the_shell_proxy_directly(monkeypatch):
+    recorder = _Recorder(monkeypatch)
     client = FakeClient()
     client.api_url = "http://det.example.test:8080/base/"
     websocket_opener(client)(SHELL_ID, None)
-    url, options = calls[0]
+    url, options = recorder.calls[0]
     assert url == f"ws://det.example.test:8080/base/proxy/{SHELL_ID}/"
     assert options["header"] == {"Authorization": "Bearer fixture-token"}
-    assert options["sslopt"] == {}
     assert options["timeout"] == 30 and options["enable_multithread"] is True
     assert options["redirect_limit"] == 0
-    assert calls[1] == ("settimeout", None)
+    assert "http_proxy_host" not in options
+    assert recorder.sockets == [("det.example.test", 8080, None, 30)]
+    assert recorder.calls[1] == ("settimeout", None)
 
-    calls.clear()
+
+def test_websocket_opener_verifies_tls_as_requests_does(monkeypatch, tmp_path):
+    recorder = _Recorder(monkeypatch)
+    client = FakeClient()
     client.api_url = "https://det.example.test"
     websocket_opener(client)(SHELL_ID, 15)
-    url, options = calls[0]
-    assert url == f"wss://det.example.test/proxy/{SHELL_ID}/"
-    assert options["sslopt"] == {"cert_reqs": ssl.CERT_NONE, "check_hostname": False}
-    assert options["timeout"] == 15
+    assert recorder.calls[0][0] == f"wss://det.example.test/proxy/{SHELL_ID}/"
+    host, port, context, timeout = recorder.sockets[0]
+    assert (host, port, timeout) == ("det.example.test", 443, 15)
+    assert context.verify_mode == ssl.CERT_NONE and context.check_hostname is False
 
-    calls.clear()
     client.verify_ssl = True
-    monkeypatch.setenv("REQUESTS_CA_BUNDLE", "/etc/org-ca.pem")
+    certificates = tmp_path / "certificates"
+    certificates.mkdir()
+    monkeypatch.setenv("REQUESTS_CA_BUNDLE", str(certificates))
     websocket_opener(client)(SHELL_ID, 15)
-    assert calls[0][1]["sslopt"] == {"ca_certs": "/etc/org-ca.pem"}
+    context = recorder.sockets[1][2]
+    assert context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname is True
 
 
-def test_missing_websocket_client_is_reported_as_unsupported(monkeypatch, access, client):
+@pytest.mark.parametrize(
+    "environment, proxied",
+    [
+        ({"HTTPS_PROXY": "http://proxy.test:3128"}, True),
+        ({"ALL_PROXY": "http://proxy.test:3128"}, True),
+        ({"HTTPS_PROXY": "http://proxy.test:3128", "NO_PROXY": "det.example.test:8443"}, False),
+        ({"HTTPS_PROXY": "http://proxy.test:3128", "NO_PROXY": "example.test"}, False),
+    ],
+)
+def test_websocket_opener_uses_the_proxy_requests_would(monkeypatch, environment, proxied):
+    recorder = _Recorder(monkeypatch)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+    client = FakeClient()
+    client.api_url = "https://det.example.test:8443"
+    websocket_opener(client)(SHELL_ID, None)
+    options = recorder.calls[0][1]
+    if proxied:
+        assert options["http_proxy_host"] == "proxy.test"
+        assert options["http_proxy_port"] == 3128
+        assert options["proxy_type"] == "http"
+        assert options["http_no_proxy"] and "det.example.test" not in options["http_no_proxy"]
+        assert isinstance(options["sslopt"]["context"], ssl.SSLContext)
+        assert recorder.sockets == []
+    else:
+        assert "http_proxy_host" not in options
+        assert recorder.sockets[0][:2] == ("det.example.test", 8443)
+
+
+def test_websocket_opener_passes_proxy_credentials(monkeypatch):
+    recorder = _Recorder(monkeypatch)
+    monkeypatch.setenv("HTTP_PROXY", "http://us%40er:p%3Ass@proxy.test")
+    websocket_opener(FakeClient())(SHELL_ID, None)
+    options = recorder.calls[0][1]
+    assert options["http_proxy_auth"] == ("us@er", "p:ss")
+    assert options["http_proxy_port"] == 80
+
+
+def test_websocket_opener_refuses_a_proxy_it_cannot_use(monkeypatch):
+    _Recorder(monkeypatch)
+    monkeypatch.setenv("ALL_PROXY", "socks5://proxy.test:1080")
+    with pytest.raises(APIError) as caught:
+        websocket_opener(FakeClient())
+    assert caught.value.code == "unsupported"
+    assert "socks5" in str(caught.value)
+
+
+def test_missing_websocket_client_is_reported_as_unsupported(monkeypatch, client):
     monkeypatch.setitem(sys.modules, "websocket", None)
     with pytest.raises(APIError) as caught:
         websocket_opener(client)
     assert caught.value.code == "unsupported"
     assert "determined-compute[mcp]" in str(caught.value)
+
+
+# OpenSSH through the relay and a real WebSocket to a real sshd.
+
+_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def _recv_exact(connection, size):
+    data = b""
+    while len(data) < size:
+        chunk = connection.recv(size - len(data))
+        if not chunk:
+            raise EOFError
+        data += chunk
+    return data
+
+
+def _frame(opcode, payload):
+    head = bytes([0x80 | opcode])
+    if len(payload) < 126:
+        head += bytes([len(payload)])
+    elif len(payload) < 65536:
+        head += bytes([126]) + len(payload).to_bytes(2, "big")
+    else:
+        head += bytes([127]) + len(payload).to_bytes(8, "big")
+    return head + payload
+
+
+class ShellProxy:
+    """A master's shell proxy: WebSocket at /proxy/<id>/, bridged to a TCP port.
+
+    It splits sshd's first bytes across two messages, as a proxy may.
+    """
+
+    def __init__(self, shell_id, target_port):
+        self.path = f"/proxy/{shell_id}/"
+        self.target_port = target_port
+        self.listener = socket.create_server(("127.0.0.1", 0))
+        self.port = self.listener.getsockname()[1]
+        self.authorizations = []
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                connection, _ = self.listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._bridge, args=(connection,), daemon=True).start()
+
+    def _bridge(self, connection):
+        request = b""
+        while b"\r\n\r\n" not in request:
+            request += connection.recv(4096)
+        lines = request.decode("latin-1").split("\r\n")
+        headers = {
+            line.split(":", 1)[0].strip().lower(): line.split(":", 1)[1].strip()
+            for line in lines[1:] if ":" in line
+        }
+        if lines[0].split()[1] != self.path:
+            connection.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+            connection.close()
+            return
+        self.authorizations.append(headers.get("authorization"))
+        accept = base64.b64encode(
+            hashlib.sha1(headers["sec-websocket-key"].encode() + _GUID).digest()
+        ).decode()
+        connection.sendall(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n".encode()
+        )
+        sshd = socket.create_connection(("127.0.0.1", self.target_port))
+        send_lock = threading.Lock()
+
+        def downstream():
+            first = True
+            try:
+                while True:
+                    data = sshd.recv(65536)
+                    if not data:
+                        break
+                    with send_lock:
+                        if first and len(data) > 2:
+                            connection.sendall(_frame(0x2, data[:2]) + _frame(0x2, data[2:]))
+                        else:
+                            connection.sendall(_frame(0x2, data))
+                    first = False
+                with send_lock:
+                    connection.sendall(_frame(0x8, b""))
+            except OSError:
+                pass
+
+        threading.Thread(target=downstream, daemon=True).start()
+        try:
+            while True:
+                head = _recv_exact(connection, 2)
+                opcode, length = head[0] & 0x0F, head[1] & 0x7F
+                if length == 126:
+                    length = int.from_bytes(_recv_exact(connection, 2), "big")
+                elif length == 127:
+                    length = int.from_bytes(_recv_exact(connection, 8), "big")
+                mask = _recv_exact(connection, 4) if head[1] & 0x80 else b"\0\0\0\0"
+                payload = bytes(
+                    byte ^ mask[index % 4]
+                    for index, byte in enumerate(_recv_exact(connection, length))
+                )
+                if opcode == 0x8:
+                    with send_lock:
+                        connection.sendall(_frame(0x8, b""))
+                    break
+                if opcode == 0x9:
+                    with send_lock:
+                        connection.sendall(_frame(0xA, payload))
+                elif opcode in (0x0, 0x1, 0x2):
+                    sshd.sendall(payload)
+        except (EOFError, OSError):
+            pass
+        finally:
+            for item in (sshd, connection):
+                with_suppress_close(item)
+
+    def close(self):
+        self.listener.close()
+
+
+def with_suppress_close(item):
+    try:
+        item.close()
+    except OSError:
+        pass
+
+
+@pytest.fixture
+def sshd(tmp_path):
+    binary = shutil.which("sshd") or "/usr/sbin/sshd"
+    if not os.path.exists(binary) or shutil.which("ssh") is None or shutil.which("ssh-keygen") is None:
+        pytest.skip("OpenSSH client and server are not installed")
+    keys = tmp_path / "sshd"
+    keys.mkdir()
+    # Determined uses one generated pair for the host key and the login key.
+    subprocess.run(
+        ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "", "-f", str(keys / "pair")],
+        check=True,
+    )
+    shutil.copy(keys / "pair.pub", keys / "authorized_keys")
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    (keys / "sshd_config").write_text(
+        f"Port {port}\nListenAddress 127.0.0.1\nHostKey {keys / 'pair'}\n"
+        f"AuthorizedKeysFile {keys / 'authorized_keys'}\nPidFile none\nStrictModes no\n"
+        "UsePAM no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n"
+    )
+    process = subprocess.Popen(
+        [binary, "-D", "-e", "-f", str(keys / "sshd_config")],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            pytest.skip(f"sshd did not start: {process.stderr.read().decode()[:200]}")
+        try:
+            socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+            break
+        except OSError:
+            time.sleep(0.05)
+    else:
+        process.kill()
+        pytest.skip("sshd did not start listening")
+    yield {
+        "port": port,
+        "private_key": (keys / "pair").read_text(),
+        "public_key": (keys / "pair.pub").read_text().strip(),
+    }
+    process.kill()
+    process.wait()
+
+
+def test_openssh_logs_in_through_the_relay_and_a_real_websocket(sshd, client, tmp_path):
+    proxy = ShellProxy(SHELL_ID, sshd["port"])
+    client.api_url = f"http://127.0.0.1:{proxy.port}"
+    client.keys = {
+        "private_key": sshd["private_key"],
+        "public_key": sshd["public_key"],
+        "user": getpass.getuser(),
+    }
+    # A path with a space checks the quoting of the generated command for real.
+    manager = ShellAccess(_service(client), tmp_path / "access dir", None)
+    try:
+        result = manager.connect(SHELL_ID)
+        assert result["probe"]["ok"] is True, result["probe"]
+        assert result["probe"]["banner"].startswith("SSH-2.0-")
+        payload = os.urandom(1 << 20)
+        arguments = shlex.split(result["ssh_command"])
+        completed = subprocess.run(
+            [arguments[0], "-F", "/dev/null", "-o", "BatchMode=yes", *arguments[1:],
+             "id -un && sha256sum"],
+            input=payload, capture_output=True, timeout=60,
+        )
+        assert completed.returncode == 0, completed.stderr.decode()
+        user, digest = completed.stdout.decode().split("\n", 1)
+        assert user == getpass.getuser()
+        assert digest.split()[0] == hashlib.sha256(payload).hexdigest()
+        assert set(proxy.authorizations) == {"Bearer fixture-token"}
+    finally:
+        manager.close_all()
+        proxy.close()
