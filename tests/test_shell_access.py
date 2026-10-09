@@ -1095,6 +1095,27 @@ def test_files_another_server_left_behind_are_not_adopted(access, client, tmp_pa
     assert (directory / SHELL_ID / "known_hosts").read_text() == other_known_hosts
 
 
+def test_files_another_server_left_on_reused_inode_numbers_are_not_adopted(
+    access, client, tmp_path, monkeypatch
+):
+    directory = tmp_path / "access"
+    access.connect(SHELL_ID)
+    ours = dict(access._tunnels[SHELL_ID].files)
+    (directory / ".lock").unlink()
+    other = ShellAccess(_service(client), directory, Opener())
+    other.connect(SHELL_ID)
+    other._tunnels[SHELL_ID].server.server_close()
+    other._release_directory()
+    # A filesystem such as ext4 can give the other server's files the numbers ours had.
+    monkeypatch.setattr(
+        module._Tunnel, "_identity",
+        staticmethod(lambda path: ours[path.name][0] if path.name in ours else None),
+    )
+    with pytest.raises(APIError) as caught:
+        access.connect(SHELL_ID)
+    assert caught.value.code == "shell_access_conflict"
+
+
 @pytest.mark.parametrize("removed", ["directory", "lock"])
 def test_a_server_that_lost_its_directory_leaves_the_new_owners_files_alone(
     access, client, tmp_path, removed
