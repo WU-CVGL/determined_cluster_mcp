@@ -672,6 +672,25 @@ def test_a_removed_lock_file_without_another_server_is_locked_again(access, tmp_
     assert sorted(path.name for path in directory.iterdir()) == [".lock"]
 
 
+def test_files_another_server_left_behind_are_not_adopted(access, client, tmp_path):
+    directory = tmp_path / "access"
+    access.connect(SHELL_ID)
+    (directory / ".lock").unlink()
+    # Another server takes the directory and the same shell, then vanishes without cleaning
+    # up: its lock is gone, but its key and known_hosts remain under the same names.
+    other = ShellAccess(_service(client), directory, Opener())
+    other.connect(SHELL_ID)
+    other_known_hosts = (directory / SHELL_ID / "known_hosts").read_text()
+    other._tunnels[SHELL_ID].server.server_close()
+    other._release_directory()
+    with pytest.raises(APIError) as caught:
+        access.connect(SHELL_ID)
+    assert caught.value.code == "shell_access_conflict"
+    assert "removed or taken over" in str(caught.value)
+    # The other server's files are left alone.
+    assert (directory / SHELL_ID / "known_hosts").read_text() == other_known_hosts
+
+
 @pytest.mark.parametrize("removed", ["directory", "lock"])
 def test_a_server_that_lost_its_directory_leaves_the_new_owners_files_alone(
     access, client, tmp_path, removed

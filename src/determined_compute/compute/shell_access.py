@@ -380,6 +380,25 @@ class _Tunnel:
         self.thread = threading.Thread(
             target=server.serve_forever, name=f"shell-tunnel-{shell_id[:8]}", daemon=True
         )
+        # The identity of the key and known_hosts files as written.
+        self.files = {
+            name: self._identity(directory / name) for name in sorted(_SHELL_FILES)
+        }
+
+    @staticmethod
+    def _identity(path: Path) -> Optional[Tuple[int, int]]:
+        try:
+            status = os.lstat(path)
+        except OSError:
+            return None
+        return (status.st_dev, status.st_ino) if stat.S_ISREG(status.st_mode) else None
+
+    def files_unchanged(self) -> bool:
+        """Whether the shell's files are still the ones this tunnel wrote."""
+        return all(
+            identity is not None and self._identity(self.directory / name) == identity
+            for name, identity in self.files.items()
+        )
 
     def stop(self) -> None:
         """Close the listener and its connections; the files are ShellAccess's to remove."""
@@ -480,10 +499,10 @@ class ShellAccess:
             return False
         if self._claim_is_current():
             return True
-        # A removed directory took the tunnels' files with it: that is not ours to repair.
+        # Only the very files this process wrote prove that no other server took the
+        # directory in between: one that did may have written its own under the same names.
         if not all(
-            self._is_shell_directory(tunnel.directory)
-            and all((tunnel.directory / name).is_file() for name in _SHELL_FILES)
+            self._is_shell_directory(tunnel.directory) and tunnel.files_unchanged()
             for tunnel in self._tunnels.values()
         ):
             return False
