@@ -57,7 +57,7 @@ When upgrading from a version with a task database, remove `--db` and `--owner` 
 
 ## Reach shells over SSH (optional)
 
-`compute_shell_connect` opens a local SSH endpoint for one of the account's running shells and returns an `ssh_command` for OpenSSH, so an agent or an IDE can work inside the shell. It also writes a matching profile into a generated config for the optional [ssh-mcp](https://github.com/tufantunc/ssh-mcp) server, which must be started or reconnected after each connect:
+`compute_shell_connect` opens a local SSH endpoint for one of the account's running shells and returns an `ssh_command` for OpenSSH, so an agent or an IDE can work inside the shell. It also writes a matching profile into a generated config for the optional [ssh-mcp](https://github.com/tufantunc/ssh-mcp) server, which must be started or reconnected after each connect that adds or changes a profile:
 
 ```bash
 claude mcp add --transport stdio ssh-mcp -- \

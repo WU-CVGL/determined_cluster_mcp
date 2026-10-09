@@ -516,7 +516,9 @@ MCP server（例如来自第二个客户端会话的 server）连接时会以 `s
 会删除已结束进程遗留的 shell 子目录和 `ssh-mcp.toml`；下一次连接会重新生成 `ssh-mcp.toml`。shell
 子目录是以 shell ID 命名、且只包含普通文件 `key` 和 `known_hosts` 的目录。其他内容一律不会被删除：
 连接时若发现以该 shell 的 ID 命名的其他目录，会以 `shell_access_conflict` 失败。若 server 运行期间
-该目录或其锁文件被删除，下一次连接会重新取得锁。该目录包含：
+该目录或其锁文件被删除，其他 server 可能接管该目录，因此本 server 不再改动其中的文件：只要它还有
+已打开的隧道，连接就会以 `shell_access_conflict` 失败，断开这些隧道时只关闭连接、不删除任何文件；
+没有已打开的隧道后，下一次连接会重新取得锁，若其他 server 持有锁则失败。该目录包含：
 
 | 路径 | 内容 |
 | --- | --- |
@@ -554,7 +556,7 @@ CLI 用户使用。适配器会从每个任务实体中移除 `privateKey`；不
 只在启动时读取配置，因此每个新连接的 shell 都需要启动或重新连接 ssh-mcp，这通常需要用户操作；
 其审批提示需要支持 elicitation 的 MCP 客户端。
 
-1. 用 `npm install -g ssh-mcp` 安装它，并以生成的配置和严格主机密钥检查注册它；每个生成的
+1. 用 `npm install -g ssh-mcp@2.18.0` 安装它，并以生成的配置和严格主机密钥检查注册它；每个生成的
    profile 都固定了 `trustedHostKey`，因此都满足严格检查。对于 Claude Code：
 
    ```bash
@@ -577,8 +579,8 @@ CLI 用户使用。适配器会从每个任务实体中移除 `privateKey`；不
 
 每个生成的 profile 包含 `name`、`host`、`port`、`user`、`auth = "key"`、`keyRef`、
 `trustedHostKey` 和 `group = "dev"`；配置不设置 `defaultProfile`，因此每次调用都要指定 profile。
-其余设置都采用 ssh-mcp 自身的默认值：角色 `operator`，审批模式 `ask-destructive`，即执行破坏性
-命令之前先询问。该文件在每次打开或关闭隧道时都会重写，因此对它的修改会丢失。如需其他策略设置，把
+其余设置都采用 ssh-mcp 自身的默认值：角色 `operator`，审批模式 `ask-destructive`，即执行 ssh-mcp
+判定为破坏性的命令之前先询问。该文件在每次连接和断开时都会重写，因此对它的修改会丢失。如需其他策略设置，把
 `profile_toml` 复制到你自己的 ssh-mcp 配置中再修改。同一 shell 的 `keyRef` 不变，但除非传入相同的
 `local_port`，每次重新打开隧道时端口都可能改变。
 

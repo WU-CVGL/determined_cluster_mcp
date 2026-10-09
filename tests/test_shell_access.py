@@ -21,6 +21,7 @@ import threading
 import time
 
 import pytest
+from pathlib import Path
 
 from determined_compute.compute import ComputeProfile, ComputeService, ShellAccess
 from determined_compute.compute import shell_access as module
@@ -632,12 +633,60 @@ def test_a_failed_config_rewrite_on_disconnect_drops_the_config(access, tmp_path
     def failing(path, text):
         raise OSError(errno.ENOSPC, "No space left on device")
 
+    write = module._write_private
     monkeypatch.setattr(module, "_write_private", failing)
     assert access.disconnect(SHELL_ID)["disconnected"] is True
     directory = tmp_path / "access"
     assert not (directory / SSH_MCP_CONFIG).exists()
     assert not (directory / f".{SSH_MCP_CONFIG}.tmp").exists()
     assert not (directory / SHELL_ID).exists()
+
+    # Once writes work again, a reused connect restores the config from the open tunnels.
+    monkeypatch.setattr(module, "_write_private", write)
+    result = access.connect(OTHER_SHELL_ID)
+    assert result["reused"] is True
+    profiles = _config(Path(result["ssh_mcp"]["config_path"]))["profiles"]
+    assert [profile["name"] for profile in profiles] == [f"det-shell-{OTHER_SHELL_ID}"]
+
+
+@pytest.mark.parametrize("removed", ["directory", "lock"])
+def test_a_server_that_lost_its_directory_leaves_the_new_owners_files_alone(
+    access, client, tmp_path, removed
+):
+    directory = tmp_path / "access"
+    first = access.connect(SHELL_ID)
+    if removed == "directory":
+        for path in sorted(directory.rglob("*"), reverse=True):
+            path.rmdir() if path.is_dir() else path.unlink()
+        directory.rmdir()
+    else:
+        (directory / ".lock").unlink()
+    owner = ShellAccess(_service(client), directory, Opener())
+    try:
+        taken = owner.connect(SHELL_ID)
+        owned = [directory / SHELL_ID / "key", directory / SHELL_ID / "known_hosts", directory / SSH_MCP_CONFIG]
+        assert all(path.exists() for path in owned)
+
+        for shell_id in (SHELL_ID, OTHER_SHELL_ID):
+            with pytest.raises(APIError) as caught:
+                access.connect(shell_id)
+            assert caught.value.code == "shell_access_conflict"
+            assert "removed or taken over while this server had open tunnels" in str(caught.value)
+
+        assert access.disconnect(SHELL_ID)["disconnected"] is True
+        assert all(path.exists() for path in owned)
+        with pytest.raises(OSError):
+            socket.create_connection(("127.0.0.1", first["port"]), timeout=1).close()
+        assert _exchange(taken["port"], b"still mine")[1] == b"still mine"
+
+        access.close_all()
+        assert all(path.exists() for path in owned)
+        # Without tunnels it may try again, and finds the directory taken.
+        with pytest.raises(APIError) as caught:
+            access.connect(SHELL_ID)
+        assert "another determined-compute-mcp process" in str(caught.value)
+    finally:
+        owner.close_all()
 
 
 def test_direct_connections_disable_nagle_and_keep_alive():

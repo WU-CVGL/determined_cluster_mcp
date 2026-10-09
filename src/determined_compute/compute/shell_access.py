@@ -157,6 +157,9 @@ _SOCKET_OPTIONS = tuple(
 )
 
 
+# A direct connection opens its own socket: websocket-client ignores http_no_proxy unless it
+# is also given a proxy, so it would otherwise apply its own reading of the proxy
+# environment where Requests decided to connect directly.
 def _direct_socket(
     host: str, port: int, context: Optional[ssl.SSLContext], timeout: float
 ) -> socket.socket:
@@ -379,12 +382,11 @@ class _Tunnel:
         )
 
     def stop(self) -> None:
+        """Close the listener and its connections; the files are ShellAccess's to remove."""
         if self.thread.is_alive():
             self.server.shutdown()
         self.server.server_close()
         self.server.drop_connections()
-        with suppress(OSError):
-            _remove_shell_directory(self.directory)
 
 
 def _remove_shell_directory(directory: Path) -> None:
@@ -467,6 +469,10 @@ class ShellAccess:
         except (OSError, TypeError):
             return False
         return held.st_nlink > 0 and (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+
+    def _owns_directory(self) -> bool:
+        """Whether this process still holds the lock on the directory's current lock file."""
+        return self._claim is not None and self._claim_is_current()
 
     def _claim_directory(self) -> None:
         """Take the directory for this process, removing what an ended one left behind."""
@@ -592,6 +598,14 @@ class ShellAccess:
         client = self.service.client
         open_websocket = self._opener(client)
         with self._lock:
+            if self._tunnels and not self._owns_directory():
+                # Its files may now belong to another server; this one must not touch them.
+                raise ConflictError(
+                    f"the shell access directory {self.directory} was removed or taken over "
+                    "while this server had open tunnels; disconnect them with "
+                    "compute_shell_disconnect, or restart the server, before connecting again",
+                    code="shell_access_conflict",
+                )
             tunnel = self._tunnels.get(remote_id)
             reused = tunnel is not None
             if tunnel is not None and local_port not in (None, tunnel.record["port"]):
@@ -604,6 +618,10 @@ class ShellAccess:
             if tunnel is None:
                 self._claim_directory()
                 tunnel = self._open(remote_id, client, open_websocket, local_port)
+            else:
+                # The config derives from the open tunnels; restore it if a failed write on
+                # disconnect removed it.
+                self._write_ssh_mcp_config()
             record = dict(tunnel.record)
         ready, unavailable = self._ready(client, remote_id)
         result = self._result(record, state, ready, reused)
@@ -751,7 +769,8 @@ class ShellAccess:
                 "code": "ssh_mcp_reload",
                 "message": (
                     "ssh-mcp reads its config only when it starts: start or reconnect it "
-                    "after each connect or disconnect so that it sees the current profiles."
+                    "after a profile is added, removed, or changed, so that it sees the "
+                    "current profiles."
                 ),
             },
         ]
@@ -788,7 +807,13 @@ class ShellAccess:
         tunnel = self._tunnels.pop(remote_id, None)
         if tunnel is None:
             return False
+        owner = self._owns_directory()
         tunnel.stop()
+        if not owner:
+            # Another server may have taken the directory over: leave its files alone.
+            return True
+        with suppress(OSError):
+            _remove_shell_directory(tunnel.directory)
         try:
             self._write_ssh_mcp_config()
         except OSError:

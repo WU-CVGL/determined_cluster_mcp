@@ -591,7 +591,10 @@ behind; the next connect writes `ssh-mcp.toml` again. A shell subdirectory is on
 a shell ID that holds nothing but the regular files `key` and `known_hosts`. Nothing else
 is ever deleted: a connect that finds any other directory under the shell's ID fails with
 `shell_access_conflict`. If the directory or its lock file is deleted while the server
-runs, the next connect takes the lock again. The directory holds:
+runs, another server may take the directory over, so this one stops touching its files:
+while it has open tunnels, connect fails with `shell_access_conflict` and disconnecting
+closes them without deleting anything; once none is open, the next connect takes the
+lock again, or fails if another server holds it. The directory holds:
 
 | Path | Content |
 | --- | --- |
@@ -631,7 +634,7 @@ config only when it starts, so each newly connected shell needs ssh-mcp to be st
 reconnected, which usually takes the user; its approval prompts need an MCP client that
 supports elicitation.
 
-1. Install it with `npm install -g ssh-mcp` and register it with the generated config and
+1. Install it with `npm install -g ssh-mcp@2.18.0` and register it with the generated config and
    strict host-key checking, which every generated profile satisfies because it pins
    `trustedHostKey`. For Claude Code:
 
@@ -657,8 +660,9 @@ supports elicitation.
 Each generated profile has `name`, `host`, `port`, `user`, `auth = "key"`, `keyRef`,
 `trustedHostKey`, and `group = "dev"`; the config sets no `defaultProfile`, so name the
 profile in each call. ssh-mcp's own defaults apply to everything else: role `operator`,
-and approval mode `ask-destructive`, which asks before destructive commands. The file is
-rewritten whenever a tunnel is opened or closed, so edits to it are lost. For other policy
+and approval mode `ask-destructive`, which asks before commands that ssh-mcp classifies as
+destructive. The file is rewritten on every connect and disconnect, so edits to it are
+lost. For other policy
 settings, copy `profile_toml` into your own ssh-mcp config and edit it there. A shell's
 `keyRef` stays the same, but its port can change each time its tunnel is reopened unless
 you pass the same `local_port`.

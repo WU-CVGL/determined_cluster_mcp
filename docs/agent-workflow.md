@@ -117,7 +117,7 @@ The compute MCP launches a shell but does not run commands in it. `compute_shell
 2. Call `compute_shell_connect(id)`. Check `probe.ok`; while `ready` is `false` or the probe fails, sshd may still be starting, so call it again after a short wait.
 3. Use the result:
    - If you have a local shell tool and the user allows SSH commands with it, run `ssh_command` followed by the command to run in the shell. This works for every shell connected during the work.
-   - If the user set up the optional [ssh-mcp](compute-service.md#use-the-shell-from-ssh-mcp) server for the generated config, it must be started or reconnected after each connect, which you usually cannot do yourself: ask the user to reconnect it, then call its tools with the profile named in `ssh_mcp.profile`.
+   - If the user set up the optional [ssh-mcp](compute-service.md#use-the-shell-from-ssh-mcp) server for the generated config, it must be started or reconnected after each connect that adds or changes a profile, which you usually cannot do yourself: ask the user to reconnect it, then call its tools with the profile named in `ssh_mcp.profile`.
    - Otherwise give the result's values to the user for their own SSH client or IDE.
 4. When done, call `compute_shell_disconnect(id)`, then `compute_cancel("shell", id)` unless the user wants the shell kept; a shell holds its slots until it is cancelled or, where the deployment sets one, its inactivity limit stops it.
 

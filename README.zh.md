@@ -62,7 +62,7 @@ HTTPS 为可选项：设置 `DET_MASTER=https://determined.example.org`，在 MC
 <a id="reach-shells-over-ssh-optional"></a>
 ## 经 SSH 访问 shell（可选）
 
-`compute_shell_connect` 为该账户的一个运行中 shell 打开本地 SSH 端点，并返回供 OpenSSH 使用的 `ssh_command`，使 agent 或 IDE 能在该 shell 中工作。它还会将对应的 profile 写入为可选的 [ssh-mcp](https://github.com/tufantunc/ssh-mcp) 服务生成的配置中；每次 connect 之后都必须启动或重新连接该服务：
+`compute_shell_connect` 为该账户的一个运行中 shell 打开本地 SSH 端点，并返回供 OpenSSH 使用的 `ssh_command`，使 agent 或 IDE 能在该 shell 中工作。它还会将对应的 profile 写入为可选的 [ssh-mcp](https://github.com/tufantunc/ssh-mcp) 服务生成的配置中；每次新增或改变 profile 的 connect 之后都必须启动或重新连接该服务：
 
 ```bash
 claude mcp add --transport stdio ssh-mcp -- \

@@ -124,7 +124,8 @@ def create_server(
             "compute_shell_connect opens local SSH access to a running shell (127.0.0.1, a "
             "port, a key file, and a pinned host key): run its ssh_command where a local shell "
             "tool is allowed, or use an SSH MCP server such as ssh-mcp, which must be started "
-            "or reconnected after each connect; disconnect when done. "
+            "or reconnected after a profile is added, removed, or changed; disconnect when "
+            "done. "
             "Credentials belong in local configuration, never in tool arguments."
         ),
     )
