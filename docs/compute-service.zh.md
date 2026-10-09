@@ -524,7 +524,8 @@ MCP server（例如来自第二个客户端会话的 server）连接时会以 `s
 会删除已结束进程遗留的 shell 子目录和 `ssh-mcp.toml`，以及 `ssh_config`；下一次连接会重新生成这两个文件。shell
 子目录是以 shell ID 命名、且只包含普通文件 `key` 和 `known_hosts` 的目录。其他内容一律不会被删除：
 连接时若发现以该 shell 的 ID 命名的其他目录，会以 `shell_access_conflict` 失败。若 server 运行期间
-只有锁文件被删除，server 会锁定新的锁文件并继续工作，除非其他 server 先锁定了它。若该目录被删除，
+只有锁文件被删除，server 会锁定新的锁文件并继续工作，除非其他 server 先锁定了它，或其隧道的
+key 和 known_hosts 文件已不是它自己写入的那些文件。若该目录被删除，
 或被其他 server 接管，本 server 不再改动其中的文件：只要它还有已打开的隧道，连接就会以
 `shell_access_conflict` 失败，断开这些隧道时只关闭连接、不删除任何文件；没有已打开的隧道后，
 下一次连接会重新取得锁，若其他 server 持有锁则失败。该目录包含：
