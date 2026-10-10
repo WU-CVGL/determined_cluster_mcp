@@ -100,14 +100,22 @@ def create_server(
             "MCP support is not installed; install determined-compute[mcp]"
         ) from exc
 
+    sessions = 0
+
     @contextlib.asynccontextmanager
     async def lifespan(_server: Any) -> Any:
+        # Entered once per session (once for stdio); this runs on the event loop's thread.
+        nonlocal sessions
+        if shell_access is not None and sessions == 0:
+            shell_access.reopen()
+        sessions += 1
         try:
             yield {}
         finally:
-            # Before the event loop joins its worker threads: end every wait and tunnel, so
-            # an open wait_seconds cannot hold the process up.
-            if shell_access is not None:
+            sessions -= 1
+            # When the last session ends, before the event loop joins its worker threads:
+            # end every wait and tunnel, so an open wait_seconds cannot hold the process up.
+            if shell_access is not None and sessions == 0:
                 shell_access.close_all()
 
     server = MCPServer(
@@ -234,6 +242,8 @@ def create_server(
             try:
                 closed = await asyncio.to_thread(shell_access.disconnect, id)
                 result["shell_access_closed"] = closed["disconnected"]
+                if "files" in closed:
+                    result["shell_access_files"] = closed["files"]
             except Exception as exc:
                 # The cancellation itself succeeded; say why the local cleanup did not.
                 result["shell_access_closed"] = None

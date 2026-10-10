@@ -479,7 +479,10 @@ summary with `cancellation_acknowledged: true` and the remote response as `remot
 command or shell response also updates `state`. Cancelling a shell also closes its
 [shell-access](#shell-access) tunnel and reports `shell_access_closed`: `true` when a
 tunnel was closed, `false` when there was none, and `null` with the reason as
-`shell_access_error` when closing failed. Remote termination alone does not prove
+`shell_access_error` when the key could not be deleted or the configs could not be
+rewritten; the tunnel has still stopped, as for `compute_shell_disconnect`. When a tunnel
+was closed, `shell_access_files` is `removed`, or `kept` when the directory may now belong
+to another server. Remote termination alone does not prove
 success; inspect exit information and expected shared-storage artifacts.
 
 ### Pause and resume
@@ -529,9 +532,11 @@ SSH MCP server, needs a TCP port instead, which
    meanwhile fails at once, and one still not running when the time is up fails with
    `shell_not_running`. A lookup that fails transiently, such as a `transport_error` or an
    HTTP 429 or 5xx, is retried until the time is up; any other error ends the wait.
-   Cancelling the request ends the wait within one 5-second check, with the error
-   `cancelled`; when the MCP server stops, every wait ends the same way with
-   `shell_access_stopping`. Neither opens a tunnel afterwards.
+   Cancelling the request ends the wait with the error `cancelled`; when the last session of
+   the MCP server ends, every wait ends the same way with `shell_access_stopping`. Either
+   happens within one 5-second check or one second of a probe, or once an API request
+   already in flight returns (up to the client's 30-second request timeout). Neither opens
+   a tunnel afterwards.
 2. It reads the shell's key pair from `GET /api/v1/shells/{id}`. Determined generates the
    pair for each shell: sshd accepts the private key for login and uses the same pair as
    its host key. The private key is written only to a `key` file with mode 0600 in the
@@ -557,7 +562,8 @@ SSH MCP server, needs a TCP port instead, which
    and another failed lookup that is not transient ends the call with that error. A
    disconnect of the tunnel meanwhile fails the call with `shell_access_closed`. Whatever
    ends the wait early, cancellation and server stop included, closes a tunnel this call
-   opened, and the original error is the one reported. Each probe gets no more than the time left, but at least
+   opened, unless another connect was meanwhile handed the same tunnel, and the original
+   error is the one reported; a failure to clean up is added to it and printed to stderr. Each probe gets no more than the time left, but at least
    1 second, and no wait starts after the deadline. The call can still overrun
    `wait_seconds` by the API requests in flight when the time runs out, each limited by the
    client's request timeout (up to three when the shell starts running just then), plus
@@ -591,10 +597,12 @@ port fails with `port_unavailable`. `compute_shell_disconnect` stops the listene
 open connections, deletes the shell's key directory, and rewrites the configs, without
 contacting the master; `compute_cancel` of a shell does the same. When the key cannot be
 deleted or the configs cannot be rewritten, the tunnel has still stopped and the error is
-returned; the configs then stay as they were, or are all removed, and the next connect
-rewrites them.
+returned. The configs then stay as they were, or are all removed; after such an error,
+removing the last tunnel's configs can also leave some of the three in place. The next
+connect rewrites them.
 
-Tunnels belong to the MCP process that opened them and stop when it exits. The tunnel
+Tunnels belong to the MCP process that opened them and stop when its last client session
+ends or it exits. The tunnel
 listens on the loopback interface only. Other local processes can connect to the port,
 but they reach only sshd, which still requires the private key, and the pinned host key
 verifies the shell end to end. sshd allows TCP forwarding, so `ssh -L` through the

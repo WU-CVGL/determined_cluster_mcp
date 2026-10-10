@@ -1329,6 +1329,127 @@ def test_cancelling_the_mcp_request_stops_the_wait_and_opens_no_tunnel(tmp_path,
     assert len([call for call in client.calls if call[0] == "get_task"]) < 10
 
 
+def test_close_all_does_not_wait_for_a_key_fetch_and_writes_nothing(tmp_path):
+    fetching, release = threading.Event(), threading.Event()
+
+    class SlowKeys(FakeClient):
+        def get_shell_keys(self, remote_id):
+            fetching.set()
+            release.wait(10)  # the master is slow to answer
+            return super().get_shell_keys(remote_id)
+
+    manager = ShellAccess(_service(SlowKeys()), tmp_path / "access", Opener())
+    worker, outcome = _in_thread(manager.connect, SHELL_ID)
+    assert fetching.wait(5)
+    started = time.monotonic()
+    manager.close_all()
+    assert time.monotonic() - started < 1
+    release.set()
+    worker.join(timeout=5)
+    assert outcome["error"].code == "shell_access_stopping"
+    assert manager._tunnels == {} and not (tmp_path / "access" / SHELL_ID).exists()
+
+
+def test_cancelling_the_opener_leaves_a_tunnel_another_call_was_given(access, client, monkeypatch):
+    monkeypatch.setattr(module, "_WAIT_INTERVAL", 0.05)
+    client.ready = False  # sshd never answers, so the opening call keeps waiting
+    stop = threading.Event()
+    worker, outcome = _in_thread(access.connect, SHELL_ID, wait_seconds=600, stop=stop)
+    deadline = time.monotonic() + 5
+    while SHELL_ID not in access._tunnels and time.monotonic() < deadline:
+        time.sleep(0.01)
+    given = access.connect(SHELL_ID)
+    assert given["reused"] is True
+    stop.set()
+    worker.join(timeout=5)
+    assert outcome["error"].code == "cancelled"
+    # The tunnel handed to the second call stays open, with its key.
+    assert os.path.exists(given["key_path"])
+    client.ready = True
+    assert _exchange(given["port"], b"still open")[1] == b"still open"
+
+
+def test_a_probe_notices_a_stop_within_a_second():
+    class Silent:
+        sock = None
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def recv_data(self):
+            time.sleep(self.timeout)
+            raise TimeoutError("timed out")
+
+        def send_binary(self, data):
+            pass
+
+        def shutdown(self):
+            pass
+
+    stop = threading.Event()
+    threading.Timer(0.3, stop.set).start()
+    started = time.monotonic()
+    result = ShellAccess._probe(lambda shell_id, timeout: Silent(), SHELL_ID, 15, stop)
+    assert result["ok"] is False and time.monotonic() - started < 2
+
+
+def test_a_failed_cleanup_after_a_cancelled_wait_is_reported(tmp_path, monkeypatch, capsys):
+    clock = _Clock(monkeypatch)
+    stop = threading.Event()
+    client = _StartingClient(["STATE_RUNNING"], [False] * 10)
+    clock.on_wait = lambda count: stop.set()
+    manager = ShellAccess(_service(client), tmp_path / "access", Opener())
+    key = tmp_path / "access" / SHELL_ID / "key"
+    unlink = os.unlink
+
+    def failing(path, *args, **kwargs):
+        if Path(path) == key:
+            raise OSError(errno.EIO, "Input/output error", str(path))
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "unlink", failing)
+    with pytest.raises(APIError) as caught:
+        manager.connect(SHELL_ID, wait_seconds=600, stop=stop)
+    assert caught.value.code == "cancelled"
+    assert "removing its key or rewriting the configs failed" in str(caught.value)
+    assert "removing its key" in capsys.readouterr().err
+
+
+def test_removing_the_last_configs_attempts_all_three(access, tmp_path, monkeypatch):
+    access.connect(SHELL_ID)
+    replace = ShellAccess._replace_private
+
+    def failing(path, text):
+        if path.name == "ssh_config" and text is None:
+            raise OSError(errno.EIO, "Input/output error", str(path))
+        return replace(path, text)
+
+    monkeypatch.setattr(ShellAccess, "_replace_private", staticmethod(failing))
+    with pytest.raises(OSError) as caught:
+        access.disconnect(SHELL_ID)
+    assert caught.value.filename.endswith("ssh_config")
+    directory = tmp_path / "access"
+    assert not (directory / "ssh_hosts").exists() and not (directory / SSH_MCP_CONFIG).exists()
+
+
+def test_the_key_is_removed_first_and_its_error_kept(access, tmp_path, monkeypatch):
+    access.connect(SHELL_ID)
+    attempted = []
+    unlink = os.unlink
+
+    def failing(path, *args, **kwargs):
+        attempted.append(Path(path).name)
+        if Path(path).parent.name == SHELL_ID:
+            raise OSError(errno.EIO, "Input/output error", str(path))
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(module.os, "unlink", failing)
+    with pytest.raises(OSError) as caught:
+        access.disconnect(SHELL_ID)
+    assert attempted[:2] == ["key", "known_hosts"]
+    assert caught.value.filename.endswith("/key")
+
+
 def test_direct_connections_disable_nagle_and_keep_alive():
     with socket.create_server(("127.0.0.1", 0)) as listener:
         connection = module._direct_socket("127.0.0.1", listener.getsockname()[1], None, 5)

@@ -42,6 +42,8 @@ SSH_HOSTS = "ssh_hosts"
 _LOCK = ".lock"
 # The only files a shell's subdirectory holds; nothing else is ever deleted.
 _SHELL_FILES = frozenset({"key", "known_hosts"})
+# Deletion order: the key first, as the file that must not outlive its tunnel.
+_SHELL_FILE_ORDER = ("key", "known_hosts")
 # How long a WebSocket may take to open, and the probe to read the sshd banner.
 _CONNECT_TIMEOUT = 30
 _PROBE_TIMEOUT = 15
@@ -415,6 +417,9 @@ class _Tunnel:
         self, shell_id: str, directory: Path, server: _RelayServer, record: Dict[str, Any]
     ) -> None:
         self.shell_id, self.directory, self.server, self.record = shell_id, directory, server, record
+        # Set once a reused connect hands the tunnel out: it is then no single call's to roll
+        # back.
+        self.shared = False
         self.thread = threading.Thread(
             target=server.serve_forever, name=f"shell-tunnel-{shell_id[:8]}", daemon=True
         )
@@ -427,10 +432,20 @@ class _Tunnel:
 
 
 def _remove_shell_directory(directory: Path) -> None:
-    """Delete a shell's subdirectory without recursing: anything unexpected makes it fail."""
-    for name in _SHELL_FILES:
-        with suppress(FileNotFoundError):
+    """Delete a shell's subdirectory without recursing: anything unexpected makes it fail.
+
+    Every file is attempted, the key first, and the first failure is raised.
+    """
+    error: Optional[OSError] = None
+    for name in _SHELL_FILE_ORDER:
+        try:
             os.unlink(directory / name)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            error = error or exc
+    if error is not None:
+        raise error
     os.rmdir(directory)
 
 
@@ -712,8 +727,14 @@ class ShellAccess:
         records = [self._tunnels[shell_id].record for shell_id in sorted(self._tunnels)]
         names = (SSH_HOSTS, SSH_CONFIG, SSH_MCP_CONFIG)
         if not records:
+            error: Optional[OSError] = None
             for name in names:
-                self._replace_private(self.directory / name, None)
+                try:
+                    self._replace_private(self.directory / name, None)
+                except OSError as exc:
+                    error = error or exc
+            if error is not None:
+                raise error
             return
         control_directory = self._control_directory()
         blocks = [ssh_config_block(record, control_directory) for record in records]
@@ -841,6 +862,16 @@ class ShellAccess:
             pause(min(_WAIT_INTERVAL, remaining))
         client = self.service.client
         open_websocket = self._opener(client)
+        fetched = None
+        while True:
+            if fetched is None and remote_id not in self._tunnels:
+                # The keys come from the master: read them without holding the lock, which
+                # close_all needs at once when the server stops.
+                fetched = self._fetch_keys(client, remote_id)
+            with self._lock:
+                if self._tunnels.get(remote_id) is None and fetched is None:
+                    continue  # the tunnel closed after the peek: read the keys first
+                break
         with self._lock:
             # Checked under the lock that close_all takes: a stopped or cancelled call never
             # opens a tunnel that nobody would hear of.
@@ -864,9 +895,17 @@ class ShellAccess:
                     code="shell_access_conflict",
                 )
             if tunnel is None:
+                if fetched is None:
+                    # Closed between the check above and this lock: connect again.
+                    raise ConflictError(
+                        f"the tunnel to shell {remote_id} was closed while connecting; "
+                        "connect again to open a new one",
+                        code="shell_access_closed",
+                    )
                 self._claim_directory()
-                tunnel = self._open(remote_id, client, open_websocket, local_port)
+                tunnel = self._open(remote_id, fetched, open_websocket, local_port)
             else:
+                tunnel.shared = True
                 # The configs derive from the open tunnels; a failed rewrite may have removed
                 # them.
                 self._write_configs()
@@ -884,7 +923,7 @@ class ShellAccess:
                     else max(1.0, min(_PROBE_TIMEOUT, deadline - _now()))
                 )
                 probe = (
-                    self._probe(open_websocket, remote_id, probe_timeout)
+                    self._probe(open_websocket, remote_id, probe_timeout, stop)
                     if ready is not False
                     else {"ok": False, "error": "the shell is not ready yet; sshd has not started"}
                 )
@@ -917,14 +956,23 @@ class ShellAccess:
                     break
                 pause(min(_WAIT_INTERVAL, remaining))
             self._check_open(remote_id, tunnel)
-        except BaseException:
-            # Whatever ends the wait, a tunnel this call opened is not left behind, and the
-            # original error is the one reported.
+        except BaseException as exc:
+            # Whatever ends the wait, a tunnel this call opened, and nobody else was handed,
+            # is not left behind; the original error is the one reported.
             if not reused:
                 with self._lock:
-                    if self._tunnels.get(remote_id) is tunnel:
-                        with suppress(OSError):
+                    if self._tunnels.get(remote_id) is tunnel and not tunnel.shared:
+                        try:
                             self._disconnect(remote_id)
+                        except OSError as cleanup:
+                            note = (
+                                f"; the tunnel stopped, but removing its key or rewriting the "
+                                f"configs failed: {cleanup}"
+                            )
+                            # The caller may be gone, as after a cancellation: say it here too.
+                            print(f"determined-compute-mcp: shell {remote_id}{note}", file=sys.stderr)
+                            if isinstance(exc, APIError) and exc.args:
+                                exc.args = (f"{exc.args[0]}{note}", *exc.args[1:])
             raise
         if state_unknown:
             # The last check of the shell failed; do not report a state it may have left.
@@ -936,10 +984,9 @@ class ShellAccess:
         result["probe"] = probe
         return result
 
-    def _open(
-        self, remote_id: str, client: Any, open_websocket: OpenWebSocket, local_port: Optional[int]
-    ) -> _Tunnel:
-        """Create a tunnel completely, or leave nothing of it behind."""
+    @staticmethod
+    def _fetch_keys(client: Any, remote_id: str) -> Tuple[Dict[str, str], str, str]:
+        """Read and check the shell's key pair; network I/O, so never under ``self._lock``."""
         keys = client.get_shell_keys(remote_id)
         if keys.get("id") != remote_id:
             raise APIError("Remote shell identity does not match the request", code="invalid_response")
@@ -947,6 +994,17 @@ class ShellAccess:
             key_type, fingerprint = host_key_fingerprint(keys["public_key"])
         except ValueError as exc:
             raise APIError("Determined returned a malformed shell public key", code="invalid_response") from exc
+        return keys, key_type, fingerprint
+
+    def _open(
+        self,
+        remote_id: str,
+        fetched: Tuple[Dict[str, str], str, str],
+        open_websocket: OpenWebSocket,
+        local_port: Optional[int],
+    ) -> _Tunnel:
+        """Create a tunnel completely, or leave nothing of it behind."""
+        keys, key_type, fingerprint = fetched
         directory = self.directory / remote_id
         if os.path.lexists(directory):
             if not self._is_shell_directory(directory):
@@ -1019,7 +1077,10 @@ class ShellAccess:
 
     @staticmethod
     def _probe(
-        open_websocket: OpenWebSocket, remote_id: str, timeout: float = _PROBE_TIMEOUT
+        open_websocket: OpenWebSocket,
+        remote_id: str,
+        timeout: float = _PROBE_TIMEOUT,
+        stop: Optional[threading.Event] = None,
     ) -> Dict[str, Any]:
         """Open the shell's proxy once and read sshd's identification line.
 
@@ -1033,10 +1094,16 @@ class ShellAccess:
             # The proxy may split the line across WebSocket messages.
             while b"\n" not in received and len(received) < _PROBE_MAX_BYTES:
                 remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if remaining <= 0 or (stop is not None and stop.is_set()):
                     break
-                ws.settimeout(remaining)
-                opcode, data = ws.recv_data()
+                # Receive in short steps, so that a stop is seen within a second.
+                ws.settimeout(min(remaining, 1.0))
+                try:
+                    opcode, data = ws.recv_data()
+                except Exception as exc:
+                    if isinstance(exc, (socket.timeout, TimeoutError)) or "Timeout" in type(exc).__name__:
+                        continue
+                    raise
                 if opcode == _OPCODE_CLOSE:
                     break
                 received += bytes(data or b"")
@@ -1128,17 +1195,38 @@ class ShellAccess:
         if not self._owns_directory():
             # Another server may have taken the directory over: leave its files alone.
             return "kept"
+        removal: Optional[OSError] = None
         try:
             _remove_shell_directory(tunnel.directory)
-        finally:
+        except OSError as exc:
+            removal = exc
+        try:
             # Attempted either way; _write_configs keeps the three files consistent.
             self._write_configs()
+        except OSError as exc:
+            if removal is None:
+                raise
+            raise OSError(
+                removal.errno,
+                f"{removal.strerror}; the configs were not rewritten either: {exc}",
+                removal.filename,
+            ) from exc
+        if removal is not None:
+            raise removal
         return "removed"
+
+    def reopen(self) -> None:
+        """Accept connects again after close_all, when a new server session starts."""
+        self._stopping.clear()
 
     def close_all(self) -> None:
         """Stop every wait and tunnel of this process and release the directory; for exit."""
+        # Wake the waits before taking the lock, which a connect may hold while it writes;
+        # again under the lock, for a connect that registered in between.
+        self._stopping.set()
+        for stop in list(self._waits):
+            stop.set()
         with self._lock:
-            self._stopping.set()
             for stop in self._waits:
                 stop.set()
             for remote_id in list(self._tunnels):

@@ -421,7 +421,9 @@ cancel endpoint，对 generic 任务使用 generic task kill endpoint；后者�
 但从不终止其祖先。它返回带 `cancellation_acknowledged: true` 的任务摘要，并把远端响应放在
 `remote` 中；command 或 shell 的响应还会更新 `state`。取消 shell 时还会关闭其
 [shell 访问](#shell-access)隧道，并报告 `shell_access_closed`：关闭了隧道时为 `true`，没有隧道时
-为 `false`，关闭失败时为 `null`，并以 `shell_access_error` 给出原因。远端终止并不能单独证明成功，还应检查退出信息和预期的共享存储
+为 `false`；无法删除密钥或无法重写配置时为 `null`，并以 `shell_access_error` 给出原因，此时隧道与
+`compute_shell_disconnect` 一样已经停止。关闭了隧道时，`shell_access_files` 为 `removed`，或在该目录
+现在可能属于另一个 server 时为 `kept`。远端终止并不能单独证明成功，还应检查退出信息和预期的共享存储
 产物。
 
 <a id="pause-and-resume"></a>
@@ -463,8 +465,9 @@ shell 是一个容器，master 通过其代理提供该容器中的 sshd。`det 
    它每 5 秒检查一次 shell，直到其运行，调用方无需轮询 `compute_status`；期间结束的 shell 立即
    失败，时间用完时仍未运行的 shell 以 `shell_not_running` 失败。暂时性的查询失败（例如
    `transport_error`，或 HTTP 429、5xx）会一直重试到时间用完；其他错误会结束等待。
-   取消请求会在一次 5 秒检查之内结束等待，错误为 `cancelled`；MCP server 停止时，所有等待都以
-   同样方式结束，错误为 `shell_access_stopping`。两者都不会在之后打开隧道。
+   取消请求会结束等待，错误为 `cancelled`；MCP server 的最后一个会话结束时，所有等待都以同样方式
+   结束，错误为 `shell_access_stopping`。两者都会在一次 5 秒检查或一次探测中的 1 秒之内发生，或在
+   正在进行的 API 请求返回之后发生（最长为客户端的 30 秒请求超时）。两者都不会在之后打开隧道。
 2. 它从 `GET /api/v1/shells/{id}` 读取 shell 的密钥对。Determined 为每个 shell 生成这对密钥：
    sshd 接受用该私钥登录，并把同一对密钥用作自己的主机密钥。私钥只写入 shell 访问目录中该
    shell 子目录下权限为 0600 的 `key` 文件；任何工具结果都不包含私钥。
@@ -482,7 +485,8 @@ shell 是一个容器，master 通过其代理提供该容器中的 sshd。`det 
    `wait_seconds` 时，它每 5 秒重复一次，直到探测成功或时间用完，然后无论结果如何都返回。
    期间它会再次检查 shell：停止的 shell 以 `shell_not_running` 失败，其他非暂时性的查询失败会以
    该错误结束调用。期间若该隧道被断开，调用以 `shell_access_closed` 失败。无论什么使等待提前结束
-   （包括取消和 server 停止），都会关闭本次调用打开的隧道，并报告原始错误。每次探测所用时间不超过剩余时间，但至少
+   （包括取消和 server 停止），都会关闭本次调用打开的隧道，除非期间另一次连接已拿到同一条隧道；
+报告的是原始错误，清理失败会附加到其中并写到 stderr。每次探测所用时间不超过剩余时间，但至少
    1 秒，且截止时间过后不再开始等待。调用仍可能比 `wait_seconds` 多出时间用完时正在进行的 API
    请求（每个受客户端请求超时限制；shell 恰好在此时开始运行时最多三个），再加上那次探测的时间。
    标识行只表明 sshd 有应答；登录交给 SSH 客户端完成。
@@ -511,9 +515,10 @@ shell 是一个容器，master 通过其代理提供该容器中的 sshd。`det 
 以 `shell_access_conflict` 失败，因此请先调用 `compute_shell_disconnect`。端口被占用时以
 `port_unavailable` 失败。`compute_shell_disconnect` 停止监听、关闭已打开的连接、删除该 shell 的
 密钥目录并重写配置，不访问 master；对 shell 调用 `compute_cancel` 也会这样做。若密钥无法删除或
-配置无法重写，隧道仍已停止，并返回该错误；此时配置保持原样或被全部删除，下一次连接会重新生成。
+配置无法重写，隧道仍已停止，并返回该错误；此时配置保持原样或被全部删除；出现这类错误后，删除最后一条隧道的配置时，三个文件中也可能有一部分
+留下。下一次连接会重新生成它们。
 
-隧道属于打开它的 MCP 进程，进程退出时隧道随之停止。隧道只在回环接口上监听。其他本地进程可以
+隧道属于打开它的 MCP 进程，在其最后一个客户端会话结束或进程退出时停止。隧道只在回环接口上监听。其他本地进程可以
 连接该端口，但只能到达 sshd，而 sshd 仍要求私钥；固定的主机密钥则端到端地验证 shell。sshd 允许
 TCP 转发，因此经隧道的 `ssh -L` 可以访问容器内的端口。
 

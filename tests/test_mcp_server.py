@@ -197,6 +197,9 @@ class FakeShellAccess:
     def close_all(self):
         self.calls.append(("close_all",))
 
+    def reopen(self):
+        self.calls.append(("reopen",))
+
     def connect(self, shell_id, local_port, wait_seconds, stop):
         self.calls.append(("connect", shell_id, local_port, wait_seconds))
         if shell_id == "busy":
@@ -207,7 +210,7 @@ class FakeShellAccess:
 
     def disconnect(self, shell_id):
         self.calls.append(("disconnect", shell_id))
-        return {"kind": "shell", "id": shell_id, "disconnected": True}
+        return {"kind": "shell", "id": shell_id, "disconnected": True, "files": "removed"}
 
 
 def test_shell_access_tools_connect_disconnect_and_close_on_cancel():
@@ -236,11 +239,13 @@ def test_shell_access_tools_connect_disconnect_and_close_on_cancel():
 
             cancelled = await client.call_tool("compute_cancel", {"kind": "shell", "id": COMMAND_ID})
             assert _structured(cancelled)["shell_access_closed"] is True
+            assert _structured(cancelled)["shell_access_files"] == "removed"
             command = await client.call_tool(
                 "compute_cancel", {"kind": "command", "id": COMMAND_ID}
             )
             assert "shell_access_closed" not in _structured(command)
         assert shell_access.calls == [
+            ("reopen",),
             ("connect", COMMAND_ID, None, 0),
             ("connect", COMMAND_ID, 2222, 60),
             ("connect", "busy", None, 0),
@@ -567,3 +572,22 @@ def test_compute_resources_takes_the_requests_gpu_topology_values():
     assert inspector.calls == [
         (2, None, None), (4, None, "soft"), (4, None, "strong"), (4, None, False), (4, None, None),
     ]
+
+
+def test_shell_access_closes_only_when_the_last_session_ends():
+    async def exercise():
+        shell_access = FakeShellAccess()
+        server = create_server(FakeService(), shell_access=shell_access)
+        async with Client(server) as first:
+            async with Client(server) as second:
+                await second.list_tools()
+            # The second session ending leaves shell access open for the first.
+            assert ("close_all",) not in shell_access.calls
+            await first.list_tools()
+        assert shell_access.calls == [("reopen",), ("close_all",)]
+        # A later session can use shell access again.
+        async with Client(server) as third:
+            await third.list_tools()
+        assert shell_access.calls == [("reopen",), ("close_all",), ("reopen",), ("close_all",)]
+
+    asyncio.run(asyncio.wait_for(exercise(), timeout=10))
