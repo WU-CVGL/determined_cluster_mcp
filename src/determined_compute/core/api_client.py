@@ -24,6 +24,8 @@ _YAML_UNSAFE = re.compile("[\x7f-\x9f\u2028\u2029\ufffe\uffff]")
 # How the research-cluster fork refuses a resource pool the user may not use; the launch
 # routes prefix it with their own context.
 _POOL_DENIED = re.compile(r'may not use resource pool "([^"\\]{1,256})"')
+# A POSIX login name, as a shell's agent user must be.
+_LOGIN_USER = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\$?")
 # The MCP logs in once per process, so a revoked or expired token fails every later call.
 _UNAUTHENTICATED_HINT = (
     "a login token expires after 7 days and a password change revokes sessions and tokens; "
@@ -1015,6 +1017,8 @@ class DeterminedAPIClient:
             raise APIError("Determined did not return the shell's SSH keys", code="invalid_response")
         group = entity.get("agentUserGroup")
         user = group.get("user") if isinstance(group, Mapping) else None
+        if isinstance(user, str) and user and not _LOGIN_USER.fullmatch(user):
+            raise APIError("Determined returned an invalid shell login user", code="invalid_response")
         return {
             "id": str(entity["id"]),
             "private_key": private_key,

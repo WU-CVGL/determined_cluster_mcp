@@ -155,10 +155,17 @@ Determined 本身也会执行权限检查。在使用 basic authorization 的 fo
 
 - `unsupported`，且消息提及 `websocket-client`：带 MCP extra 重新安装服务（在检出目录中运行 `python -m pip install -e '.[mcp]'`），然后重启 MCP 进程。
 - `unsupported`，且消息提及代理：环境为 master 选择了 `http://` 以外的代理，例如 `socks5://`。shell 访问只能直接或通过 `http://` 代理访问 master；把 master 同时列入 `NO_PROXY` 和 `no_proxy`，或为它设置一个 `http://` 代理。
-- `shell_not_running`：只能连接处于 `STATE_RUNNING` 的 shell。排队中的 shell 正在等待容量；已结束的 shell 无法重新打开，应提交新的 shell。
+- `compute_shell_connect` 返回 `state: null` 并带有 `context_unavailable: ["state"]`：在 `wait_seconds` 期间无法检查该 shell，例如 master 短暂无法访问。隧道已打开；依赖它之前请先用 `compute_status` 检查。
+- `shell_not_running`：只能连接处于 `STATE_RUNNING` 的 shell。排队中的 shell 正在等待容量：传入 `wait_seconds`（最多 600），或稍后再连接。已结束的 shell 无法重新打开，应提交新的 shell。shell 在 `wait_seconds` 等待其 sshd 期间结束时也会返回 `shell_not_running`；已由另一次连接返回的隧道会保持打开，直到调用 `compute_shell_disconnect`。
 - shell 刚启动后出现 `ready: false` 或 `probe.ok: false`：sshd 仍在启动。sshd 就绪后，`compute_logs` 会显示 `Server listening on`；再次调用 `compute_shell_connect`，它会保留已打开的隧道并重新探测。
 - 探测错误 `the WebSocket handshake was refused with HTTP <status>` 来自 master 或其 shell 代理：404 或 502 通常表示 shell 已结束，或其代理尚未注册。
 - 探测错误 `WebSocketProxyException: failed CONNECT via proxy status: <status>` 来自为 master 选定的 HTTP 代理：407 表示它要求其他凭据（在代理 URL 中设置），403 或 405 表示它不允许对 master 端口的 `CONNECT`。TLS 错误和其他代理失败的原因与 API 相同；见[TLS 证书验证失败](#tls-certificate-verification-fails)和[通过代理无法访问 master](#the-master-is-unreachable-through-a-proxy)。
+- `cancelled`：启动 `compute_shell_connect` 的请求在等待期间被取消，例如客户端超时。它没有打开隧道，或已关闭它等待的隧道，除非另一个 `compute_shell_connect` 已返回该隧道或仍在等待它；请重新连接。
+- `shell_access_stopping`：MCP 服务正在停止，或其最后一个客户端会话已结束；它不会打开隧道。请重启 MCP 服务，或在客户端中重新连接它。
+- `shell_access_closed`：`compute_shell_connect` 等待 sshd 期间，该隧道被断开，例如被 `compute_shell_disconnect` 或 `compute_cancel`。请重新连接以打开新的隧道。
+- `compute_shell_disconnect` 返回诸如 `No space left on device` 或指明密钥文件的错误：隧道已停止，但配置无法重写或密钥无法删除。请释放空间或修复该文件，若密钥仍在请手动删除；下一次连接会重写配置。
+- `compute_shell_disconnect` 返回 `files: kept`：有已打开的隧道时 shell 访问目录或其锁文件被删除，因此 server 保留了这些文件，以防它们现在属于另一个 server。所有隧道都关闭后，下一次连接会重新取得该目录并删除它们。
+- 连接以 `No locks available`（`ENOLCK`）失败：shell 访问目录所在的文件系统不支持可用的锁，例如没有锁守护进程的 NFS。请把 `--shell-access-dir` 指向本地目录。
 - `port_unavailable`：请求的 `local_port` 已被其他程序占用。省略该参数即可获得一个空闲端口。
 - `shell_access_conflict`，且消息说另一个 determined-compute-mcp 进程正在使用该 shell 访问目录：另一个 MCP 服务（例如来自另一个客户端会话的服务）正在使用它。为每个服务分别指定各自的 `--shell-access-dir` 或 `DETERMINED_COMPUTE_SHELL_ACCESS`。
 - `shell_access_conflict`，且消息说本 server 有已打开的隧道时 shell 访问目录被删除或被接管：该目录被删除，或其锁文件被删除且其他 server 锁定了新的锁文件。对本 server 已打开的隧道调用 `compute_shell_disconnect`（不会改动该目录中的文件），或重启 server；然后再连接。
@@ -166,6 +173,11 @@ Determined 本身也会执行权限检查。在使用 basic authorization 的 fo
 - `shell_access_conflict`，且消息说某个目录已存在但不是 shell 访问目录：以该 shell 的 ID 命名的目录中有 shell 访问文件以外的内容。删除该目录，或使用专用的 shell 访问目录。
 - ssh-mcp 因找不到配置文件而启动失败，或不认识该 profile：该文件只在有隧道打开时存在，而 ssh-mcp 只在启动时读取它，因此请在 `compute_shell_connect` 之后启动或重新连接 ssh-mcp。检查注册时是否写成 `--config=<ssh_mcp.config_path>`（带 `=`）：ssh-mcp 会忽略以空格分隔的值。
 - ssh-mcp 报告主机密钥不匹配：其配置比该端口上的隧道旧。重启 ssh-mcp，使其读取当前的 `trustedHostKey`。
+- stderr 出现 `mux_client_request_session: session request failed: Session open refused by peer`，随后是 `ControlSocket ... already exists, disabling multiplexing`：经由同一个多路复用主连接同时运行的命令超过了 sshd 的 `MaxSessions`（默认 10）。命令并未被拒绝：`ssh` 改用一条自己的新连接运行了它。请以退出状态判断结果，不要因这条消息重新运行它。减少同时运行的命令数可让它们共用一条连接。
+- 经由别名的某条命令挂起或失败而其他命令正常，或大量数据传输不应共用连接：在 `ssh_command` 后加上 `-S none` 运行它，使其使用自己的连接；`ssh ... -O exit` 会结束共享连接，下一条命令会新建一个。
+- `control_path_dir` 为 `null`：没有足够短且私有的 socket 目录，或 MCP 服务运行在 Windows 上，而 OpenSSH 在 Windows 上不支持多路复用。命令仍然可用，各自使用自己的连接。如需多路复用，使用不超过 39 字节的 shell 访问目录、把 `XDG_RUNTIME_DIR` 设为一个由你拥有且权限为 0700 的短目录，或在 `~/.ssh/det-cm` 足够短时创建 `~/.ssh`，然后重启 MCP 服务。
+- 对某个别名运行 `ssh_command` 以 `connect to host 127.0.0.1 port 1: Connection refused` 失败：没有已打开的隧道使用该别名，原因可能是它已断开、MCP 服务已重启，或该别名属于另一个服务。调用 `compute_shell_connect` 并使用它返回的别名。
+- `compute_shell_connect` 以关于登录用户的 `invalid_response` 失败：master 报告的 shell 用户不是 POSIX 登录名，生成的 `ssh_config` 无法安全容纳它。请管理员检查该账户的 agent user。
 - determined-compute MCP 重启时 SSH 会话断开：隧道存在于该进程中。再次调用 `compute_shell_connect`，并重启 ssh-mcp，因为端口会改变。
 
 <a id="a-transfer-is-partial-or-different-from-the-preview"></a>

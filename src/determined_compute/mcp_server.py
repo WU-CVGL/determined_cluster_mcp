@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import atexit
+import contextlib
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, Optional, Sequence, Union
 
@@ -98,8 +100,27 @@ def create_server(
             "MCP support is not installed; install determined-compute[mcp]"
         ) from exc
 
+    sessions = 0
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_server: Any) -> Any:
+        # Entered once per session (once for stdio); this runs on the event loop's thread.
+        nonlocal sessions
+        if shell_access is not None and sessions == 0:
+            shell_access.reopen()
+        sessions += 1
+        try:
+            yield {}
+        finally:
+            sessions -= 1
+            # When the last session ends, before the event loop joins its worker threads:
+            # end every wait and tunnel, so an open wait_seconds cannot hold the process up.
+            if shell_access is not None and sessions == 0:
+                shell_access.close_all()
+
     server = MCPServer(
         "determined-compute",
+        lifespan=lifespan,
         instructions=(
             "Choose a meaningful request.name and request.description for each launch. "
             "Use compute_resources for capacity questions. Launch checks capacity unless "
@@ -122,10 +143,11 @@ def create_server(
             "continues from its trials' latest checkpoints, a resumed generic task reruns its "
             "command from the start. "
             "compute_shell_connect opens local SSH access to a running shell (127.0.0.1, a "
-            "port, a key file, and a pinned host key): run its ssh_command where a local shell "
-            "tool is allowed, or use an SSH MCP server such as ssh-mcp, which must be started "
-            "or reconnected after a profile is added, removed, or changed; disconnect when "
-            "done. "
+            "port, a key file, and a pinned host key); pass wait_seconds instead of polling a "
+            "starting shell. Run commands as its ssh_command followed by the command where a "
+            "local shell tool is allowed, or use an SSH MCP server such as ssh-mcp, which "
+            "must be started or reconnected after a profile is added, removed, or changed; "
+            "disconnect when done. "
             "Credentials belong in local configuration, never in tool arguments."
         ),
     )
@@ -220,8 +242,12 @@ def create_server(
             try:
                 closed = await asyncio.to_thread(shell_access.disconnect, id)
                 result["shell_access_closed"] = closed["disconnected"]
-            except Exception:
+                if "files" in closed:
+                    result["shell_access_files"] = closed["files"]
+            except Exception as exc:
+                # The cancellation itself succeeded; say why the local cleanup did not.
                 result["shell_access_closed"] = None
+                result["shell_access_error"] = str(exc)
         return result
 
     @server.tool(annotations=ToolAnnotations(
@@ -284,15 +310,26 @@ def create_server(
         @server.tool(annotations=ToolAnnotations(
             read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
         ))
-        async def compute_shell_connect(id: str, local_port: Optional[int] = None) -> dict[str, Any]:
+        async def compute_shell_connect(
+            id: str, local_port: Optional[int] = None, wait_seconds: int = 0
+        ) -> dict[str, Any]:
             """Open local SSH access to one of the account's running shells.
 
-            Listens on 127.0.0.1 (local_port, or a free port) and relays to the shell through
-            the master. Returns port, user, key_path, host_key_fingerprint, ssh_command, and an
-            ssh-mcp profile in a generated config; the private key stays in key_path. Calling
-            it again returns the open tunnel; another local_port needs a disconnect first.
+            wait_seconds (up to 600) waits for the shell to run and its sshd to answer, so no
+            status polling is needed. Run commands with ssh_command (ssh -F <config> <alias>)
+            followed by the command; when control_path_dir is set, one multiplexed connection
+            serves them all. Also returns the ssh-mcp config path and profile name; the private
+            key stays in key_path. Calling it again returns the open tunnel; another local_port
+            needs a disconnect first.
             """
-            return await call(shell_access.connect, id, local_port)
+            # The wait runs in a worker thread, which cancelling the request cannot interrupt;
+            # this event can, and the worker then closes a tunnel it opened.
+            stop = threading.Event()
+            try:
+                return await call(shell_access.connect, id, local_port, wait_seconds, stop)
+            except BaseException:
+                stop.set()
+                raise
 
         @server.tool(annotations=ToolAnnotations(
             read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False,
