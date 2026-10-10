@@ -243,7 +243,7 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 | `compute_resume` | `kind`、`id` | experiment 和 generic 任务：任务摘要、远端响应和 `resume_acknowledged` |
 | `compute_list` | `kind`，可选 `limit=50`、`offset=0`、`marker`、`states` | 当前账户的一页任务，最新的在前；指定 `states` 时只列出处于这些状态的 experiment 或 generic 任务；指定 `marker` 时返回该页中配置带有该标记的任务 |
 | `compute_shell_connect` | `id`，可选 `local_port`、`wait_seconds=0`（最多 600） | 为该账户某个正在运行的 shell 打开或返回本地 SSH 隧道；见[shell 访问](#shell-access) |
-| `compute_shell_disconnect` | `id` | 关闭该隧道并删除该 shell 的密钥文件；shell 继续运行 |
+| `compute_shell_disconnect` | `id` | 关闭该隧道并删除该 shell 的密钥文件；shell 继续运行。返回 `disconnected`，确有隧道时还返回 `files`：`removed`，或在该目录现在可能属于另一个 server 时为 `kept` |
 | `compute_resources` | 可选 `slots=1`、`pool`、`prefer_gpu_topology` | 当前调度容量和候选资源池。值为 `"strong"` 且请求 2 个及以上 slot 时，每个资源池会增加 `max_numa_node_free_slots`（当前能放下的最大 `"strong"` 任务）和 `max_numa_node_slots`（master 在当前 agent 下接受的最大值）。每个资源池还有 `description` 和 `gpu_models` |
 | `storage_check` | `path` | 映射容器路径的访问情况 |
 | `storage_sync` | `local_dir`、`shared_dir`，可选 `dry_run=true` | 预览或把本地目录内容复制到共享存储 |
@@ -421,7 +421,7 @@ cancel endpoint，对 generic 任务使用 generic task kill endpoint；后者�
 但从不终止其祖先。它返回带 `cancellation_acknowledged: true` 的任务摘要，并把远端响应放在
 `remote` 中；command 或 shell 的响应还会更新 `state`。取消 shell 时还会关闭其
 [shell 访问](#shell-access)隧道，并报告 `shell_access_closed`：关闭了隧道时为 `true`，没有隧道时
-为 `false`，关闭失败时为 `null`。远端终止并不能单独证明成功，还应检查退出信息和预期的共享存储
+为 `false`，关闭失败时为 `null`，并以 `shell_access_error` 给出原因。远端终止并不能单独证明成功，还应检查退出信息和预期的共享存储
 产物。
 
 <a id="pause-and-resume"></a>
@@ -463,6 +463,8 @@ shell 是一个容器，master 通过其代理提供该容器中的 sshd。`det 
    它每 5 秒检查一次 shell，直到其运行，调用方无需轮询 `compute_status`；期间结束的 shell 立即
    失败，时间用完时仍未运行的 shell 以 `shell_not_running` 失败。暂时性的查询失败（例如
    `transport_error`，或 HTTP 429、5xx）会一直重试到时间用完；其他错误会结束等待。
+   取消请求会在一次 5 秒检查之内结束等待，错误为 `cancelled`；MCP server 停止时，所有等待都以
+   同样方式结束，错误为 `shell_access_stopping`。两者都不会在之后打开隧道。
 2. 它从 `GET /api/v1/shells/{id}` 读取 shell 的密钥对。Determined 为每个 shell 生成这对密钥：
    sshd 接受用该私钥登录，并把同一对密钥用作自己的主机密钥。私钥只写入 shell 访问目录中该
    shell 子目录下权限为 0600 的 `key` 文件；任何工具结果都不包含私钥。
@@ -479,7 +481,8 @@ shell 是一个容器，master 通过其代理提供该容器中的 sshd。`det 
 5. shell 的 allocation 报告就绪时，它打开一次代理，并把读到的 sshd 标识行作为 `probe` 返回；指定
    `wait_seconds` 时，它每 5 秒重复一次，直到探测成功或时间用完，然后无论结果如何都返回。
    期间它会再次检查 shell：停止的 shell 以 `shell_not_running` 失败，其他非暂时性的查询失败会以
-   该错误结束调用，两种情况都会关闭本次调用打开的隧道。每次探测所用时间不超过剩余时间，但至少
+   该错误结束调用。期间若该隧道被断开，调用以 `shell_access_closed` 失败。无论什么使等待提前结束
+   （包括取消和 server 停止），都会关闭本次调用打开的隧道，并报告原始错误。每次探测所用时间不超过剩余时间，但至少
    1 秒，且截止时间过后不再开始等待。调用仍可能比 `wait_seconds` 多出时间用完时正在进行的 API
    请求（每个受客户端请求超时限制；shell 恰好在此时开始运行时最多三个），再加上那次探测的时间。
    标识行只表明 sshd 有应答；登录交给 SSH 客户端完成。
@@ -506,8 +509,9 @@ shell 是一个容器，master 通过其代理提供该容器中的 sshd。`det 
 探测失败不会关闭隧道：sshd 可能仍在启动，再次调用 `compute_shell_connect` 会返回已打开的隧道并
 重新探测。再次调用会返回已打开的隧道（`reused: true`）；在隧道打开期间请求不同的 `local_port` 会
 以 `shell_access_conflict` 失败，因此请先调用 `compute_shell_disconnect`。端口被占用时以
-`port_unavailable` 失败。`compute_shell_disconnect` 停止监听、关闭已打开的连接并删除该 shell 的
-密钥目录，不访问 master；对 shell 调用 `compute_cancel` 也会这样做。
+`port_unavailable` 失败。`compute_shell_disconnect` 停止监听、关闭已打开的连接、删除该 shell 的
+密钥目录并重写配置，不访问 master；对 shell 调用 `compute_cancel` 也会这样做。若密钥无法删除或
+配置无法重写，隧道仍已停止，并返回该错误；此时配置保持原样或被全部删除，下一次连接会重新生成。
 
 隧道属于打开它的 MCP 进程，进程退出时隧道随之停止。隧道只在回环接口上监听。其他本地进程可以
 连接该端口，但只能到达 sshd，而 sshd 仍要求私钥；固定的主机密钥则端到端地验证 shell。sshd 允许
@@ -529,12 +533,11 @@ MCP server（例如来自第二个客户端会话的 server）连接时会以 `s
 指定自己的 `--shell-access-dir`。在取得锁时，以及在没有其他 server 持有锁的情况下启动时，server
 会删除已结束进程遗留的 shell 子目录和 `ssh-mcp.toml`，以及 `ssh_config`；下一次连接会重新生成这两个文件。shell
 子目录是以 shell ID 命名、且只包含普通文件 `key` 和 `known_hosts` 的目录。其他内容一律不会被删除：
-连接时若发现以该 shell 的 ID 命名的其他目录，会以 `shell_access_conflict` 失败。若 server 运行期间
-只有锁文件被删除，server 会锁定新的锁文件并继续工作，除非其他 server 先锁定了它，或其隧道的
-key 和 known_hosts 文件已不是它自己写入的那些文件。若该目录被删除，
-或被其他 server 接管，本 server 不再改动其中的文件：只要它还有已打开的隧道，连接就会以
-`shell_access_conflict` 失败，断开这些隧道时只关闭连接、不删除任何文件；没有已打开的隧道后，
-下一次连接会重新取得锁，若其他 server 持有锁则失败。该目录包含：
+连接时若发现以该 shell 的 ID 命名的其他目录，会以 `shell_access_conflict` 失败。若 server 还有
+已打开的隧道时该目录或其锁文件被删除，其他 server 可能接管该目录，因此本 server 不再改动其中的
+文件：连接以 `shell_access_conflict` 失败，断开时关闭隧道并报告 `files: kept`。没有已打开的隧道后，
+下一次连接会重新取得锁并删除遗留的内容，若其他 server 持有锁则失败。因其他原因失败的加锁，例如
+在没有锁守护进程的 NFS 挂载上出现 `ENOLCK`，会按原样报告。该目录包含：
 
 | 路径 | 内容 |
 | --- | --- |
@@ -804,7 +807,8 @@ MCP 失败使用 `isError: true`；其文本内容是如下形式的紧凑 JSON�
 `retryable` 和 `details` 仅在可用时出现，structured content 为 null。
 [Shell 访问](#shell-access)另外使用 `shell_not_running`；另一个 MCP server 正在使用 shell 访问
 目录、该 shell 的隧道已在其他端口打开，或某个外来目录使用了该 shell 的名称时的
-`shell_access_conflict`；`port_unavailable`；以及缺少 `websocket-client` 包或环境选出了
+`shell_access_conflict`；等待期间隧道被断开时的 `shell_access_closed`；等待期间请求被取消或 server
+停止时的 `cancelled` 和 `shell_access_stopping`；`port_unavailable`；以及缺少 `websocket-client` 包或环境选出了
 `http://` 以外的代理时的 `unsupported`。安全 details 可包含
 未确认提交的 kind 和提交标记；HTTP 代理代替 Determined 作出应答时的 `source: "proxy"`、
 `status_code` 和 `proxy_error`；容量信息；以及 `permission_denied` 错误中被拒绝的资源池。

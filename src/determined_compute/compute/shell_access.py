@@ -13,6 +13,7 @@ runs in this process and stops with it.
 from __future__ import annotations
 
 import base64
+import errno
 import hashlib
 import os
 import re
@@ -61,7 +62,11 @@ _PLAIN_SSH_WORD = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_.-]*")
 # either: a value holding one could add directives, such as Match exec, or change a path.
 _SSH_CONFIG_UNSAFE = re.compile(r"[\x00-\x1f\x7f]|\$\{")
 _now = time.monotonic
-_sleep = time.sleep
+
+
+def _wait(stop: threading.Event, seconds: float) -> bool:
+    """Wait up to ``seconds``; True when ``stop`` was set meanwhile."""
+    return stop.wait(seconds)
 # After the SSH client closes, how long to wait for the proxy to answer the close frame.
 _CLOSE_TIMEOUT = 10
 _OPCODE_CLOSE = 0x8
@@ -413,39 +418,6 @@ class _Tunnel:
         self.thread = threading.Thread(
             target=server.serve_forever, name=f"shell-tunnel-{shell_id[:8]}", daemon=True
         )
-        # The identity and content of the key and known_hosts files as written. An inode
-        # number alone can be handed to another server's file once this one is deleted; that
-        # server's known_hosts names its own port, so its content cannot match.
-        self.files = {
-            name: (self._identity(directory / name), self._content(directory / name))
-            for name in sorted(_SHELL_FILES)
-        }
-
-    @staticmethod
-    def _identity(path: Path) -> Optional[Tuple[int, int]]:
-        try:
-            status = os.lstat(path)
-        except OSError:
-            return None
-        return (status.st_dev, status.st_ino) if stat.S_ISREG(status.st_mode) else None
-
-    @staticmethod
-    def _content(path: Path) -> Optional[bytes]:
-        try:
-            return path.read_bytes()
-        except OSError:
-            return None
-
-    def files_unchanged(self) -> bool:
-        """Whether the shell's files are still the ones this tunnel wrote."""
-        return all(
-            identity is not None
-            and content is not None
-            and self._identity(self.directory / name) == identity
-            and self._content(self.directory / name) == content
-            for name, (identity, content) in self.files.items()
-        )
-
     def stop(self) -> None:
         """Close the listener and its connections; the files are ShellAccess's to remove."""
         if self.thread.is_alive():
@@ -528,8 +500,10 @@ class ShellAccess:
         self._tunnels: Dict[str, _Tunnel] = {}
         self._lock = threading.Lock()
         self._claim: Optional[int] = None
-        # The chosen multiplexing socket directory, once chosen; (None,) when none fits.
-        self._control: Optional[Tuple[Optional[Path]]] = None
+        # The stop events of connects in progress; close_all sets them, as does cancelling
+        # the request that started one.
+        self._waits: set = set()
+        self._stopping = threading.Event()
 
     # The directory.
 
@@ -568,9 +542,13 @@ class ShellAccess:
                 msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
             else:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except OSError as exc:
             os.close(descriptor)
-            return None
+            # Only a lock held elsewhere is a conflict; any other failure, such as ENOLCK on
+            # an NFS mount without a lock daemon, is reported as it is.
+            if isinstance(exc, BlockingIOError) or exc.errno in (errno.EACCES, errno.EAGAIN):
+                return None
+            raise
         return descriptor
 
     def _claim_is_current(self) -> bool:
@@ -583,32 +561,12 @@ class ShellAccess:
         return held.st_nlink > 0 and (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
 
     def _owns_directory(self) -> bool:
-        """Whether this process holds the lock on the directory's current lock file.
+        """Whether this process still holds the lock on the directory's current lock file.
 
-        When only the lock file was removed and no other server locked its replacement, this
-        locks it again, so it changes the claim: call it with ``self._lock`` held.
+        A deleted or replaced lock file is never adopted again while tunnels are open: their
+        files may meanwhile belong to another server.
         """
-        if self._claim is None:
-            return False
-        if self._claim_is_current():
-            return True
-        # Only the very files this process wrote prove that no other server took the
-        # directory in between: one that did may have written its own under the same names.
-        if not all(
-            self._is_shell_directory(tunnel.directory) and tunnel.files_unchanged()
-            for tunnel in self._tunnels.values()
-        ):
-            return False
-        try:
-            self._prepare_directory()
-            descriptor = self._try_lock()
-        except (OSError, ValidationError):
-            descriptor = None
-        if descriptor is None:
-            return False
-        os.close(self._claim)
-        self._claim = descriptor
-        return True
+        return self._claim is not None and self._claim_is_current()
 
     def _claim_directory(self) -> None:
         """Take the directory for this process, removing what an ended one left behind."""
@@ -710,13 +668,9 @@ class ShellAccess:
         """A private directory short enough for OpenSSH's multiplexing sockets, or None.
 
         Tried in order: the shell-access directory's cm/, $XDG_RUNTIME_DIR/determined-compute,
-        and ~/.ssh/det-cm. Only the last component is created, with mode 0700. A choice that
-        stopped qualifying, for example because it was removed, is made again.
+        and ~/.ssh/det-cm. Only the last component is created, with mode 0700. It is chosen
+        afresh on each call, so a removed directory is made again.
         """
-        if self._control is not None:
-            chosen = self._control[0]
-            if chosen is None or self._usable_control_directory(chosen):
-                return chosen
         chosen = None
         candidates = [self.directory / "cm"]
         runtime = os.environ.get("XDG_RUNTIME_DIR")
@@ -728,7 +682,6 @@ class ShellAccess:
             if self._usable_control_directory(candidate):
                 chosen = candidate
                 break
-        self._control = (chosen,)
         return chosen
 
     @staticmethod
@@ -799,13 +752,49 @@ class ShellAccess:
     # Tool operations.
 
     def connect(
-        self, shell_id: Any, local_port: Any = None, wait_seconds: Any = 0
+        self,
+        shell_id: Any,
+        local_port: Any = None,
+        wait_seconds: Any = 0,
+        stop: Optional[threading.Event] = None,
     ) -> Dict[str, Any]:
         """Open, or return, the local tunnel to one of the account's running shells.
 
         With wait_seconds, wait up to that long for the shell to run and for its sshd to
-        answer the probe, checking every few seconds.
+        answer the probe, checking every few seconds. Setting ``stop``, as cancelling the
+        request does, or close_all ends the wait, and closes a tunnel this call opened.
         """
+        stop = stop or threading.Event()
+        with self._lock:
+            if self._stopping.is_set():
+                raise self._interrupted()
+            self._waits.add(stop)
+        try:
+            return self._connect(shell_id, local_port, wait_seconds, stop)
+        finally:
+            with self._lock:
+                self._waits.discard(stop)
+
+    def _interrupted(self) -> ConflictError:
+        if self._stopping.is_set():
+            return ConflictError(
+                "the MCP server is stopping, so no shell tunnel is opened",
+                code="shell_access_stopping",
+            )
+        return ConflictError("the request was cancelled", code="cancelled")
+
+    def _check_open(self, remote_id: str, tunnel: _Tunnel) -> None:
+        with self._lock:
+            if self._tunnels.get(remote_id) is not tunnel:
+                raise ConflictError(
+                    f"the tunnel to shell {remote_id} was closed while waiting for its sshd; "
+                    "connect again to open a new one",
+                    code="shell_access_closed",
+                )
+
+    def _connect(
+        self, shell_id: Any, local_port: Any, wait_seconds: Any, stop: threading.Event
+    ) -> Dict[str, Any]:
         if local_port is not None and (
             isinstance(local_port, bool)
             or not isinstance(local_port, int)
@@ -819,6 +808,11 @@ class ShellAccess:
         ):
             raise ValidationError(f"wait_seconds must be an integer from 0 to {MAX_WAIT_SECONDS}")
         deadline = _now() + wait_seconds
+
+        def pause(seconds: float) -> None:
+            if _wait(stop, seconds):
+                raise self._interrupted()
+
         while True:
             try:
                 kind, remote_id, entity = self.service._owned("shell", shell_id)
@@ -827,7 +821,7 @@ class ShellAccess:
                 remaining = deadline - _now()
                 if not exc.retryable or remaining <= 0:
                     raise
-                _sleep(min(_WAIT_INTERVAL, remaining))
+                pause(min(_WAIT_INTERVAL, remaining))
                 continue
             state = entity.get("state")
             if state == "STATE_RUNNING":
@@ -844,10 +838,14 @@ class ShellAccess:
                     f"running shell can be connected{hint}",
                     code="shell_not_running",
                 )
-            _sleep(min(_WAIT_INTERVAL, remaining))
+            pause(min(_WAIT_INTERVAL, remaining))
         client = self.service.client
         open_websocket = self._opener(client)
         with self._lock:
+            # Checked under the lock that close_all takes: a stopped or cancelled call never
+            # opens a tunnel that nobody would hear of.
+            if stop.is_set() or self._stopping.is_set():
+                raise self._interrupted()
             if self._tunnels and not self._owns_directory():
                 # Its files may now belong to another server; this one must not touch them.
                 raise ConflictError(
@@ -869,59 +867,65 @@ class ShellAccess:
                 self._claim_directory()
                 tunnel = self._open(remote_id, client, open_websocket, local_port)
             else:
-                # The config derives from the open tunnels; restore it if a failed write on
-                # disconnect removed it.
+                # The configs derive from the open tunnels; a failed rewrite may have removed
+                # them.
                 self._write_configs()
             record = dict(tunnel.record)
             control_directory = self._control_directory()
         state_unknown = False
-        while True:
-            ready, unavailable = self._ready(client, remote_id)
-            # Without wait_seconds the probe gets its usual time; with it, no more than is left.
-            probe_timeout = (
-                _PROBE_TIMEOUT if not wait_seconds
-                else max(1.0, min(_PROBE_TIMEOUT, deadline - _now()))
-            )
-            probe = (
-                self._probe(open_websocket, remote_id, probe_timeout)
-                if ready is not False
-                else {"ok": False, "error": "the shell is not ready yet; sshd has not started"}
-            )
-            remaining = deadline - _now()
-            if probe["ok"] or remaining <= 0:
-                break
-            try:
-                state = self.service._owned("shell", shell_id)[2].get("state")
-                state_unknown = False
-            except APIError as exc:
-                if not exc.retryable:
-                    # The shell can no longer be checked, for example because it is gone or
-                    # the login expired; a tunnel this call opened is not handed back.
-                    if not reused:
-                        with self._lock:
-                            self._disconnect(remote_id)
-                    raise
-                state_unknown = True
-                # The lookup may have taken a while: never sleep past the deadline.
+        try:
+            while True:
+                self._check_open(remote_id, tunnel)
+                ready, unavailable = self._ready(client, remote_id)
+                # Without wait_seconds the probe gets its usual time; with it, no more than
+                # is left.
+                probe_timeout = (
+                    _PROBE_TIMEOUT if not wait_seconds
+                    else max(1.0, min(_PROBE_TIMEOUT, deadline - _now()))
+                )
+                probe = (
+                    self._probe(open_websocket, remote_id, probe_timeout)
+                    if ready is not False
+                    else {"ok": False, "error": "the shell is not ready yet; sshd has not started"}
+                )
+                if stop.is_set():
+                    raise self._interrupted()
+                remaining = deadline - _now()
+                if probe["ok"] or remaining <= 0:
+                    break
+                try:
+                    state = self.service._owned("shell", shell_id)[2].get("state")
+                    state_unknown = False
+                except APIError as exc:
+                    if not exc.retryable:
+                        raise
+                    state_unknown = True
+                    # The lookup may have taken a while: never wait past the deadline.
+                    remaining = deadline - _now()
+                    if remaining <= 0:
+                        break
+                    pause(min(_WAIT_INTERVAL, remaining))
+                    continue
+                if state != "STATE_RUNNING":
+                    raise ConflictError(
+                        f"shell {remote_id} is {state or 'in an unknown state'}; it stopped "
+                        "while waiting for its sshd",
+                        code="shell_not_running",
+                    )
                 remaining = deadline - _now()
                 if remaining <= 0:
                     break
-                _sleep(min(_WAIT_INTERVAL, remaining))
-                continue
-            if state != "STATE_RUNNING":
-                if not reused:
-                    # The tunnel was opened by this call for a shell that is gone.
-                    with self._lock:
-                        self._disconnect(remote_id)
-                raise ConflictError(
-                    f"shell {remote_id} is {state or 'in an unknown state'}; it stopped while "
-                    "waiting for its sshd",
-                    code="shell_not_running",
-                )
-            remaining = deadline - _now()
-            if remaining <= 0:
-                break
-            _sleep(min(_WAIT_INTERVAL, remaining))
+                pause(min(_WAIT_INTERVAL, remaining))
+            self._check_open(remote_id, tunnel)
+        except BaseException:
+            # Whatever ends the wait, a tunnel this call opened is not left behind, and the
+            # original error is the one reported.
+            if not reused:
+                with self._lock:
+                    if self._tunnels.get(remote_id) is tunnel:
+                        with suppress(OSError):
+                            self._disconnect(remote_id)
+            raise
         if state_unknown:
             # The last check of the shell failed; do not report a state it may have left.
             state = None
@@ -1103,38 +1107,48 @@ class ShellAccess:
         }
 
     def disconnect(self, shell_id: Any) -> Dict[str, Any]:
-        """Stop a shell's tunnel in this process and delete its key; the shell keeps running."""
+        """Stop a shell's tunnel in this process and delete its key; the shell keeps running.
+
+        ``files`` is ``removed``, or ``kept`` when the directory may now belong to another
+        server. A failure to remove the key or rewrite the configs is raised after the tunnel
+        has stopped.
+        """
         remote_id = self.service._canonical_id("shell", shell_id)
         with self._lock:
-            closed = self._disconnect(remote_id)
-        return {"kind": "shell", "id": remote_id, "disconnected": closed}
+            files = self._disconnect(remote_id)
+        if files is None:
+            return {"kind": "shell", "id": remote_id, "disconnected": False}
+        return {"kind": "shell", "id": remote_id, "disconnected": True, "files": files}
 
-    def _disconnect(self, remote_id: str) -> bool:
+    def _disconnect(self, remote_id: str) -> Optional[str]:
         tunnel = self._tunnels.pop(remote_id, None)
         if tunnel is None:
-            return False
-        owner = self._owns_directory()
+            return None
         tunnel.stop()
-        if not owner:
+        if not self._owns_directory():
             # Another server may have taken the directory over: leave its files alone.
-            return True
-        with suppress(OSError):
-            _remove_shell_directory(tunnel.directory)
+            return "kept"
         try:
+            _remove_shell_directory(tunnel.directory)
+        finally:
+            # Attempted either way; _write_configs keeps the three files consistent.
             self._write_configs()
-        except OSError:
-            # The tunnel is gone; a config that still listed it would mislead its clients.
-            for name in (SSH_CONFIG, SSH_HOSTS, SSH_MCP_CONFIG):
-                with suppress(OSError):
-                    (self.directory / name).unlink()
-        return True
+        return "removed"
 
     def close_all(self) -> None:
-        """Stop every tunnel of this process and release the directory; for process exit."""
+        """Stop every wait and tunnel of this process and release the directory; for exit."""
         with self._lock:
+            self._stopping.set()
+            for stop in self._waits:
+                stop.set()
             for remote_id in list(self._tunnels):
-                with suppress(Exception):
+                try:
                     self._disconnect(remote_id)
+                except Exception as exc:  # report and go on: the process is stopping
+                    print(
+                        f"determined-compute-mcp: closing the tunnel to shell {remote_id}: {exc}",
+                        file=sys.stderr,
+                    )
             self._release_directory()
 
 

@@ -10,8 +10,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import atexit
+import contextlib
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, Optional, Sequence, Union
 
@@ -98,8 +100,19 @@ def create_server(
             "MCP support is not installed; install determined-compute[mcp]"
         ) from exc
 
+    @contextlib.asynccontextmanager
+    async def lifespan(_server: Any) -> Any:
+        try:
+            yield {}
+        finally:
+            # Before the event loop joins its worker threads: end every wait and tunnel, so
+            # an open wait_seconds cannot hold the process up.
+            if shell_access is not None:
+                shell_access.close_all()
+
     server = MCPServer(
         "determined-compute",
+        lifespan=lifespan,
         instructions=(
             "Choose a meaningful request.name and request.description for each launch. "
             "Use compute_resources for capacity questions. Launch checks capacity unless "
@@ -221,8 +234,10 @@ def create_server(
             try:
                 closed = await asyncio.to_thread(shell_access.disconnect, id)
                 result["shell_access_closed"] = closed["disconnected"]
-            except Exception:
+            except Exception as exc:
+                # The cancellation itself succeeded; say why the local cleanup did not.
                 result["shell_access_closed"] = None
+                result["shell_access_error"] = str(exc)
         return result
 
     @server.tool(annotations=ToolAnnotations(
@@ -297,7 +312,14 @@ def create_server(
             key stays in key_path. Calling it again returns the open tunnel; another local_port
             needs a disconnect first.
             """
-            return await call(shell_access.connect, id, local_port, wait_seconds)
+            # The wait runs in a worker thread, which cancelling the request cannot interrupt;
+            # this event can, and the worker then closes a tunnel it opened.
+            stop = threading.Event()
+            try:
+                return await call(shell_access.connect, id, local_port, wait_seconds, stop)
+            except BaseException:
+                stop.set()
+                raise
 
         @server.tool(annotations=ToolAnnotations(
             read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False,

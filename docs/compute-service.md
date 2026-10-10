@@ -268,7 +268,7 @@ positive integer for an experiment, which can also be passed as a numeric string
 | `compute_resume` | `kind`, `id` | Experiments and generic tasks: task summary, remote response, and `resume_acknowledged` |
 | `compute_list` | `kind`, optional `limit=50`, `offset=0`, `marker`, `states` | One page of the account's tasks, newest first; with `states`, only experiments or generic tasks in those states; with `marker`, the tasks on that page whose config carries it |
 | `compute_shell_connect` | `id`, optional `local_port`, `wait_seconds=0` (up to 600) | Opens or returns a local SSH tunnel to one of the account's running shells; see [shell access](#shell-access) |
-| `compute_shell_disconnect` | `id` | Closes that tunnel and deletes the shell's key file; the shell keeps running |
+| `compute_shell_disconnect` | `id` | Closes that tunnel and deletes the shell's key file; the shell keeps running. Returns `disconnected` and, when it was, `files`: `removed`, or `kept` when the directory may now belong to another server |
 | `compute_resources` | optional `slots=1`, `pool`, `prefer_gpu_topology` | Current scheduler capacity and candidate pools. With `"strong"` and 2 or more slots, each pool adds `max_numa_node_free_slots` (largest `"strong"` task that fits now) and `max_numa_node_slots` (largest the master accepts with the current agents). Each pool also has `description` and `gpu_models` |
 | `storage_check` | `path` | Access information for a mapped container path |
 | `storage_sync` | `local_dir`, `shared_dir`, optional `dry_run=true` | Preview or copy local directory contents to shared storage |
@@ -478,7 +478,8 @@ the task's descendants but never its ancestors, for generic tasks. It returns th
 summary with `cancellation_acknowledged: true` and the remote response as `remote`; a
 command or shell response also updates `state`. Cancelling a shell also closes its
 [shell-access](#shell-access) tunnel and reports `shell_access_closed`: `true` when a
-tunnel was closed, `false` when there was none, and `null` when closing failed. Remote termination alone does not prove
+tunnel was closed, `false` when there was none, and `null` with the reason as
+`shell_access_error` when closing failed. Remote termination alone does not prove
 success; inspect exit information and expected shared-storage artifacts.
 
 ### Pause and resume
@@ -528,6 +529,9 @@ SSH MCP server, needs a TCP port instead, which
    meanwhile fails at once, and one still not running when the time is up fails with
    `shell_not_running`. A lookup that fails transiently, such as a `transport_error` or an
    HTTP 429 or 5xx, is retried until the time is up; any other error ends the wait.
+   Cancelling the request ends the wait within one 5-second check, with the error
+   `cancelled`; when the MCP server stops, every wait ends the same way with
+   `shell_access_stopping`. Neither opens a tunnel afterwards.
 2. It reads the shell's key pair from `GET /api/v1/shells/{id}`. Determined generates the
    pair for each shell: sshd accepts the private key for login and uses the same pair as
    its host key. The private key is written only to a `key` file with mode 0600 in the
@@ -550,8 +554,10 @@ SSH MCP server, needs a TCP port instead, which
    identification line as `probe`; with `wait_seconds`, it repeats this every 5 seconds
    until the probe succeeds or the time is up, and then returns the result either way.
    Meanwhile it checks the shell again: a shell that stops fails with `shell_not_running`,
-   another failed lookup that is not transient ends the call with that error, and each
-   closes a tunnel the call opened. Each probe gets no more than the time left, but at least
+   and another failed lookup that is not transient ends the call with that error. A
+   disconnect of the tunnel meanwhile fails the call with `shell_access_closed`. Whatever
+   ends the wait early, cancellation and server stop included, closes a tunnel this call
+   opened, and the original error is the one reported. Each probe gets no more than the time left, but at least
    1 second, and no wait starts after the deadline. The call can still overrun
    `wait_seconds` by the API requests in flight when the time runs out, each limited by the
    client's request timeout (up to three when the shell starts running just then), plus
@@ -582,8 +588,11 @@ A failed probe does not close the tunnel: sshd may still be starting, and callin
 returns the open tunnel (`reused: true`); asking for a different `local_port` while it is
 open fails with `shell_access_conflict`, so call `compute_shell_disconnect` first. A busy
 port fails with `port_unavailable`. `compute_shell_disconnect` stops the listener, closes
-open connections, and deletes the shell's key directory, without contacting the master;
-`compute_cancel` of a shell does the same.
+open connections, deletes the shell's key directory, and rewrites the configs, without
+contacting the master; `compute_cancel` of a shell does the same. When the key cannot be
+deleted or the configs cannot be rewritten, the tunnel has still stopped and the error is
+returned; the configs then stay as they were, or are all removed, and the next connect
+rewrites them.
 
 Tunnels belong to the MCP process that opened them and stop when it exits. The tunnel
 listens on the loopback interface only. Other local processes can connect to the port,
@@ -611,13 +620,13 @@ deletes the shell subdirectories and the `ssh-mcp.toml` that an ended process le
 behind, and `ssh_config` with it; the next connect writes both again. A shell subdirectory is one named by
 a shell ID that holds nothing but the regular files `key` and `known_hosts`. Nothing else
 is ever deleted: a connect that finds any other directory under the shell's ID fails with
-`shell_access_conflict`. If only the lock file is deleted while the server runs, the
-server locks a new one and carries on, unless another server locked it first or its
-tunnels' key and known_hosts files are no longer the very files it wrote. If the
-directory is deleted, or another server took it over, this server stops touching its files:
-while it has open tunnels, connect fails with `shell_access_conflict` and disconnecting
-closes them without deleting anything; once none is open, the next connect takes the
-lock again, or fails if another server holds it. The directory holds:
+`shell_access_conflict`. If the directory or its lock file is deleted while the server
+has open tunnels, another server may take the directory over, so this one stops touching
+its files: connect fails with `shell_access_conflict`, and disconnecting closes the
+tunnels and reports `files: kept`. Once none is open, the next connect takes the lock
+again and removes what was left, or fails if another server holds it. A lock that fails
+for another reason, such as `ENOLCK` on an NFS mount without a lock daemon, is reported
+as it is. The directory holds:
 
 | Path | Content |
 | --- | --- |
@@ -942,7 +951,9 @@ MCP failures use `isError: true`; their text content is compact JSON of this for
 `retryable` and `details` appear only when available, and structured content is null.
 [Shell access](#shell-access) adds `shell_not_running`; `shell_access_conflict` when
 another MCP server uses the shell-access directory, the shell's tunnel is open on another
-port, or a foreign directory has the shell's name; `port_unavailable`; and `unsupported`
+port, or a foreign directory has the shell's name; `shell_access_closed` when the tunnel
+was disconnected during the wait; `cancelled` and `shell_access_stopping` when the request
+was cancelled or the server stopped during the wait; `port_unavailable`; and `unsupported`
 when the `websocket-client` package is missing or the environment selects a proxy other
 than `http://`.
 Safe details can include the kind and submission marker of an unconfirmed launch;

@@ -160,6 +160,12 @@ Determined 本身也会执行权限检查。在使用 basic authorization 的 fo
 - shell 刚启动后出现 `ready: false` 或 `probe.ok: false`：sshd 仍在启动。sshd 就绪后，`compute_logs` 会显示 `Server listening on`；再次调用 `compute_shell_connect`，它会保留已打开的隧道并重新探测。
 - 探测错误 `the WebSocket handshake was refused with HTTP <status>` 来自 master 或其 shell 代理：404 或 502 通常表示 shell 已结束，或其代理尚未注册。
 - 探测错误 `WebSocketProxyException: failed CONNECT via proxy status: <status>` 来自为 master 选定的 HTTP 代理：407 表示它要求其他凭据（在代理 URL 中设置），403 或 405 表示它不允许对 master 端口的 `CONNECT`。TLS 错误和其他代理失败的原因与 API 相同；见[TLS 证书验证失败](#tls-certificate-verification-fails)和[通过代理无法访问 master](#the-master-is-unreachable-through-a-proxy)。
+- `cancelled`：启动 `compute_shell_connect` 的请求在等待期间被取消，例如客户端超时。它没有打开隧道，或已关闭自己打开的隧道；请重新连接。
+- `shell_access_stopping`：MCP 服务正在停止，或已停止其 shell 访问；它不会打开隧道。请重启 MCP 服务，或在客户端中重新连接它。
+- `shell_access_closed`：`compute_shell_connect` 等待 sshd 期间，该隧道被断开，例如被 `compute_shell_disconnect` 或 `compute_cancel`。请重新连接以打开新的隧道。
+- `compute_shell_disconnect` 返回诸如 `No space left on device` 或指明密钥文件的错误：隧道已停止，但配置无法重写或密钥无法删除。请释放空间或修复该文件，若密钥仍在请手动删除；下一次连接会重写配置。
+- `compute_shell_disconnect` 返回 `files: kept`：有已打开的隧道时 shell 访问目录或其锁文件被删除，因此 server 保留了这些文件，以防它们现在属于另一个 server。所有隧道都关闭后，下一次连接会重新取得该目录并删除它们。
+- 连接以 `No locks available`（`ENOLCK`）失败：shell 访问目录所在的文件系统不支持可用的锁，例如没有锁守护进程的 NFS。请把 `--shell-access-dir` 指向本地目录。
 - `port_unavailable`：请求的 `local_port` 已被其他程序占用。省略该参数即可获得一个空闲端口。
 - `shell_access_conflict`，且消息说另一个 determined-compute-mcp 进程正在使用该 shell 访问目录：另一个 MCP 服务（例如来自另一个客户端会话的服务）正在使用它。为每个服务分别指定各自的 `--shell-access-dir` 或 `DETERMINED_COMPUTE_SHELL_ACCESS`。
 - `shell_access_conflict`，且消息说本 server 有已打开的隧道时 shell 访问目录被删除或被接管：该目录被删除，或其锁文件被删除且其他 server 锁定了新的锁文件。对本 server 已打开的隧道调用 `compute_shell_disconnect`（不会改动该目录中的文件），或重启 server；然后再连接。

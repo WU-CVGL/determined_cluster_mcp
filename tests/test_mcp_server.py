@@ -194,7 +194,10 @@ class FakeShellAccess:
     def __init__(self) -> None:
         self.calls = []
 
-    def connect(self, shell_id, local_port, wait_seconds):
+    def close_all(self):
+        self.calls.append(("close_all",))
+
+    def connect(self, shell_id, local_port, wait_seconds, stop):
         self.calls.append(("connect", shell_id, local_port, wait_seconds))
         if shell_id == "busy":
             from determined_compute.compute import ConflictError
@@ -243,6 +246,8 @@ def test_shell_access_tools_connect_disconnect_and_close_on_cancel():
             ("connect", "busy", None, 0),
             ("disconnect", COMMAND_ID),
             ("disconnect", COMMAND_ID),
+            # The session ended: its lifespan closes every wait and tunnel.
+            ("close_all",),
         ]
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=10))
