@@ -156,12 +156,12 @@ Determined 本身也会执行权限检查。在使用 basic authorization 的 fo
 - `unsupported`，且消息提及 `websocket-client`：带 MCP extra 重新安装服务（在检出目录中运行 `python -m pip install -e '.[mcp]'`），然后重启 MCP 进程。
 - `unsupported`，且消息提及代理：环境为 master 选择了 `http://` 以外的代理，例如 `socks5://`。shell 访问只能直接或通过 `http://` 代理访问 master；把 master 同时列入 `NO_PROXY` 和 `no_proxy`，或为它设置一个 `http://` 代理。
 - `compute_shell_connect` 返回 `state: null` 并带有 `context_unavailable: ["state"]`：在 `wait_seconds` 期间无法检查该 shell，例如 master 短暂无法访问。隧道已打开；依赖它之前请先用 `compute_status` 检查。
-- `shell_not_running`：只能连接处于 `STATE_RUNNING` 的 shell。排队中的 shell 正在等待容量：传入 `wait_seconds`（最多 600），或稍后再连接。已结束的 shell 无法重新打开，应提交新的 shell。shell 在 `wait_seconds` 等待其 sshd 期间结束时也会返回 `shell_not_running`；该调用之前已打开的隧道会保持打开，直到调用 `compute_shell_disconnect`。
+- `shell_not_running`：只能连接处于 `STATE_RUNNING` 的 shell。排队中的 shell 正在等待容量：传入 `wait_seconds`（最多 600），或稍后再连接。已结束的 shell 无法重新打开，应提交新的 shell。shell 在 `wait_seconds` 等待其 sshd 期间结束时也会返回 `shell_not_running`；已由另一次连接返回的隧道会保持打开，直到调用 `compute_shell_disconnect`。
 - shell 刚启动后出现 `ready: false` 或 `probe.ok: false`：sshd 仍在启动。sshd 就绪后，`compute_logs` 会显示 `Server listening on`；再次调用 `compute_shell_connect`，它会保留已打开的隧道并重新探测。
 - 探测错误 `the WebSocket handshake was refused with HTTP <status>` 来自 master 或其 shell 代理：404 或 502 通常表示 shell 已结束，或其代理尚未注册。
 - 探测错误 `WebSocketProxyException: failed CONNECT via proxy status: <status>` 来自为 master 选定的 HTTP 代理：407 表示它要求其他凭据（在代理 URL 中设置），403 或 405 表示它不允许对 master 端口的 `CONNECT`。TLS 错误和其他代理失败的原因与 API 相同；见[TLS 证书验证失败](#tls-certificate-verification-fails)和[通过代理无法访问 master](#the-master-is-unreachable-through-a-proxy)。
-- `cancelled`：启动 `compute_shell_connect` 的请求在等待期间被取消，例如客户端超时。它没有打开隧道，或已关闭自己打开的隧道；请重新连接。
-- `shell_access_stopping`：MCP 服务正在停止，或已停止其 shell 访问；它不会打开隧道。请重启 MCP 服务，或在客户端中重新连接它。
+- `cancelled`：启动 `compute_shell_connect` 的请求在等待期间被取消，例如客户端超时。它没有打开隧道，或已关闭它等待的隧道，除非另一个 `compute_shell_connect` 已返回该隧道或仍在等待它；请重新连接。
+- `shell_access_stopping`：MCP 服务正在停止，或其最后一个客户端会话已结束；它不会打开隧道。请重启 MCP 服务，或在客户端中重新连接它。
 - `shell_access_closed`：`compute_shell_connect` 等待 sshd 期间，该隧道被断开，例如被 `compute_shell_disconnect` 或 `compute_cancel`。请重新连接以打开新的隧道。
 - `compute_shell_disconnect` 返回诸如 `No space left on device` 或指明密钥文件的错误：隧道已停止，但配置无法重写或密钥无法删除。请释放空间或修复该文件，若密钥仍在请手动删除；下一次连接会重写配置。
 - `compute_shell_disconnect` 返回 `files: kept`：有已打开的隧道时 shell 访问目录或其锁文件被删除，因此 server 保留了这些文件，以防它们现在属于另一个 server。所有隧道都关闭后，下一次连接会重新取得该目录并删除它们。

@@ -417,9 +417,11 @@ class _Tunnel:
         self, shell_id: str, directory: Path, server: _RelayServer, record: Dict[str, Any]
     ) -> None:
         self.shell_id, self.directory, self.server, self.record = shell_id, directory, server, record
-        # Set once a reused connect hands the tunnel out: it is then no single call's to roll
-        # back.
-        self.shared = False
+        # Under ShellAccess._lock: the connects still inside their wait on this tunnel, and
+        # whether any connect has returned it. The last of them to fail, before any has
+        # returned it, closes it.
+        self.waiters = 0
+        self.returned = False
         self.thread = threading.Thread(
             target=server.serve_forever, name=f"shell-tunnel-{shell_id[:8]}", daemon=True
         )
@@ -796,6 +798,27 @@ class ShellAccess:
             with self._lock:
                 self._waits.discard(stop)
 
+    def _release(self, remote_id: str, tunnel: _Tunnel, error: BaseException) -> None:
+        """A connect that waited on ``tunnel`` fails with ``error``; with ``self._lock`` held.
+
+        Whatever ends the wait, a tunnel that no connect has returned is not left behind once
+        its last waiter fails; ``error`` stays the one reported, with any cleanup failure.
+        """
+        tunnel.waiters -= 1
+        if tunnel.waiters or tunnel.returned or self._tunnels.get(remote_id) is not tunnel:
+            return
+        try:
+            self._disconnect(remote_id)
+        except OSError as cleanup:
+            note = (
+                f"; the tunnel stopped, but removing its key or rewriting the configs failed: "
+                f"{cleanup}"
+            )
+            # The caller may be gone, as after a cancellation: say it here too.
+            print(f"determined-compute-mcp: shell {remote_id}{note}", file=sys.stderr)
+            if isinstance(error, APIError) and error.args:
+                error.args = (f"{error.args[0]}{note}", *error.args[1:])
+
     def _interrupted(self) -> ConflictError:
         if self._stopping.is_set():
             return ConflictError(
@@ -904,11 +927,15 @@ class ShellAccess:
                     )
                 self._claim_directory()
                 tunnel = self._open(remote_id, fetched, open_websocket, local_port)
-            else:
-                tunnel.shared = True
-                # The configs derive from the open tunnels; a failed rewrite may have removed
-                # them.
-                self._write_configs()
+            tunnel.waiters += 1
+            if reused:
+                try:
+                    # The configs derive from the open tunnels; a failed rewrite may have
+                    # removed them.
+                    self._write_configs()
+                except BaseException as exc:
+                    self._release(remote_id, tunnel, exc)
+                    raise
             record = dict(tunnel.record)
             control_directory = self._control_directory()
         state_unknown = False
@@ -955,24 +982,18 @@ class ShellAccess:
                 if remaining <= 0:
                     break
                 pause(min(_WAIT_INTERVAL, remaining))
-            self._check_open(remote_id, tunnel)
+            with self._lock:
+                if self._tunnels.get(remote_id) is not tunnel:
+                    raise ConflictError(
+                        f"the tunnel to shell {remote_id} was closed while waiting for its "
+                        "sshd; connect again to open a new one",
+                        code="shell_access_closed",
+                    )
+                tunnel.returned = True
+                tunnel.waiters -= 1
         except BaseException as exc:
-            # Whatever ends the wait, a tunnel this call opened, and nobody else was handed,
-            # is not left behind; the original error is the one reported.
-            if not reused:
-                with self._lock:
-                    if self._tunnels.get(remote_id) is tunnel and not tunnel.shared:
-                        try:
-                            self._disconnect(remote_id)
-                        except OSError as cleanup:
-                            note = (
-                                f"; the tunnel stopped, but removing its key or rewriting the "
-                                f"configs failed: {cleanup}"
-                            )
-                            # The caller may be gone, as after a cancellation: say it here too.
-                            print(f"determined-compute-mcp: shell {remote_id}{note}", file=sys.stderr)
-                            if isinstance(exc, APIError) and exc.args:
-                                exc.args = (f"{exc.args[0]}{note}", *exc.args[1:])
+            with self._lock:
+                self._release(remote_id, tunnel, exc)
             raise
         if state_unknown:
             # The last check of the shell failed; do not report a state it may have left.

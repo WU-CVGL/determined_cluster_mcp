@@ -1369,6 +1369,47 @@ def test_cancelling_the_opener_leaves_a_tunnel_another_call_was_given(access, cl
     assert _exchange(given["port"], b"still open")[1] == b"still open"
 
 
+def _two_waits(access, client, monkeypatch, first_stop, second_stop):
+    monkeypatch.setattr(module, "_WAIT_INTERVAL", 0.05)
+    client.ready = False  # sshd never answers, so both calls keep waiting
+    first, first_outcome = _in_thread(access.connect, SHELL_ID, wait_seconds=600, stop=first_stop)
+    deadline = time.monotonic() + 5
+    while SHELL_ID not in access._tunnels and time.monotonic() < deadline:
+        time.sleep(0.01)
+    second, second_outcome = _in_thread(access.connect, SHELL_ID, wait_seconds=600, stop=second_stop)
+    while access._tunnels[SHELL_ID].waiters < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return (first, first_outcome), (second, second_outcome)
+
+
+@pytest.mark.parametrize("order", ["opener first", "second first"])
+def test_a_tunnel_no_connect_returned_closes_when_every_wait_is_cancelled(
+    access, client, tmp_path, monkeypatch, order
+):
+    stops = threading.Event(), threading.Event()
+    calls = _two_waits(access, client, monkeypatch, *stops)
+    port = access._tunnels[SHELL_ID].record["port"]
+    for index in ((0, 1) if order == "opener first" else (1, 0)):
+        stops[index].set()
+        calls[index][0].join(timeout=5)
+        assert calls[index][1]["error"].code == "cancelled"
+    assert access._tunnels == {}
+    assert not (tmp_path / "access" / SHELL_ID).exists()
+    with pytest.raises(OSError):
+        socket.create_connection(("127.0.0.1", port), timeout=1).close()
+
+
+def test_a_tunnel_no_connect_returned_closes_when_its_shell_ends(access, client, tmp_path, monkeypatch):
+    calls = _two_waits(access, client, monkeypatch, threading.Event(), threading.Event())
+    client.state = "STATE_TERMINATED"
+    for worker, outcome in calls:
+        worker.join(timeout=5)
+        assert outcome["error"].code == "shell_not_running"
+    assert access._tunnels == {}
+    assert not (tmp_path / "access" / SHELL_ID).exists()
+    assert not (tmp_path / "access" / "ssh_config").exists()
+
+
 def test_a_probe_notices_a_stop_within_a_second():
     class Silent:
         sock = None

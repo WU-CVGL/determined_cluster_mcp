@@ -562,8 +562,8 @@ SSH MCP server, needs a TCP port instead, which
    and another failed lookup that is not transient ends the call with that error. A
    disconnect of the tunnel meanwhile fails the call with `shell_access_closed`. Whatever
    ends the wait early, cancellation and server stop included, closes a tunnel this call
-   opened, unless another connect was meanwhile handed the same tunnel, and the original
-   error is the one reported; a failure to clean up is added to it and printed to stderr. Each probe gets no more than the time left, but at least
+   opened or reused, once no other connect is still waiting on it, unless a connect has
+   already returned it; the original error is the one reported; a failure to clean up is added to it and printed to stderr. Each probe gets no more than the time left, but at least
    1 second, and no wait starts after the deadline. The call can still overrun
    `wait_seconds` by the API requests in flight when the time runs out, each limited by the
    client's request timeout (up to three when the shell starts running just then), plus
