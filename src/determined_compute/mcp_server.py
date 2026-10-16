@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,9 @@ try:  # pydantic ships with the optional mcp extra; tool annotations need it onl
     from pydantic import BeforeValidator
 except ImportError:  # pragma: no cover - exercised without the optional extra
     BeforeValidator = None
+
+
+DEFAULT_SHELL_ACCESS_DIR = "~/.cache/determined-compute/shell-access"
 
 
 def _exact_preference(value: Any) -> Any:
@@ -80,8 +84,10 @@ def create_server(
     service: ComputeService,
     storage_service: Any = None,
     resource_inspector: Any = None,
+    shell_access: Any = None,
 ) -> Any:
-    """Create an MCP server for the compute service and optional storage access."""
+    """Create an MCP server for the compute service, optional storage access, and optional
+    local SSH access to shells."""
 
     try:
         from mcp.server import MCPServer
@@ -115,6 +121,11 @@ def create_server(
             "Experiments and generic tasks can be paused and resumed; a resumed experiment "
             "continues from its trials' latest checkpoints, a resumed generic task reruns its "
             "command from the start. "
+            "compute_shell_connect opens local SSH access to a running shell (127.0.0.1, a "
+            "port, a key file, and a pinned host key): run its ssh_command where a local shell "
+            "tool is allowed, or use an SSH MCP server such as ssh-mcp, which must be started "
+            "or reconnected after a profile is added, removed, or changed; disconnect when "
+            "done. "
             "Credentials belong in local configuration, never in tool arguments."
         ),
     )
@@ -203,7 +214,15 @@ def create_server(
     async def compute_cancel(kind: str, id: Union[int, str]) -> dict[str, Any]:
         """Cancel one of the account's tasks; a generic task's descendants are killed with it."""
 
-        return await call(service.cancel, kind, id)
+        result = await call(service.cancel, kind, id)
+        if kind == "shell" and shell_access is not None:
+            # The shell is going away, so its local tunnel and key file go too.
+            try:
+                closed = await asyncio.to_thread(shell_access.disconnect, id)
+                result["shell_access_closed"] = closed["disconnected"]
+            except Exception:
+                result["shell_access_closed"] = None
+        return result
 
     @server.tool(annotations=ToolAnnotations(
         read_only_hint=False, destructive_hint=True, idempotent_hint=True, open_world_hint=True,
@@ -260,6 +279,28 @@ def create_server(
             """
             return await call(resource_inspector.resources, slots, pool, prefer_gpu_topology)
 
+    if shell_access is not None:
+
+        @server.tool(annotations=ToolAnnotations(
+            read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=True,
+        ))
+        async def compute_shell_connect(id: str, local_port: Optional[int] = None) -> dict[str, Any]:
+            """Open local SSH access to one of the account's running shells.
+
+            Listens on 127.0.0.1 (local_port, or a free port) and relays to the shell through
+            the master. Returns port, user, key_path, host_key_fingerprint, ssh_command, and an
+            ssh-mcp profile in a generated config; the private key stays in key_path. Calling
+            it again returns the open tunnel; another local_port needs a disconnect first.
+            """
+            return await call(shell_access.connect, id, local_port)
+
+        @server.tool(annotations=ToolAnnotations(
+            read_only_hint=False, destructive_hint=False, idempotent_hint=True, open_world_hint=False,
+        ))
+        async def compute_shell_disconnect(id: str) -> dict[str, Any]:
+            """Close a shell's local SSH tunnel and delete its key file; the shell keeps running."""
+            return await call(shell_access.disconnect, id)
+
     if storage_service is not None:
 
         @server.tool(annotations=ToolAnnotations(
@@ -307,6 +348,11 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--verify-ssl", action="store_true", dest="verify_ssl")
     verify.add_argument("--no-verify-ssl", action="store_false", dest="verify_ssl")
     parser.set_defaults(verify_ssl=None)
+    parser.add_argument(
+        "--shell-access-dir",
+        help="Private directory for shell tunnel keys and the generated ssh-mcp config "
+        f"(or DETERMINED_COMPUTE_SHELL_ACCESS; default {DEFAULT_SHELL_ACCESS_DIR})",
+    )
     return parser
 
 
@@ -331,8 +377,22 @@ def _runtime(args: argparse.Namespace) -> Any:
     access = StorageAccessConfig.from_file(access_path) if access_path else StorageAccessConfig()
     storage = StorageService(profile, access, Path(args.secrets_file).expanduser() if args.secrets_file else None)
 
+    from determined_compute.compute.shell_access import ShellAccess
+    shell_dir = (
+        args.shell_access_dir
+        or os.environ.get("DETERMINED_COMPUTE_SHELL_ACCESS")
+        or DEFAULT_SHELL_ACCESS_DIR
+    )
+    shell_access = ShellAccess(service, Path(shell_dir).expanduser())
+    try:
+        shell_access.sweep()
+    except (OSError, ValueError, ComputeError) as exc:
+        # Shell access is optional; report a bad directory, and let connect fail on it later.
+        print(f"determined-compute-mcp: shell access directory: {exc}", file=os.sys.stderr)
+    atexit.register(shell_access.close_all)
+
     from determined_compute.compute.admission import ResourceInspector
-    return create_server(service, storage, ResourceInspector(service.client))
+    return create_server(service, storage, ResourceInspector(service.client), shell_access)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

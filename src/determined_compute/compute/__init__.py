@@ -10,6 +10,7 @@ from .models import (
 )
 from .profile import ComputeProfile, SharedMount
 from .service import ComputeService
+from .shell_access import ShellAccess
 
 __all__ = [
     "APIError",
@@ -19,6 +20,7 @@ __all__ = [
     "ConflictError",
     "NotFoundError",
     "SharedMount",
+    "ShellAccess",
     "SubmissionUncertainError",
     "ValidationError",
 ]

@@ -28,7 +28,7 @@ Do not read or print credential values merely to confirm configuration. The MCP 
 Choose the task kind according to the work. The four kinds, from the simplest:
 
 - `command` runs your command once in a container and ends when it exits. Use it for finite, non-interactive work such as an evaluation, a conversion, or a build.
-- `shell` gives you a container to connect to over SSH instead of a command to run. Use it for interactive debugging and environment inspection.
+- `shell` gives you a container to connect to over SSH instead of a command to run. Use it for interactive debugging and environment inspection; see [work inside a shell](#work-inside-a-shell).
 - `generic` runs your command once like a `command`, with a name, child tasks, and, if launched with `pausable: true`, pause and resume under the same task ID to free its slots. Resuming starts the command again from the beginning in a new container, and nothing restarts it after a failure, so make a task pausable only when it is safe to rerun; see [Pause and resume](#pause-and-resume). It requires a Determined master from the research-cluster fork with WU-CVGL/determined#27, which lists generic tasks with their owners; on an older master the launch fails with `unsupported` before anything is created. `kind: auto` never selects it.
 - `experiment` runs your command as one or more trials and adds Determined's experiment features:
   - a searcher, set in `experiment_config.searcher`, that runs a single trial or many trials over a hyperparameter space (grid, random, or adaptive search that stops weak trials early);
@@ -108,6 +108,20 @@ Call `compute_usage(kind, id)` when you need to know how much CPU, memory, and G
 A successful submission or a terminal state alone is not acceptance. Check the process exit information and the success criteria defined at the start. When storage access is configured, verify expected shared artifacts with `storage_check`; otherwise use workload output or another explicit task-level check. When a local copy is needed, configure storage access, preview `storage_fetch(shared_dir, local_dir, dry_run=true)`, review it, then execute with `dry_run=false` and inspect the fetched result.
 
 Report the task kind and ID, final state, exit result when available, output path, and observed artifact or metric. Never include tokens, passwords, private keys, cookies, or secrets-file contents.
+
+## Work inside a shell
+
+The compute MCP launches a shell but does not run commands in it. `compute_shell_connect` gives the shell a local SSH endpoint for an SSH client:
+
+1. Launch a `shell` with the slots the work needs, and poll `compute_status` until `state` is `STATE_RUNNING`.
+2. Call `compute_shell_connect(id)`. Check `probe.ok`; while `ready` is `false` or the probe fails, sshd may still be starting, so call it again after a short wait.
+3. Use the result:
+   - If you have a local shell tool and the user allows SSH commands with it, run `ssh_command` followed by the command to run in the shell. This works for every shell connected during the work.
+   - If the user set up the optional [ssh-mcp](compute-service.md#use-the-shell-from-ssh-mcp) server for the generated config, it must be started or reconnected after each connect that adds or changes a profile, which you usually cannot do yourself: ask the user to reconnect it, then call its tools with the profile named in `ssh_mcp.profile`.
+   - Otherwise give the result's values to the user for their own SSH client or IDE.
+4. When done, call `compute_shell_disconnect(id)`, then `compute_cancel("shell", id)` unless the user wants the shell kept; a shell holds its slots until it is cancelled or, where the deployment sets one, its inactivity limit stops it.
+
+The shell logs in as the account's agent user, and anything run there can change shared storage mounted into the container with that user's permissions. Keep the work within the user's requested scope, and keep ssh-mcp's approval gate on, never `auto`. Never read or print the key file; refer to it by `key_path`.
 
 ## Pause and resume
 

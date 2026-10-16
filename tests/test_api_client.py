@@ -195,6 +195,38 @@ def test_launch_payloads_and_shell_secret_removal(monkeypatch):
     assert result["reconnectCommand"] == "det shell show_ssh_command s1"
 
 
+def test_shell_keys_are_read_unredacted_only_by_their_own_method(monkeypatch):
+    shell = {
+        "id": "s1", "privateKey": "-----BEGIN KEY-----\nsecret\n-----END KEY-----\n",
+        "publicKey": "ssh-ed25519 AAAA\n", "agentUserGroup": {"user": "alice", "uid": 1000},
+        "state": "STATE_RUNNING", "userId": 7,
+    }
+    urls = []
+
+    def get(url, **kwargs):
+        urls.append(url)
+        return Response({"shell": shell})
+
+    monkeypatch.setattr(requests, "get", get)
+    api = client()
+    assert api.get_shell_keys("s1") == {
+        "id": "s1", "private_key": shell["privateKey"], "public_key": "ssh-ed25519 AAAA",
+        "user": "alice",
+    }
+    assert urls == ["http://master:8080/api/v1/shells/s1"]
+    assert "privateKey" not in api.get_task("shell", "s1")
+
+    shell["agentUserGroup"] = {"user": ""}
+    assert api.get_shell_keys("s1")["user"] == "root"
+    del shell["agentUserGroup"]
+    assert api.get_shell_keys("s1")["user"] == "root"
+    shell["privateKey"] = ""
+    with pytest.raises(APIError) as caught:
+        api.get_shell_keys("s1")
+    assert caught.value.code == "invalid_response"
+    assert "secret" not in str(caught.value)
+
+
 def test_get_task_preserves_safe_config_for_identity_check(monkeypatch):
     monkeypatch.setattr(
         requests,

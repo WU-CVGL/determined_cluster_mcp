@@ -138,6 +138,23 @@ The MCP acts only on tasks owned by the authenticated account. `ownership_mismat
 
 Determined applies its own permissions as well. On the fork 0.40.1 or later with basic authorization, only a task's owner or an administrator can kill, cancel, pause, or resume it; other accounts receive `permission_denied` (HTTP 403), or HTTP 404 `experiment '<id>' not found` for an experiment.
 
+## Shell access fails
+
+- `unsupported` with a message about `websocket-client`: reinstall the server with its MCP extra (`python -m pip install -e '.[mcp]'` in the checkout) and restart the MCP process.
+- `unsupported` with a message about a proxy: the environment selects a proxy other than `http://`, such as `socks5://`, for the master. Shell access reaches the master only directly or through an `http://` proxy; list the master in `NO_PROXY` and `no_proxy`, or set an `http://` proxy for it.
+- `shell_not_running`: only a `STATE_RUNNING` shell can be connected. A queued shell is waiting for capacity; an ended one cannot be reopened, so launch a new shell.
+- `ready: false`, or `probe.ok: false` right after the shell started: sshd is still starting. `compute_logs` shows `Server listening on` once it is up; call `compute_shell_connect` again, which keeps the open tunnel and probes again.
+- A probe error `the WebSocket handshake was refused with HTTP <status>` comes from the master or its shell proxy: 404 or 502 usually means the shell ended or its proxy is not registered yet.
+- A probe error `WebSocketProxyException: failed CONNECT via proxy status: <status>` comes from the HTTP proxy chosen for the master: 407 means it wants other credentials, set in the proxy URL, and 403 or 405 means it does not allow `CONNECT` to the master's port. TLS errors and other proxy failures have the same causes as for the API; see [TLS certificate verification fails](#tls-certificate-verification-fails) and [the master is unreachable through a proxy](#the-master-is-unreachable-through-a-proxy).
+- `port_unavailable`: another program uses the requested `local_port`. Omit it to get a free port.
+- `shell_access_conflict` saying that another determined-compute-mcp process uses the shell access directory: another MCP server, such as one from another client session, uses it. Give each server its own `--shell-access-dir` or `DETERMINED_COMPUTE_SHELL_ACCESS`.
+- `shell_access_conflict` saying that the shell access directory was removed or taken over while this server had open tunnels: the directory was deleted, or its lock file was deleted and another server locked a new one. Call `compute_shell_disconnect` for this server's open tunnels, which leaves the directory's files alone, or restart the server; then connect again.
+- `shell_access_conflict` saying that the shell already has a tunnel: it is open on another port. Use it, or call `compute_shell_disconnect` before connecting with another `local_port`.
+- `shell_access_conflict` saying that a directory exists and is not a shell access directory: a directory with the shell's ID as its name holds something other than shell-access files. Remove it, or use a dedicated shell-access directory.
+- ssh-mcp fails to start with its config file not found, or does not know the profile: the file exists only while a tunnel is open, and ssh-mcp reads it only at startup, so start or reconnect ssh-mcp after `compute_shell_connect`. Check that it was registered as `--config=<ssh_mcp.config_path>`, with `=`: ssh-mcp ignores a value separated by a space.
+- ssh-mcp reports a host-key mismatch: its config is older than the tunnel on that port. Restart it so that it reads the current `trustedHostKey`.
+- An SSH session drops when the determined-compute MCP restarts: tunnels live in that process. Call `compute_shell_connect` again, and restart ssh-mcp, since the port changes.
+
 ## A transfer is partial or different from the preview
 
 Transfers never add `--delete`, so unrelated destination files remain. Normal rsync behavior can still replace same-named destination files. A failed executed transfer can leave a partial destination; rsync exit code 23 specifically reports that some files or attributes were not transferred.

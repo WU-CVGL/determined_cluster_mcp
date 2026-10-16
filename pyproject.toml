@@ -33,6 +33,7 @@ keyring = [
 ]
 mcp = [
     "mcp>=2,<3",
+    "websocket-client>=1.8,<2",
 ]
 dev = [
     "pytest>=7.0",

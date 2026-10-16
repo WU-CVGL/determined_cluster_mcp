@@ -29,6 +29,8 @@ ALL_TOOLS = {
     "compute_resume",
     "compute_list",
     "compute_resources",
+    "compute_shell_connect",
+    "compute_shell_disconnect",
     "storage_check",
     "storage_sync",
     "storage_fetch",
@@ -99,7 +101,8 @@ def test_real_sdk_client_lists_tools_and_passes_native_ids():
             listed = await client.list_tools()
             tools = {tool.name: tool for tool in listed.tools}
             assert set(tools) == ALL_TOOLS - {
-                "compute_resources", "storage_check", "storage_sync", "storage_fetch",
+                "compute_resources", "compute_shell_connect", "compute_shell_disconnect",
+                "storage_check", "storage_sync", "storage_fetch",
             }
             for tool in tools.values():
                 properties = tool.input_schema.get("properties", {})
@@ -185,6 +188,69 @@ def test_real_sdk_client_lists_tools_and_passes_native_ids():
         ) in service.calls
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=10))
+
+
+class FakeShellAccess:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def connect(self, shell_id, local_port):
+        self.calls.append(("connect", shell_id, local_port))
+        if shell_id == "busy":
+            from determined_compute.compute import ConflictError
+
+            raise ConflictError("cannot listen", code="port_unavailable")
+        return {"kind": "shell", "id": shell_id, "port": local_port or 40123}
+
+    def disconnect(self, shell_id):
+        self.calls.append(("disconnect", shell_id))
+        return {"kind": "shell", "id": shell_id, "disconnected": True}
+
+
+def test_shell_access_tools_connect_disconnect_and_close_on_cancel():
+    async def exercise():
+        service, shell_access = FakeService(), FakeShellAccess()
+        async with Client(create_server(service, shell_access=shell_access)) as client:
+            tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+            connect = tools["compute_shell_connect"]
+            assert connect.input_schema["required"] == ["id"]
+            assert connect.input_schema["properties"]["local_port"]["default"] is None
+            assert connect.annotations.read_only_hint is False
+            assert connect.annotations.destructive_hint is False
+            assert tools["compute_shell_disconnect"].input_schema["required"] == ["id"]
+            assert tools["compute_shell_disconnect"].annotations.open_world_hint is False
+
+            opened = await client.call_tool("compute_shell_connect", {"id": COMMAND_ID})
+            assert _structured(opened)["port"] == 40123
+            await client.call_tool(
+                "compute_shell_connect", {"id": COMMAND_ID, "local_port": 2222}
+            )
+            refused = await client.call_tool("compute_shell_connect", {"id": "busy"})
+            assert _error(refused)["code"] == "port_unavailable"
+            closed = await client.call_tool("compute_shell_disconnect", {"id": COMMAND_ID})
+            assert _structured(closed)["disconnected"] is True
+
+            cancelled = await client.call_tool("compute_cancel", {"kind": "shell", "id": COMMAND_ID})
+            assert _structured(cancelled)["shell_access_closed"] is True
+            command = await client.call_tool(
+                "compute_cancel", {"kind": "command", "id": COMMAND_ID}
+            )
+            assert "shell_access_closed" not in _structured(command)
+        assert shell_access.calls == [
+            ("connect", COMMAND_ID, None),
+            ("connect", COMMAND_ID, 2222),
+            ("connect", "busy", None),
+            ("disconnect", COMMAND_ID),
+            ("disconnect", COMMAND_ID),
+        ]
+
+    asyncio.run(asyncio.wait_for(exercise(), timeout=10))
+
+
+def test_shell_access_dir_option():
+    args = build_parser().parse_args(["--profile", "p.yaml", "--shell-access-dir", "/x"])
+    assert args.shell_access_dir == "/x"
+    assert build_parser().parse_args(["--profile", "p.yaml"]).shell_access_dir is None
 
 
 def test_tool_errors_are_structured():
