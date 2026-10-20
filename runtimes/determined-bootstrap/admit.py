@@ -41,7 +41,8 @@ def main():
         subprocess.run([sys.executable, "-m", "pip", "install", "--user", "--no-index", "--no-deps", str(wheels[0])], check=True)
         subprocess.run([sys.executable, "-m", "pip", "check"], check=True)
         subprocess.run([sys.executable, "-c", "import importlib.metadata as m; import determined; assert m.version('determined') == " + repr(args.sdk_version)], check=True)
-        print("Injected Determined " + args.sdk_version + " imports offline as job UID")
+        subprocess.run([sys.executable, "-m", "determined.exec.prep_container", "--help"], check=True, timeout=60)
+        print("Injected Determined " + args.sdk_version + " imports and prep_container help succeeds offline as job UID")
     else:
         raise ValueError(mode)
 

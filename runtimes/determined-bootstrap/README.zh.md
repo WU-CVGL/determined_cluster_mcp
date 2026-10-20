@@ -18,6 +18,6 @@ timeout 20m docker build --cpus 8 --memory 16g \
 
 构建前拒绝已有输出目录或镜像标签，在新输出目录记录准确输入、构建日志和最终退出状态。命令限时 20 分钟、8 CPU、16 GiB。失败重试须使用新目录和标签。Docker 守护进程必须支持并落实这些限制；客户端中断后的守护进程取消和清理由操作员负责。导入准入程序不会构建或提交集群任务。
 
-接受镜像前，通过 `/usr/local/bin/bm-bootstrap-python` 以真实非 root 作业 UID 运行 `admit.py sdk /opt/determined/wheels`，并覆盖 passwd 中不存在该 UID 的情况。设置 `LOGNAME=bm-runtime`、全新的作业所有 `PYTHONUSERBASE` 和作业所有 `XDG_CACHE_HOME`、`PIP_CACHE_DIR`、`CUDA_CACHE_PATH`；不要全局覆盖 HOME。TMPDIR 使用短路径（如 `/tmp`），避免 CUDA 编译路径长度限制。检查仅离线安装实际注入的 SDK 到用户 site，核对依赖并导入它，不修改镜像。输出保存在作业旁。同一作业环境中，用科学解释器运行 `admit.py compare /opt/determined-bootstrap/science-before.json` 再次检查。GPU 仿真验收是独立任务。
+接受镜像前，通过 `/usr/local/bin/bm-bootstrap-python` 以真实非 root 作业 UID 运行 `admit.py sdk /opt/determined/wheels`，并覆盖 passwd 中不存在该 UID 的情况。设置 `LOGNAME=bm-runtime`、全新的作业所有 `PYTHONUSERBASE` 和作业所有 `XDG_CACHE_HOME`、`PIP_CACHE_DIR`、`CUDA_CACHE_PATH`；不要全局覆盖 HOME。TMPDIR 使用短路径（如 `/tmp`），避免 CUDA 编译路径长度限制。检查仅离线安装实际注入的 SDK 到用户 site，核对依赖、导入它，并在同一 UID 和引导环境中以 60 秒限时运行 `python -m determined.exec.prep_container --help`。该版本 SDK 的 argparse 在读取任务配置或向服务器认证前即为 `--help` 退出，不修改镜像。输出保存在作业旁。同一作业环境中，用科学解释器运行 `admit.py compare /opt/determined-bootstrap/science-before.json` 再次检查。GPU 仿真验收是独立任务。
 
 构建检查只证明已安装发行包的版本一致，不证明原生仿真器兼容性；科学配置仍须验证解释器、Torch/CUDA、仿真器导入及实际执行。不能仅凭 SDK 检查接受科学配置。
