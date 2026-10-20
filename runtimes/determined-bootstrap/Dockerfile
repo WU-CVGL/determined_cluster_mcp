@@ -8,7 +8,8 @@ ARG SCIENCE_REVISION
 ENV DET_PYTHON_EXECUTABLE=/usr/local/bin/bm-bootstrap-python
 COPY bootstrap-python /usr/local/bin/bm-bootstrap-python
 COPY bootstrap.txt admit.py /opt/determined-bootstrap/
-RUN test "$SDK_VERSION" = "0.42.1" && test -n "$SCIENCE_PROFILE" && test -n "$SCIENCE_REVISION" && \
+RUN --mount=type=cache,id=determined-bootstrap-pip,target=/root/.cache/pip \
+    test "$SDK_VERSION" = "0.42.1" && test -n "$SCIENCE_PROFILE" && test -n "$SCIENCE_REVISION" && \
     chmod 755 /usr/local/bin/bm-bootstrap-python && \
     "$SCIENCE_PYTHON" /opt/determined-bootstrap/admit.py snapshot /opt/determined-bootstrap/science-before.json && \
     /usr/local/bin/python -c 'import site,sys; assert site.ENABLE_USER_SITE is True; assert sys.prefix != "/opt/venv"' && \
