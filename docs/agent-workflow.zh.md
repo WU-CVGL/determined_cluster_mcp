@@ -19,7 +19,7 @@
 - 集群计算节点宿主机路径及其容器挂载路径
 - 可选的共享存储本地挂载或登录节点 SSH 访问方式
 
-例如：“使用一个槽位评估这个版本，不排队，将 `metrics.json` 写入共享结果目录，并报告任务 ID、退出结果和该文件是否存在。”
+例如：“使用一个槽位评估这个版本，将 `metrics.json` 写入共享结果目录，并报告任务 ID、退出结果和该文件是否存在。”
 
 <a id="read-local-configuration-first"></a>
 ## 先读取本地配置
@@ -70,17 +70,17 @@ MCP 不接受 `kind: notebook`。
 
 传输会复制目录内容，不会删除目标中多余的文件；但可能覆盖同名文件，因此预览是安全检查的一部分。可能重启或恢复的任务，应把每个版本放在单独的目录中，之后不要再向该目录同步；重启或恢复会运行该目录当时的内容，而 `code_revision` 仍记录原来的版本。没有存储后端时，规划仍不会验证远端文件是否存在或权限是否有效；应让任务自身验证所需输入并写出可观察的结果。SSH 认证、排除规则和传输行为见[共享存储访问](shared-storage-access.zh.md)。
 
-<a id="check-capacity-and-avoid-accidental-queues"></a>
-## 检查容量并避免意外排队
+<a id="check-capacity-and-choose-whether-to-queue"></a>
+## 检查容量并决定是否排队
 
 需要选择资源、回答容量问题或排查容量拒绝时，调用 `compute_resources(slots, pool)`。正槽位数检查可调度的 agent slot，零槽位检查辅助容器容量。结果只是快照，不是资源预留。`allow_queue: false` 时，`compute_launch` 会在提交前执行这项准入检查，因此不必在每次提交前单独查询容量。按显卡型号（CUDA 上）、CPU 或内存选择资源池时，读取每个资源池的 `gpu_models` 和 `description`，不要根据名称猜测。`gpu_models` 为 `null` 表示未知，而不是没有 GPU；`description` 为 `null` 表示资源池没有提供说明。说明中未写明 CPU 或内存时视为未知。
 
-对于多 GPU 数据并行任务，`prefer_gpu_topology` 可取 `"strong"`（全部 GPU 在同一 agent 的同一 NUMA 节点上；等待到有这样的节点空闲）或 `"soft"`（不会为等待更好的 GPU 拓扑而额外排队；GPU 可能跨 NUMA 节点）；不设置表示没有偏好。用户明确提出拓扑要求时照做；否则保持默认，即没有偏好。向 `compute_resources(slots=N, pool=P, prefer_gpu_topology=...)` 和 `compute_launch` 传入同一个值。只有当拓扑决定任务能否运行且用户意图不明确时，才询问用户。`max_numa_node_free_slots` 是当前能放下的最大 `"strong"` 任务，`max_numa_node_slots` 是 master 接受的最大值。N 更大时，向用户报告拒绝信息给出的选项（更少 GPU、其他资源池，或在某个 agent 有 N 个 slot 时改用 `"soft"`）；不要自行切换。`"strong"` experiment 的每个 trial 分别需要同一 NUMA 节点上的 N 个空闲 GPU；多个 trial 可以共用一个节点。以资源池的默认优先级提交 `"strong"` 任务：未开启抢占时，一个等待中的任务会挡住所有需要 slot 的低优先级任务。
+对于多 GPU 数据并行任务，`prefer_gpu_topology` 可取 `"strong"`（全部 GPU 在同一 agent 的同一 NUMA 节点上；等待到有这样的节点空闲）或 `"soft"`（不会为等待更好的 GPU 拓扑而额外排队；GPU 可能跨 NUMA 节点）；不设置表示没有偏好。用户明确提出拓扑要求时照做；否则保持默认，即没有偏好。向 `compute_resources(slots=N, pool=P, prefer_gpu_topology=...)` 和 `compute_launch` 传入同一个值。只有当拓扑决定任务能否运行且用户意图不明确时，才询问用户。`max_numa_node_free_slots` 是当前能放下的最大 `"strong"` 任务，`max_numa_node_slots` 是 master 接受的最大值。N 更大且用户要求 `"strong"` 时，向用户报告拒绝信息给出的选项（更少 GPU、其他资源池，或在某个 agent 有 N 个 slot 时改用 `"soft"`）；否则改用其他资源池或 `"soft"`。`"strong"` experiment 的每个 trial 分别需要同一 NUMA 节点上的 N 个空闲 GPU；多个 trial 可以共用一个节点。以资源池的默认优先级提交 `"strong"` 任务：未开启抢占时，一个等待中的任务会挡住所有需要 slot 的低优先级任务。
 
-除非用户明确要求等待，否则保持 `allow_queue: false`。容量不足或无法确定，或资源池不存在或对你不可用时，报告该结果；指明某个资源池的 `permission_denied` 错误表示当前账户无权使用该资源池。不要擅自切换资源池、改变槽位数或开启排队。以 `capacity_unknown` 或 `capacity_unavailable` 被拒绝的提交没有提交任何任务。不要循环重新提交；报告该结果，或请用户决定使用 `allow_queue: true` 或其他资源池。在 research-cluster fork 0.41.1 或更高版本上，排队中的任务在 master 重启后仍保持排队。
+任务可以等待容量时，例如批量或过夜运行，或用户接受等待时，设置 `allow_queue: true`；排队中的任务可用 `compute_status` 跟踪，也可以取消。需要尽快得到结果时保持 `allow_queue: false`。保留用户或项目已固定的资源池或槽位数；改变槽位数会改变任务本身，因此改动前先询问。资源池未固定时，选择一个合适且可用的资源池，首选资源池已满或对你不可用时也是如此，并说明使用了哪个资源池；指明某个资源池的 `permission_denied` 错误表示当前账户无权使用该资源池。以 `capacity_unknown` 或 `capacity_unavailable` 被拒绝的提交没有提交任何任务：排队、换用其他资源池或报告该结果，而不是循环提交同一请求。在 research-cluster fork 0.41.1 或更高版本上，排队中的任务在 master 重启后仍保持排队。
 
-<a id="plan-review-and-launch-once"></a>
-## 规划、审核并只提交一次
+<a id="plan-and-launch-once"></a>
+## 规划并只提交一次
 
 创建请求时填写有意义的 `name`（最多 128 个字符）和 `description`（最多 2,048 个字符），并提供选定的 `kind`、命令、容器 `workdir`、容器 `output_dir`、槽位数、`allow_queue`，以及存在时的版本或内容标识。镜像和资源池可来自计算 profile，也可使用明确批准的覆盖值。过长的名称或描述会在提交前以 `invalid_request` 拒绝；缩短后提交修正的请求即可。
 
@@ -98,7 +98,7 @@ MCP 不接受 `kind: notebook`。
 }
 ```
 
-调用 `compute_plan(request)`，检查解析后的任务类型、镜像、资源池、挂载、工作目录、输出目录、资源字段和提示信息。规划只在本地验证并渲染配置，不能证明远端文件、权限、凭据、资源池访问权限或实时容量有效。
+`compute_plan(request)` 在不提交的情况下显示解析后的任务类型、镜像、资源池、挂载、工作目录、输出目录、资源字段和提示信息；`compute_launch` 执行相同的验证，因此需要检查这些内容时再先规划。规划只在本地验证并渲染配置，不能证明远端文件、权限、凭据、资源池访问权限或实时容量有效。
 
 调用一次 `compute_launch(request)`。它返回任务的 `kind` 和 `id`，即 Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，experiment 为整数。之后的所有工具都使用这一对值。MCP 不保存这次提交的记录，所以请把 kind、ID、名称和 `submission_marker` 写入自己的工作记录。每次调用都是一次新的提交：用同一请求再次调用 `compute_launch` 会启动第二个任务。
 

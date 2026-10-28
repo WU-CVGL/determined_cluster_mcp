@@ -123,12 +123,13 @@ def create_server(
         lifespan=lifespan,
         instructions=(
             "Choose a meaningful request.name and request.description for each launch. "
-            "Use compute_resources for capacity questions. Launch checks capacity unless "
-            "queuing is explicitly authorized with allow_queue=true. "
+            "Use compute_resources for capacity questions. Launch checks capacity first "
+            "unless allow_queue=true; set it when the work can wait for capacity. "
             "For multi-GPU work, pass the same prefer_gpu_topology to compute_resources and "
             "the request. "
             "Keep code and data on shared mounts; use storage_check/sync/fetch for file access. "
-            "Plan before launch. Every launch is a new submission: the server keeps no task "
+            "compute_plan renders a request without submitting it; compute_launch validates it the "
+            "same way. Every launch is a new submission: the server keeps no task "
             "records, so keep the returned kind and id, which are Determined's own task ID. "
             "If a launch is unconfirmed, look for it with compute_list(kind, marker=...); an "
             "empty result does not prove it failed, so never launch again automatically: "
