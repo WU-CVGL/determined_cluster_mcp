@@ -285,7 +285,7 @@ agent 运行，准入不检查这种情况：只要有一个 agent 有足够空�
 不起作用：它不会被发送，规划结果带有 advisory `gpu_topology_ignored`。准入看不到正在等待的任务：
 一个等待 NUMA 节点的高优先级任务可能让已通过准入的低优先级任务一直排队。
 
-除非显式设置 `allow_queue: true`，`compute_launch` 会先检查容量，然后把请求提交一次。不在
+除非设置 `allow_queue: true`，`compute_launch` 会先检查容量，然后把请求提交一次。不在
 当前账户资源池列表中的资源池会使该检查以 `capacity_unknown` 失败；master 拒绝的资源池会以
 `permission_denied` 失败（见[错误](#errors)）。每次调用都是一次新的提交：同一请求提交两次会
 启动两个任务。成功时返回 `kind`；`id`，即 Determined 的任务 ID（command、shell 和 generic

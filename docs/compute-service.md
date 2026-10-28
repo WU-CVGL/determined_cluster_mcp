@@ -319,7 +319,7 @@ plan carries the advisory `gpu_topology_ignored`. Admission does not see waiting
 higher-priority task waiting for a NUMA node can keep an admitted lower-priority task
 queued.
 
-`compute_launch` checks capacity unless `allow_queue` is explicitly true, then submits
+`compute_launch` checks capacity unless `allow_queue` is true, then submits
 the request once. A pool missing from the account's pool list fails that check with
 `capacity_unknown`; a pool that the master refuses fails with `permission_denied` (see
 [Errors](#errors)). Every call is a new submission: launching the same request twice
