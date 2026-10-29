@@ -108,7 +108,7 @@ For a request with `gpu_groups`:
 
 A resource pool that an administrator created dynamically appears in `compute_resources` only once it is Ready. A Pending or Failed pool is absent: the result reports that the pool is not present or not available to you, with unknown availability, and a launch without queuing is rejected with `capacity_unknown`. This MCP does not expose the dynamic-pool administration API, so ask an administrator about the pool's status.
 
-On the research-cluster fork 0.42.0 or later, an administrator can restrict a pool to some accounts, and the pool list omits a pool that the account may not use, so `compute_resources` and a launch without queuing report it the same way. A launch with `allow_queue: true`, or resuming an experiment or generic task in such a pool, fails with `permission_denied`; its message and `details.resource_pool` name the pool. Choose another pool with the user or ask an administrator for access.
+On the research-cluster fork 0.42.0 or later, an administrator can restrict a pool to some accounts. Fork 0.42.0 leaves a pool that the account may not use out of the pool list, so `compute_resources` reports it as not present or not available to you; 0.42.1 and later list it with `usable` false, and `compute_resources` reports it as not available. A launch without queuing fails with `permission_denied` (`this account may not use resource pool '<pool>': the pool is restricted`), and so does a launch with `allow_queue: true`, or resuming an experiment or generic task in such a pool, when the master refuses it; the message and `details.resource_pool` name the pool. Choose another pool with the user or ask an administrator for access.
 
 ## Submission outcome is uncertain
 

@@ -116,7 +116,7 @@ Requests 从 MCP 进程环境读取 `HTTPS_PROXY`、`HTTP_PROXY` 和 `NO_PROXY` 
 
 管理员动态创建的资源池只有在进入 Ready 状态后才会出现在 `compute_resources` 中。处于 Pending 或 Failed 状态的资源池不会出现：结果会说明该资源池不存在或对你不可用，且可用性未知，不排队的提交会以 `capacity_unknown` 被拒绝。本 MCP 不提供动态资源池管理 API，请向管理员确认该资源池的状态。
 
-在 research-cluster fork 0.42.0 或更高版本上，管理员可以把资源池限定给部分账户使用，资源池列表会省略当前账户无权使用的资源池，因此 `compute_resources` 和不排队的提交会以同样方式报告它。设置 `allow_queue: true` 的提交，或恢复该资源池中的 experiment 或 generic 任务，会以 `permission_denied` 失败；其消息和 `details.resource_pool` 会给出该资源池。请与用户一起选择其他资源池，或请管理员授予权限。
+在 research-cluster fork 0.42.0 或更高版本上，管理员可以把资源池限定给部分账户使用。fork 0.42.0 会在资源池列表中省略当前账户无权使用的资源池，因此 `compute_resources` 报告它不存在或对你不可用；0.42.1 及以后会列出它并将 `usable` 设为 false，`compute_resources` 报告它不可用。不排队的提交会以 `permission_denied`（`this account may not use resource pool '<pool>': the pool is restricted`）失败；设置 `allow_queue: true` 的提交，或恢复该资源池中的 experiment 或 generic 任务，在 master 拒绝时也会以 `permission_denied` 失败；其消息和 `details.resource_pool` 会给出该资源池。请与用户一起选择其他资源池，或请管理员授予权限。
 
 <a id="submission-outcome-is-uncertain"></a>
 ## 提交结果不确定
