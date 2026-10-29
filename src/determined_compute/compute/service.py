@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from determined_compute.core.api_client import DeterminedAPIClient
 
+from .gpu_groups import describe_gpu_groups, normalize_gpu_groups
 from .models import (
     APIError,
     ConflictError,
@@ -40,6 +41,7 @@ _REQUEST_FIELDS = {
     "slots",
     "pool",
     "prefer_gpu_topology",
+    "gpu_groups",
     "image",
     "code_revision",
     "experiment_config",
@@ -337,6 +339,10 @@ class ComputeService:
         # The fork treats a preference as off below 2 slots, so it is sent only from 2 slots up,
         # and false is never sent.
         topology = preference if isinstance(preference, str) and slots >= 2 else None
+        try:
+            gpu_groups = normalize_gpu_groups(request.get("gpu_groups"), slots)
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
         _required_text(image, "image")
         code_revision = request.get("code_revision")
         if code_revision is not None and not isinstance(code_revision, str):
@@ -380,6 +386,7 @@ class ComputeService:
                 slots,
                 pool,
                 topology,
+                gpu_groups,
                 image,
                 code_revision,
             )
@@ -394,6 +401,7 @@ class ComputeService:
                 slots,
                 pool,
                 topology,
+                gpu_groups,
                 image,
                 code_revision,
             )
@@ -467,6 +475,21 @@ class ComputeService:
                     ),
                 }
             )
+        if gpu_groups is not None:
+            advisories.append(
+                {
+                    "code": "gpu_groups",
+                    "message": (
+                        f"gpu_groups {describe_gpu_groups(gpu_groups)}: needs the "
+                        "research-cluster fork 0.42.2 or later. The task runs on one agent and "
+                        "starts only when that agent has free GPUs for every group at once. "
+                        "Without allow_queue it launches only if one agent has them free now. "
+                        "The container gets DET_GPU_GROUPS, JSON mapping each group to its GPU "
+                        "UUIDs, which replaces a DET_GPU_GROUPS the task sets itself; start "
+                        "each process with CUDA_VISIBLE_DEVICES set to its group's UUIDs."
+                    ),
+                }
+            )
         if kind == "shell" and self.profile.shell_inactivity_seconds is not None:
             advisories.append(
                 {
@@ -532,6 +555,7 @@ class ComputeService:
         slots: int,
         pool: str,
         topology: Optional[str],
+        gpu_groups: Optional[List[Dict[str, Any]]],
         image: str,
         code_revision: Optional[str],
     ) -> Dict[str, Any]:
@@ -547,6 +571,8 @@ class ComputeService:
         }
         if topology is not None:
             resources["prefer_gpu_topology"] = topology
+        if gpu_groups is not None:
+            resources["gpu_groups"] = copy.deepcopy(gpu_groups)
         return {
             "resources": resources,
             "environment": {
@@ -567,11 +593,12 @@ class ComputeService:
         slots: int,
         pool: str,
         topology: Optional[str],
+        gpu_groups: Optional[List[Dict[str, Any]]],
         image: str,
         code_revision: Optional[str],
     ) -> Dict[str, Any]:
         config = self._base_config(
-            kind, workdir, output_dir, slots, pool, topology, image, code_revision
+            kind, workdir, output_dir, slots, pool, topology, gpu_groups, image, code_revision
         )
         if kind == "generic":
             # Generic tasks have native display fields; masters without them are
@@ -609,6 +636,7 @@ class ComputeService:
         slots: int,
         pool: str,
         topology: Optional[str],
+        gpu_groups: Optional[List[Dict[str, Any]]],
         image: str,
         code_revision: Optional[str],
     ) -> Dict[str, Any]:
@@ -650,10 +678,14 @@ class ComputeService:
             raise ValidationError("experiment_config.resources must be an object")
         if "prefer_gpu_topology" in resources:
             raise ValidationError("set prefer_gpu_topology at the top level")
+        if "gpu_groups" in resources:
+            raise ValidationError("set gpu_groups at the top level")
         resources = copy.deepcopy(dict(resources))
         resources.update({"slots_per_trial": slots, "resource_pool": pool})
         if topology is not None:
             resources["prefer_gpu_topology"] = topology
+        if gpu_groups is not None:
+            resources["gpu_groups"] = copy.deepcopy(gpu_groups)
         config["resources"] = resources
 
         environment = config.get("environment", {})

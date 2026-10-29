@@ -77,6 +77,8 @@ MCP 不接受 `kind: notebook`。
 
 对于多 GPU 数据并行任务，`prefer_gpu_topology` 可取 `"strong"`（全部 GPU 在同一 agent 的同一 NUMA 节点上；等待到有这样的节点空闲）或 `"soft"`（不会为等待更好的 GPU 拓扑而额外排队；GPU 可能跨 NUMA 节点）；不设置表示没有偏好。用户明确提出拓扑要求时照做；否则保持默认，即没有偏好。向 `compute_resources(slots=N, pool=P, prefer_gpu_topology=...)` 和 `compute_launch` 传入同一个值。只有当拓扑决定任务能否运行且用户意图不明确时，才询问用户。`max_numa_node_free_slots` 是当前能放下的最大 `"strong"` 任务，`max_numa_node_slots` 是 master 接受的最大值。N 更大且用户要求 `"strong"` 时，向用户报告拒绝信息给出的选项（更少 GPU、其他资源池，或在某个 agent 有 N 个 slot 时改用 `"soft"`）；否则改用其他资源池或 `"soft"`。`"strong"` experiment 的每个 trial 分别需要同一 NUMA 节点上的 N 个空闲 GPU；多个 trial 可以共用一个节点。以资源池的默认优先级提交 `"strong"` 任务：未开启抢占时，一个等待中的任务会挡住所有需要 slot 的低优先级任务。
 
+一个任务需要同一 agent 上不同型号的 GPU 时，例如一张 RTX 用于仿真、一张计算卡用于学习，在请求中设置 `gpu_groups`：若干命名的组，每组有 `count` 和取自资源池 `gpu_models` 的精确型号 `models`，各组数量之和等于 `slots`。向 `compute_resources` 传入同样的 `gpu_groups`；`per_agent_free_gpus_by_model` 显示每个 agent 上各型号的空闲 GPU。某个 agent 有满足每个组的空闲 GPU 时，任务就在该 agent 上运行。容器中的 `DET_GPU_GROUPS` 把每个组映射到其 GPU UUID，例如 `{"learner":["GPU-…"],"simulation":["GPU-…"]}`；由于 CUDA 的设备序号不一定与组对应，启动每个进程时，把 `CUDA_VISIBLE_DEVICES` 设为其组的 UUID，以逗号分隔。
+
 任务可以等待容量时，例如批量或过夜运行，或用户接受等待时，设置 `allow_queue: true`；排队中的任务可用 `compute_status` 跟踪，也可以取消。需要尽快得到结果时保持 `allow_queue: false`。保留用户或项目已固定的资源池或槽位数；改变槽位数会改变任务本身，因此改动前先询问。资源池未固定时，选择一个合适且可用的资源池，首选资源池已满或对你不可用时也是如此，并说明使用了哪个资源池；指明某个资源池的 `permission_denied` 错误表示当前账户无权使用该资源池。以 `capacity_unknown` 或 `capacity_unavailable` 被拒绝的提交没有提交任何任务：排队、换用其他资源池或报告该结果，而不是循环提交同一请求。在 research-cluster fork 0.41.1 或更高版本上，排队中的任务在 master 重启后仍保持排队。
 
 <a id="plan-and-launch-once"></a>

@@ -1415,7 +1415,7 @@ def test_the_pool_facts_do_not_change_the_verdict():
         )
         if isinstance(first, dict):
             for item in (first, second):
-                for key in ("description", "gpu_models"):
+                for key in ("description", "gpu_models", "per_agent_free_gpus_by_model"):
                     item["selected_pool"].pop(key)
                     for entry in item["pools"]:
                         entry.pop(key, None)

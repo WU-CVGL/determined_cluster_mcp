@@ -83,6 +83,7 @@ does not enforce an idle timeout.
 | `output_dir` | absolute container path | Output directory under a writable configured mount |
 | `slots` | non-negative integer | Requested slots; defaults to the profile value |
 | `prefer_gpu_topology` | `"soft"`, `"strong"`, `false`, or null | GPU placement for 2 or more slots; requires the research-cluster fork 0.42.0 or later. `"strong"` takes all GPUs from one NUMA node of one agent and waits until one has them free; `"soft"` does not queue extra to wait for a better GPU topology, never guarantees one NUMA node, and prefers the best-connected free GPUs of the chosen agent. Sent only with 2 or more slots and `"soft"` or `"strong"`. An experiment sets it here, not in `experiment_config.resources` |
+| `gpu_groups` | list or null | Named groups of GPUs of exact models on one agent, each `{name, count, models}`; requires the research-cluster fork 0.42.2 or later. `name` matches `^[a-z][a-z0-9_-]{0,31}$` and is unique, `count` is at least 1, and `models` lists distinct model names exactly as `nvidia-smi` prints them, as in each pool's `gpu_models`. The counts must add up to `slots`. The container gets `DET_GPU_GROUPS`, JSON mapping each group name to its GPU UUIDs. An experiment sets it here, not in `experiment_config.resources` |
 | `pool`, `image` | string | Optional overrides of profile defaults |
 | `code_revision` | string or null | Caller-provided revision or content identifier |
 | `experiment_config` | object | Extra experiment configuration; requires experiment mode |
@@ -269,7 +270,7 @@ positive integer for an experiment, which can also be passed as a numeric string
 | `compute_list` | `kind`, optional `limit=50`, `offset=0`, `marker`, `states` | One page of the account's tasks, newest first; with `states`, only experiments or generic tasks in those states; with `marker`, the tasks on that page whose config carries it |
 | `compute_shell_connect` | `id`, optional `local_port`, `wait_seconds=0` (up to 600) | Opens or returns a local SSH tunnel to one of the account's running shells; see [shell access](#shell-access) |
 | `compute_shell_disconnect` | `id` | Closes that tunnel and deletes the shell's key file; the shell keeps running. Returns `disconnected` and, when it was, `files`: `removed`, or `kept` when the directory may now belong to another server |
-| `compute_resources` | optional `slots=1`, `pool`, `prefer_gpu_topology` | Current scheduler capacity and candidate pools. With `"strong"` and 2 or more slots, each pool adds `max_numa_node_free_slots` (largest `"strong"` task that fits now) and `max_numa_node_slots` (largest the master accepts with the current agents). Each pool also has `description` and `gpu_models` |
+| `compute_resources` | optional `slots=1`, `pool`, `prefer_gpu_topology`, `gpu_groups` | Current scheduler capacity and candidate pools. With `"strong"` and 2 or more slots, each pool adds `max_numa_node_free_slots` (largest `"strong"` task that fits now) and `max_numa_node_slots` (largest the master accepts with the current agents). With `gpu_groups`, whose counts must add up to `slots`, a pool is available when one agent has free GPUs for every group. Each pool also has `description`, `gpu_models` and `per_agent_free_gpus_by_model` |
 | `storage_check` | `path` | Access information for a mapped container path |
 | `storage_sync` | `local_dir`, `shared_dir`, optional `dry_run=true` | Preview or copy local directory contents to shared storage |
 | `storage_fetch` | `shared_dir`, `local_dir`, optional `dry_run=true` | Preview or copy shared directory contents locally |
@@ -292,8 +293,11 @@ duplicates, the device brand Determined reports for each GPU slot of the pool's 
 GPU product name on CUDA; on ROCm, Determined reports the card vendor, which does not tell
 card classes apart), busy, disabled, or draining slots included. It is `[]` when the pool's
 connected agents have no GPU slot, and `null` when the pool has no agents, the agent list
-does not match the pool, or a slot's device or GPU brand is unreadable. Neither fact changes
-admission.
+does not match the pool, or a slot's device or GPU brand is unreadable.
+`per_agent_free_gpus_by_model` maps each of the pool's agents to its free GPUs by model, for
+example `{"node": {"NVIDIA CMP 170HX": 3, "NVIDIA GeForce RTX 5060 Ti": 2}}`, counting free
+slots as admission does; it is `null` when the agent list does not match the pool or a GPU's
+model is unreadable. None of these facts changes admission.
 
 Admission counts slots as the pool does: a drained or disabled slot, and every slot of a
 disabled agent, is not capacity, and a draining slot or agent counts only the slots that
@@ -318,6 +322,23 @@ With 0 or 1 slot the preference has no effect: it is not sent, and the
 plan carries the advisory `gpu_topology_ignored`. Admission does not see waiting tasks: a
 higher-priority task waiting for a NUMA node can keep an admitted lower-priority task
 queued.
+
+With `gpu_groups`, every kind, an experiment included, needs one schedulable agent whose free
+GPUs serve every group at once, each GPU in one group, matched by exact model as the master
+matches them; with `"strong"`, these GPUs must also be on one NUMA node of that agent. The
+pool's `capacity_kind` is `gpu_groups_single_agent`, or `gpu_groups_one_numa_node` with
+`"strong"`, and `available_capacity` is the number of agents that hold the groups now. A
+request that waits fails with retryable `capacity_unavailable` (`no schedulable agent in pool
+'<pool>' has free GPUs for gpu_groups <groups> now; the task would wait`). One that the master
+refuses at submit fails with `retryable: false` and the master's message, `no agent in pool
+<pool> has GPUs for gpu_groups <groups>`: no agent of the pool could hold the groups even with
+all its GPUs free, disabled and draining ones included (on one NUMA node with `"strong"`), or
+the pool is static and every agent has fewer slots than the task, or the pool's instances have
+fewer slots than the task (its `slotsPerAgent`, even when it has no agents). A provisioned pool
+without agents whose instances have the slots waits, and so does an agent that has not reported
+its GPU topology under `"strong"`. Capacity is unknown when a GPU's model is unreadable. `<groups>` is written as
+`simulation: 1 × NVIDIA GeForce RTX 5060 Ti; learner: 1 × NVIDIA CMP 170HX`. The plan carries
+the advisory `gpu_groups`.
 
 `compute_launch` checks capacity unless `allow_queue` is true, then submits
 the request once. A pool missing from the account's pool list fails that check with

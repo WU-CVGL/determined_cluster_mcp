@@ -532,8 +532,8 @@ class _FakeInspector:
     def __init__(self):
         self.calls = []
 
-    def resources(self, slots, pool, prefer_gpu_topology):
-        self.calls.append((slots, pool, prefer_gpu_topology))
+    def resources(self, slots, pool, prefer_gpu_topology, gpu_groups=None):
+        self.calls.append((slots, pool, prefer_gpu_topology, gpu_groups))
         return {"requested_slots": slots, "prefer_gpu_topology": prefer_gpu_topology}
 
 
@@ -570,8 +570,31 @@ def test_compute_resources_takes_the_requests_gpu_topology_values():
     default = asyncio.run(asyncio.wait_for(exercise(), timeout=10))
     assert default.is_error is False
     assert inspector.calls == [
-        (2, None, None), (4, None, "soft"), (4, None, "strong"), (4, None, False), (4, None, None),
+        (2, None, None, None), (4, None, "soft", None), (4, None, "strong", None),
+        (4, None, False, None), (4, None, None, None),
     ]
+
+
+def test_compute_resources_passes_the_requests_gpu_groups():
+    inspector = _FakeInspector()
+    groups = [
+        {"name": "simulation", "count": 1, "models": ["NVIDIA GeForce RTX 5060 Ti"]},
+        {"name": "learner", "count": 1, "models": ["NVIDIA CMP 170HX"]},
+    ]
+
+    async def exercise():
+        server = create_server(FakeService(), resource_inspector=inspector)
+        async with Client(server) as client:
+            tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+            assert "gpu_groups" in tools["compute_resources"].input_schema["properties"]
+            assert "gpu_groups" in tools["compute_plan"].description
+            return await client.call_tool(
+                "compute_resources", {"slots": 2, "pool": "gpu", "gpu_groups": groups}
+            )
+
+    result = asyncio.run(asyncio.wait_for(exercise(), timeout=10))
+    assert result.is_error is False
+    assert inspector.calls == [(2, "gpu", None, groups)]
 
 
 def test_shell_access_closes_only_when_the_last_session_ends():

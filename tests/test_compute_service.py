@@ -1112,3 +1112,70 @@ def test_an_admitted_launch_checks_the_config_it_sends(profile, command_request)
     assert kind == "experiment"
     assert admitted_config["resources"]["prefer_gpu_topology"] == "soft"
     assert client.launches[0][1]["resources"]["prefer_gpu_topology"] == "soft"
+
+
+_GROUPS = [
+    {"name": "simulation", "count": 1, "models": ["NVIDIA GeForce RTX 5060 Ti"]},
+    {"name": "learner", "count": 1, "models": ["NVIDIA CMP 170HX"]},
+]
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_gpu_groups_go_into_the_resources_of_every_kind(profile, command_request, kind):
+    plan = ComputeService(FakeClient(), profile).plan(
+        topology_request(command_request, kind, 2, gpu_groups=_GROUPS)
+    )
+
+    slot_key = "slots_per_trial" if kind == "experiment" else "slots"
+    assert _resources_of(plan) == {slot_key: 2, "resource_pool": "gpu", "gpu_groups": _GROUPS}
+    assert "gpu_groups" in _codes(plan)
+    advisory = next(item for item in plan["advisories"] if item["code"] == "gpu_groups")
+    assert "DET_GPU_GROUPS" in advisory["message"]
+    assert "simulation: 1 × NVIDIA GeForce RTX 5060 Ti" in advisory["message"]
+
+
+def test_a_generic_task_sends_gpu_groups_in_its_config_text(profile, command_request):
+    from determined_compute.core.api_client import _config_text
+
+    plan = ComputeService(FakeClient(), profile).plan(
+        topology_request(command_request, "generic", 2, gpu_groups=_GROUPS)
+    )
+
+    assert json.loads(_config_text(plan["config"]))["resources"]["gpu_groups"] == _GROUPS
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+def test_gpu_groups_whose_counts_differ_from_slots_are_refused(profile, command_request, kind):
+    with pytest.raises(ValidationError) as caught:
+        ComputeService(FakeClient(), profile).plan(
+            topology_request(command_request, kind, 3, gpu_groups=_GROUPS)
+        )
+    assert caught.value.code == "invalid_request"
+    assert str(caught.value) == "gpu_groups counts must add up to slots (3)"
+
+
+def test_gpu_groups_inside_experiment_config_resources_are_refused(profile, command_request):
+    request = topology_request(
+        command_request, "experiment", 2,
+        experiment_config={"resources": {"gpu_groups": _GROUPS}},
+    )
+    with pytest.raises(ValidationError) as caught:
+        ComputeService(FakeClient(), profile).plan(request)
+    assert str(caught.value) == "set gpu_groups at the top level"
+
+
+def test_without_gpu_groups_nothing_is_sent(profile, command_request):
+    plan = ComputeService(FakeClient(), profile).plan(
+        topology_request(command_request, "command", 2, gpu_groups=None)
+    )
+    assert "gpu_groups" not in _resources_of(plan)
+    assert "gpu_groups" not in _codes(plan)
+
+
+def test_a_launch_with_gpu_groups_passes_them_to_admission(profile, command_request):
+    inspector = ToggleInspector()
+    service = ComputeService(FakeClient(), profile, inspector=inspector)
+
+    service.launch(topology_request(command_request, "command", 2, gpu_groups=_GROUPS))
+
+    assert inspector.calls[0][1]["resources"]["gpu_groups"] == _GROUPS
