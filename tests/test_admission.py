@@ -1420,3 +1420,99 @@ def test_the_pool_facts_do_not_change_the_verdict():
                     for entry in item["pools"]:
                         entry.pop(key, None)
         assert first == second
+
+
+# Requests no agent can ever hold (ValidateResources) and pools the account may not use.
+
+
+def oversized(kind, slots, **resources):
+    return experiment_config(slots, **resources) if kind == "experiment" else command_config(
+        slots=slots, **resources
+    )
+
+
+@pytest.mark.parametrize("kind", ["command", "shell"])
+def test_a_single_agent_task_larger_than_every_agent_is_refused_as_the_master_does(kind):
+    target = ResourceInspector(Client([pool(total=4, agents=2)], [agent("a", slots=2),
+                                                                  agent("b", slots=2)]))
+    error = refused(target, oversized(kind, 3), kind)
+
+    assert error.code == "capacity_unavailable" and error.retryable is False
+    assert str(error) == no_agent_holds(3)
+
+
+def test_a_single_node_experiment_larger_than_every_agent_is_refused():
+    target = ResourceInspector(Client([pool(total=4, agents=2)], [agent("a", slots=2),
+                                                                  agent("b", slots=2)]))
+    error = refused(target, oversized("experiment", 3, is_single_node=True), "experiment")
+
+    assert error.retryable is False and str(error) == no_agent_holds(3)
+
+
+@pytest.mark.parametrize("kind", ["generic", "experiment"])
+def test_a_task_that_may_span_agents_is_not_refused_for_its_size(kind):
+    # The master only warns about these (CurrentSlotsExceeded); they queue.
+    target = ResourceInspector(Client([pool(total=4, agents=2)], [agent("a", slots=2),
+                                                                  agent("b", slots=2)]))
+    error = refused(target, oversized(kind, 3), kind)
+
+    if kind == "generic":
+        assert error.code == "capacity_unavailable" and error.retryable is True
+    else:
+        assert error.code == "capacity_unknown"
+    assert "has 3 slots; request fewer slots" not in str(error)
+
+
+@pytest.mark.parametrize(("per_instance", "retryable"), [(2, False), (4, True)])
+def test_a_provisioned_pool_is_judged_by_its_slots_per_instance(per_instance, retryable):
+    empty = {
+        **pool(total=0, agents=0, type="RESOURCE_POOL_TYPE_AWS"), "slotsPerAgent": per_instance
+    }
+    error = refused(ResourceInspector(Client([empty], [])), command_config(slots=4))
+
+    assert error.code == "capacity_unavailable" and error.retryable is retryable
+    if not retryable:
+        assert str(error) == no_agent_holds(4)
+
+
+@pytest.mark.parametrize(("per_instance", "retryable"), [(2, False), (4, True)])
+def test_strong_in_a_provisioned_pool_is_judged_by_its_slots_per_instance(per_instance, retryable):
+    empty = {
+        **pool(total=0, agents=0, type="RESOURCE_POOL_TYPE_AWS"), "slotsPerAgent": per_instance
+    }
+    error = refused(ResourceInspector(Client([empty], [])), strong_config(4))
+
+    assert error.retryable is retryable
+    if not retryable:
+        assert str(error) == no_node_holds(4)
+
+
+@pytest.mark.parametrize("kind", ["command", "shell", "generic", "experiment"])
+def test_a_pool_the_account_may_not_use_is_refused_with_permission_denied(kind):
+    restricted = {**pool(), "usable": False}
+    target = ResourceInspector(Client([restricted], [agent()]))
+    error = refused(target, oversized(kind, 1), kind)
+
+    assert error.code == "permission_denied" and error.retryable is False
+    assert error.details["resource_pool"] == "gpu"
+    assert str(error) == "this account may not use resource pool 'gpu': the pool is restricted"
+
+
+def test_a_pool_the_account_may_not_use_is_no_candidate():
+    pools = [{**pool(), "usable": False}, pool("open")]
+    agents = [agent(), agent("b", pool_name="open")]
+    report = ResourceInspector(Client(pools, agents)).resources(1)
+    by_name = {item["resource_pool"]: item for item in report["pools"]}
+
+    assert by_name["gpu"]["usable"] is False and by_name["gpu"]["available"] is False
+    assert by_name["gpu"]["explanation"] == (
+        "this account may not use resource pool gpu: the pool is restricted"
+    )
+    assert by_name["open"]["usable"] is True
+    assert report["candidate_pools"] == ["open"]
+
+
+def test_a_pool_without_the_usable_field_is_usable():
+    assert ResourceInspector(Client([pool()], [agent()])).resources(1, "gpu")["selected_pool"][
+        "usable"
+    ] is True

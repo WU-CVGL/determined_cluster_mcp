@@ -240,6 +240,26 @@ def _free_gpus_by_model(
     return result
 
 
+def _fulfillable(
+    raw: Mapping[str, Any],
+    members: List[Tuple[str, Mapping[str, Any], List[Mapping[str, Any]]]],
+    *,
+    complete: bool,
+    slots: int,
+) -> Optional[bool]:
+    """Whether one agent of the pool can ever have the slots, as the master decides at submit
+    (ValidateResources): from a positive slots per instance (slotsPerAgent) alone, even without
+    agents; otherwise, for a static pool whose agent list matches it, from its largest agent,
+    every slot counted. None when this cannot be told."""
+
+    per_instance = _nonnegative_int(raw.get("slotsPerAgent"))
+    if per_instance:
+        return per_instance >= slots
+    if complete and raw.get("type") == _STATIC_POOL:
+        return max((len(entries) for _id, _agent, entries in members), default=0) >= slots
+    return None
+
+
 def _no_agent_has_gpus_for(pool: str, groups: List[Mapping[str, Any]]) -> str:
     """The master's refusal of gpu_groups that no agent of the pool can hold
     (errGPUGroupsNoAgent)."""
@@ -278,6 +298,7 @@ class ResourceInspector:
         pool: Optional[str],
         preference: Any,
         groups: Optional[List[Mapping[str, Any]]] = None,
+        single_node: bool = True,
     ) -> Tuple[Dict[str, Any], Dict[str, str]]:
         """Return the report and, by pool, why the master refuses the request."""
 
@@ -306,7 +327,8 @@ class ResourceInspector:
         for item in pools:
             if isinstance(item, Mapping) and isinstance(item.get("name"), str):
                 assessment, refusal = self._assess_pool(
-                    item, agents, slots=slots, strong=strong, groups=groups
+                    item, agents, slots=slots, strong=strong, groups=groups,
+                    single_node=single_node,
                 )
                 assessments.append(assessment)
                 if refusal is not None:
@@ -349,7 +371,7 @@ class ResourceInspector:
             "requested_pool": pool,
             "prefer_gpu_topology": preference,
             "gpu_groups": groups,
-            "single_node": True,
+            "single_node": single_node,
             "available": available,
             "selected_pool": selected,
             "pools": assessments,
@@ -378,8 +400,15 @@ class ResourceInspector:
         slots: int,
         strong: bool = False,
         groups: Optional[List[Mapping[str, Any]]] = None,
+        single_node: bool = True,
     ) -> Tuple[Dict[str, Any], Optional[str]]:
-        """Assess one pool; also return why the master refuses the request, if it does."""
+        """Assess one pool; also return why the master refuses the request, if it does.
+
+        ``single_node`` says the request uses one agent, as commands and shells always do and
+        experiments and generic tasks do with is_single_node: true; the master then refuses it
+        at submit when no agent of the pool can ever have the slots. "strong" and gpu_groups
+        always use one agent.
+        """
 
         name = str(raw["name"])
         total = _nonnegative_int(raw.get("slotsAvailable"))
@@ -430,12 +459,12 @@ class ResourceInspector:
                     f"used slots ({used}) differ from slots holding containers ({holding}); "
                     "a task may be starting or stopping"
                 )
+            fulfillable = _fulfillable(raw, members, complete=complete, slots=slots)
             if groups is not None:
                 capacity_kind = "gpu_groups_one_numa_node" if strong else "gpu_groups_single_agent"
                 available, available_capacity, explanation, refusal = self._assess_groups(
                     name,
-                    static=raw.get("type") == _STATIC_POOL,
-                    slots_per_agent=_nonnegative_int(raw.get("slotsPerAgent")),
+                    fulfillable=fulfillable,
                     members=members,
                     groups=groups,
                     slots=slots,
@@ -448,13 +477,19 @@ class ResourceInspector:
                 capacity_kind = "slots_one_numa_node"
                 available, available_capacity, explanation, refusal, numa = self._assess_strong(
                     name,
-                    static=raw.get("type") == _STATIC_POOL,
+                    fulfillable=fulfillable,
+                    per_instance=bool(_nonnegative_int(raw.get("slotsPerAgent"))),
                     members=members,
                     slots=slots,
                     complete=complete,
                     known=known,
                     problem=problem or _STATISTICS_MISSING,
                 )
+            elif single_node and fulfillable is False:
+                refusal = _no_agent_holds(name, slots)
+                available = False
+                available_capacity = max(per_agent.values(), default=0) if complete else None
+                explanation = refusal
             elif known:
                 available_capacity = max(per_agent.values(), default=0)
                 available = available_capacity >= slots
@@ -467,8 +502,15 @@ class ResourceInspector:
                 available = None
                 explanation = problem or _STATISTICS_MISSING
 
+        # Since fork 0.42.1 the pool list also holds pools the account may not use, with usable
+        # false; older masters leave them out. Such a pool is never capacity for this account.
+        usable = raw.get("usable") is not False
+        if not usable:
+            available = False
+            explanation = f"this account may not use resource pool {name}: the pool is restricted"
         return {
             "resource_pool": name,
+            "usable": usable,
             "description": _pool_description(raw.get("description")),
             # Read from the agents only when they match the pool, so a partial list never
             # passes for the pool's models, and unknown for a pool without agents, whose
@@ -507,7 +549,8 @@ class ResourceInspector:
     def _assess_strong(
         name: str,
         *,
-        static: bool,
+        fulfillable: Optional[bool],
+        per_instance: bool = False,
         members: List[Tuple[str, Mapping[str, Any], List[Mapping[str, Any]]]],
         slots: int,
         complete: bool,
@@ -523,12 +566,16 @@ class ResourceInspector:
 
         refusal: Optional[str] = None
         largest = max((len(entries) for _id, _agent, entries in members), default=0)
-        if complete and static and largest < slots:
-            # The master refuses a request larger than every agent of a static pool at submit,
-            # from slot counts alone (ValidateResources), whatever the topology or the slots in
-            # use. A provisioned pool checks its instance size instead, which is not read here.
-            # A static pool without agents gets the master's "no NUMA nodes" reason.
-            refusal = _no_agent_holds(name, slots) if members else _no_numa_nodes(name)
+        if fulfillable is False:
+            # The master refuses a request that no agent of the pool can ever hold at submit,
+            # from slot counts alone (ValidateResources, see _fulfillable), whatever the
+            # topology or the slots in use. A pool whose instances are too small gets the
+            # master's "no NUMA node holds" reason, and a static pool without agents its
+            # "no NUMA nodes" reason.
+            if per_instance:
+                refusal = _no_numa_node_holds(name, slots)
+            else:
+                refusal = _no_agent_holds(name, slots) if members else _no_numa_nodes(name)
 
         layouts = [
             (agent_id, *_numa_layout(agent, entries)) for agent_id, agent, entries in members
@@ -600,8 +647,7 @@ class ResourceInspector:
     def _assess_groups(
         name: str,
         *,
-        static: bool,
-        slots_per_agent: Optional[int] = None,
+        fulfillable: Optional[bool],
         members: List[Tuple[str, Mapping[str, Any], List[Mapping[str, Any]]]],
         groups: List[Mapping[str, Any]],
         slots: int,
@@ -615,9 +661,7 @@ class ResourceInspector:
 
         Returns the verdict, the number of agents whose free GPUs hold the groups now, the
         explanation, and why the master refuses the request (or None). The master refuses a
-        provisioned pool whose instances have fewer slots than the task (slotsPerAgent, the
-        master's slotsPerInstance, even without agents), a static pool whose agents all have
-        fewer slots than the task, and a pool none of whose
+        pool that no agent can ever give the task's slots (_fulfillable), and a pool none of whose
         agents could hold the groups with every slot free, disabled and draining slots included,
         on one NUMA node under "strong" (gpuGroupsCannotFit). A pool without agents waits, and so
         does an agent that has not reported its GPU topology.
@@ -626,13 +670,7 @@ class ResourceInspector:
         described = describe_gpu_groups(groups)
         on_node = " on one NUMA node" if strong else ""
         refusal: Optional[str] = None
-        largest = max((len(entries) for _id, _agent, entries in members), default=0)
-        if slots_per_agent:
-            # A positive slots per instance decides alone (ValidateResources): more instances
-            # cannot help a task that needs one agent.
-            if slots_per_agent < slots:
-                refusal = _no_agent_has_gpus_for(name, groups)
-        elif complete and static and largest < slots:
+        if fulfillable is False:
             refusal = _no_agent_has_gpus_for(name, groups)
         if refusal is not None:
             return False, None, refusal, refusal
@@ -809,12 +847,23 @@ class ResourceInspector:
             and not strong
             and groups is None
         )
+        # Commands and shells always use one agent (the master validates them as single-node);
+        # experiments and generic tasks only with is_single_node: true.
+        single_node = kind in {"command", "shell"} or is_single_node is True
         report, refusals = self._resources(
-            slots=slots, pool=pool, preference=preference, groups=groups
+            slots=slots, pool=pool, preference=preference, groups=groups,
+            single_node=single_node or strong or groups is not None,
         )
         selected = report["selected_pool"]
         if selected is not None and selected["available"] is True:
             return {**report, "admitted": True}
+        if selected is not None and selected["usable"] is False:
+            raise APIError(
+                f"this account may not use resource pool {pool!r}: the pool is restricted",
+                code="permission_denied",
+                details={"resource_pool": pool, "requested_slots": slots},
+                retryable=False,
+            )
 
         available = selected["available_capacity"] if selected is not None else None
         code = "capacity_unknown"

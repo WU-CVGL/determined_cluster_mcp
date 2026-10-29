@@ -116,12 +116,12 @@ Requests 从 MCP 进程环境读取 `HTTPS_PROXY`、`HTTP_PROXY` 和 `NO_PROXY` 
 
 管理员动态创建的资源池只有在进入 Ready 状态后才会出现在 `compute_resources` 中。处于 Pending 或 Failed 状态的资源池不会出现：结果会说明该资源池不存在或对你不可用，且可用性未知，不排队的提交会以 `capacity_unknown` 被拒绝。本 MCP 不提供动态资源池管理 API，请向管理员确认该资源池的状态。
 
-在 research-cluster fork 0.42.0 或更高版本上，管理员可以把资源池限定给部分账户使用，资源池列表会省略当前账户无权使用的资源池，因此 `compute_resources` 和不排队的提交会以同样方式报告它。设置 `allow_queue: true` 的提交，或恢复该资源池中的 experiment 或 generic 任务，会以 `permission_denied` 失败；其消息和 `details.resource_pool` 会给出该资源池。请与用户一起选择其他资源池，或请管理员授予权限。
+管理员可以把资源池限定给部分账户使用。资源池列表会列出当前账户无权使用的资源池并将 `usable` 设为 false，`compute_resources` 报告它不可用。不排队的提交会以 `permission_denied`（`this account may not use resource pool '<pool>': the pool is restricted`）失败；设置 `allow_queue: true` 的提交，或恢复该资源池中的 experiment 或 generic 任务，在 master 拒绝时也会以 `permission_denied` 失败；其消息和 `details.resource_pool` 会给出该资源池。请与用户一起选择其他资源池，或请管理员授予权限。
 
 <a id="submission-outcome-is-uncertain"></a>
 ## 提交结果不确定
 
-提交请求发出后连接中断或超时、返回 HTTP 5xx、返回重定向（HTTP 3xx，任何变更请求都不会跟随），或响应中没有任务 ID，都可能表示 Determined 已经创建了任务，只是客户端没有收到 ID。此时 `compute_launch` 返回 `submission_uncertain`，错误 details 中包含 `kind` 和 `submission_marker`，且不会重试。在任何连接建立之前发生的失败（例如连接被拒绝或域名解析失败）则是可重试的 `transport_error`：请求没有发出。research-cluster fork 0.42.0 或更高版本无法检查当前账户能否使用所请求的资源池时，会以 HTTP 503 `could not check access to resource pool "<pool>": ...; try again` 应答，服务同样将其报告为 `submission_uncertain`。
+提交请求发出后连接中断或超时、返回 HTTP 5xx、返回重定向（HTTP 3xx，任何变更请求都不会跟随），或响应中没有任务 ID，都可能表示 Determined 已经创建了任务，只是客户端没有收到 ID。此时 `compute_launch` 返回 `submission_uncertain`，错误 details 中包含 `kind` 和 `submission_marker`，且不会重试。在任何连接建立之前发生的失败（例如连接被拒绝或域名解析失败）则是可重试的 `transport_error`：请求没有发出。master 无法检查当前账户能否使用所请求的资源池时，会以 HTTP 503 `could not check access to resource pool "<pool>": ...; try again` 应答，服务同样将其报告为 `submission_uncertain`。
 
 发生故障或收到 5xx 之后，在你自己的回合中用 `compute_resources` 检查 master 是否应答；不要启动在 shell 中监视 master 的脚本。
 
@@ -139,7 +139,7 @@ Experiment 在 trial 启动前可能没有 trial 日志。Shell 仍然可用时�
 <a id="usage-measurements-are-unavailable-or-empty"></a>
 ## 用量测量不可用或为空
 
-`compute_usage` 依赖 master 的任务资源 API。`task_resources_disabled` 表示 master 具备该 API，但管理员尚未启用 `integrations.task_resources`。`task_resources_unsupported` 表示 master 缺少该 API，需要 research-cluster fork 0.40.1 或更高版本的 Determined master。两者都不可重试，应联系管理员。无法取得测量值不能作为任务空闲的证据。
+`compute_usage` 依赖 master 的任务资源 API。`task_resources_disabled` 表示 master 具备该 API，但管理员尚未启用 `integrations.task_resources`。`task_resources_unsupported` 表示 master 缺少该 API。两者都不可重试，应联系管理员。无法取得测量值不能作为任务空闲的证据。
 
 HTTP 503 表示测量后端繁忙或不可用；每个 master 同时最多运行四个资源查询，因此应稍后重试。HTTP 400 可能表示时钟偏差：master 会拒绝比其自身时钟超前 60 秒以上的窗口终点，应校正运行 MCP 服务的机器的时钟。HTTP 404 表示 Determined task 或指定的 trial ID 不存在，或当前账户无权访问。Determined 只在已结束的 command 或 shell 结束后 24 小时内提供它，master 重启后也不再提供；此后无法验证其所有者，因此其用量、状态和日志都返回 HTTP 404，重试也无济于事。
 
@@ -154,7 +154,7 @@ HTTP 503 表示测量后端繁忙或不可用；每个 master 同时最多运行
 
 MCP 只操作已认证账户拥有的任务。`ownership_mismatch` 表示任务属于其他账户；即使凭据属于管理员，服务也会在读取任务后、发出任何后续请求之前拒绝。应使用拥有该任务的账户凭据，或请管理员直接通过 Determined 操作。`ownership_unavailable` 表示 master 没有报告 generic 任务的所有者，因为它缺少 research-cluster fork 的 generic 任务列表（WU-CVGL/determined#27）；请管理员升级 master。在这样的 master 上，提交或列出 generic 任务会以 `unsupported` 失败；提交会在创建任何内容之前检查这一点。
 
-Determined 本身也会执行权限检查。在使用 basic authorization 的 fork 0.40.1 或更高版本上，只有任务所有者或管理员可以终止、取消、暂停或恢复任务；其他账户会收到 `permission_denied`（HTTP 403），experiment 则返回 HTTP 404 `experiment '<id>' not found`。
+Determined 本身也会执行权限检查。在使用 basic authorization 时，只有任务所有者或管理员可以终止、取消、暂停或恢复任务；其他账户会收到 `permission_denied`（HTTP 403），experiment 则返回 HTTP 404 `experiment '<id>' not found`。
 
 <a id="shell-access-fails"></a>
 ## Shell 访问失败

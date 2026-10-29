@@ -108,11 +108,11 @@ For a request with `gpu_groups`:
 
 A resource pool that an administrator created dynamically appears in `compute_resources` only once it is Ready. A Pending or Failed pool is absent: the result reports that the pool is not present or not available to you, with unknown availability, and a launch without queuing is rejected with `capacity_unknown`. This MCP does not expose the dynamic-pool administration API, so ask an administrator about the pool's status.
 
-On the research-cluster fork 0.42.0 or later, an administrator can restrict a pool to some accounts, and the pool list omits a pool that the account may not use, so `compute_resources` and a launch without queuing report it the same way. A launch with `allow_queue: true`, or resuming an experiment or generic task in such a pool, fails with `permission_denied`; its message and `details.resource_pool` name the pool. Choose another pool with the user or ask an administrator for access.
+An administrator can restrict a pool to some accounts. The pool list holds a pool that the account may not use with `usable` false, and `compute_resources` reports it as not available. A launch without queuing fails with `permission_denied` (`this account may not use resource pool '<pool>': the pool is restricted`), and so does a launch with `allow_queue: true`, or resuming an experiment or generic task in such a pool, when the master refuses it; the message and `details.resource_pool` name the pool. Choose another pool with the user or ask an administrator for access.
 
 ## Submission outcome is uncertain
 
-A connection that drops or times out after a launch request was sent, an HTTP 5xx response, a redirect (HTTP 3xx, which no mutation follows), or a response without a task ID may mean that Determined created the task even though the client did not receive its ID. `compute_launch` then returns `submission_uncertain` with `kind` and `submission_marker` in the error details, and does not retry. A failure before any connection opened, such as a refused connection or a failed name lookup, is a retryable `transport_error` instead: nothing was sent. When the research-cluster fork 0.42.0 or later cannot check whether the account may use the requested pool, it answers with HTTP 503 `could not check access to resource pool "<pool>": ...; try again`, which the service also reports as `submission_uncertain`.
+A connection that drops or times out after a launch request was sent, an HTTP 5xx response, a redirect (HTTP 3xx, which no mutation follows), or a response without a task ID may mean that Determined created the task even though the client did not receive its ID. `compute_launch` then returns `submission_uncertain` with `kind` and `submission_marker` in the error details, and does not retry. A failure before any connection opened, such as a refused connection or a failed name lookup, is a retryable `transport_error` instead: nothing was sent. When the master cannot check whether the account may use the requested pool, it answers with HTTP 503 `could not check access to resource pool "<pool>": ...; try again`, which the service also reports as `submission_uncertain`.
 
 After an outage or a 5xx, check from your own turn with `compute_resources` whether the master answers; do not start a shell watcher on the master.
 
@@ -128,7 +128,7 @@ An experiment may have no trial logs before a trial starts. For a shell, the san
 
 ## Usage measurements are unavailable or empty
 
-`compute_usage` depends on the master's task-resources API. `task_resources_disabled` means the master has the API but an administrator has not enabled `integrations.task_resources`. `task_resources_unsupported` means the master lacks the API; it needs a Determined master from the research-cluster fork 0.40.1 or later. Neither is retryable, so ask an administrator. Unavailable measurements are not evidence that a task is idle.
+`compute_usage` depends on the master's task-resources API. `task_resources_disabled` means the master has the API but an administrator has not enabled `integrations.task_resources`. `task_resources_unsupported` means the master lacks the API. Neither is retryable, so ask an administrator. Unavailable measurements are not evidence that a task is idle.
 
 HTTP 503 means the measurement backend is busy or unavailable; each master runs at most four resource queries at once, so wait and retry. HTTP 400 can mean clock skew: the master rejects a window end more than 60 seconds ahead of its own clock, so correct the clock of the machine running the MCP server. HTTP 404 means the Determined task, or a requested trial ID, is missing or inaccessible to the current account. Determined serves an ended command or shell for only 24 hours after it ends and not after a master restart; after that its owner cannot be verified, so its usage, status, and logs return HTTP 404 and retrying will not help.
 
@@ -142,7 +142,7 @@ An empty `series` list means no data for the window, not an idle task: the task 
 
 The MCP acts only on tasks owned by the authenticated account. `ownership_mismatch` means the task belongs to another account; the service reads the task, then refuses before any further request, even when the credentials belong to an administrator. Use the owning account's credentials, or ask an administrator to act through Determined directly. `ownership_unavailable` means the master did not report a generic task's owner, because it lacks the research-cluster fork's generic task list (WU-CVGL/determined#27); ask an administrator to upgrade the master. On such a master, launching a generic task or listing generic tasks fails with `unsupported`; a launch checks this before anything is created.
 
-Determined applies its own permissions as well. On the fork 0.40.1 or later with basic authorization, only a task's owner or an administrator can kill, cancel, pause, or resume it; other accounts receive `permission_denied` (HTTP 403), or HTTP 404 `experiment '<id>' not found` for an experiment.
+Determined applies its own permissions as well. With basic authorization, only a task's owner or an administrator can kill, cancel, pause, or resume it; other accounts receive `permission_denied` (HTTP 403), or HTTP 404 `experiment '<id>' not found` for an experiment.
 
 ## Shell access fails
 

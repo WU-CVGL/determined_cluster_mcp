@@ -304,7 +304,8 @@ def create_server(
             """Inspect current scheduler capacity; slots=0 checks auxiliary capacity, not free GPUs.
 
             Each pool has description (null when the pool has none), gpu_models (null when
-            unknown) and per_agent_free_gpus_by_model. Pass the request's prefer_gpu_topology;
+            unknown), per_agent_free_gpus_by_model, and usable (false: this account may not use
+            it, so it is never available). Pass the request's prefer_gpu_topology;
             with "strong" and 2 or more slots each pool adds max_numa_node_free_slots and
             max_numa_node_slots. Pass the request's gpu_groups ([{name, count, models}], counts
             adding up to slots) to check for one agent with free GPUs for every group.

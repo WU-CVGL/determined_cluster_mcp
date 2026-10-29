@@ -82,8 +82,8 @@ does not enforce an idle timeout.
 | `workdir` | absolute container path | Working directory under a writable configured mount |
 | `output_dir` | absolute container path | Output directory under a writable configured mount |
 | `slots` | non-negative integer | Requested slots; defaults to the profile value |
-| `prefer_gpu_topology` | `"soft"`, `"strong"`, `false`, or null | GPU placement for 2 or more slots; requires the research-cluster fork 0.42.0 or later. `"strong"` takes all GPUs from one NUMA node of one agent and waits until one has them free; `"soft"` does not queue extra to wait for a better GPU topology, never guarantees one NUMA node, and prefers the best-connected free GPUs of the chosen agent. Sent only with 2 or more slots and `"soft"` or `"strong"`. An experiment sets it here, not in `experiment_config.resources` |
-| `gpu_groups` | list or null | Named groups of GPUs of exact models on one agent, each `{name, count, models}`; requires the research-cluster fork 0.42.2 or later. `name` matches `^[a-z][a-z0-9_-]{0,31}$` and is unique, `count` is at least 1, and `models` lists distinct model names exactly as `nvidia-smi` prints them, as in each pool's `gpu_models`. The counts must add up to `slots`. The container gets `DET_GPU_GROUPS`, JSON mapping each group name to its GPU UUIDs. An experiment sets it here, not in `experiment_config.resources` |
+| `prefer_gpu_topology` | `"soft"`, `"strong"`, `false`, or null | GPU placement for 2 or more slots. `"strong"` takes all GPUs from one NUMA node of one agent and waits until one has them free; `"soft"` does not queue extra to wait for a better GPU topology, never guarantees one NUMA node, and prefers the best-connected free GPUs of the chosen agent. Sent only with 2 or more slots and `"soft"` or `"strong"`. An experiment sets it here, not in `experiment_config.resources` |
+| `gpu_groups` | list or null | Named groups of GPUs of exact models on one agent, each `{name, count, models}`. `name` matches `^[a-z][a-z0-9_-]{0,31}$` and is unique, `count` is at least 1, and `models` lists distinct model names exactly as `nvidia-smi` prints them, as in each pool's `gpu_models`. The counts must add up to `slots`. The container gets `DET_GPU_GROUPS`, JSON mapping each group name to its GPU UUIDs. An experiment sets it here, not in `experiment_config.resources` |
 | `pool`, `image` | string | Optional overrides of profile defaults |
 | `code_revision` | string or null | Caller-provided revision or content identifier |
 | `experiment_config` | object | Extra experiment configuration; requires experiment mode |
@@ -280,10 +280,12 @@ positive integer for an experiment, which can also be passed as a numeric string
 Call `compute_plan` first and review resolved paths, mode, image, pool, slots, and
 advisories. `compute_resources` is a live snapshot, not a reservation. Positive slot
 requests inspect schedulable agent slots; zero checks auxiliary-container capacity.
-Candidate pools are suggestions and are never substituted automatically. On the
-research-cluster fork 0.42.0 or later, the pool list holds only the pools the account may
-use, so a requested pool missing from it is reported as not present or not available to
-you, with unknown availability.
+Candidate pools are suggestions and are never substituted automatically. A requested pool
+missing from the pool list is reported as not present or not available to you, with unknown
+availability. The list also holds the pools the account may not use, with `usable` false:
+each pool has `usable`
+(`true` when the master does not say), and a pool that is not usable is never available, a
+candidate, or an alternative.
 
 Each pool in `pools` and `selected_pool` also carries two facts from the same two reads.
 `description` is the operator's free-text pool description, passed through: trimmed,
@@ -302,7 +304,14 @@ model is unreadable. None of these facts changes admission.
 Admission counts slots as the pool does: a drained or disabled slot, and every slot of a
 disabled agent, is not capacity, and a draining slot or agent counts only the slots that
 still hold a container. A command, shell, or generic task, and an experiment with
-`is_single_node: true`, needs one schedulable agent with the requested free slots. For 1 or
+`is_single_node: true`, needs one schedulable agent with the requested free slots. A command
+or shell, and an experiment or generic task with `is_single_node: true`, that no agent of the
+pool can ever hold is refused as the master refuses it at submit, with `capacity_unavailable`,
+`retryable: false` and `no agent in pool <pool> has <n> slots; request fewer slots or use
+another pool`: when the pool reports `slotsPerAgent` (the slots of one instance of a
+provisioned pool) below the slots, even without agents, or when the pool is static and every
+agent has fewer slots, busy and disabled ones included. A provisioned pool whose instances have
+the slots waits for an instance. For 1 or
 more slots, capacity is unknown when the pool's used-slot count differs from the slots
 holding containers, which means a task is starting or stopping. An experiment with 2 or
 more `slots_per_trial` and without `is_single_node: true` may span agents, which admission
@@ -336,14 +345,16 @@ all its GPUs free, disabled and draining ones included (on one NUMA node with `"
 the pool is static and every agent has fewer slots than the task, or the pool's instances have
 fewer slots than the task (its `slotsPerAgent`, even when it has no agents). A provisioned pool
 without agents whose instances have the slots waits, and so does an agent that has not reported
-its GPU topology under `"strong"`. Capacity is unknown when a GPU's model is unreadable. `<groups>` is written as
-`simulation: 1 × NVIDIA GeForce RTX 5060 Ti; learner: 1 × NVIDIA CMP 170HX`. The plan carries
-the advisory `gpu_groups`.
+its GPU topology under `"strong"`. Capacity is unknown when a GPU's model is unreadable.
+`<groups>` is written as `simulation: 1 × NVIDIA GeForce RTX 5060 Ti; learner: 1 × NVIDIA CMP
+170HX`. The plan carries the advisory `gpu_groups`.
 
 `compute_launch` checks capacity unless `allow_queue` is true, then submits
 the request once. A pool missing from the account's pool list fails that check with
-`capacity_unknown`; a pool that the master refuses fails with `permission_denied` (see
-[Errors](#errors)). Every call is a new submission: launching the same request twice
+`capacity_unknown`; a pool listed with `usable` false fails it with `permission_denied` and
+`this account may not use resource pool '<pool>': the pool is restricted`, as does a pool that
+the master refuses at submit (see [Errors](#errors)). Every call is a new submission:
+launching the same request twice
 starts two tasks. On success it returns `kind`; `id`, Determined's task ID (a UUID
 string for a command, shell, or generic task, an integer for an experiment); `name` and
 `description`; the `state` reported at creation, or `null`; `submission_marker`; the
@@ -391,7 +402,7 @@ Do not launch again automatically. Whether to submit again is the user's decisio
 checking, for example in the WebUI or with a later search. A duplicate cancelled
 afterwards may already have had effects, such as files it wrote, that cancelling does not
 undo. A definite rejection, such as HTTP 400, 401, or 403, is an ordinary error: nothing
-was submitted. When the research-cluster fork 0.42.0 or later cannot check whether the
+was submitted. When the master cannot check whether the
 account may use the requested pool, it answers a launch or resume with HTTP 503 `could not
 check access to resource pool "<pool>": ...; try again`. The service reports that answer as
 `submission_uncertain`, like any other 5xx; check a launch with the marker as above, and a
@@ -476,7 +487,7 @@ the ownership check, and reports the task's own job as `queue`:
 | `state` | The scheduler's state: `STATE_QUEUED`, `STATE_SCHEDULED`, or `STATE_SCHEDULED_BACKFILLED` |
 | `jobs_ahead` | The job's position in the pool's queue: the number of jobs the scheduler ranks ahead of it, which can include jobs already running. It is not a prediction of wait time; `null` when the pool's scheduler does not rank jobs (fair share) |
 | `requested_slots`, `allocated_slots` | Slots the job requests and holds |
-| `placement` | List of `{agent_id, device_ids}`, one per agent where the job holds slots; `device_ids` are the agent's slot device IDs, ascending, which equal the `nvidia-smi` index on that agent's node only for NVIDIA GPU slots. `[]` for a queued or zero-slot job; `null` on a master older than the research-cluster fork 0.42.0 |
+| `placement` | List of `{agent_id, device_ids}`, one per agent where the job holds slots; `device_ids` are the agent's slot device IDs, ascending, which equal the `nvidia-smi` index on that agent's node only for NVIDIA GPU slots. `[]` for a queued or zero-slot job; `null` when the master does not report it |
 
 A task with an end time has ended; a command or shell, which reports no end time, has
 ended once its state is `STATE_TERMINATED`. An ended task gets `queue: null` without a
@@ -761,7 +772,7 @@ you pass the same `local_port`.
 
 `compute_usage` is read-only and summarizes the measured CPU, memory, and GPU use of one
 task owned by the account; `compute_resources` describes scheduler capacity instead. It
-requires a Determined master from the research-cluster fork 0.40.1 or later on which an
+requires a master on which an
 administrator has configured `integrations.task_resources` (`prometheus_url` and
 `det_cluster`).
 
@@ -999,7 +1010,7 @@ the master lacks the route. Usage-specific codes are described in
 [Task usage measurements](#task-usage-measurements).
 
 HTTP 403, Determined's permission refusal, has the code `permission_denied` and is not
-retryable. The research-cluster fork 0.42.0 or later checks the resource pool when a task
+retryable. The master checks the resource pool when a task
 is launched and when an experiment or generic task is resumed. When it refuses a pool the
 account may not use, the message is the master's own refusal in the form `403 <message>`,
 for example `403 failed to prepare launch params: user "<username>" may not use resource
@@ -1012,6 +1023,6 @@ The service acts only on tasks owned by the authenticated account and checks thi
 before acting on a task, so another account's task returns `ownership_mismatch` even when the
 credentials belong to an administrator. Use the owning account's credentials, or ask an
 administrator to act through Determined directly. Determined applies its own permissions
-as well: on the fork 0.40.1 or later with basic authorization, only a task's owner or an
+as well: with basic authorization, only a task's owner or an
 administrator can kill, cancel, pause, or resume it, and other accounts receive
 `permission_denied` (HTTP 403), or HTTP 404 for an experiment.
