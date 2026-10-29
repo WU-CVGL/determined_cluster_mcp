@@ -100,6 +100,12 @@ For a request with `prefer_gpu_topology: "strong"` and 2 or more slots:
 - `capacity_unknown` naming GPU topology: the account cannot see agent GPU topology, or it does not match the slots. Requests without `"strong"` do not need it. Queue it with `allow_queue: true` when the work can wait.
 - A queued `"strong"` task logs `GPU topology preference strong: waiting until one NUMA node of an agent in pool P has N free GPUs`. It can still fail later with `no NUMA node in pool P has N slots; use soft`, for example after a master restart or a GPU exclusion; a trial that fails this way is not restarted.
 
+For a request with `gpu_groups`:
+
+- `capacity_unavailable` with `retryable: false` and `no agent in pool P has GPUs for gpu_groups ...`: no agent of the pool has GPUs of the named models for every group, even counting busy, disabled, and draining ones (on one NUMA node with `"strong"`). Check the model names against the pool's `gpu_models`; they must match exactly, as `nvidia-smi` prints them. Otherwise choose another pool or change the groups.
+- `capacity_unavailable` with `retryable: true` and `... has free GPUs for gpu_groups ... now; the task would wait`: an agent has the models, but not all of them are free now. `per_agent_free_gpus_by_model` from `compute_resources` shows what is free. Queue it with `allow_queue: true` when the work can wait.
+- `gpu_groups counts must add up to slots (N)`: the request's `slots` differs from the sum of the groups' counts.
+
 A resource pool that an administrator created dynamically appears in `compute_resources` only once it is Ready. A Pending or Failed pool is absent: the result reports that the pool is not present or not available to you, with unknown availability, and a launch without queuing is rejected with `capacity_unknown`. This MCP does not expose the dynamic-pool administration API, so ask an administrator about the pool's status.
 
 On the research-cluster fork 0.42.0 or later, an administrator can restrict a pool to some accounts, and the pool list omits a pool that the account may not use, so `compute_resources` and a launch without queuing report it the same way. A launch with `allow_queue: true`, or resuming an experiment or generic task in such a pool, fails with `permission_denied`; its message and `details.resource_pool` name the pool. Choose another pool with the user or ask an administrator for access.

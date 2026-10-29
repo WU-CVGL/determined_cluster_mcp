@@ -108,6 +108,12 @@ Requests 从 MCP 进程环境读取 `HTTPS_PROXY`、`HTTP_PROXY` 和 `NO_PROXY` 
 - 指明 GPU 拓扑的 `capacity_unknown`：当前账户看不到 agent 的 GPU 拓扑，或拓扑与 slot 不一致。不设置 `"strong"` 的请求不需要拓扑。任务可以等待时，用 `allow_queue: true` 排队。
 - 排队中的 `"strong"` 任务会记录日志 `GPU topology preference strong: waiting until one NUMA node of an agent in pool P has N free GPUs`。它之后仍可能以 `no NUMA node in pool P has N slots; use soft` 失败，例如在 master 重启或某个 GPU 被排除之后；以这种方式失败的 trial 不会被重启。
 
+对于设置了 `gpu_groups` 的请求：
+
+- `capacity_unavailable`、`retryable: false` 和 `no agent in pool P has GPUs for gpu_groups ...`：即使把正在使用、已禁用和正在 drain 的 GPU 都算上，资源池中也没有 agent 拥有满足每个组的指定型号 GPU（设置 `"strong"` 时须在同一 NUMA 节点上）。请对照资源池的 `gpu_models` 检查型号名，它们必须与 `nvidia-smi` 打印的完全一致；否则换用其他资源池或修改这些组。
+- `capacity_unavailable`、`retryable: true` 和 `... has free GPUs for gpu_groups ... now; the task would wait`：某个 agent 有这些型号，但当前并非全部空闲。`compute_resources` 返回的 `per_agent_free_gpus_by_model` 显示当前空闲的 GPU。任务可以等待时，用 `allow_queue: true` 排队。
+- `gpu_groups counts must add up to slots (N)`：请求的 `slots` 与各组数量之和不同。
+
 管理员动态创建的资源池只有在进入 Ready 状态后才会出现在 `compute_resources` 中。处于 Pending 或 Failed 状态的资源池不会出现：结果会说明该资源池不存在或对你不可用，且可用性未知，不排队的提交会以 `capacity_unknown` 被拒绝。本 MCP 不提供动态资源池管理 API，请向管理员确认该资源池的状态。
 
 在 research-cluster fork 0.42.0 或更高版本上，管理员可以把资源池限定给部分账户使用，资源池列表会省略当前账户无权使用的资源池，因此 `compute_resources` 和不排队的提交会以同样方式报告它。设置 `allow_queue: true` 的提交，或恢复该资源池中的 experiment 或 generic 任务，会以 `permission_denied` 失败；其消息和 `details.resource_pool` 会给出该资源池。请与用户一起选择其他资源池，或请管理员授予权限。

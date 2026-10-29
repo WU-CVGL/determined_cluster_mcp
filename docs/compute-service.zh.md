@@ -79,6 +79,7 @@ shell_inactivity_seconds: 7200
 | `output_dir` | 容器绝对路径 | 可写已配置挂载下的输出目录 |
 | `slots` | 非负整数 | 请求的 slot 数；默认使用配置值 |
 | `prefer_gpu_topology` | `"soft"`、`"strong"`、`false` 或 null | 2 个及以上 slot 的 GPU 放置偏好；需要 research-cluster fork 0.42.0 或更高版本。`"strong"` 要求全部 GPU 来自同一 agent 的同一 NUMA 节点，并等待到有这样的节点空闲；`"soft"` 不会为等待更好的 GPU 拓扑而额外排队，也不保证同一 NUMA 节点，只在所选 agent 上优先选择连接最好的空闲 GPU。仅在 2 个及以上 slot 且值为 `"soft"` 或 `"strong"` 时发送。experiment 也在这里设置，不能写在 `experiment_config.resources` 中 |
+| `gpu_groups` | 列表或 null | 一个 agent 上按精确型号命名的若干组 GPU，每组为 `{name, count, models}`；需要 research-cluster fork 0.42.2 或更高版本。`name` 符合 `^[a-z][a-z0-9_-]{0,31}$` 且不重复，`count` 至少为 1，`models` 列出互不相同的型号名，写法与 `nvidia-smi` 打印的完全一致，即各资源池 `gpu_models` 中的名称。各组数量之和必须等于 `slots`。容器中的 `DET_GPU_GROUPS` 以 JSON 把每个组名映射到其 GPU UUID。experiment 也在这里设置，不能写在 `experiment_config.resources` 中 |
 | `pool`、`image` | 字符串 | 可选的配置默认值覆盖 |
 | `code_revision` | 字符串或 null | 调用方提供的版本或内容标识 |
 | `experiment_config` | 对象 | 额外的实验配置；要求 experiment 模式 |
@@ -244,7 +245,7 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 | `compute_list` | `kind`，可选 `limit=50`、`offset=0`、`marker`、`states` | 当前账户的一页任务，最新的在前；指定 `states` 时只列出处于这些状态的 experiment 或 generic 任务；指定 `marker` 时返回该页中配置带有该标记的任务 |
 | `compute_shell_connect` | `id`，可选 `local_port`、`wait_seconds=0`（最多 600） | 为该账户某个正在运行的 shell 打开或返回本地 SSH 隧道；见[shell 访问](#shell-access) |
 | `compute_shell_disconnect` | `id` | 关闭该隧道并删除该 shell 的密钥文件；shell 继续运行。返回 `disconnected`，确有隧道时还返回 `files`：`removed`，或在该目录现在可能属于另一个 server 时为 `kept` |
-| `compute_resources` | 可选 `slots=1`、`pool`、`prefer_gpu_topology` | 当前调度容量和候选资源池。值为 `"strong"` 且请求 2 个及以上 slot 时，每个资源池会增加 `max_numa_node_free_slots`（当前能放下的最大 `"strong"` 任务）和 `max_numa_node_slots`（master 在当前 agent 下接受的最大值）。每个资源池还有 `description` 和 `gpu_models` |
+| `compute_resources` | 可选 `slots=1`、`pool`、`prefer_gpu_topology`、`gpu_groups` | 当前调度容量和候选资源池。值为 `"strong"` 且请求 2 个及以上 slot 时，每个资源池会增加 `max_numa_node_free_slots`（当前能放下的最大 `"strong"` 任务）和 `max_numa_node_slots`（master 在当前 agent 下接受的最大值）。传入 `gpu_groups`（各组数量之和必须等于 `slots`）时，只有某个 agent 有满足每个组的空闲 GPU，资源池才算可用。每个资源池还有 `description`、`gpu_models` 和 `per_agent_free_gpus_by_model` |
 | `storage_check` | `path` | 映射容器路径的访问情况 |
 | `storage_sync` | `local_dir`、`shared_dir`，可选 `dry_run=true` | 预览或把本地目录内容复制到共享存储 |
 | `storage_fetch` | `shared_dir`、`local_dir`，可选 `dry_run=true` | 预览或把共享目录内容复制到本地 |
@@ -264,7 +265,10 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 资源池各 agent 的每个 GPU slot 报告的设备 brand（CUDA 上是 GPU 型号名；ROCm 上 Determined 报告的
 是显卡厂商，无法区分显卡型号），包括正在使用、已禁用或正在 drain 的 slot。资源池当前连接的 agent
 没有 GPU slot 时为 `[]`；资源池没有 agent、agent 列表与资源池不一致，或某个 slot 的设备或 GPU
-brand 无法读取时为 `null`。这两项都不影响准入。
+brand 无法读取时为 `null`。`per_agent_free_gpus_by_model` 把资源池的每个 agent 映射到其按型号统计的
+空闲 GPU，例如 `{"node": {"NVIDIA CMP 170HX": 3, "NVIDIA GeForce RTX 5060 Ti": 2}}`，空闲 slot 的
+计算方式与准入相同；agent 列表与资源池不一致或某个 GPU 的型号无法读取时为 `null`。这些信息都不影响
+准入。
 
 准入按资源池自身的方式计算 slot：已 drain 或已禁用的 slot，以及已禁用 agent 的所有 slot，都不算
 容量；正在 drain 的 slot 或 agent 只计入仍有容器占用的 slot。command、shell、generic 任务以及
@@ -284,6 +288,19 @@ agent 运行，准入不检查这种情况：只要有一个 agent 有足够空�
 的非静态资源池会等待其 agent。请求 0 或 1 个 slot 时该偏好
 不起作用：它不会被发送，规划结果带有 advisory `gpu_topology_ignored`。准入看不到正在等待的任务：
 一个等待 NUMA 节点的高优先级任务可能让已通过准入的低优先级任务一直排队。
+
+设置 `gpu_groups` 时，所有任务类型（包括 experiment）都需要一个可调度 agent，其空闲 GPU 能同时满足
+每个组，每个 GPU 只属于一个组，按精确型号匹配，与 master 的匹配方式相同；设置 `"strong"` 时，这些
+GPU 还必须在该 agent 的同一 NUMA 节点上。资源池的 `capacity_kind` 为 `gpu_groups_single_agent`，
+设置 `"strong"` 时为 `gpu_groups_one_numa_node`，`available_capacity` 是当前能容纳这些组的 agent
+数。需要等待的请求以可重试的 `capacity_unavailable` 失败（`no schedulable agent in pool '<pool>'
+has free GPUs for gpu_groups <groups> now; the task would wait`）。master 在提交时会拒绝的请求以
+`retryable: false` 和 master 的消息 `no agent in pool <pool> has GPUs for gpu_groups <groups>` 失败：
+即使资源池中每个 agent 的全部 GPU（包括已禁用和正在 drain 的）都空闲也容纳不下这些组（设置 `"strong"`
+时须在同一 NUMA 节点上），或资源池为静态且每个 agent 的 slot 都少于任务所需。尚无 agent 的非静态资源池
+会等待；设置 `"strong"` 时，尚未报告 GPU 拓扑的 agent 也会等待。某个 GPU 的型号无法读取时容量为未知。
+`<groups>` 的写法为 `simulation: 1 × NVIDIA GeForce RTX 5060 Ti; learner: 1 × NVIDIA CMP 170HX`。
+规划结果带有 advisory `gpu_groups`。
 
 除非设置 `allow_queue: true`，`compute_launch` 会先检查容量，然后把请求提交一次。不在
 当前账户资源池列表中的资源池会使该检查以 `capacity_unknown` 失败；master 拒绝的资源池会以

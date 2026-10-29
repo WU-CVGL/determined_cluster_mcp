@@ -126,7 +126,9 @@ def create_server(
             "Use compute_resources for capacity questions. Launch checks capacity first "
             "unless allow_queue=true; set it when the work can wait for capacity. "
             "For multi-GPU work, pass the same prefer_gpu_topology to compute_resources and "
-            "the request. "
+            "the request. A task that needs GPUs of certain models on one agent sets gpu_groups "
+            "([{name, count, models}], counts adding up to slots, models as nvidia-smi names "
+            "them); its container finds each group's GPU UUIDs in DET_GPU_GROUPS. "
             "Keep code and data on shared mounts; use storage_check/sync/fetch for file access. "
             "compute_plan renders a request without submitting it; compute_launch validates it the "
             "same way. Every launch is a new submission: the server keeps no task "
@@ -170,8 +172,8 @@ def create_server(
     async def compute_plan(request: dict[str, Any]) -> dict[str, Any]:
         """Render a request offline. Include name, description, command, workdir and output_dir.
 
-        Optional kind, slots, pool, prefer_gpu_topology, image and allow_queue control execution;
-        paths use container mounts.
+        Optional kind, slots, pool, prefer_gpu_topology, gpu_groups, image and allow_queue
+        control execution; paths use container mounts.
         """
 
         return await call(service.plan, request)
@@ -297,14 +299,19 @@ def create_server(
             prefer_gpu_topology: Annotated[
                 Optional[Literal["soft", "strong", False]], BeforeValidator(_exact_preference)
             ] = None,
+            gpu_groups: Optional[list[dict[str, Any]]] = None,
         ) -> dict[str, Any]:
             """Inspect current scheduler capacity; slots=0 checks auxiliary capacity, not free GPUs.
 
-            Each pool has description (null when the pool has none) and gpu_models (null when
-            unknown). Pass the request's prefer_gpu_topology; with "strong" and 2 or more slots
-            each pool adds max_numa_node_free_slots and max_numa_node_slots.
+            Each pool has description (null when the pool has none), gpu_models (null when
+            unknown) and per_agent_free_gpus_by_model. Pass the request's prefer_gpu_topology;
+            with "strong" and 2 or more slots each pool adds max_numa_node_free_slots and
+            max_numa_node_slots. Pass the request's gpu_groups ([{name, count, models}], counts
+            adding up to slots) to check for one agent with free GPUs for every group.
             """
-            return await call(resource_inspector.resources, slots, pool, prefer_gpu_topology)
+            return await call(
+                resource_inspector.resources, slots, pool, prefer_gpu_topology, gpu_groups
+            )
 
     if shell_access is not None:
 

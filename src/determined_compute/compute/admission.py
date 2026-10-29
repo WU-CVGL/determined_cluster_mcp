@@ -9,6 +9,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from determined_compute.compute.gpu_groups import (
+    describe_gpu_groups,
+    holds_gpu_groups,
+    normalize_gpu_groups,
+)
 from determined_compute.core.api_client import APIError
 
 
@@ -102,51 +107,63 @@ def _no_numa_node_holds(pool: str, slots: int) -> str:
     return f"no NUMA node in pool {pool} has {slots} slots; use soft"
 
 
-def _numa_layout(
-    agent: Mapping[str, Any], entries: List[Mapping[str, Any]]
-) -> Tuple[str, Dict[int, int], Dict[int, int], str]:
-    """Classify an agent's GPU topology and count its CUDA slots by NUMA node.
+def _slot_free(agent: Mapping[str, Any], slot: Mapping[str, Any]) -> bool:
+    """Whether a slot takes new work now: enabled, not draining, and holding no container, on an
+    enabled agent that is not draining."""
 
-    Returns the class, the slots per node in any state, the free slots per node, and the
-    agent's unknown reason. A slot counts toward a node only when the topology gives it a node
-    of 0 or more, as the scheduler's numaNodeOf reads it; a slot is free when it is enabled, not
-    draining, and holds no container, on an enabled agent that is not draining.
+    return (
+        agent.get("enabled", True)
+        and not agent.get("draining", False)
+        and slot.get("enabled", True)
+        and not slot.get("draining", False)
+        and slot.get("container") is None
+    )
+
+
+def _numa_devices(
+    agent: Mapping[str, Any], entries: List[Mapping[str, Any]]
+) -> Tuple[str, List[Tuple[Mapping[str, Any], int]], str]:
+    """Classify an agent's GPU topology and give each CUDA slot its NUMA node.
+
+    Returns the class, the CUDA slots with their nodes (for the known class only), and the
+    agent's unknown reason. A node below 0 means the topology gives the slot no node, as the
+    scheduler's numaNodeOf reads it.
     """
 
     cuda: List[Mapping[str, Any]] = []
     for slot in entries:
         device = slot.get("device")
         if not isinstance(device, Mapping) or not isinstance(device.get("type"), str):
-            return _MALFORMED, {}, {}, ""
+            return _MALFORMED, [], ""
         if device["type"] == _CUDA:
             cuda.append(slot)
     if not cuda:
-        return _NONE, {}, {}, ""
+        return _NONE, [], ""
     topology = agent.get("gpuTopology")
     ids = [_nonnegative_int(slot["device"].get("id")) for slot in cuda]
     if not isinstance(topology, Mapping) or any(item is None for item in ids):
         # Without the sensitive-agent permission the master drops the topology and sets every
         # device id to -1.
-        return _HIDDEN, {}, {}, ""
+        return _HIDDEN, [], ""
     if len(set(ids)) != len(ids):
-        return _MALFORMED, {}, {}, ""
+        return _MALFORMED, [], ""
     reason = topology.get("unknownReason")
     if not isinstance(reason, str):
-        return _MALFORMED, {}, {}, ""
+        return _MALFORMED, [], ""
     if reason == _TOPOLOGY_PENDING:
-        return _PENDING, {}, {}, reason
+        return _PENDING, [], reason
     if reason:
-        return _NONE, {}, {}, reason
+        return _NONE, [], reason
     gpus = topology.get("gpus")
     if not isinstance(gpus, list):
-        return _MALFORMED, {}, {}, ""
+        return _MALFORMED, [], ""
     node_of: Dict[int, int] = {}
     for entry in gpus:
         if not isinstance(entry, Mapping):
-            return _MALFORMED, {}, {}, ""
+            return _MALFORMED, [], ""
         excluded = entry.get("excluded", False)
         if not isinstance(excluded, bool):
-            return _MALFORMED, {}, {}, ""
+            return _MALFORMED, [], ""
         if excluded:
             # An excluded GPU is never a slot.
             continue
@@ -158,26 +175,76 @@ def _numa_layout(
             or isinstance(node, bool)
             or not isinstance(node, int)
         ):
-            return _MALFORMED, {}, {}, ""
+            return _MALFORMED, [], ""
         node_of[device_id] = node
     if set(node_of) != set(ids):
-        return _MALFORMED, {}, {}, ""
-    schedulable = agent.get("enabled", True) and not agent.get("draining", False)
+        return _MALFORMED, [], ""
+    return _KNOWN, [(slot, node_of[device_id]) for slot, device_id in zip(cuda, ids)], ""
+
+
+def _numa_layout(
+    agent: Mapping[str, Any], entries: List[Mapping[str, Any]]
+) -> Tuple[str, Dict[int, int], Dict[int, int], str]:
+    """Classify an agent's GPU topology and count its CUDA slots by NUMA node.
+
+    Returns the class, the slots per node in any state, the free slots per node, and the
+    agent's unknown reason. A slot counts toward a node only when the topology gives it a node
+    of 0 or more; a slot is free as _slot_free says.
+    """
+
+    cls, devices, reason = _numa_devices(agent, entries)
     total: Dict[int, int] = {}
     free: Dict[int, int] = {}
-    for slot, device_id in zip(cuda, ids):
-        node = node_of[device_id]
+    for slot, node in devices:
         if node < 0:
             continue
         total[node] = total.get(node, 0) + 1
-        if (
-            schedulable
-            and slot.get("enabled", True)
-            and not slot.get("draining", False)
-            and slot.get("container") is None
-        ):
+        if _slot_free(agent, slot):
             free[node] = free.get(node, 0) + 1
-    return _KNOWN, total, free, ""
+    return cls, total, free, reason
+
+
+def _gpu_slots(entries: List[Mapping[str, Any]]) -> Optional[List[Tuple[Mapping[str, Any], str]]]:
+    """Return the agent's GPU slots (CUDA or ROCm) with their model names, or None when a slot's
+    device type or a GPU's model name is unreadable."""
+
+    out = []
+    for slot in entries:
+        device = slot.get("device")
+        if not isinstance(device, Mapping) or not isinstance(device.get("type"), str):
+            return None
+        if device["type"] not in _GPU_TYPES:
+            continue
+        brand = device.get("brand")
+        if not isinstance(brand, str) or not brand:
+            return None
+        out.append((slot, brand))
+    return out
+
+
+def _free_gpus_by_model(
+    members: List[Tuple[str, Mapping[str, Any], List[Mapping[str, Any]]]]
+) -> Optional[Dict[str, Dict[str, int]]]:
+    """Each agent's free GPUs by model, or None when a GPU's model is unreadable."""
+
+    result: Dict[str, Dict[str, int]] = {}
+    for agent_id, agent, entries in members:
+        gpus = _gpu_slots(entries)
+        if gpus is None:
+            return None
+        counts: Dict[str, int] = {}
+        for slot, brand in gpus:
+            if _slot_free(agent, slot):
+                counts[brand[:256]] = counts.get(brand[:256], 0) + 1
+        result[agent_id] = counts
+    return result
+
+
+def _no_agent_has_gpus_for(pool: str, groups: List[Mapping[str, Any]]) -> str:
+    """The master's refusal of gpu_groups that no agent of the pool can hold
+    (errGPUGroupsNoAgent)."""
+
+    return f"no agent in pool {pool} has GPUs for gpu_groups {describe_gpu_groups(groups)}"
 
 
 class ResourceInspector:
@@ -191,19 +258,26 @@ class ResourceInspector:
         slots: int = 1,
         pool: Optional[str] = None,
         prefer_gpu_topology: Any = None,
+        gpu_groups: Any = None,
     ) -> Dict[str, Any]:
         """Return conservative, per-pool capacity for a request on one agent."""
 
         self._validate_request(slots, pool)
         if not _valid_preference(prefer_gpu_topology):
             raise ValueError('prefer_gpu_topology must be "soft", "strong", false, or null')
+        groups = normalize_gpu_groups(gpu_groups, slots)
         report, _refusals = self._resources(
-            slots=slots, pool=pool, preference=prefer_gpu_topology
+            slots=slots, pool=pool, preference=prefer_gpu_topology, groups=groups
         )
         return report
 
     def _resources(
-        self, *, slots: int, pool: Optional[str], preference: Any
+        self,
+        *,
+        slots: int,
+        pool: Optional[str],
+        preference: Any,
+        groups: Optional[List[Mapping[str, Any]]] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, str]]:
         """Return the report and, by pool, why the master refuses the request."""
 
@@ -231,7 +305,9 @@ class ResourceInspector:
         refusals: Dict[str, str] = {}
         for item in pools:
             if isinstance(item, Mapping) and isinstance(item.get("name"), str):
-                assessment, refusal = self._assess_pool(item, agents, slots=slots, strong=strong)
+                assessment, refusal = self._assess_pool(
+                    item, agents, slots=slots, strong=strong, groups=groups
+                )
                 assessments.append(assessment)
                 if refusal is not None:
                     refusals[assessment["resource_pool"]] = refusal
@@ -272,6 +348,7 @@ class ResourceInspector:
             "requested_slots": slots,
             "requested_pool": pool,
             "prefer_gpu_topology": preference,
+            "gpu_groups": groups,
             "single_node": True,
             "available": available,
             "selected_pool": selected,
@@ -300,6 +377,7 @@ class ResourceInspector:
         *,
         slots: int,
         strong: bool = False,
+        groups: Optional[List[Mapping[str, Any]]] = None,
     ) -> Tuple[Dict[str, Any], Optional[str]]:
         """Assess one pool; also return why the master refuses the request, if it does."""
 
@@ -352,7 +430,20 @@ class ResourceInspector:
                     f"used slots ({used}) differ from slots holding containers ({holding}); "
                     "a task may be starting or stopping"
                 )
-            if strong:
+            if groups is not None:
+                capacity_kind = "gpu_groups_one_numa_node" if strong else "gpu_groups_single_agent"
+                available, available_capacity, explanation, refusal = self._assess_groups(
+                    name,
+                    static=raw.get("type") == _STATIC_POOL,
+                    members=members,
+                    groups=groups,
+                    slots=slots,
+                    strong=strong,
+                    complete=complete,
+                    known=known,
+                    problem=problem or _STATISTICS_MISSING,
+                )
+            elif strong:
                 capacity_kind = "slots_one_numa_node"
                 available, available_capacity, explanation, refusal, numa = self._assess_strong(
                     name,
@@ -390,6 +481,10 @@ class ResourceInspector:
                 max(0, total - used) if total is not None and used is not None else None
             ),
             "per_agent_free_slots": per_agent if agent_data_known else None,
+            # Free GPUs by model on each agent, for jobs that need certain models (gpu_groups).
+            "per_agent_free_gpus_by_model": (
+                _free_gpus_by_model(members) if agent_data_known else None
+            ),
             "max_single_agent_free_slots": (
                 max(per_agent.values(), default=0) if agent_data_known else None
             ),
@@ -501,6 +596,92 @@ class ResourceInspector:
         return False, max_free, explained(summary), None, numa
 
     @staticmethod
+    def _assess_groups(
+        name: str,
+        *,
+        static: bool,
+        members: List[Tuple[str, Mapping[str, Any], List[Mapping[str, Any]]]],
+        groups: List[Mapping[str, Any]],
+        slots: int,
+        strong: bool,
+        complete: bool,
+        known: bool,
+        problem: str,
+    ) -> Tuple[Optional[bool], Optional[int], str, Optional[str]]:
+        """Assess a request with gpu_groups: one agent whose free GPUs hold every group at once,
+        on one known NUMA node under "strong".
+
+        Returns the verdict, the number of agents whose free GPUs hold the groups now, the
+        explanation, and why the master refuses the request (or None). The master refuses a
+        static pool whose agents all have fewer slots than the task, and a pool none of whose
+        agents could hold the groups with every slot free, disabled and draining slots included,
+        on one NUMA node under "strong" (gpuGroupsCannotFit). A pool without agents waits, and so
+        does an agent that has not reported its GPU topology.
+        """
+
+        described = describe_gpu_groups(groups)
+        on_node = " on one NUMA node" if strong else ""
+        refusal: Optional[str] = None
+        largest = max((len(entries) for _id, _agent, entries in members), default=0)
+        if complete and static and largest < slots:
+            refusal = _no_agent_has_gpus_for(name, groups)
+        if refusal is not None:
+            return False, None, refusal, refusal
+        if not complete:
+            return None, None, problem, None
+
+        fitting = 0
+        could_fit = False
+        for agent_id, agent, entries in members:
+            gpus = _gpu_slots(entries)
+            if gpus is None:
+                return None, None, f"GPU models of agent {agent_id} are unreadable", None
+            if not holds_gpu_groups(groups, [brand for _slot, brand in gpus]):
+                continue
+            if not strong:
+                could_fit = True
+                free = [brand for slot, brand in gpus if _slot_free(agent, slot)]
+                fitting += holds_gpu_groups(groups, free)
+                continue
+            cls, devices, _reason = _numa_devices(agent, entries)
+            if cls == _HIDDEN:
+                cause = f"GPU topology of agent {agent_id} is not visible to this account"
+                return None, None, cause, None
+            if cls == _MALFORMED:
+                cause = f"GPU topology of agent {agent_id} is inconsistent with its slots"
+                return None, None, cause, None
+            if cls == _PENDING:
+                # The master lets the task wait for the agent's topology.
+                could_fit = True
+                continue
+            brand_of = {id(slot): brand for slot, brand in gpus}
+            all_by_node: Dict[int, List[str]] = {}
+            free_by_node: Dict[int, List[str]] = {}
+            for slot, node in devices:
+                if node < 0:
+                    continue
+                all_by_node.setdefault(node, []).append(brand_of[id(slot)])
+                if _slot_free(agent, slot):
+                    free_by_node.setdefault(node, []).append(brand_of[id(slot)])
+            could_fit = could_fit or any(
+                holds_gpu_groups(groups, models) for models in all_by_node.values()
+            )
+            fitting += any(holds_gpu_groups(groups, models) for models in free_by_node.values())
+        if members and not could_fit:
+            refusal = _no_agent_has_gpus_for(name, groups)
+            return False, fitting, refusal, refusal
+        if not known:
+            return None, None, problem, None
+        if fitting:
+            return True, fitting, (
+                f"{fitting} schedulable agent(s) have free GPUs for gpu_groups {described}{on_node}"
+            ), None
+        return False, 0, (
+            f"no schedulable agent in pool {name} has free GPUs for gpu_groups {described}"
+            f"{on_node} now"
+        ), None
+
+    @staticmethod
     def _agent_free(
         pool: str,
         agents: List[Any],
@@ -605,13 +786,23 @@ class ResourceInspector:
                 'config.resources.prefer_gpu_topology must be "soft", "strong", false, or null'
             )
         strong = preference == "strong" and slots >= 2
+        groups = normalize_gpu_groups(
+            resources.get("gpu_groups"), slots, slot_key, "config.resources.gpu_groups"
+        )
         # A trial is multi-agent unless is_single_node is true (absent or null included). The
         # scheduler tries one agent first; spanning agents is not modelled, so a trial that
-        # fits on no single agent has unknown capacity. "strong" always uses one agent.
+        # fits on no single agent has unknown capacity. "strong" and gpu_groups always use one
+        # agent.
         may_span_agents = (
-            kind == "experiment" and slots >= 2 and is_single_node is not True and not strong
+            kind == "experiment"
+            and slots >= 2
+            and is_single_node is not True
+            and not strong
+            and groups is None
         )
-        report, refusals = self._resources(slots=slots, pool=pool, preference=preference)
+        report, refusals = self._resources(
+            slots=slots, pool=pool, preference=preference, groups=groups
+        )
         selected = report["selected_pool"]
         if selected is not None and selected["available"] is True:
             return {**report, "admitted": True}
@@ -627,6 +818,14 @@ class ResourceInspector:
             message = refusals[pool]
         elif selected["available"] is None:
             message = f"capacity for resource pool {pool!r} is unknown: {selected['explanation']}"
+        elif groups is not None:
+            code = "capacity_unavailable"
+            retryable = True
+            on_node = " on one NUMA node" if strong else ""
+            message = (
+                f"no schedulable agent in pool {pool!r} has free GPUs for gpu_groups "
+                f"{describe_gpu_groups(groups)}{on_node} now; the task would wait"
+            )
         elif strong:
             code = "capacity_unavailable"
             retryable = True
