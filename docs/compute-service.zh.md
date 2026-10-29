@@ -297,8 +297,9 @@ GPU 还必须在该 agent 的同一 NUMA 节点上。资源池的 `capacity_kind
 has free GPUs for gpu_groups <groups> now; the task would wait`）。master 在提交时会拒绝的请求以
 `retryable: false` 和 master 的消息 `no agent in pool <pool> has GPUs for gpu_groups <groups>` 失败：
 即使资源池中每个 agent 的全部 GPU（包括已禁用和正在 drain 的）都空闲也容纳不下这些组（设置 `"strong"`
-时须在同一 NUMA 节点上），或资源池为静态且每个 agent 的 slot 都少于任务所需。尚无 agent 的非静态资源池
-会等待；设置 `"strong"` 时，尚未报告 GPU 拓扑的 agent 也会等待。某个 GPU 的型号无法读取时容量为未知。
+时须在同一 NUMA 节点上），或资源池为静态且每个 agent 的 slot 都少于任务所需，或资源池单个实例的 slot
+少于任务所需（其 `slotsPerAgent`，即使资源池尚无 agent）。单个实例 slot 足够但尚无 agent 的自动扩缩资源池会
+等待；设置 `"strong"` 时，尚未报告 GPU 拓扑的 agent 也会等待。某个 GPU 的型号无法读取时容量为未知。
 `<groups>` 的写法为 `simulation: 1 × NVIDIA GeForce RTX 5060 Ti; learner: 1 × NVIDIA CMP 170HX`。
 规划结果带有 advisory `gpu_groups`。
 

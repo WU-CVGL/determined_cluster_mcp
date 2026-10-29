@@ -333,9 +333,10 @@ request that waits fails with retryable `capacity_unavailable` (`no schedulable 
 refuses at submit fails with `retryable: false` and the master's message, `no agent in pool
 <pool> has GPUs for gpu_groups <groups>`: no agent of the pool could hold the groups even with
 all its GPUs free, disabled and draining ones included (on one NUMA node with `"strong"`), or
-the pool is static and every agent has fewer slots than the task. A pool that is not static
-and has no agents yet waits, and so does an agent that has not reported its GPU topology under
-`"strong"`. Capacity is unknown when a GPU's model is unreadable. `<groups>` is written as
+the pool is static and every agent has fewer slots than the task, or the pool's instances have
+fewer slots than the task (its `slotsPerAgent`, even when it has no agents). A provisioned pool
+without agents whose instances have the slots waits, and so does an agent that has not reported
+its GPU topology under `"strong"`. Capacity is unknown when a GPU's model is unreadable. `<groups>` is written as
 `simulation: 1 × NVIDIA GeForce RTX 5060 Ti; learner: 1 × NVIDIA CMP 170HX`. The plan carries
 the advisory `gpu_groups`.
 

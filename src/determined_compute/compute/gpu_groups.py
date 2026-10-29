@@ -42,7 +42,8 @@ def normalize_gpu_groups(
         if unknown:
             raise ValueError(f"{path}[{index}] has unknown fields: {sorted(unknown)}")
         name, count, models = group.get("name"), group.get("count"), group.get("models")
-        if not isinstance(name, str) or not _NAME.match(name):
+        # fullmatch, as Go's regexp reads $: Python's match would accept a trailing newline.
+        if not isinstance(name, str) or not _NAME.fullmatch(name):
             shown = json.dumps(name) if isinstance(name, str) else repr(name)
             raise ValueError(f"{path} name {shown} must match {_NAME_PATTERN}")
         if name in names:

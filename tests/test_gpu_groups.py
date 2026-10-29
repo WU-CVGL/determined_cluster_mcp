@@ -38,6 +38,8 @@ def test_valid_groups_are_returned_as_plain_dicts():
         ([{"count": 1, "models": ["x"]}], 1,
          "gpu_groups name None must match ^[a-z][a-z0-9_-]{0,31}$"),
         ([SIM, SIM], 2, 'gpu_groups name "simulation" is not unique'),
+        ([{"name": "sim\n", "count": 1, "models": ["x"]}], 1,
+         'gpu_groups name "sim\\n" must match ^[a-z][a-z0-9_-]{0,31}$'),
         ([{"name": "a", "count": 0, "models": ["x"]}], 0, "gpu_groups a: count must be at least 1"),
         ([{"name": "a", "count": True, "models": ["x"]}], 1,
          "gpu_groups a: count must be at least 1"),
@@ -249,6 +251,21 @@ def test_a_static_pool_without_agents_is_refused_and_a_dynamic_one_waits():
         config([SIM, LEARNER]),
     )
     assert dynamic.retryable is True
+
+
+@pytest.mark.parametrize(("per_instance", "retryable"), [(1, False), (2, True)])
+def test_a_provisioned_pool_without_agents_is_judged_by_its_slots_per_instance(
+    per_instance, retryable
+):
+    # The master refuses when one instance has fewer slots than the task, even with no agents;
+    # otherwise the task waits for an instance.
+    empty = {**pool_of([], type="RESOURCE_POOL_TYPE_AWS"), "slotsPerAgent": per_instance}
+    for kind in ("command", "shell", "generic", "experiment"):
+        error = refused(ResourceInspector(Client([empty], [])), config([SIM, LEARNER], kind), kind)
+        assert error.code == "capacity_unavailable"
+        assert error.retryable is retryable
+        if not retryable:
+            assert str(error) == NO_AGENT
 
 
 def test_an_unreadable_gpu_model_makes_the_capacity_unknown():

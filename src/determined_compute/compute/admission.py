@@ -435,6 +435,7 @@ class ResourceInspector:
                 available, available_capacity, explanation, refusal = self._assess_groups(
                     name,
                     static=raw.get("type") == _STATIC_POOL,
+                    slots_per_agent=_nonnegative_int(raw.get("slotsPerAgent")),
                     members=members,
                     groups=groups,
                     slots=slots,
@@ -600,6 +601,7 @@ class ResourceInspector:
         name: str,
         *,
         static: bool,
+        slots_per_agent: Optional[int] = None,
         members: List[Tuple[str, Mapping[str, Any], List[Mapping[str, Any]]]],
         groups: List[Mapping[str, Any]],
         slots: int,
@@ -613,7 +615,9 @@ class ResourceInspector:
 
         Returns the verdict, the number of agents whose free GPUs hold the groups now, the
         explanation, and why the master refuses the request (or None). The master refuses a
-        static pool whose agents all have fewer slots than the task, and a pool none of whose
+        provisioned pool whose instances have fewer slots than the task (slotsPerAgent, the
+        master's slotsPerInstance, even without agents), a static pool whose agents all have
+        fewer slots than the task, and a pool none of whose
         agents could hold the groups with every slot free, disabled and draining slots included,
         on one NUMA node under "strong" (gpuGroupsCannotFit). A pool without agents waits, and so
         does an agent that has not reported its GPU topology.
@@ -623,7 +627,12 @@ class ResourceInspector:
         on_node = " on one NUMA node" if strong else ""
         refusal: Optional[str] = None
         largest = max((len(entries) for _id, _agent, entries in members), default=0)
-        if complete and static and largest < slots:
+        if slots_per_agent:
+            # A positive slots per instance decides alone (ValidateResources): more instances
+            # cannot help a task that needs one agent.
+            if slots_per_agent < slots:
+                refusal = _no_agent_has_gpus_for(name, groups)
+        elif complete and static and largest < slots:
             refusal = _no_agent_has_gpus_for(name, groups)
         if refusal is not None:
             return False, None, refusal, refusal
