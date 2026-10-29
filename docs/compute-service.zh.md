@@ -78,8 +78,8 @@ shell_inactivity_seconds: 7200
 | `workdir` | 容器绝对路径 | 可写已配置挂载下的工作目录 |
 | `output_dir` | 容器绝对路径 | 可写已配置挂载下的输出目录 |
 | `slots` | 非负整数 | 请求的 slot 数；默认使用配置值 |
-| `prefer_gpu_topology` | `"soft"`、`"strong"`、`false` 或 null | 2 个及以上 slot 的 GPU 放置偏好；需要 research-cluster fork 0.42.0 或更高版本。`"strong"` 要求全部 GPU 来自同一 agent 的同一 NUMA 节点，并等待到有这样的节点空闲；`"soft"` 不会为等待更好的 GPU 拓扑而额外排队，也不保证同一 NUMA 节点，只在所选 agent 上优先选择连接最好的空闲 GPU。仅在 2 个及以上 slot 且值为 `"soft"` 或 `"strong"` 时发送。experiment 也在这里设置，不能写在 `experiment_config.resources` 中 |
-| `gpu_groups` | 列表或 null | 一个 agent 上按精确型号命名的若干组 GPU，每组为 `{name, count, models}`；需要 research-cluster fork 0.42.2 或更高版本。`name` 符合 `^[a-z][a-z0-9_-]{0,31}$` 且不重复，`count` 至少为 1，`models` 列出互不相同的型号名，写法与 `nvidia-smi` 打印的完全一致，即各资源池 `gpu_models` 中的名称。各组数量之和必须等于 `slots`。容器中的 `DET_GPU_GROUPS` 以 JSON 把每个组名映射到其 GPU UUID。experiment 也在这里设置，不能写在 `experiment_config.resources` 中 |
+| `prefer_gpu_topology` | `"soft"`、`"strong"`、`false` 或 null | 2 个及以上 slot 的 GPU 放置偏好。`"strong"` 要求全部 GPU 来自同一 agent 的同一 NUMA 节点，并等待到有这样的节点空闲；`"soft"` 不会为等待更好的 GPU 拓扑而额外排队，也不保证同一 NUMA 节点，只在所选 agent 上优先选择连接最好的空闲 GPU。仅在 2 个及以上 slot 且值为 `"soft"` 或 `"strong"` 时发送。experiment 也在这里设置，不能写在 `experiment_config.resources` 中 |
+| `gpu_groups` | 列表或 null | 一个 agent 上按精确型号命名的若干组 GPU，每组为 `{name, count, models}`。`name` 符合 `^[a-z][a-z0-9_-]{0,31}$` 且不重复，`count` 至少为 1，`models` 列出互不相同的型号名，写法与 `nvidia-smi` 打印的完全一致，即各资源池 `gpu_models` 中的名称。各组数量之和必须等于 `slots`。容器中的 `DET_GPU_GROUPS` 以 JSON 把每个组名映射到其 GPU UUID。experiment 也在这里设置，不能写在 `experiment_config.resources` 中 |
 | `pool`、`image` | 字符串 | 可选的配置默认值覆盖 |
 | `code_revision` | 字符串或 null | 调用方提供的版本或内容标识 |
 | `experiment_config` | 对象 | 额外的实验配置；要求 experiment 模式 |
@@ -256,8 +256,7 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 先调用 `compute_plan`，检查解析后的路径、模式、镜像、资源池、slot 和提示。
 `compute_resources` 返回实时快照，不保留资源。正 slot 数检查可调度的 agent slot；零检查辅助
 容器容量。候选资源池只是建议，服务不会自动替换。不在资源池列表中的资源池会报告为不存在或对你不
-可用，可用性未知。在 research-cluster fork 0.42.1 或更高版本上，列表中还包括当前账户无权使用的资源
-池，其 `usable` 为 false（0.42.0 会省略它们）：每个资源池都有 `usable`（master 未提供时为 `true`），
+可用，可用性未知。列表中还包括当前账户无权使用的资源池，其 `usable` 为 false：每个资源池都有 `usable`（master 未提供时为 `true`），
 不可用的资源池永远不会被判为可用，也不会成为候选资源池或替代资源池。
 
 `pools` 和 `selected_pool` 中的每个资源池还带有来自同样两次读取的两项事实。`description` 是
@@ -353,8 +352,7 @@ Determined 可能创建了任务，也可能没有。服务从不重试这样的
 在已结束的 command 或 shell 结束 24 小时后不再提供它。不要自动再次提交；是否重新提交由用户
 在检查之后决定，例如在 WebUI 中查看，或稍后再次搜索。事后取消的重复任务可能已经产生了取消
 无法撤销的影响，例如已写入的文件。明确的拒绝（例如 HTTP 400、401 或 403）是普通错误：没有
-提交任何任务。research-cluster fork 0.42.0 或更高版本无法检查当前账户能否使用所请求的资源池时，
-会以 HTTP 503 `could not check access to resource pool "<pool>": ...; try again` 应答提交或恢复。
+提交任何任务。master 无法检查当前账户能否使用所请求的资源池时，会以 HTTP 503 `could not check access to resource pool "<pool>": ...; try again` 应答提交或恢复。
 服务与其他 5xx 一样，把这种应答报告为 `submission_uncertain`；提交按上文用标记检查，恢复则用
 `compute_status` 检查。
 
@@ -427,7 +425,7 @@ generic 任务，该实体合并任务记录（`GET /api/v1/tasks/{id}`）和提
 | `state` | 调度器状态：`STATE_QUEUED`、`STATE_SCHEDULED` 或 `STATE_SCHEDULED_BACKFILLED` |
 | `jobs_ahead` | 作业在资源池队列中的位置：调度器排在它之前的作业数，可能包括已在运行的作业。它不是等待时间的预测；资源池的调度器不为作业排序（fair share）时为 `null` |
 | `requested_slots`、`allocated_slots` | 作业请求和持有的槽位数 |
-| `placement` | `{agent_id, device_ids}` 列表，作业在哪个 agent 上持有槽位就有一项；`device_ids` 是该 agent 的槽位 device ID，升序排列；只有 NVIDIA GPU 槽位的 device ID 才与该 agent 所在节点上 `nvidia-smi` 的编号一致。排队中或零槽位的作业为 `[]`；早于 research-cluster fork 0.42.0 的 master 为 `null` |
+| `placement` | `{agent_id, device_ids}` 列表，作业在哪个 agent 上持有槽位就有一项；`device_ids` 是该 agent 的槽位 device ID，升序排列；只有 NVIDIA GPU 槽位的 device ID 才与该 agent 所在节点上 `nvidia-smi` 的编号一致。排队中或零槽位的作业为 `[]`；master 未报告时为 `null` |
 
 有结束时间的任务已结束；command 和 shell 不报告结束时间，状态为 `STATE_TERMINATED` 时即已结束。
 已结束的任务得到 `queue: null`，不发送请求。找不到作业时，`queue` 为 `null`，并由
@@ -656,8 +654,7 @@ CLI 用户使用。适配器会从每个任务实体中移除 `privateKey`；不
 ### 任务用量测量
 
 `compute_usage` 是只读工具，汇总当前账户拥有的某个任务实测的 CPU、内存和 GPU 用量；
-`compute_resources` 描述的则是调度容量。它要求 Determined master 来自 research-cluster fork
-0.40.1 或更高版本，并由管理员配置 `integrations.task_resources`（`prometheus_url` 和
+`compute_resources` 描述的则是调度容量。它要求 master 由管理员配置 `integrations.task_resources`（`prometheus_url` 和
 `det_cluster`）。
 
 服务先验证参数，再执行[任务身份与所有权](#task-identity-and-ownership)中的所有权检查。随后
@@ -849,8 +846,7 @@ Determined 的 HTTP 失败（包括 gRPC-gateway 错误响应体）显示为 `<s
 以及除 501 之外的 5xx 响应可以重试；501 表示 master 缺少对应路由。用量相关的错误码见
 [任务用量测量](#task-usage-measurements)。
 
-HTTP 403 即 Determined 的权限拒绝，错误码为 `permission_denied`，不可重试。research-cluster
-fork 0.42.0 或更高版本会在提交任务以及恢复 experiment 或 generic 任务时检查资源池。拒绝当前
+HTTP 403 即 Determined 的权限拒绝，错误码为 `permission_denied`，不可重试。master 会在提交任务以及恢复 experiment 或 generic 任务时检查资源池。拒绝当前
 账户无权使用的资源池时，消息是 master 自己的拒绝原文，形式为 `403 <message>`，例如
 `403 failed to prepare launch params: user "<username>" may not use resource pool "<pool>":
 the pool is restricted; choose another pool or ask an administrator for access (...)`，
@@ -859,6 +855,5 @@ the pool is restricted; choose another pool or ask an administrator for access (
 
 服务只操作已认证账户拥有的任务，并在操作任务之前检查这一点；因此即使凭据属于管理员，
 其他账户的任务也会返回 `ownership_mismatch`。应使用拥有该任务的账户凭据，或请管理员直接通过
-Determined 操作。Determined 本身也会执行权限检查：在使用 basic authorization 的 fork 0.40.1
-或更高版本上，只有任务所有者或管理员可以终止、取消、暂停或恢复任务，其他账户会收到
+Determined 操作。Determined 本身也会执行权限检查：在使用 basic authorization 时，只有任务所有者或管理员可以终止、取消、暂停或恢复任务，其他账户会收到
 `permission_denied`（HTTP 403；experiment 为 HTTP 404）。

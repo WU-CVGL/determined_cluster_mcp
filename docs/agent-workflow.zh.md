@@ -79,7 +79,7 @@ MCP 不接受 `kind: notebook`。
 
 一个任务需要同一 agent 上不同型号的 GPU 时，例如一张 RTX 用于仿真、一张计算卡用于学习，在请求中设置 `gpu_groups`：若干命名的组，每组有 `count` 和取自资源池 `gpu_models` 的精确型号 `models`，各组数量之和等于 `slots`。向 `compute_resources` 传入同样的 `gpu_groups`；`per_agent_free_gpus_by_model` 显示每个 agent 上各型号的空闲 GPU。某个 agent 有满足每个组的空闲 GPU 时，任务就在该 agent 上运行。容器中的 `DET_GPU_GROUPS` 把每个组映射到其 GPU UUID，例如 `{"learner":["GPU-…"],"simulation":["GPU-…"]}`；由于 CUDA 的设备序号不一定与组对应，启动每个进程时，把 `CUDA_VISIBLE_DEVICES` 设为其组的 UUID，以逗号分隔。
 
-任务可以等待容量时，例如批量或过夜运行，或用户接受等待时，设置 `allow_queue: true`；排队中的任务可用 `compute_status` 跟踪，也可以取消。需要尽快得到结果时保持 `allow_queue: false`。保留用户或项目已固定的资源池或槽位数；改变槽位数会改变任务本身，因此改动前先询问。资源池未固定时，选择一个合适且可用的资源池，首选资源池已满或对你不可用时也是如此，并说明使用了哪个资源池；指明某个资源池的 `permission_denied` 错误表示当前账户无权使用该资源池。以 `capacity_unknown` 或 `capacity_unavailable` 被拒绝的提交没有提交任何任务：排队、换用其他资源池或报告该结果，而不是循环提交同一请求。在 research-cluster fork 0.41.1 或更高版本上，排队中的任务在 master 重启后仍保持排队。
+任务可以等待容量时，例如批量或过夜运行，或用户接受等待时，设置 `allow_queue: true`；排队中的任务可用 `compute_status` 跟踪，也可以取消。需要尽快得到结果时保持 `allow_queue: false`。保留用户或项目已固定的资源池或槽位数；改变槽位数会改变任务本身，因此改动前先询问。资源池未固定时，选择一个合适且可用的资源池，首选资源池已满或对你不可用时也是如此，并说明使用了哪个资源池；指明某个资源池的 `permission_denied` 错误表示当前账户无权使用该资源池。以 `capacity_unknown` 或 `capacity_unavailable` 被拒绝的提交没有提交任何任务：排队、换用其他资源池或报告该结果，而不是循环提交同一请求。排队中的任务在 master 重启后仍保持排队。
 
 <a id="plan-and-launch-once"></a>
 ## 规划并只提交一次
