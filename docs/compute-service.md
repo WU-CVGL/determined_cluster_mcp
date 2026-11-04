@@ -260,7 +260,7 @@ positive integer for an experiment, which can also be passed as a numeric string
 | Tool | Arguments | Return value and effect |
 | --- | --- | --- |
 | `compute_plan` | `request` | Offline normalized plan; no cluster access |
-| `compute_launch` | `request` | Submits once; returns `kind`, `id`, `name`, `description`, `state`, `submission_marker`, `advisories`, and any `warnings` |
+| `compute_launch` | `request` | Submits once; returns `kind`, `id`, `name`, `description`, `state`, `submission_marker`, `advisories`, and any `warnings`; `confirmation` and `note` when found by its marker |
 | `compute_status` | `kind`, `id` | Task summary, submission marker, sanitized remote entity, and the task's place in its pool's job queue |
 | `compute_logs` | `kind`, `id`, optional `tail=200` | Chronological list of the newest remote log records |
 | `compute_usage` | `kind`, `id`, optional `window_seconds=3600`, `allocation_id`, `trial_id`, `metrics`, `include_samples=false` | Read-only summary of one task's measured CPU, memory, and GPU use |
@@ -384,22 +384,29 @@ exceeding current slots, appear in `warnings` with code `launch_warning`.
 A launch request can reach the master without a confirmed answer: a transport failure
 or timeout after the request was sent, an HTTP 5xx response, a redirect (HTTP 3xx,
 which no mutation follows), or a response without a task ID. Determined may or may not
-have created the task. The service never retries such a launch. It returns a
-`submission_uncertain` error that is not retryable, whose message names the next step
-and whose `details` carry `kind` and `submission_marker`:
+have created the task. The service never retries such a launch. It searches for the
+task by its submission marker, as `compute_list(kind, marker=..., limit=10)` does,
+following one more page when the newest has no match, up to three times about 5 seconds
+apart and within about 15 seconds in all; each task is read once. It stops at the first
+match; a search that fails is retried while time remains and recorded in
+`details.lookup_error`. When exactly one task carries the marker, the launch returns it
+as usual, with `confirmation: "lookup"` and a `note`. Otherwise it returns a
+`submission_uncertain` error that is not retryable, whose message and
+`details.next_step` name the next step, and whose `details` carry `kind`,
+`submission_marker`, and `lookups`:
 
 ```json
-{"error":{"code":"submission_uncertain","message":"The command submission is unconfirmed (...); ...","retryable":false,"details":{"kind":"command","submission_marker":"determined-compute:<uuid>"}}}
+{"error":{"code":"submission_uncertain","message":"The command submission is unconfirmed (...); ...","retryable":false,"details":{"kind":"command","submission_marker":"determined-compute:<uuid>","lookups":3,"next_step":"Search once more with compute_list(...) after about 30 seconds. ..."}}}
 ```
 
-Look for the task with `compute_list(kind, marker=submission_marker)`, with a small
-`limit`, and follow `pagination.next_offset` when needed. Every task it returns carries
-the marker. One returned task is most likely the submission; several share a copied
-config, so show them to the user instead of choosing one. An empty result does not prove
-that the submission failed: each search covers one page, the master may store the task
-after the search, and Determined stops serving an ended command or shell after 24 hours.
-Do not launch again automatically. Whether to submit again is the user's decision after
-checking, for example in the WebUI or with a later search. A duplicate cancelled
+When several tasks carry the marker, they share a copied config; `details.candidates`
+lists them (`kind`, `id`, `name`, `state`), to show to the user instead of choosing one, and end the turn.
+When none does, search once more after about 30 seconds and continue with the task if
+one carries the marker; otherwise tell the user that the launch is unconfirmed, give them
+the marker and the exact request, and end the turn, without waiting, polling
+indefinitely, or launching again on your own. An empty result does not prove that the submission
+failed: each search covers one page, the master may store the task after the search, and
+Determined stops serving an ended command or shell after 24 hours. A duplicate cancelled
 afterwards may already have had effects, such as files it wrote, that cancelling does not
 undo. A definite rejection, such as HTTP 400, 401, or 403, is an ordinary error: nothing
 was submitted. When the master cannot check whether the
@@ -996,11 +1003,12 @@ was disconnected during the wait; `cancelled` and `shell_access_stopping` when t
 was cancelled or the server stopped during the wait; `port_unavailable`; and `unsupported`
 when the `websocket-client` package is missing or the environment selects a proxy other
 than `http://`.
-Safe details can include the kind and submission marker of an unconfirmed launch;
-`source: "proxy"`, `status_code`, and `proxy_error` when an HTTP proxy answered instead
-of Determined; capacity information; and the refused pool of a `permission_denied`
-error. Authentication, permission, transport, and response-shape failures are errors
-rather than empty results. Error messages and reports may contain sanitized commands,
+Safe details can include the kind, submission marker, `lookups`, `next_step`,
+`candidates`, and `lookup_error` of an unconfirmed launch; `source: "proxy"`,
+`status_code`, and `proxy_error` when an HTTP proxy answered instead of Determined;
+capacity information; and the refused pool of a `permission_denied` error.
+Authentication, permission, transport, and response-shape failures are errors rather
+than empty results. Error messages and reports may contain sanitized commands,
 paths, IDs, states, and error classes, but must not include credentials or secret-file
 contents.
 

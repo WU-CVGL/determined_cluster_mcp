@@ -235,7 +235,7 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 | 工具 | 参数 | 返回值与作用 |
 | --- | --- | --- |
 | `compute_plan` | `request` | 离线规范化的规划；不访问集群 |
-| `compute_launch` | `request` | 提交一次；返回 `kind`、`id`、`name`、`description`、`state`、`submission_marker`、`advisories`，以及可能存在的 `warnings` |
+| `compute_launch` | `request` | 提交一次；返回 `kind`、`id`、`name`、`description`、`state`、`submission_marker`、`advisories`，以及可能存在的 `warnings`；按标记找到时还有 `confirmation` 和 `note` |
 | `compute_status` | `kind`、`id` | 任务摘要、提交标记、清理后的远端实体，以及任务在其资源池作业队列中的位置 |
 | `compute_logs` | `kind`、`id`，可选 `tail=200` | 最新远端日志按时间正序排列的列表 |
 | `compute_usage` | `kind`、`id`，可选 `window_seconds=3600`、`allocation_id`、`trial_id`、`metrics`、`include_samples=false` | 一个任务实测 CPU、内存和 GPU 用量的只读摘要 |
@@ -337,21 +337,24 @@ JSON 文本，master 的 YAML 解析器按字面读取该文本，因此 `y`、`
 
 提交请求可能已到达 master，却没有得到确认的答复：请求发出后出现传输失败或超时、返回
 HTTP 5xx、返回重定向（HTTP 3xx，任何变更请求都不会跟随），或响应中没有任务 ID。此时
-Determined 可能创建了任务，也可能没有。服务从不重试这样的提交，而是返回不可重试的
-`submission_uncertain` 错误；其消息说明下一步操作，`details` 包含 `kind` 和
-`submission_marker`：
+Determined 可能创建了任务，也可能没有。服务从不重试这样的提交，而是像
+`compute_list(kind, marker=..., limit=10)` 一样按提交标记查找该任务，最新一页没有匹配时再
+查看下一页，最多查找三次，每次间隔约 5 秒，总共约 15 秒以内；每个任务只读取一次。找到匹配时
+停止；查找本身失败时，在时间允许的范围内重试，失败记录在 `details.lookup_error` 中。恰好一个任务带有该标记时，提交照常返回该任务，并带有
+`confirmation: "lookup"` 和 `note`。否则返回不可重试的 `submission_uncertain` 错误；其消息和
+`details.next_step` 说明下一步操作，`details` 包含 `kind`、`submission_marker` 和 `lookups`：
 
 ```json
-{"error":{"code":"submission_uncertain","message":"The command submission is unconfirmed (...); ...","retryable":false,"details":{"kind":"command","submission_marker":"determined-compute:<uuid>"}}}
+{"error":{"code":"submission_uncertain","message":"The command submission is unconfirmed (...); ...","retryable":false,"details":{"kind":"command","submission_marker":"determined-compute:<uuid>","lookups":3,"next_step":"Search once more with compute_list(...) after about 30 seconds. ..."}}}
 ```
 
-用 `compute_list(kind, marker=submission_marker)` 查找该任务，使用较小的 `limit`，需要时
-沿 `pagination.next_offset` 继续。它返回的每个任务都带有该标记。只返回一个任务时，它很可能
-就是这次提交；返回多个时，它们共用一份复制的配置，应把它们交给用户判断，而不是自行选择。
-空结果不能证明提交失败：每次搜索只覆盖一页，master 可能在搜索之后才保存任务，而且 Determined
-在已结束的 command 或 shell 结束 24 小时后不再提供它。不要自动再次提交；是否重新提交由用户
-在检查之后决定，例如在 WebUI 中查看，或稍后再次搜索。事后取消的重复任务可能已经产生了取消
-无法撤销的影响，例如已写入的文件。明确的拒绝（例如 HTTP 400、401 或 403）是普通错误：没有
+多个任务带有该标记时，它们共用一份复制的配置；`details.candidates` 列出这些任务（`kind`、
+`id`、`name`、`state`），应把它们交给用户判断，而不是自行选择，然后结束本轮。没有任务带有该标记时，约 30
+秒后再搜索一次，有任务带有该标记时继续使用它；否则告诉用户这次提交未确认，给出标记和完整的
+请求，然后结束本轮，不要等待、无限轮询或自行再次提交。空结果不能证明提交失败：每次搜索只覆盖
+一页，master 可能在搜索之后才保存任务，而且 Determined 在已结束的 command 或 shell 结束 24
+小时后不再提供它。事后取消的重复任务可能已经产生了取消无法撤销的影响，例如已写入的文件。
+明确的拒绝（例如 HTTP 400、401 或 403）是普通错误：没有
 提交任何任务。master 无法检查当前账户能否使用所请求的资源池时，会以 HTTP 503 `could not check access to resource pool "<pool>": ...; try again` 应答提交或恢复。
 服务与其他 5xx 一样，把这种应答报告为 `submission_uncertain`；提交按上文用标记检查，恢复则用
 `compute_status` 检查。
@@ -837,7 +840,7 @@ MCP 失败使用 `isError: true`；其文本内容是如下形式的紧凑 JSON�
 `shell_access_conflict`；等待期间隧道被断开时的 `shell_access_closed`；等待期间请求被取消或 server
 停止时的 `cancelled` 和 `shell_access_stopping`；`port_unavailable`；以及缺少 `websocket-client` 包或环境选出了
 `http://` 以外的代理时的 `unsupported`。安全 details 可包含
-未确认提交的 kind 和提交标记；HTTP 代理代替 Determined 作出应答时的 `source: "proxy"`、
+未确认提交的 kind、提交标记、`lookups`、`next_step`、`candidates` 和 `lookup_error`；HTTP 代理代替 Determined 作出应答时的 `source: "proxy"`、
 `status_code` 和 `proxy_error`；容量信息；以及 `permission_denied` 错误中被拒绝的资源池。
 认证、权限、传输和响应结构错误都会返回错误，而不是空结果。错误消息和报告可以包含清理后的
 命令、路径、ID、状态和错误类别，但不能包含凭据或 secrets 文件内容。
