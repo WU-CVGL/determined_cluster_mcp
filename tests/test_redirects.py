@@ -159,13 +159,19 @@ def test_a_redirected_launch_whose_follow_up_fails_keeps_its_marker(transport):
         service().launch({"name": "probe", "command": "true", "workdir": "/shared/work",
                           "output_dir": "/shared/out", "allow_queue": True})
 
-    assert transport.sent == [("POST", MASTER + "/api/v1/commands")]
-    marker = caught.value.details["submission_marker"]
-    assert caught.value.details == {"kind": "command", "submission_marker": marker}
+    # Each search for the marker finds the master down.
+    me = ("GET", MASTER + "/api/v1/me")
+    assert transport.sent == [("POST", MASTER + "/api/v1/commands"), me, me, me]
+    details = caught.value.details
+    marker = details["submission_marker"]
+    assert details == {"kind": "command", "submission_marker": marker, "lookups": 3,
+                       "next_step": details["next_step"], "lookup_error": details["lookup_error"]}
+    assert details["lookup_error"].startswith("transport_error: ")
     assert f"COMPUTE_SUBMISSION_MARKER={marker}".encode() in transport.bodies[0]
     message = str(caught.value)
     assert "HTTP 303" in message and "not followed" in message and "landing" not in message
-    assert "does not prove that the submission failed" in message and "token" not in message
+    assert "could not search for its submission marker (transport_error)" in message
+    assert "token" not in message
 
 
 def test_a_redirected_cancel_has_an_unknown_outcome(transport):

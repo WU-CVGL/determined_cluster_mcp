@@ -286,7 +286,10 @@ def test_unconfirmed_launch_error_carries_the_marker():
             )
             error.details = {
                 "kind": "command", "submission_marker": MARKER, "status_code": 502,
-                "error": "echoed request data",
+                "error": "echoed request data", "lookups": 3, "next_step": NEXT_STEP,
+                "lookup_error": "transport_error: unreachable",
+                "candidates": [{"kind": "command", "id": COMMAND_ID, "name": "probe",
+                                "state": "QUEUED"}],
             }
             raise error
 
@@ -298,10 +301,35 @@ def test_unconfirmed_launch_error_carries_the_marker():
             assert error["retryable"] is False
             assert error["details"] == {
                 "kind": "command", "submission_marker": MARKER, "status_code": 502,
+                "lookups": 3, "next_step": NEXT_STEP,
+                "lookup_error": "transport_error: unreachable",
+                "candidates": [{"kind": "command", "id": COMMAND_ID, "name": "probe",
+                                "state": "QUEUED"}],
             }
             assert MARKER in error["message"]
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=10))
+
+
+NEXT_STEP = "Search once more ... and end your turn"
+
+
+def test_an_unconfirmed_launch_is_described_as_ending_the_turn():
+    server = create_server(FakeService())
+
+    async def exercise():
+        async with Client(server) as client:
+            listed = await client.list_tools()
+            return {tool.name: tool for tool in listed.tools}["compute_launch"].description
+
+    launch = " ".join(asyncio.run(asyncio.wait_for(exercise(), timeout=10)).split())
+    instructions = " ".join(server.instructions.split())
+    for text in (instructions, launch):
+        assert "end your turn" in text
+        assert "already" in text and "marker" in text
+        assert "resubmission to the user" not in text
+        assert "user's decision" not in text
+    assert "on your own" in launch and "continue with the task" in launch
 
 
 def test_slow_service_call_does_not_block_other_tools():

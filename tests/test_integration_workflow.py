@@ -190,7 +190,17 @@ def pool_check_failure():
                     503)
 
 
+def no_commands(monkeypatch):
+    """The account has no commands, so the search for an unconfirmed launch finds none."""
+    routes(monkeypatch, {
+        'api/v1/me': ME,
+        'api/v1/commands': {'commands': [], 'pagination': {
+            'limit': 10, 'offset': 0, 'startIndex': 0, 'endIndex': 0, 'total': 0}},
+    })
+
+
 def test_a_failed_pool_check_on_launch_is_unconfirmed_and_carries_the_marker(monkeypatch):
+    no_commands(monkeypatch)
     calls = []
 
     def post(url, **kwargs):
@@ -205,6 +215,8 @@ def test_a_failed_pool_check_on_launch_is_unconfirmed_and_carries_the_marker(mon
     assert caught.value.code == 'submission_uncertain'
     assert caught.value.details['kind'] == 'command'
     assert caught.value.details['submission_marker'].startswith('determined-compute:')
+    assert caught.value.details['lookups'] == 3
+    assert 'lookup_error' not in caught.value.details
     assert len(calls) == 1
 
 
@@ -234,6 +246,7 @@ def test_a_failed_pool_check_on_resume_is_unconfirmed_without_a_marker(monkeypat
 
 
 def test_timeout_is_unconfirmed_never_reposted_and_found_by_marker(monkeypatch):
+    no_commands(monkeypatch)
     calls = []
     def uncertain(url, **kwargs):
         calls.append(kwargs['json'])
@@ -245,6 +258,8 @@ def test_timeout_is_unconfirmed_never_reposted_and_found_by_marker(monkeypatch):
         service.launch(request())
     assert len(calls) == 1
     marker = caught.value.details['submission_marker']
+    assert caught.value.details['lookups'] == 3
+    assert 'lookup_error' not in caught.value.details
     variables = calls[0]['config']['environment']['environment_variables']
     assert f'COMPUTE_SUBMISSION_MARKER={marker}' in variables
 

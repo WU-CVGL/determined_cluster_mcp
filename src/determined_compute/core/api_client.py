@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
 import re
 import ssl
+import threading
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Union
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Union
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import requests
@@ -411,6 +413,22 @@ class DeterminedAPIClient:
         self.headers: Dict[str, str] = {}
         if self.api_token:
             self.headers["Authorization"] = f"Bearer {self.api_token}"
+        self._read_timeouts = threading.local()
+
+    @contextlib.contextmanager
+    def read_timeout(self, seconds: float) -> Iterator[None]:
+        """Use this timeout for the current thread's GET requests inside the block."""
+        local = self._read_timeouts
+        previous = getattr(local, "seconds", None)
+        local.seconds = seconds
+        try:
+            yield
+        finally:
+            local.seconds = previous
+
+    def _get_timeout(self) -> float:
+        seconds = getattr(getattr(self, "_read_timeouts", None), "seconds", None)
+        return 30 if seconds is None else seconds
 
     def _url(self, endpoint: str) -> str:
         return urljoin(self.api_url.rstrip("/") + "/", endpoint)
@@ -448,7 +466,7 @@ class DeterminedAPIClient:
 
     def _get(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         try:
-            response = requests.get(self._url(endpoint), headers=self.headers, params=params, timeout=30, verify=self.verify_ssl)
+            response = requests.get(self._url(endpoint), headers=self.headers, params=params, timeout=self._get_timeout(), verify=self.verify_ssl)
         except requests.RequestException as exc:
             raise APIError(
                 _transport_message("Determined request failed", exc),

@@ -63,7 +63,8 @@ def safe_error_details(exc: BaseException) -> dict[str, Any]:
     details = getattr(exc, "details", None)
     allowed = {
         "kind", "submission_marker", "source", "status_code", "proxy_error", "resource_pool",
-        "requested_slots", "available", "candidate_pools",
+        "requested_slots", "available", "candidate_pools", "lookups", "lookup_error",
+        "candidates", "next_step",
     }
     return {key: value for key, value in details.items() if key in allowed} if isinstance(details, dict) else {}
 
@@ -133,9 +134,11 @@ def create_server(
             "compute_plan renders a request without submitting it; compute_launch validates it the "
             "same way. Every launch is a new submission: the server keeps no task "
             "records, so keep the returned kind and id, which are Determined's own task ID. "
-            "If a launch is unconfirmed, look for it with compute_list(kind, marker=...); an "
-            "empty result does not prove it failed, so never launch again automatically: "
-            "resubmitting is the user's decision. Use compute_list to find the account's tasks "
+            "If a launch is unconfirmed, the server has already searched for it by its marker: "
+            "follow error.details.next_step, search once more with compute_list(kind, "
+            "marker=...) after about 30 seconds, continue with the task if one is found, and "
+            "otherwise report the marker and the request to the user and end your turn; never "
+            "wait or launch again on your own. Use compute_list to find the account's tasks "
             "(compute_list(kind, states=['STATE_ACTIVE']) lists the active experiments or "
             "generic tasks, queued or running, one page at a time; follow pagination.next_offset "
             "until it is null) "
@@ -184,8 +187,10 @@ def create_server(
     async def compute_launch(request: dict[str, Any]) -> dict[str, Any]:
         """Submit a request once and return its kind and Determined id; checks capacity unless allow_queue=true.
 
-        Every call is a new submission. On an unconfirmed outcome, look for the task with
-        compute_list and the returned marker, and leave any resubmission to the user.
+        Every call is a new submission. An unconfirmed outcome has already been searched for
+        by its marker; follow details.next_step: search once more after about 30 seconds and
+        continue with the task if one carries the marker; otherwise report the marker and the
+        request to the user and end your turn. Never launch again on your own.
         """
 
         return await call(service.launch, request)

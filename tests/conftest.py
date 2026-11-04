@@ -17,3 +17,12 @@ def _no_ambient_credentials(monkeypatch):
 
     for name in _CREDENTIAL_ENVIRONMENT:
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_lookup_spacing(monkeypatch):
+    """Search for an unconfirmed launch without waiting between searches."""
+
+    from determined_compute.compute import service
+
+    monkeypatch.setattr(service, "_LOOKUP_SPACING_SECONDS", 0)
