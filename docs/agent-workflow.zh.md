@@ -104,7 +104,7 @@ MCP 不接受 `kind: notebook`。
 
 调用一次 `compute_launch(request)`。它返回任务的 `kind` 和 `id`，即 Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，experiment 为整数。之后的所有工具都使用这一对值。MCP 不保存这次提交的记录，所以请把 kind、ID、名称和 `submission_marker` 写入自己的工作记录。每次调用都是一次新的提交：用同一请求再次调用 `compute_launch` 会启动第二个任务。
 
-如果提交返回 `submission_uncertain`，说明提交未确认：Determined 可能创建了任务，也可能没有，任务也可能稍后才出现。不要自动再次提交。用错误 details 中的 `submission_marker` 和较小的 `limit` 调用 `compute_list(kind, marker=...)`。只返回一个任务时，它很可能就是这次提交，继续使用它的 ID；返回多个任务时，它们共用一份复制的配置，应交给用户判断，而不是自行选择。空结果不能证明提交失败，因为每次搜索只覆盖一页，master 也可能稍后才保存任务。报告这次未确认的提交，是否重新提交由用户决定。参见[故障排查](troubleshooting.zh.md#submission-outcome-is-uncertain)。
+Determined 对提交的应答丢失时，服务会按提交标记查找该任务。找到的任务作为普通的提交结果返回，并带有 `confirmation: "lookup"`。否则提交返回 `submission_uncertain`：Determined 可能创建了任务，也可能没有，任务也可能稍后才出现。按 `details.next_step` 操作：约 30 秒后用 `compute_list(kind, marker=..., limit=10)` 再搜索一次，有任务带有该标记时继续使用它；没有时，告诉用户这次提交未确认，给出标记和完整的请求，然后结束本轮。不要等待、无限轮询或自行再次提交。带有该标记的多个任务（`details.candidates`）共用一份复制的配置，应交给用户判断，而不是自行选择，然后结束本轮。空结果不能证明提交失败，因为每次搜索只覆盖一页，master 也可能稍后才保存任务。参见[故障排查](troubleshooting.zh.md#submission-outcome-is-uncertain)。
 
 <a id="monitor-and-accept-the-result"></a>
 ## 跟踪并验收结果

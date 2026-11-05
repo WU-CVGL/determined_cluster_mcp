@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import math
 import posixpath
@@ -13,7 +14,7 @@ import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import PurePosixPath
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from determined_compute.core.api_client import DeterminedAPIClient
 
@@ -58,6 +59,27 @@ _GPU_TOPOLOGY_PREFERENCES = ("soft", "strong")
 _NAME_MAX_LENGTH = 128
 _DESCRIPTION_MAX_LENGTH = 2048
 _SUBMISSION_MARKER_VARIABLE = "COMPUTE_SUBMISSION_MARKER"
+# Searches by submission marker after a launch whose answer was lost, and the wait between them.
+_LOOKUP_ATTEMPTS = 3
+_LOOKUP_SPACING_SECONDS = 5.0
+_LOOKUP_PAGE_SIZE = 10
+# The time all searches may take together, and the cap on each of their requests.
+_LOOKUP_BUDGET_SECONDS = 15.0
+_LOOKUP_REQUEST_TIMEOUT_SECONDS = 5.0
+
+
+def _clock() -> float:
+    return time.monotonic()
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+class _LookupOutOfTime(Exception):
+    """The search for a submission marker used up its time budget."""
+
+
 _FORBIDDEN_FIELDS = {
     "context",
     "contextdir",
@@ -764,7 +786,8 @@ class ComputeService:
         """Submit a request once and return Determined's own task ID.
 
         Nothing is recorded locally. A launch whose outcome is unknown is never
-        retried; the error carries the submission marker for compute_list.
+        retried: the service searches for it by its submission marker, and returns the one
+        task found or raises an error that carries the marker and the next step.
         """
         plan = self.plan(request)
         kind = plan["kind"]
@@ -786,12 +809,14 @@ class ComputeService:
                 entity = self.client.launch_task(kind, launch_config, launch_options)
             remote_id = self._launched_id(kind, entity)
         except SubmissionUncertainError as exc:
-            raise self._uncertain(kind, marker, str(exc), exc.details) from exc
+            return self._resolve_unconfirmed(plan, marker, str(exc), exc.details, exc)
         except APIError:
             # The master answered with a definite rejection, so nothing was submitted.
             raise
         except Exception as exc:
-            raise self._uncertain(kind, marker, "the launch failed unexpectedly") from exc
+            return self._resolve_unconfirmed(
+                plan, marker, "the launch failed unexpectedly", None, exc
+            )
         result: Dict[str, Any] = {
             "kind": kind,
             "id": self._public_id(kind, remote_id),
@@ -817,18 +842,162 @@ class ComputeService:
         except ValidationError as exc:
             raise SubmissionUncertainError("launch response contained a malformed task id") from exc
 
+    def _resolve_unconfirmed(
+        self,
+        plan: Mapping[str, Any],
+        marker: str,
+        reason: str,
+        cause: Any,
+        exc: BaseException,
+    ) -> Dict[str, Any]:
+        """Search for a launch whose answer was lost; return it when exactly one task matches."""
+        kind = plan["kind"]
+        deadline = _clock() + _LOOKUP_BUDGET_SECONDS
+        # A task read without the marker cannot gain it later, so each is read once.
+        unmarked: Set[str] = set()
+        found: List[Dict[str, Any]] = []
+        lookups = 0
+        completed = 0
+        lookup_error: Optional[str] = None
+        for attempt in range(_LOOKUP_ATTEMPTS):
+            if attempt:
+                if _clock() + _LOOKUP_SPACING_SECONDS >= deadline:
+                    break
+                if _LOOKUP_SPACING_SECONDS > 0:
+                    _sleep(_LOOKUP_SPACING_SECONDS)
+            lookups += 1
+            try:
+                found = self._find_by_marker(kind, marker, unmarked, deadline)
+            except _LookupOutOfTime:
+                lookup_error = (
+                    f"lookup_timeout: the search did not finish within "
+                    f"{_LOOKUP_BUDGET_SECONDS:g} seconds"
+                )
+                break
+            except Exception as lookup_exc:
+                # A fast failure, such as a restarting master, may pass by the next search;
+                # a slow one uses up the budget.
+                code = getattr(lookup_exc, "code", type(lookup_exc).__name__)
+                lookup_error = f"{code}: {lookup_exc}"[:500]
+                continue
+            completed += 1
+            if found:
+                break
+        if len(found) == 1:
+            task = found[0]
+            return {
+                "kind": kind,
+                "id": task["id"],
+                "name": plan["name"],
+                "description": plan["description"],
+                "state": task.get("state"),
+                "submission_marker": marker,
+                "advisories": plan["advisories"],
+                "confirmation": "lookup",
+                "note": (
+                    "Determined's answer to the launch was lost; the task was found by its "
+                    "submission marker."
+                ),
+            }
+        error = self._uncertain(
+            kind,
+            marker,
+            reason,
+            cause,
+            lookups=lookups,
+            completed=completed,
+            found=found,
+            lookup_error=lookup_error,
+        )
+        raise error from exc
+
+    def _find_by_marker(
+        self, kind: str, marker: str, unmarked: Set[str], deadline: float
+    ) -> List[Dict[str, Any]]:
+        """Search the newest page of the account's tasks, and the next one, for the marker."""
+        user = self._in_time(deadline, self._account)
+        found: List[Dict[str, Any]] = []
+        offset = 0
+        for _page in range(2):
+            listed, total = self._in_time(
+                deadline, self._task_page, kind, user, _LOOKUP_PAGE_SIZE, offset, None
+            )
+            for remote_id, item in listed:
+                if remote_id in unmarked:
+                    continue
+                task = self._in_time(
+                    deadline, self._marked_task, kind, remote_id, item, marker, user
+                )
+                if task is None:
+                    unmarked.add(remote_id)
+                else:
+                    found.append(task)
+            offset += len(listed)
+            if found or not listed or offset >= total:
+                break
+        return found
+
+    def _in_time(self, deadline: float, call: Any, *args: Any) -> Any:
+        """Run one step of a marker search with what is left of its time budget."""
+        remaining = deadline - _clock()
+        if remaining <= 0:
+            raise _LookupOutOfTime()
+        limit = (
+            self.client.read_timeout(min(_LOOKUP_REQUEST_TIMEOUT_SECONDS, remaining))
+            if isinstance(self.client, DeterminedAPIClient)
+            else contextlib.nullcontext()
+        )
+        with limit:
+            return call(*args)
+
     @staticmethod
     def _uncertain(
-        kind: str, marker: str, reason: str, cause: Any = None
+        kind: str,
+        marker: str,
+        reason: str,
+        cause: Any = None,
+        lookups: int = 0,
+        completed: int = 0,
+        found: Sequence[Mapping[str, Any]] = (),
+        lookup_error: Optional[str] = None,
     ) -> SubmissionUncertainError:
+        details: Dict[str, Any] = {"kind": kind, "submission_marker": marker}
+        if found:
+            details["candidates"] = [
+                {key: task.get(key) for key in ("kind", "id", "name", "state")} for task in found
+            ]
+            searched = f"{len(found)} tasks carry its submission marker"
+            next_step = (
+                "Show these tasks to the user, who decides which one, if any, is this "
+                "submission, and end your turn; do not resubmit on your own."
+            )
+        else:
+            if completed:
+                times = "once" if completed == 1 else f"{completed} times"
+                searched = (
+                    f"the server searched for its submission marker {times} without finding "
+                    "it; an empty result does not prove that the submission failed"
+                )
+            else:
+                searched = (
+                    "the server could not search for its submission marker "
+                    f"({(lookup_error or 'no answer').split(':', 1)[0]})"
+                )
+            next_step = (
+                f"Search once more with compute_list(kind={kind!r}, marker={marker!r}, "
+                "limit=10) after about 30 seconds. If one task carries the marker, continue "
+                "with its id. Otherwise tell the user that the submission is unconfirmed, give "
+                "them this marker and the exact compute_launch request to resubmit, and end "
+                "your turn; do not wait, poll indefinitely or resubmit on your own."
+            )
+        details["lookups"] = lookups
+        if lookup_error is not None:
+            details["lookup_error"] = lookup_error
+        details["next_step"] = next_step
         error = SubmissionUncertainError(
             f"The {kind} submission is unconfirmed ({reason}); Determined may or may not have "
-            f"created it, and it may still appear. Look for it with compute_list(kind={kind!r}, "
-            f"marker={marker!r}). An empty result does not prove that the submission failed. "
-            "Do not launch again automatically: whether to resubmit is the user's decision "
-            "after checking."
+            f"created it, and {searched}. {next_step}"
         )
-        details: Dict[str, Any] = {"kind": kind, "submission_marker": marker}
         if isinstance(cause, Mapping) and cause.get("source") == "proxy":
             # An HTTP proxy, not Determined, answered; keep that label for the caller.
             details.update(
@@ -1401,6 +1570,45 @@ class ComputeService:
         except ValueError as exc:
             raise ValidationError(str(exc)) from exc
         user = self._account()
+        listed, total = self._task_page(kind, user, limit, offset, states)
+        tasks: List[Dict[str, Any]] = []
+        for remote_id, item in listed:
+            if marker is None:
+                tasks.append(self._summary(kind, remote_id, item))
+                continue
+            task = self._marked_task(kind, remote_id, item, marker, user)
+            if task is not None:
+                tasks.append(task)
+        next_offset = offset + len(listed)
+        result: Dict[str, Any] = {
+            "kind": kind,
+            "account": user,
+            "tasks": tasks,
+            "pagination": {
+                "offset": offset,
+                "limit": limit,
+                "total": total,
+                "next_offset": (
+                    next_offset if next_offset > offset and next_offset < total else None
+                ),
+            },
+        }
+        if states is not None:
+            result["filters"] = {"states": states}
+        if marker is not None:
+            result["marker"] = marker
+            result["searched"] = len(listed)
+        return result
+
+    def _task_page(
+        self,
+        kind: str,
+        user: Mapping[str, str],
+        limit: int,
+        offset: int,
+        states: Optional[List[str]],
+    ) -> Tuple[List[Tuple[str, Mapping[str, Any]]], int]:
+        """Return one checked page of the account's tasks as (id, listed task), and the total."""
         page = self.client.list_remote_tasks(
             kind, user_id=user["id"], limit=limit, offset=offset, states=states
         )
@@ -1414,52 +1622,39 @@ class ComputeService:
             or isinstance(pagination.get("total"), bool)
             or not isinstance(pagination.get("total"), int)
             or pagination["total"] < 0
-            or (
-                page["tasks"]
-                and pagination["total"] < offset + len(page["tasks"])
-            )
+            or (page["tasks"] and pagination["total"] < offset + len(page["tasks"]))
             or len(page["tasks"]) > limit
         ):
             raise APIError("Remote task pagination is malformed", code="invalid_response")
-        tasks: List[Dict[str, Any]] = []
-        for listed in page["tasks"]:
-            self._check_remote_owner(kind, listed, user["id"])
+        listed: List[Tuple[str, Mapping[str, Any]]] = []
+        for item in page["tasks"]:
+            self._check_remote_owner(kind, item, user["id"])
             try:
-                remote_id = self._canonical_id(kind, listed.get("id"))
+                remote_id = self._canonical_id(kind, item.get("id"))
             except ValidationError as exc:
-                raise APIError("Remote task identity is malformed", code="invalid_response") from exc
-            if marker is None:
-                tasks.append(self._summary(kind, remote_id, listed))
-                continue
-            entity = self.client.get_task(kind, remote_id)
-            self._check_remote_entity(kind, remote_id, entity, user["id"])
-            if entity.get("submissionMarker") == marker:
-                tasks.append({
-                    **self._summary(kind, remote_id, {**listed, **entity}),
-                    "submission_marker": marker,
-                })
-        next_offset = offset + len(page["tasks"])
-        result: Dict[str, Any] = {
-            "kind": kind,
-            "account": user,
-            "tasks": tasks,
-            "pagination": {
-                "offset": offset,
-                "limit": limit,
-                "total": pagination["total"],
-                "next_offset": (
-                    next_offset
-                    if next_offset > offset and next_offset < pagination["total"]
-                    else None
-                ),
-            },
+                raise APIError(
+                    "Remote task identity is malformed", code="invalid_response"
+                ) from exc
+            listed.append((remote_id, item))
+        return listed, pagination["total"]
+
+    def _marked_task(
+        self,
+        kind: str,
+        remote_id: str,
+        listed: Mapping[str, Any],
+        marker: str,
+        user: Mapping[str, str],
+    ) -> Optional[Dict[str, Any]]:
+        """Read one listed task; return its summary when its config carries the marker."""
+        entity = self.client.get_task(kind, remote_id)
+        self._check_remote_entity(kind, remote_id, entity, user["id"])
+        if entity.get("submissionMarker") != marker:
+            return None
+        return {
+            **self._summary(kind, remote_id, {**listed, **entity}),
+            "submission_marker": marker,
         }
-        if states is not None:
-            result["filters"] = {"states": states}
-        if marker is not None:
-            result["marker"] = marker
-            result["searched"] = len(page["tasks"])
-        return result
 
     @staticmethod
     def _task_kind(kind: Any) -> str:

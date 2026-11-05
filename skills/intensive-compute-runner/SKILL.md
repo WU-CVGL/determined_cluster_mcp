@@ -40,7 +40,7 @@ If `name` or `description` is rejected as too long with `invalid_request`, short
 
 A `permission_denied` error that names a resource pool means the account may not use that pool. Choose another fitting pool unless the user fixed this one; then report it, and the user can ask an administrator for access.
 
-For `submission_uncertain`, do not launch again automatically. Search with `compute_list(kind, marker=...)` using the returned `submission_marker`. An empty result does not prove failure; report an unresolved or ambiguous result and leave resubmission to the user. See [unconfirmed submissions](../../docs/troubleshooting.md#submission-outcome-is-uncertain).
+For `submission_uncertain`, the server has already searched for the task by its `submission_marker`. Follow `details.next_step`: search once more with `compute_list(kind, marker=..., limit=10)` after about 30 seconds and continue with the task if one carries the marker; show several to the user and end your turn; if none, report the marker and the exact request to the user and end your turn. Never wait, poll indefinitely, or launch again on your own; an empty result does not prove failure. See [unconfirmed submissions](../../docs/troubleshooting.md#submission-outcome-is-uncertain).
 
 Stop and report authentication or deployment-configuration errors without reading credential values or changing the secrets file or MCP configuration; see [authentication fails](../../docs/troubleshooting.md#authentication-fails). They do not authorize a local fallback.
 

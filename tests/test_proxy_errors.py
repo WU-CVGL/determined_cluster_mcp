@@ -232,17 +232,29 @@ def test_an_unconfirmed_launch_through_a_proxy_keeps_its_marker(monkeypatch, ser
         sent.append(kwargs["json"])
         return RawResponse(503, "", PROXY_503)
 
+    searched = []
+
+    def get(url, **kwargs):
+        searched.append((url, kwargs["timeout"]))
+        return RawResponse(503, "", PROXY_503)
+
     monkeypatch.setattr(requests, "post", post)
+    # The master is down, so the proxy also answers the search for the marker.
+    monkeypatch.setattr(requests, "get", get)
     with pytest.raises(SubmissionUncertainError) as caught:
         service.launch(REQUEST)
 
     details = caught.value.details
     marker = details["submission_marker"]
     assert details == {"kind": "command", "submission_marker": marker, "source": "proxy",
-                       "status_code": 503}
+                       "status_code": 503, "lookups": 3, "next_step": details["next_step"],
+                       "lookup_error": details["lookup_error"]}
+    assert details["lookup_error"].startswith("503: ")
+    # Each search is retried after a fast failure, with a short timeout.
+    assert searched == [("http://master:8080/api/v1/me", 5.0)] * 3
     assert f"COMPUTE_SUBMISSION_MARKER={marker}" in sent[0]["config"]["environment"]["environment_variables"]
     assert "an HTTP proxy, not Determined, answered with HTTP 503" in str(caught.value)
-    assert "does not prove that the submission failed" in str(caught.value)
+    assert "could not search for its submission marker (503)" in str(caught.value)
     assert len(sent) == 1
 
 

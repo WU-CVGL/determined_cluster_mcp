@@ -681,10 +681,46 @@ class _Crashed(FakeClient):
 
 @pytest.mark.parametrize("client_type", [_Disconnected, _Crashed, _MissingId])
 @pytest.mark.parametrize("kind", ["command", "generic", "experiment"])
-def test_uncertain_launch_returns_the_marker_and_is_not_retried(
+def test_a_lost_launch_answer_is_resolved_by_the_marker_and_never_retried(
     profile, command_request, client_type, kind
 ):
     client = client_type()
+    service = ComputeService(client, profile)
+
+    launched = service.launch(dict(command_request, kind=kind, allow_queue=True))
+
+    assert len(client.launches) == 1
+    marker = marker_of(client.launches[0][1])
+    expected_id = 1 if kind == "experiment" else str(uuid.UUID(int=1))
+    assert (launched["kind"], launched["id"]) == (kind, expected_id)
+    assert launched["submission_marker"] == marker
+    assert launched["confirmation"] == "lookup"
+    assert "found by its submission marker" in launched["note"]
+    assert launched["name"] == service.plan(dict(command_request, kind=kind))["name"]
+
+
+class _Lost(FakeClient):
+    """The master never stores the task, or not before the service stops searching."""
+
+    def __init__(self):
+        super().__init__()
+        self.lists = []
+
+    def launch_task(self, kind, config, options=None):
+        self.pending = (kind, config, options)
+        self.launches.append((kind, copy.deepcopy(config)))
+        raise SubmissionUncertainError("Determined mutation outcome is unknown")
+
+    def list_remote_tasks(self, kind, *, user_id, limit, offset, states=None):
+        self.lists.append((kind, limit, offset))
+        return super().list_remote_tasks(
+            kind, user_id=user_id, limit=limit, offset=offset, states=states
+        )
+
+
+@pytest.mark.parametrize("kind", ["command", "generic", "experiment"])
+def test_an_unfound_launch_ends_in_a_report_to_the_user(profile, command_request, kind):
+    client = _Lost()
     service = ComputeService(client, profile)
 
     with pytest.raises(SubmissionUncertainError) as caught:
@@ -695,29 +731,259 @@ def test_uncertain_launch_returns_the_marker_and_is_not_retried(
     error = caught.value
     assert error.code == "submission_uncertain"
     assert error.retryable is False
-    assert error.details == {"kind": kind, "submission_marker": marker}
-    assert "unconfirmed" in str(error)
-    assert f"compute_list(kind={kind!r}, marker={marker!r})" in str(error)
-    assert "does not prove that the submission failed" in str(error)
+    next_step = error.details["next_step"]
+    assert error.details == {
+        "kind": kind,
+        "submission_marker": marker,
+        "lookups": 3,
+        "next_step": next_step,
+    }
+    assert f"compute_list(kind={kind!r}, marker={marker!r}, limit=10)" in next_step
+    assert "after about 30 seconds" in next_step
+    assert "end your turn" in next_step and "resubmit on your own" in next_step
+    assert client.lists == [(kind, 10, 0)] * 3
+    message = str(error)
+    assert "unconfirmed" in message and next_step in message
+    assert "does not prove that the submission failed" in message
 
-    # The marker finds the task the master did create, without launching again.
-    found = service.list_tasks(kind, marker=marker)
-    assert [task["submission_marker"] for task in found["tasks"]] == [marker]
+
+class _Clock:
+    """A clock that only the fake sleeps and requests move."""
+
+    def __init__(self, monkeypatch):
+        from determined_compute.compute import service as service_module
+
+        self.now = 0.0
+        self.waits = []
+        monkeypatch.setattr(service_module, "_clock", lambda: self.now)
+        monkeypatch.setattr(service_module, "_sleep", self.sleep)
+
+    def sleep(self, seconds):
+        self.waits.append(seconds)
+        self.now += seconds
+
+
+def test_the_searches_are_spaced_and_end_within_twenty_seconds(
+    monkeypatch, profile, command_request
+):
+    from determined_compute.compute import service as service_module
+
+    clock = _Clock(monkeypatch)
+    monkeypatch.setattr(service_module, "_LOOKUP_SPACING_SECONDS", 5.0)
+
+    with pytest.raises(SubmissionUncertainError) as caught:
+        ComputeService(_Lost(), profile).launch(dict(command_request, allow_queue=True))
+
+    assert clock.waits == [5.0, 5.0]
+    assert clock.now < 20
+    assert caught.value.details["lookups"] == 3
+    assert "3 times without finding it" in str(caught.value)
+
+
+def test_slow_searches_stop_at_the_time_budget(monkeypatch, profile, command_request):
+    from determined_compute.compute import service as service_module
+
+    clock = _Clock(monkeypatch)
+    monkeypatch.setattr(service_module, "_LOOKUP_SPACING_SECONDS", 5.0)
+
+    class Slow(_Lost):
+        def launch_task(self, kind, config, options=None):
+            for _ in range(3):
+                other = copy.deepcopy(config)
+                other["environment"]["environment_variables"] = [
+                    f"COMPUTE_SUBMISSION_MARKER=determined-compute:{uuid.uuid4()}"
+                ]
+                self._create(kind, other)
+            return super().launch_task(kind, config, options)
+
+        def get_task(self, kind, remote_id):
+            # Each read of a task takes 4 seconds on the overloaded master.
+            clock.now += 4.0
+            return super().get_task(kind, remote_id)
+
+    client = Slow()
+    with pytest.raises(SubmissionUncertainError) as caught:
+        ComputeService(client, profile).launch(dict(command_request, allow_queue=True))
+
+    details = caught.value.details
+    # The first search reads all three tasks in 12 s; none is read again.
+    assert len(client.gets) == 3
+    assert len(set(client.gets)) == 3
+    assert clock.now <= service_module._LOOKUP_BUDGET_SECONDS
+    assert details["lookups"] == 1
+    assert "end your turn" in details["next_step"]
+    assert "once without finding it" in str(caught.value)
+
+
+def test_a_search_cut_short_by_the_budget_is_not_an_empty_result(
+    monkeypatch, profile, command_request
+):
+    clock = _Clock(monkeypatch)
+
+    class Stuck(_Lost):
+        def list_remote_tasks(self, kind, *, user_id, limit, offset, states=None):
+            clock.now += 20.0
+            return super().list_remote_tasks(
+                kind, user_id=user_id, limit=limit, offset=offset, states=states
+            )
+
+        def launch_task(self, kind, config, options=None):
+            other = copy.deepcopy(config)
+            other["environment"]["environment_variables"] = [
+                f"COMPUTE_SUBMISSION_MARKER=determined-compute:{uuid.uuid4()}"
+            ]
+            self._create(kind, other)
+            return super().launch_task(kind, config, options)
+
+    client = Stuck()
+    with pytest.raises(SubmissionUncertainError) as caught:
+        ComputeService(client, profile).launch(dict(command_request, allow_queue=True))
+
+    details = caught.value.details
+    assert client.gets == []
+    assert details["lookups"] == 1
+    assert details["lookup_error"].startswith("lookup_timeout: ")
+    message = str(caught.value)
+    assert "could not search for its submission marker (lookup_timeout)" in message
+    assert "without finding it" not in message
+
+
+def test_tasks_read_without_the_marker_are_not_read_again(profile, command_request):
+    class Crowded(_Lost):
+        def launch_task(self, kind, config, options=None):
+            for _ in range(4):
+                other = copy.deepcopy(config)
+                other["environment"]["environment_variables"] = [
+                    f"COMPUTE_SUBMISSION_MARKER=determined-compute:{uuid.uuid4()}"
+                ]
+                self._create(kind, other)
+            return super().launch_task(kind, config, options)
+
+    client = Crowded()
+    with pytest.raises(SubmissionUncertainError) as caught:
+        ComputeService(client, profile).launch(dict(command_request, allow_queue=True))
+
+    assert caught.value.details["lookups"] == 3
+    assert client.lists == [("command", 10, 0)] * 3
+    assert sorted(client.gets) == sorted(set(client.gets)) and len(client.gets) == 4
+
+
+def test_the_search_stops_at_the_first_hit(monkeypatch, profile, command_request):
+    class Late(_Lost):
+        def list_remote_tasks(self, kind, *, user_id, limit, offset, states=None):
+            if len(self.lists) == 1:
+                # The master stores the task between the first and second search.
+                kind_, config, options = self.pending
+                self.launches.pop()
+                self._create(kind_, config, options)
+            return super().list_remote_tasks(
+                kind, user_id=user_id, limit=limit, offset=offset, states=states
+            )
+
+    client = Late()
+    launched = ComputeService(client, profile).launch(dict(command_request, allow_queue=True))
+
+    assert launched["confirmation"] == "lookup"
+    assert launched["id"] == str(uuid.UUID(int=1))
+    assert len(client.lists) == 2
+    assert len(client.launches) == 1
+
+
+def test_the_search_follows_one_more_page(profile, command_request):
+    class Buried(_Lost):
+        def launch_task(self, kind, config, options=None):
+            self._create(kind, config, options)
+            for _ in range(12):
+                other = copy.deepcopy(config)
+                other["environment"]["environment_variables"] = [
+                    item
+                    for item in other["environment"]["environment_variables"]
+                    if not item.startswith("COMPUTE_SUBMISSION_MARKER=")
+                ] + [f"COMPUTE_SUBMISSION_MARKER=determined-compute:{uuid.uuid4()}"]
+                self._create(kind, other)
+            raise SubmissionUncertainError("Determined mutation outcome is unknown")
+
+    client = Buried()
+    launched = ComputeService(client, profile).launch(dict(command_request, allow_queue=True))
+
+    assert launched["id"] == str(uuid.UUID(int=1))
+    assert client.lists == [("command", 10, 0), ("command", 10, 10)]
+
+
+def test_several_marked_tasks_are_shown_to_the_user(profile, command_request):
+    class Copied(_Lost):
+        def launch_task(self, kind, config, options=None):
+            # A copy of the config, submitted outside the service, carries the same marker.
+            self._create(kind, config, options)
+            self._create(kind, config, options)
+            raise SubmissionUncertainError("Determined mutation outcome is unknown")
+
+    client = Copied()
+    with pytest.raises(SubmissionUncertainError) as caught:
+        ComputeService(client, profile).launch(dict(command_request, allow_queue=True))
+
+    details = caught.value.details
+    assert details["lookups"] == 1
+    candidates = details["candidates"]
+    assert [set(task) for task in candidates] == [{"kind", "id", "name", "state"}] * 2
+    assert [(task["kind"], task["id"], task["state"]) for task in candidates] == [
+        ("command", str(uuid.UUID(int=n)), "QUEUED") for n in (2, 1)
+    ]
+    assert "Show these tasks to the user" in details["next_step"]
+    assert "end your turn" in details["next_step"]
+
+
+class _Unreachable(_Lost):
+    def list_remote_tasks(self, kind, *, user_id, limit, offset, states=None):
+        self.lists.append((kind, limit, offset))
+        raise APIError("Could not reach Determined", code="transport_error", retryable=True)
+
+
+def test_a_failed_search_does_not_mask_the_unconfirmed_launch(profile, command_request):
+    client = _Unreachable()
+    with pytest.raises(SubmissionUncertainError) as caught:
+        ComputeService(client, profile).launch(dict(command_request, allow_queue=True))
+
+    details = caught.value.details
+    assert caught.value.code == "submission_uncertain"
+    assert details["lookups"] == 3 and len(client.lists) == 3
+    assert details["lookup_error"] == "transport_error: Could not reach Determined"
+    assert "end your turn" in details["next_step"]
+    message = str(caught.value)
+    assert "could not search for its submission marker (transport_error)" in message
+    assert "without finding it" not in message
+
+
+def test_a_failed_search_is_retried_and_finds_the_task(profile, command_request):
+    class Restarting(_Unreachable):
+        def launch_task(self, kind, config, options=None):
+            self._create(kind, config, options)
+            raise SubmissionUncertainError("Determined mutation outcome is unknown")
+
+        def list_remote_tasks(self, kind, *, user_id, limit, offset, states=None):
+            if not self.lists:
+                # The master is restarting when the first search runs.
+                return super().list_remote_tasks(
+                    kind, user_id=user_id, limit=limit, offset=offset, states=states
+                )
+            self.lists.append((kind, limit, offset))
+            return FakeClient.list_remote_tasks(
+                self, kind, user_id=user_id, limit=limit, offset=offset, states=states
+            )
+
+    client = Restarting()
+    launched = ComputeService(client, profile).launch(dict(command_request, allow_queue=True))
+
+    assert launched["confirmation"] == "lookup"
+    assert (launched["kind"], launched["id"]) == ("command", str(uuid.UUID(int=1)))
+    assert len(client.lists) == 2
     assert len(client.launches) == 1
 
 
 def test_a_task_that_appears_after_an_empty_search_is_found_and_never_relaunched(
     profile, command_request
 ):
-    class Slow(FakeClient):
-        """The master stores the task only after the client gave up waiting."""
-
-        def launch_task(self, kind, config, options=None):
-            self.pending = (kind, config, options)
-            self.launches.append((kind, copy.deepcopy(config)))
-            raise SubmissionUncertainError("Determined mutation outcome is unknown")
-
-    client = Slow()
+    client = _Lost()
     service = ComputeService(client, profile)
 
     with pytest.raises(SubmissionUncertainError) as caught:
@@ -725,7 +991,7 @@ def test_a_task_that_appears_after_an_empty_search_is_found_and_never_relaunched
 
     message = str(caught.value)
     assert "does not prove that the submission failed" in message
-    assert "Do not launch again automatically" in message
+    assert "resubmit on your own" in message
     assert "safe" not in message and "not created" not in message
     marker = caught.value.details["submission_marker"]
     assert service.list_tasks("command", marker=marker)["tasks"] == []
