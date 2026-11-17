@@ -88,7 +88,7 @@ shell_inactivity_seconds: 7200
 | `pausable` | 布尔值 | 仅 generic：该任务可以暂停，恢复时从头重新运行；默认 `false` |
 | `preemption_timeout` | 非负整数 | 仅 generic：收到暂停请求后任务可用于停止的秒数；Determined 默认为 0。experiment 在 `experiment_config` 中设置 |
 
-服务拒绝未知字段以及上传/context 字段。在 auto 模式中，`interactive` 优先选择 `shell`，
+服务拒绝未知字段；`experiment_config` 中的值（包括超参数）原样传递，由 master 校验。在 auto 模式中，`interactive` 优先选择 `shell`，
 其次由 `overnight` 或 `experiment_config` 选择 `experiment`，其余请求选择 `command`。
 auto 模式从不选择 `generic`。显式 `kind` 会保留，所以 overnight command 仍是 command，
 并收到一条提示。其他任何 kind 都会拒绝这四个仅限 generic 的字段。
@@ -110,7 +110,7 @@ experiment 必须提供 `command` 或 `experiment_config.entrypoint`，但不能
 `checkpoint_storage` 必须使用 `type: shared_fs`、可写的映射 `host_path`，且可选的
 `storage_path` 必须留在该 host path 内。服务拒绝旧的 `checkpoint_path` 和
 `tensorboard_path` 别名。若省略 checkpoint storage，Determined 使用集群默认配置，离线规划
-无法检查该默认值。
+无法检查该默认值。每个 `resources.devices` 条目都需要映射的 `host_path` 和 `container_path`。
 
 <a id="generic-tasks"></a>
 ### Generic 任务
@@ -326,8 +326,9 @@ kind 和 ID：服务不会记住它们。
 适配器把 command 和 shell 配置作为 mapping 发送；experiment 和 generic 任务配置会序列化为
 JSON 文本，master 的 YAML 解析器按字面读取该文本，因此 `y`、`n` 或 `1e-3` 这类字符串仍是
 字符串。experiment 提交时请求激活；generic 任务配置与空的 `contextDirectory`、解析后的
-`parentId`、`inheritContext` 和 `noPause` 选项一起发送，不带 `projectId`。适配器拒绝源码上传别名，从不
-自动创建项目，会移除 API envelope、从返回的实体中去除机密，并返回含 `id` 的实体。
+`parentId`、`inheritContext` 和 `noPause` 选项一起发送，不带 `projectId`。请求体不携带代码或文件：
+experiment 没有 model definition，command 和 shell 没有 `files`。无法构造的请求（例如配置中含 NaN）
+不会发送，并以 `invalid_request` 失败。适配器从不自动创建项目，会移除 API envelope、从返回的实体中去除机密，并返回含 `id` 的实体。
 
 提交不会重试。generic 任务的 master 提交警告（例如请求超过当前 slot）以代码
 `launch_warning` 出现在 `warnings` 中。
