@@ -6,6 +6,7 @@ changes the requested resource pool and never treats utilization as capacity.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
@@ -87,44 +88,62 @@ def _gpu_models(
     return sorted(models)
 
 
-_GPU_MEMORY_FIELDS = ("total", "used", "free", "reserved")
+def _invalid_gpu_readings(what: str) -> APIError:
+    return APIError(f"the master's GPU {what} response is malformed", code="invalid_response")
 
 
-def _invalid_gpu_memory() -> APIError:
-    return APIError("the master's GPU memory response is malformed", code="invalid_response")
+def _gpu_memory_reading(value: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """{bytes, sampled_at}; the gateway encodes int64 bytes as a string."""
 
-
-def _gpu_memory_reading(value: Any) -> Optional[Dict[str, Any]]:
-    """A reading as {bytes, sampled_at}; the gateway encodes int64 bytes as a string."""
-
-    if value is None:
-        return None
-    if not isinstance(value, Mapping):
-        raise _invalid_gpu_memory()
-    raw, sampled_at = value.get("bytes"), value.get("sampledAt")
+    raw = value.get("bytes")
     if isinstance(raw, str) and raw.isdigit():
-        size = int(raw)
-    elif isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
-        size = raw
-    else:
-        raise _invalid_gpu_memory()
-    if not isinstance(sampled_at, str) or not sampled_at:
-        raise _invalid_gpu_memory()
-    return {"bytes": size, "sampled_at": sampled_at}
+        return {"bytes": int(raw)}
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0:
+        return {"bytes": raw}
+    return None
 
 
-def _gpu_memory(
-    agents_value: Mapping[str, Any], agents: List[Any], pool: Optional[str]
+def _gpu_power_reading(value: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """{watts, sampled_at}; watts may have a fraction."""
+
+    raw = value.get("watts")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return {"watts": raw} if math.isfinite(raw) and raw >= 0 else None
+
+
+# For each GPU reading group: the response's marker, the GPU's field, the output fields with the
+# gateway's names, and how one reading's value is read.
+_GPU_READING_GROUPS: Dict[str, Tuple[str, str, Tuple[Tuple[str, str], ...], Any]] = {
+    "memory": (
+        "gpuMemoryQueriedAt", "memory",
+        (("total", "total"), ("used", "used"), ("free", "free"), ("reserved", "reserved")),
+        _gpu_memory_reading,
+    ),
+    "power": (
+        "gpuPowerQueriedAt", "power",
+        (
+            ("draw", "draw"), ("limit", "limit"), ("default_limit", "defaultLimit"),
+            ("enforced_limit", "enforcedLimit"),
+        ),
+        _gpu_power_reading,
+    ),
+}
+
+
+def _gpu_readings(
+    group: str, agents_value: Mapping[str, Any], agents: List[Any], pool: Optional[str]
 ) -> Dict[str, Any]:
-    """Each GPU's memory readings from the same agents response as the capacity report."""
+    """Each GPU's memory or power readings from the same agents response as the capacity report."""
 
-    queried_at = agents_value.get("gpuMemoryQueriedAt")
+    marker, gpu_field, fields, read = _GPU_READING_GROUPS[group]
+    queried_at = agents_value.get(marker)
     if not isinstance(queried_at, str) or not queried_at:
-        raise APIError("the Determined master does not report GPU memory", code="unsupported")
+        raise APIError(f"the Determined master does not report GPU {group}", code="unsupported")
     gpus = []
     for agent in agents:
         if not isinstance(agent, Mapping):
-            raise _invalid_gpu_memory()
+            raise _invalid_gpu_readings(group)
         pools = agent.get("resourcePools")
         if pool is not None and (not isinstance(pools, list) or pool not in pools):
             continue
@@ -132,16 +151,16 @@ def _gpu_memory(
         if topology is None:
             continue
         if not isinstance(topology, Mapping) or not isinstance(topology.get("gpus") or [], list):
-            raise _invalid_gpu_memory()
+            raise _invalid_gpu_readings(group)
         models = {}
         for slot in (_slots(agent.get("slots")) or []):
             device = slot.get("device")
             if isinstance(device, Mapping) and isinstance(device.get("uuid"), str):
                 models[device["uuid"]] = device.get("brand")
         for gpu in topology.get("gpus") or []:
-            memory = gpu.get("memory") if isinstance(gpu, Mapping) else None
-            if not isinstance(memory, Mapping) or not isinstance(gpu.get("uuid"), str):
-                raise _invalid_gpu_memory()
+            readings = gpu.get(gpu_field) if isinstance(gpu, Mapping) else None
+            if not isinstance(readings, Mapping) or not isinstance(gpu.get("uuid"), str):
+                raise _invalid_gpu_readings(group)
             entry: Dict[str, Any] = {
                 "agent_id": agent.get("id"),
                 "uuid": gpu["uuid"],
@@ -149,8 +168,16 @@ def _gpu_memory(
                 "model": models.get(gpu["uuid"]),
                 "excluded": gpu.get("excluded") is True,
             }
-            for field in _GPU_MEMORY_FIELDS:
-                entry[field] = _gpu_memory_reading(memory.get(field))
+            for name, wire in fields:
+                value = readings.get(wire)
+                if value is None:
+                    entry[name] = None
+                    continue
+                reading = read(value) if isinstance(value, Mapping) else None
+                sampled_at = value.get("sampledAt") if isinstance(value, Mapping) else None
+                if reading is None or not isinstance(sampled_at, str) or not sampled_at:
+                    raise _invalid_gpu_readings(group)
+                entry[name] = {**reading, "sampled_at": sampled_at}
             gpus.append(entry)
     return {"queried_at": queried_at, "gpus": gpus}
 
@@ -348,12 +375,13 @@ class ResourceInspector:
         prefer_gpu_topology: Any = None,
         gpu_groups: Any = None,
         include_gpu_memory: Any = False,
+        include_gpu_power: Any = False,
     ) -> Dict[str, Any]:
         """Return conservative, per-pool capacity for a request on one agent.
 
-        With include_gpu_memory, the report adds gpu_memory: each GPU's latest memory
-        readings, read with the same agents request. They are observations only and never
-        change availability.
+        With include_gpu_memory or include_gpu_power, the report adds gpu_memory or gpu_power:
+        each GPU's latest readings, read with the same agents request. They are observations
+        only and never change availability.
         """
 
         self._validate_request(slots, pool)
@@ -361,10 +389,12 @@ class ResourceInspector:
             raise ValueError('prefer_gpu_topology must be "soft", "strong", false, or null')
         if not isinstance(include_gpu_memory, bool):
             raise ValueError("include_gpu_memory must be a boolean")
+        if not isinstance(include_gpu_power, bool):
+            raise ValueError("include_gpu_power must be a boolean")
         groups = normalize_gpu_groups(gpu_groups, slots)
         report, _refusals = self._resources(
             slots=slots, pool=pool, preference=prefer_gpu_topology, groups=groups,
-            include_gpu_memory=include_gpu_memory,
+            include_gpu_memory=include_gpu_memory, include_gpu_power=include_gpu_power,
         )
         return report
 
@@ -377,6 +407,7 @@ class ResourceInspector:
         groups: Optional[List[Mapping[str, Any]]] = None,
         single_node: bool = True,
         include_gpu_memory: bool = False,
+        include_gpu_power: bool = False,
     ) -> Tuple[Dict[str, Any], Dict[str, str]]:
         """Return the report and, by pool, why the master refuses the request."""
 
@@ -387,6 +418,8 @@ class ResourceInspector:
         agents_params: Dict[str, Any] = {"limit": 0}
         if include_gpu_memory:
             agents_params["includeGpuMemory"] = "true"
+        if include_gpu_power:
+            agents_params["includeGpuPower"] = "true"
         agents_value = self.client._get("api/v1/agents", params=agents_params)
         pools_value = self.client._get("api/v1/resource-pools", params={"limit": 0})
         pools = pools_value.get("resourcePools") if isinstance(pools_value, Mapping) else None
@@ -402,7 +435,11 @@ class ResourceInspector:
                     "candidate_pools": [],
                 },
             )
-        gpu_memory = _gpu_memory(agents_value, agents, pool) if include_gpu_memory else None
+        readings = {
+            f"gpu_{group}": _gpu_readings(group, agents_value, agents, pool)
+            for group, wanted in (("memory", include_gpu_memory), ("power", include_gpu_power))
+            if wanted
+        }
 
         assessments = []
         refusals: Dict[str, str] = {}
@@ -466,8 +503,7 @@ class ResourceInspector:
                 "was not checked."
             ),
         }
-        if gpu_memory is not None:
-            report["gpu_memory"] = gpu_memory
+        report.update(readings)
         return report, refusals
 
     @staticmethod

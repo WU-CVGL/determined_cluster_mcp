@@ -1677,3 +1677,148 @@ def test_a_malformed_gpu_memory_reading_is_an_invalid_response(reading):
 def test_include_gpu_memory_must_be_a_boolean():
     with pytest.raises(ValueError):
         ResourceInspector(Client([], [])).resources(1, None, include_gpu_memory="yes")
+
+
+# GpuPower as the gateway encodes it: watts are JSON numbers, a reading without a sample is null.
+GATEWAY_GPU_POWER = {
+    "GPU-a": {
+        "draw": {"watts": 221.4, "sampledAt": "2026-11-17T12:57:05.742Z"},
+        "limit": {"watts": 250, "sampledAt": "2026-11-17T12:57:05.742Z"},
+        "defaultLimit": {"watts": 300, "sampledAt": "2026-11-17T12:57:05.742Z"},
+        "enforcedLimit": None,
+    },
+    "GPU-b": {
+        "draw": {"watts": 0, "sampledAt": "2026-11-17T12:57:05.742Z"},
+        "limit": None, "defaultLimit": None, "enforcedLimit": None,
+    },
+    "GPU-x": {"draw": None, "limit": None, "defaultLimit": None, "enforcedLimit": None},
+}
+
+
+class ReadingsClient(Client):
+    """A master that answers each requested reading group with its marker."""
+
+    def __init__(self, pools, agents, queried_at, groups=("memory", "power")):
+        super().__init__(pools, agents)
+        self.queried_at = queried_at
+        self.groups = groups
+
+    def _get(self, endpoint, params=None):
+        value = super()._get(endpoint, params)
+        if endpoint == "api/v1/agents":
+            value = dict(value)
+            if params.get("includeGpuMemory") == "true" and "memory" in self.groups:
+                value["gpuMemoryQueriedAt"] = self.queried_at
+            if params.get("includeGpuPower") == "true" and "power" in self.groups:
+                value["gpuPowerQueriedAt"] = self.queried_at
+        return value
+
+
+def gpu_power_agent(occupied=0):
+    import copy as _copy
+
+    measured, queried_at = gpu_memory_agent(occupied=occupied)
+    for gpu in measured["gpuTopology"]["gpus"]:
+        gpu["power"] = _copy.deepcopy(GATEWAY_GPU_POWER[gpu["uuid"]])
+    return measured, queried_at
+
+
+def test_gpu_memory_and_power_come_from_one_agents_request():
+    measured, queried_at = gpu_power_agent()
+    client = ReadingsClient([pool(total=2)], [measured], queried_at)
+
+    report = ResourceInspector(client).resources(
+        1, "gpu", include_gpu_memory=True, include_gpu_power=True
+    )
+
+    assert client.calls == [
+        ("api/v1/agents", {"limit": 0, "includeGpuMemory": "true", "includeGpuPower": "true"}),
+        ("api/v1/resource-pools", {"limit": 0}),
+    ]
+    assert len(report["gpu_memory"]["gpus"]) == 3
+    model = "NVIDIA RTX 6000 Ada Generation"
+    at = "2026-11-17T12:57:05.742Z"
+    assert report["gpu_power"] == {
+        "queried_at": "2026-11-17T12:57:20Z",
+        "gpus": [
+            {
+                "agent_id": "node01", "uuid": "GPU-a", "device_id": 0, "model": model,
+                "excluded": False,
+                "draw": {"watts": 221.4, "sampled_at": at},
+                "limit": {"watts": 250, "sampled_at": at},
+                "default_limit": {"watts": 300, "sampled_at": at},
+                "enforced_limit": None,
+            },
+            {
+                "agent_id": "node01", "uuid": "GPU-b", "device_id": 1, "model": model,
+                "excluded": False, "draw": {"watts": 0, "sampled_at": at},
+                "limit": None, "default_limit": None, "enforced_limit": None,
+            },
+            {
+                "agent_id": "node01", "uuid": "GPU-x", "device_id": -1, "model": None,
+                "excluded": True, "draw": None, "limit": None, "default_limit": None,
+                "enforced_limit": None,
+            },
+        ],
+    }
+
+
+def test_gpu_power_alone_leaves_out_gpu_memory():
+    measured, queried_at = gpu_power_agent()
+    client = ReadingsClient([pool(total=2)], [measured], queried_at)
+
+    report = ResourceInspector(client).resources(1, "gpu", include_gpu_power=True)
+
+    assert client.calls[0] == ("api/v1/agents", {"limit": 0, "includeGpuPower": "true"})
+    assert "gpu_memory" not in report
+    assert report["gpu_power"]["gpus"][0]["draw"]["watts"] == 221.4
+
+
+def test_a_master_with_memory_but_without_power_is_unsupported():
+    measured, queried_at = gpu_power_agent()
+    client = ReadingsClient([pool(total=2)], [measured], queried_at, groups=("memory",))
+
+    with pytest.raises(APIError) as caught:
+        ResourceInspector(client).resources(
+            1, "gpu", include_gpu_memory=True, include_gpu_power=True
+        )
+
+    assert caught.value.code == "unsupported"
+    assert "power" in str(caught.value)
+
+
+def test_free_power_headroom_does_not_make_a_busy_slot_available():
+    measured, queried_at = gpu_power_agent(occupied=2)
+    client = ReadingsClient([pool(total=2, used=2)], [measured], queried_at)
+
+    report = ResourceInspector(client).resources(1, "gpu", include_gpu_power=True)
+
+    assert report["available"] is False
+
+
+@pytest.mark.parametrize(
+    "reading",
+    [
+        {"watts": -1, "sampledAt": "2026-11-17T12:57:05Z"},
+        {"watts": "250", "sampledAt": "2026-11-17T12:57:05Z"},
+        {"watts": True, "sampledAt": "2026-11-17T12:57:05Z"},
+        {"watts": float("inf"), "sampledAt": "2026-11-17T12:57:05Z"},
+        {"watts": 250},
+        {"sampledAt": "2026-11-17T12:57:05Z"},
+        250,
+    ],
+)
+def test_a_malformed_gpu_power_reading_is_an_invalid_response(reading):
+    measured, queried_at = gpu_power_agent()
+    measured["gpuTopology"]["gpus"][0]["power"]["limit"] = reading
+    client = ReadingsClient([pool(total=2)], [measured], queried_at)
+
+    with pytest.raises(APIError) as caught:
+        ResourceInspector(client).resources(1, "gpu", include_gpu_power=True)
+
+    assert caught.value.code == "invalid_response"
+
+
+def test_include_gpu_power_must_be_a_boolean():
+    with pytest.raises(ValueError):
+        ResourceInspector(Client([], [])).resources(1, None, include_gpu_power=1)

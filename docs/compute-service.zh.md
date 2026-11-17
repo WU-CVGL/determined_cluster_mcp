@@ -245,7 +245,7 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 | `compute_list` | `kind`，可选 `limit=50`、`offset=0`、`marker`、`states` | 当前账户的一页任务，最新的在前；指定 `states` 时只列出处于这些状态的 experiment 或 generic 任务；指定 `marker` 时返回该页中配置带有该标记的任务 |
 | `compute_shell_connect` | `id`，可选 `local_port`、`wait_seconds=0`（最多 600） | 为该账户某个正在运行的 shell 打开或返回本地 SSH 隧道；见[shell 访问](#shell-access) |
 | `compute_shell_disconnect` | `id` | 关闭该隧道并删除该 shell 的密钥文件；shell 继续运行。返回 `disconnected`，确有隧道时还返回 `files`：`removed`，或在该目录现在可能属于另一个 server 时为 `kept` |
-| `compute_resources` | 可选 `slots=1`、`pool`、`prefer_gpu_topology`、`gpu_groups`、`include_gpu_memory=false` | 当前调度容量和候选资源池。值为 `"strong"` 且请求 2 个及以上 slot 时，每个资源池会增加 `max_numa_node_free_slots`（当前能放下的最大 `"strong"` 任务）和 `max_numa_node_slots`（master 在当前 agent 下接受的最大值）。传入 `gpu_groups`（各组数量之和必须等于 `slots`）时，只有某个 agent 有满足每个组的空闲 GPU，资源池才算可用。每个资源池还有 `description`、`gpu_models` 和 `per_agent_free_gpus_by_model`。`include_gpu_memory` 会增加 `gpu_memory` |
+| `compute_resources` | 可选 `slots=1`、`pool`、`prefer_gpu_topology`、`gpu_groups`、`include_gpu_memory=false`、`include_gpu_power=false` | 当前调度容量和候选资源池。值为 `"strong"` 且请求 2 个及以上 slot 时，每个资源池会增加 `max_numa_node_free_slots`（当前能放下的最大 `"strong"` 任务）和 `max_numa_node_slots`（master 在当前 agent 下接受的最大值）。传入 `gpu_groups`（各组数量之和必须等于 `slots`）时，只有某个 agent 有满足每个组的空闲 GPU，资源池才算可用。每个资源池还有 `description`、`gpu_models` 和 `per_agent_free_gpus_by_model`。`include_gpu_memory` 会增加 `gpu_memory`，`include_gpu_power` 会增加 `gpu_power` |
 | `storage_check` | `path` | 映射容器路径的访问情况 |
 | `storage_sync` | `local_dir`、`shared_dir`，可选 `dry_run=true` | 预览或把本地目录内容复制到共享存储 |
 | `storage_fetch` | `shared_dir`、`local_dir`，可选 `dry_run=true` | 预览或把共享目录内容复制到本地 |
@@ -278,6 +278,12 @@ brand 无法读取时为 `null`。`per_agent_free_gpus_by_model` 把资源池的
 但 slot 已占用的 GPU 仍不算容量。不提供 GPU 显存的 master 返回 `unsupported`；master 读取失败
 （例如未配置监控）时，调用以 master 的错误失败，不会改用其他来源。任务自身随时间的显存用量请用
 `compute_usage` 的 `gpu_memory_used_bytes`。
+
+`include_gpu_power: true` 以同样方式、在同一次请求中增加 `gpu_power`：每张 GPU 的 `draw`（功耗）、
+`limit`（当前配置的功率上限）、`default_limit`（设备的默认功率上限，最接近 TDP 的读数，但不一定等于厂商
+标称 TDP）和 `enforced_limit`（综合各项限制后实际执行的上限），每项为 `{watts, sampled_at}` 或 `null`。
+提供 GPU 显存但不提供功率的 master 返回 `unsupported`。任务自身随时间的功耗请用 `compute_usage` 的
+`gpu_power_watts`。
 
 准入按资源池自身的方式计算 slot：已 drain 或已禁用的 slot，以及已禁用 agent 的所有 slot，都不算
 容量；正在 drain 的 slot 或 agent 只计入仍有容器占用的 slot。command、shell、generic 任务以及

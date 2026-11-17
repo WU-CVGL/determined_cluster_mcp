@@ -272,7 +272,7 @@ positive integer for an experiment, which can also be passed as a numeric string
 | `compute_list` | `kind`, optional `limit=50`, `offset=0`, `marker`, `states` | One page of the account's tasks, newest first; with `states`, only experiments or generic tasks in those states; with `marker`, the tasks on that page whose config carries it |
 | `compute_shell_connect` | `id`, optional `local_port`, `wait_seconds=0` (up to 600) | Opens or returns a local SSH tunnel to one of the account's running shells; see [shell access](#shell-access) |
 | `compute_shell_disconnect` | `id` | Closes that tunnel and deletes the shell's key file; the shell keeps running. Returns `disconnected` and, when it was, `files`: `removed`, or `kept` when the directory may now belong to another server |
-| `compute_resources` | optional `slots=1`, `pool`, `prefer_gpu_topology`, `gpu_groups`, `include_gpu_memory=false` | Current scheduler capacity and candidate pools. With `"strong"` and 2 or more slots, each pool adds `max_numa_node_free_slots` (largest `"strong"` task that fits now) and `max_numa_node_slots` (largest the master accepts with the current agents). With `gpu_groups`, whose counts must add up to `slots`, a pool is available when one agent has free GPUs for every group. Each pool also has `description`, `gpu_models` and `per_agent_free_gpus_by_model`. `include_gpu_memory` adds `gpu_memory` |
+| `compute_resources` | optional `slots=1`, `pool`, `prefer_gpu_topology`, `gpu_groups`, `include_gpu_memory=false`, `include_gpu_power=false` | Current scheduler capacity and candidate pools. With `"strong"` and 2 or more slots, each pool adds `max_numa_node_free_slots` (largest `"strong"` task that fits now) and `max_numa_node_slots` (largest the master accepts with the current agents). With `gpu_groups`, whose counts must add up to `slots`, a pool is available when one agent has free GPUs for every group. Each pool also has `description`, `gpu_models` and `per_agent_free_gpus_by_model`. `include_gpu_memory` adds `gpu_memory`, `include_gpu_power` adds `gpu_power` |
 | `storage_check` | `path` | Access information for a mapped container path |
 | `storage_sync` | `local_dir`, `shared_dir`, optional `dry_run=true` | Preview or copy local directory contents to shared storage |
 | `storage_fetch` | `shared_dir`, `local_dir`, optional `dry_run=true` | Preview or copy shared directory contents locally |
@@ -314,6 +314,13 @@ that does not report GPU memory fails with `unsupported`; a failed read on the m
 example without monitoring, fails the call with the master's error, and nothing falls back
 to another source. For a task's own memory use over time, use `compute_usage` with
 `gpu_memory_used_bytes`.
+
+`include_gpu_power: true` adds `gpu_power` the same way, read in the same request: per GPU,
+`draw`, `limit` (the configured power limit), `default_limit` (the device's default power
+limit, the nearest reading to its TDP, which need not equal a vendor's rated TDP) and
+`enforced_limit` (the limit in effect after every constraint), each `{watts, sampled_at}` or
+`null`. A master that reports GPU memory but not power fails with `unsupported`. For a
+task's own power over time, use `compute_usage` with `gpu_power_watts`.
 
 Admission counts slots as the pool does: a drained or disabled slot, and every slot of a
 disabled agent, is not capacity, and a draining slot or agent counts only the slots that
