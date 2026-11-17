@@ -264,9 +264,14 @@ def test_overnight_command_becomes_experiment(tmp_path, profile, command_request
         {"output_dir": "/shared/container/jobs/../escape"},
         {"workdir": "shared/container/code"},
         {"upload_context": "/tmp/context"},
-        {"experiment_config": {"files": [{"path": "secret"}]}},
-        {"experiment_config": {"context_path": "/tmp/upload"}},
         {"experiment_config": {"bind_mounts": []}},
+        {"experiment_config": {"resources": {"devices": [
+            {"host_path": "/dev/fuse", "container_path": "/shared/container/fuse"}
+        ]}}},
+        {"experiment_config": {"resources": {"devices": [
+            {"host_path": "/shared/host/dev", "container_path": "/dev/fuse"}
+        ]}}},
+        {"experiment_config": {"resources": {"devices": {"host_path": "/shared/host"}}}},
     ],
 )
 def test_rejects_unmapped_paths_and_upload_or_mount_fields(
@@ -280,6 +285,110 @@ def test_rejects_unmapped_paths_and_upload_or_mount_fields(
 
     with pytest.raises(ValidationError):
         service.plan(request)
+
+
+def _real_client_service(monkeypatch, profile, response):
+    """A service on the real client, with every HTTP request recorded."""
+    import requests
+
+    from determined_compute.core.api_client import DeterminedAPIClient
+
+    sent = {"post": [], "get": []}
+
+    class _Answer:
+        status_code = 200
+        reason = "OK"
+
+        def __init__(self, payload):
+            self.payload = payload
+            self.text = json.dumps(payload)
+            self.content = self.text.encode()
+
+        def json(self):
+            return self.payload
+
+    def post(url, json=None, **kwargs):
+        sent["post"].append((url, json))
+        return _Answer(response)
+
+    def get(url, **kwargs):
+        sent["get"].append(url)
+        raise AssertionError(f"unexpected GET {url}")
+
+    monkeypatch.setattr(requests, "post", post)
+    monkeypatch.setattr(requests, "get", get)
+    client = DeterminedAPIClient("master:8080", api_token="token")
+    return ComputeService(client, profile), sent
+
+
+def _experiment_request(hyperparameters):
+    return {
+        "kind": "experiment",
+        "allow_queue": True,
+        "workdir": "/shared/container/code",
+        "output_dir": "/shared/container/out",
+        "experiment_config": {"entrypoint": "python train.py", "hyperparameters": hyperparameters},
+    }
+
+
+def test_upload_named_hyperparameters_are_submitted_unchanged(monkeypatch, profile):
+    hyperparameters = {
+        "data": "dataset-a", "context": 8192, "files": ["a.txt"], "host_path": "not-a-mount",
+    }
+    service, sent = _real_client_service(monkeypatch, profile, {"experiment": {"id": 41}})
+
+    launched = service.launch(_experiment_request(hyperparameters))
+
+    assert (launched["kind"], launched["id"]) == ("experiment", 41)
+    [(url, body)] = sent["post"]
+    assert url.endswith("/api/v1/experiments")
+    assert json.loads(body["config"])["hyperparameters"] == hyperparameters
+    assert sent["get"] == []
+
+
+def test_a_launch_request_that_cannot_be_built_fails_without_a_marker_search(
+    monkeypatch, profile
+):
+    service, sent = _real_client_service(monkeypatch, profile, {"experiment": {"id": 41}})
+
+    with pytest.raises(APIError) as caught:
+        service.launch(_experiment_request({"lr": float("nan")}))
+
+    assert caught.value.code == "invalid_request"
+    assert not isinstance(caught.value, SubmissionUncertainError)
+    assert sent == {"post": [], "get": []}
+
+
+class _BrokenAfterSend(FakeClient):
+    """The master creates the task, then the client fails unexpectedly on the answer."""
+
+    def launch_task(self, kind, config, options=None):
+        self._create(kind, config, options)
+        raise RuntimeError("answer handling failed")
+
+
+def test_an_unexpected_failure_after_sending_is_resolved_by_the_marker(
+    profile, command_request
+):
+    client = _BrokenAfterSend()
+    service = ComputeService(client, profile)
+
+    launched = service.launch(dict(command_request, kind="command", allow_queue=True))
+
+    assert len(client.launches) == 1
+    assert launched["confirmation"] == "lookup"
+    assert launched["submission_marker"] == marker_of(client.launches[0][1])
+
+
+def test_devices_on_mapped_paths_are_kept(profile):
+    service = ComputeService(FakeClient(), profile)
+    device = {"host_path": "/shared/host/dev", "container_path": "/shared/container/dev"}
+    request = _experiment_request({})
+    request["experiment_config"]["resources"] = {"devices": [device]}
+
+    plan = service.plan(request)
+
+    assert plan["config"]["resources"]["devices"] == [device]
 
 
 def test_context_named_hyperparameters_are_allowed(tmp_path, profile):

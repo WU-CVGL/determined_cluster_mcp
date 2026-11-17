@@ -2,6 +2,7 @@ import json
 
 import pytest
 import requests
+import yaml
 
 from determined_compute.core.api_client import (
     APIError,
@@ -409,15 +410,39 @@ def test_experiment_cancel_preserves_empty_response_acknowledgement(monkeypatch)
     }
 
 
-@pytest.mark.parametrize("field", ["files", "data", "context", "project_root", "modelDefinition"])
-def test_launch_rejects_upload_aliases(field):
-    with pytest.raises(ValueError, match="uploads are not supported"):
-        client().launch_task("command", {field: "anything"})
+@pytest.mark.parametrize(
+    ("kind", "endpoint", "envelope"),
+    [
+        ("command", "/api/v1/commands", {"config"}),
+        ("shell", "/api/v1/shells", {"config"}),
+        ("experiment", "/api/v1/experiments", {"config", "activate"}),
+        ("generic", "/api/v1/generic-tasks", {"config", "contextDirectory"}),
+    ],
+)
+def test_launch_body_carries_only_the_config_and_upload_named_keys_stay_in_it(
+    monkeypatch, kind, endpoint, envelope
+):
+    # Code and files reach a task only through the request envelope, never through a key
+    # inside the config, so hyperparameters with such names pass through unchanged.
+    hyperparameters = {"data": "dataset-a", "context": 8192, "files": ["a"], "model_definition": 1}
+    posted = []
 
+    def post(url, json=None, **kwargs):
+        posted.append((url, json))
+        if kind == "generic":
+            return Response({"taskId": GENERIC_ID})
+        return Response({kind: {"id": 12 if kind == "experiment" else "task-id"}})
 
-def test_launch_rejects_nested_normalized_upload_alias():
-    with pytest.raises(ValueError, match=r"config\.nested\.model-definition"):
-        client().launch_task("experiment", {"nested": {"model-definition": []}})
+    monkeypatch.setattr(requests, "post", post)
+    client().launch_task(kind, {"hyperparameters": hyperparameters})
+
+    [(url, body)] = posted
+    assert url.endswith(endpoint)
+    assert set(body) == envelope
+    config = body["config"] if isinstance(body["config"], dict) else yaml.safe_load(body["config"])
+    assert config == {"hyperparameters": hyperparameters}
+    if kind == "generic":
+        assert body["contextDirectory"] == []
 
 
 def test_get_experiment_unwrap_and_true_tail(monkeypatch):
@@ -505,10 +530,14 @@ def test_experiment_config_values_reach_the_master_unchanged(monkeypatch):
     assert yaml.safe_load(text) == config
 
 
-def test_experiment_config_rejects_non_finite_numbers_before_any_request(monkeypatch):
+@pytest.mark.parametrize('kind', ['command', 'shell', 'experiment', 'generic'])
+@pytest.mark.parametrize('value', [float('nan'), float('inf'), object()])
+def test_a_config_json_cannot_encode_fails_before_any_request(monkeypatch, kind, value):
     monkeypatch.setattr(requests, 'post', lambda *a, **kw: pytest.fail('no request may be sent'))
-    with pytest.raises(ValueError):
-        client().launch_task('experiment', {'hyperparameters': {'lr': float('nan')}})
+    with pytest.raises(APIError) as caught:
+        client().launch_task(kind, {'hyperparameters': {'lr': value}})
+    assert caught.value.code == 'invalid_request'
+    assert not isinstance(caught.value, SubmissionUncertainError)
 
 
 def test_shell_cancel_unwraps_response_and_removes_private_key(monkeypatch):
@@ -1299,10 +1328,15 @@ def test_generic_launch_requires_task_id_and_known_options(monkeypatch):
     monkeypatch.setattr(requests, "post", lambda *a, **k: Response({"warnings": []}))
     with pytest.raises(SubmissionUncertainError):
         client().launch_task("generic", generic_config())
-    with pytest.raises(ValueError, match="projectId"):
+    sent = []
+    monkeypatch.setattr(requests, "post", lambda *a, **k: sent.append(a))
+    with pytest.raises(APIError, match="projectId") as caught:
         client().launch_task("generic", generic_config(), {"projectId": 1})
-    with pytest.raises(ValueError, match="only to generic"):
+    assert caught.value.code == "invalid_request"
+    with pytest.raises(APIError, match="only to generic") as caught:
         client().launch_task("command", generic_config(), {"noPause": True})
+    assert caught.value.code == "invalid_request"
+    assert sent == []
 
 
 def test_get_generic_task_maps_state_and_reads_marker_from_config(monkeypatch):

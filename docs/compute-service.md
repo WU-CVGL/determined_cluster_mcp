@@ -92,7 +92,8 @@ does not enforce an idle timeout.
 | `pausable` | boolean | Generic only: the task can be paused, and resuming reruns it from the start; default `false` |
 | `preemption_timeout` | non-negative integer | Generic only: seconds a task gets to stop after a pause request; Determined's default is 0. An experiment sets it in `experiment_config` |
 
-Unknown request fields and upload/context fields are rejected. In auto mode,
+Unknown request fields are rejected; `experiment_config` values, hyperparameters
+included, pass through unchanged and the master validates them. In auto mode,
 `interactive` selects `shell`, then `overnight` or `experiment_config` selects
 `experiment`, and all other requests select `command`. Auto mode never selects
 `generic`. An explicit `kind` is retained; an overnight command therefore stays a
@@ -120,6 +121,7 @@ explicit `checkpoint_storage` must have `type: shared_fs`, a writable mapped
 `host_path`, and an optional `storage_path` that remains inside that host path. Legacy
 `checkpoint_path` and `tensorboard_path` aliases are rejected. If checkpoint storage is
 omitted, Determined applies its cluster default, which offline planning cannot inspect.
+Each `resources.devices` entry needs a mapped `host_path` and `container_path`.
 
 ### Generic tasks
 
@@ -391,8 +393,10 @@ The adapter sends command and shell configs as mappings. It serializes experimen
 generic task configs as JSON text, which the master's YAML parser reads literally, so a
 string such as `y`, `n`, or `1e-3` stays a string. It requests activation of an
 experiment, and sends a generic task config with an empty `contextDirectory`, no
-`projectId`, and the resolved `parentId`, `inheritContext`, and `noPause` options. It
-rejects source upload aliases, never creates a project, removes API envelopes, redacts
+`projectId`, and the resolved `parentId`, `inheritContext`, and `noPause` options. The request
+body carries no code or files: an experiment has no model definition and a command or
+shell no `files`. A request that cannot be built, such as a config with a NaN, is not
+sent and fails with `invalid_request`. The adapter never creates a project, removes API envelopes, redacts
 secrets from returned entities, and returns an entity with an `id`.
 
 No launch is retried. Master launch warnings for a generic task, such as a request

@@ -11,7 +11,7 @@ import ssl
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Union
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple, Union
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
 
 import requests
@@ -835,63 +835,55 @@ class DeterminedAPIClient:
                 return marker
         return None
 
-    @staticmethod
-    def _upload_fields(value: Any, path: str = "config") -> List[str]:
-        forbidden = {
-            "context",
-            "contextdir",
-            "contextpath",
-            "data",
-            "files",
-            "includes",
-            "modeldefinition",
-            "projectroot",
-            "upload",
-            "uploadcontext",
-            "uploads",
-        }
-        found: List[str] = []
-        if isinstance(value, dict):
-            for key, item in value.items():
-                nested_path = f"{path}.{key}"
-                normalized = "".join(char for char in str(key).lower() if char.isalnum())
-                if normalized in forbidden:
-                    found.append(nested_path)
-                found.extend(DeterminedAPIClient._upload_fields(item, nested_path))
-        elif isinstance(value, (list, tuple)):
-            for index, item in enumerate(value):
-                found.extend(DeterminedAPIClient._upload_fields(item, f"{path}[{index}]"))
-        return found
-
     def launch_task(
         self, kind: str, config: Dict[str, Any], options: Optional[Mapping[str, Any]] = None
     ) -> Dict[str, Any]:
-        kind = self._kind(kind)
-        if not isinstance(config, dict):
-            raise TypeError("config must be a dictionary")
-        present = self._upload_fields(config)
-        if present:
-            raise ValueError("Code/data uploads are not supported; remove: " + ", ".join(present))
+        """Create a task. The request body carries the config and no code or files: an
+        experiment has no model definition, a generic task an empty context directory, and a
+        command or shell no ``files``.
+
+        A request that cannot be built is never sent and fails with ``invalid_request``.
+        """
+        try:
+            kind = self._kind(kind)
+            endpoint, body = self._launch_request(kind, config, options or {})
+        except (TypeError, ValueError) as exc:
+            raise APIError(
+                f"the launch request was not sent: {exc}", code="invalid_request"
+            ) from exc
+        response = self._post(endpoint, data=body)
         if kind == "generic":
-            return self._launch_generic_task(config, options or {})
-        if options:
-            raise ValueError("launch options apply only to generic tasks")
-        body = {"config": _config_text(config), "activate": True} if kind == "experiment" else {"config": config}
-        entity = self._entity(self._post(f"api/v1/{kind}s", data=body), kind, mutation=True)
+            return self._generic_launched(response)
+        entity = self._entity(response, kind, mutation=True)
         return self._safe_shell(entity) if kind == "shell" else entity
 
     _GENERIC_OPTIONS = {"parentId": str, "inheritContext": bool, "noPause": bool}
 
-    def _launch_generic_task(
-        self, config: Dict[str, Any], options: Mapping[str, Any]
-    ) -> Dict[str, Any]:
-        for key, value in options.items():
-            expected = self._GENERIC_OPTIONS.get(key)
-            if expected is None or not isinstance(value, expected):
-                raise ValueError(f"unsupported generic task launch option: {key}")
-        # Code and data stay on shared mounts, so the context directory is always empty.
-        body: Dict[str, Any] = {"contextDirectory": [], "config": _config_text(config), **options}
-        response = self._post("api/v1/generic-tasks", data=body)
+    def _launch_request(
+        self, kind: str, config: Dict[str, Any], options: Mapping[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
+        if not isinstance(config, dict):
+            raise TypeError("config must be a dictionary")
+        if kind == "generic":
+            for key, value in options.items():
+                expected = self._GENERIC_OPTIONS.get(key)
+                if expected is None or not isinstance(value, expected):
+                    raise ValueError(f"unsupported generic task launch option: {key}")
+            # Code and data stay on shared mounts, so the context directory is always empty.
+            return "api/v1/generic-tasks", {
+                "contextDirectory": [], "config": _config_text(config), **options,
+            }
+        if options:
+            raise ValueError("launch options apply only to generic tasks")
+        if kind == "experiment":
+            return "api/v1/experiments", {"config": _config_text(config), "activate": True}
+        # Sent as a mapping, but serialized here so that a config JSON cannot encode fails
+        # before the request, as for the other kinds.
+        json.dumps(config, allow_nan=False)
+        return f"api/v1/{kind}s", {"config": config}
+
+    @staticmethod
+    def _generic_launched(response: Dict[str, Any]) -> Dict[str, Any]:
         task_id = response.get("taskId")
         if not isinstance(task_id, str) or not task_id:
             raise SubmissionUncertainError(
