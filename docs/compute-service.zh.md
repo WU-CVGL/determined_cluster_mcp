@@ -245,7 +245,7 @@ Determined 自身的任务 ID：command、shell 和 generic 任务为 UUID，exp
 | `compute_list` | `kind`，可选 `limit=50`、`offset=0`、`marker`、`states` | 当前账户的一页任务，最新的在前；指定 `states` 时只列出处于这些状态的 experiment 或 generic 任务；指定 `marker` 时返回该页中配置带有该标记的任务 |
 | `compute_shell_connect` | `id`，可选 `local_port`、`wait_seconds=0`（最多 600） | 为该账户某个正在运行的 shell 打开或返回本地 SSH 隧道；见[shell 访问](#shell-access) |
 | `compute_shell_disconnect` | `id` | 关闭该隧道并删除该 shell 的密钥文件；shell 继续运行。返回 `disconnected`，确有隧道时还返回 `files`：`removed`，或在该目录现在可能属于另一个 server 时为 `kept` |
-| `compute_resources` | 可选 `slots=1`、`pool`、`prefer_gpu_topology`、`gpu_groups` | 当前调度容量和候选资源池。值为 `"strong"` 且请求 2 个及以上 slot 时，每个资源池会增加 `max_numa_node_free_slots`（当前能放下的最大 `"strong"` 任务）和 `max_numa_node_slots`（master 在当前 agent 下接受的最大值）。传入 `gpu_groups`（各组数量之和必须等于 `slots`）时，只有某个 agent 有满足每个组的空闲 GPU，资源池才算可用。每个资源池还有 `description`、`gpu_models` 和 `per_agent_free_gpus_by_model` |
+| `compute_resources` | 可选 `slots=1`、`pool`、`prefer_gpu_topology`、`gpu_groups`、`include_gpu_memory=false` | 当前调度容量和候选资源池。值为 `"strong"` 且请求 2 个及以上 slot 时，每个资源池会增加 `max_numa_node_free_slots`（当前能放下的最大 `"strong"` 任务）和 `max_numa_node_slots`（master 在当前 agent 下接受的最大值）。传入 `gpu_groups`（各组数量之和必须等于 `slots`）时，只有某个 agent 有满足每个组的空闲 GPU，资源池才算可用。每个资源池还有 `description`、`gpu_models` 和 `per_agent_free_gpus_by_model`。`include_gpu_memory` 会增加 `gpu_memory` |
 | `storage_check` | `path` | 映射容器路径的访问情况 |
 | `storage_sync` | `local_dir`、`shared_dir`，可选 `dry_run=true` | 预览或把本地目录内容复制到共享存储 |
 | `storage_fetch` | `shared_dir`、`local_dir`，可选 `dry_run=true` | 预览或把共享目录内容复制到本地 |
@@ -269,6 +269,15 @@ brand 无法读取时为 `null`。`per_agent_free_gpus_by_model` 把资源池的
 空闲 GPU，例如 `{"node": {"NVIDIA CMP 170HX": 3, "NVIDIA GeForce RTX 5060 Ti": 2}}`，空闲 slot 的
 计算方式与准入相同；agent 列表与资源池不一致或某个 GPU 的型号无法读取时为 `null`。这些信息都不影响
 准入。
+
+传入 `include_gpu_memory: true` 时，报告增加 `gpu_memory`，与容量使用同一次 agent 请求读取：
+`queried_at` 是 master 读取的时间；`gpus` 为各 agent（给定 `pool` 时仅该资源池）的每张 GPU 一项，
+含 `agent_id`、`uuid`、`device_id`、`model`（不是 slot 的 GPU 为 `null`）、`excluded`，以及
+`total`、`used`、`free`、`reserved`，每项为 `{bytes, sampled_at}`，没有样本时为 `null`。
+`sampled_at` 是 exporter 的采样时间。读数经 master 取自集群的 DCGM-Exporter，仅供观察：显存有余
+但 slot 已占用的 GPU 仍不算容量。不提供 GPU 显存的 master 返回 `unsupported`；master 读取失败
+（例如未配置监控）时，调用以 master 的错误失败，不会改用其他来源。任务自身随时间的显存用量请用
+`compute_usage` 的 `gpu_memory_used_bytes`。
 
 准入按资源池自身的方式计算 slot：已 drain 或已禁用的 slot，以及已禁用 agent 的所有 slot，都不算
 容量；正在 drain 的 slot 或 agent 只计入仍有容器占用的 slot。command、shell、generic 任务以及
