@@ -560,8 +560,11 @@ class _FakeInspector:
     def __init__(self):
         self.calls = []
 
-    def resources(self, slots, pool, prefer_gpu_topology, gpu_groups=None):
+    def resources(
+        self, slots, pool, prefer_gpu_topology, gpu_groups=None, include_gpu_memory=False
+    ):
         self.calls.append((slots, pool, prefer_gpu_topology, gpu_groups))
+        self.memory = getattr(self, "memory", []) + [include_gpu_memory]
         return {"requested_slots": slots, "prefer_gpu_topology": prefer_gpu_topology}
 
 
@@ -642,3 +645,19 @@ def test_shell_access_closes_only_when_the_last_session_ends():
         assert shell_access.calls == [("reopen",), ("close_all",), ("reopen",), ("close_all",)]
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=10))
+
+
+def test_compute_resources_passes_include_gpu_memory():
+    inspector = _FakeInspector()
+
+    async def exercise():
+        server = create_server(FakeService(), resource_inspector=inspector)
+        async with Client(server) as client:
+            tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+            schema = tools["compute_resources"].input_schema["properties"]["include_gpu_memory"]
+            assert schema["default"] is False
+            await client.call_tool("compute_resources", {"slots": 1})
+            await client.call_tool("compute_resources", {"slots": 1, "include_gpu_memory": True})
+
+    asyncio.run(asyncio.wait_for(exercise(), timeout=10))
+    assert inspector.memory == [False, True]

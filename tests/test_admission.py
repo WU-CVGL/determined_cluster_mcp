@@ -1516,3 +1516,164 @@ def test_a_pool_without_the_usable_field_is_usable():
     assert ResourceInspector(Client([pool()], [agent()])).resources(1, "gpu")["selected_pool"][
         "usable"
     ] is True
+
+
+# GetAgents fields as the master's gateway encodes them (JSONPb with EmitDefaults): int64 bytes
+# are strings, a reading without a sample is null.
+GATEWAY_GPU_MEMORY = """{
+  "agents": [{"id": "node01", "gpuTopology": {"gpus": [
+    {"deviceId": 0, "uuid": "GPU-a", "excluded": false, "memory": {
+      "total": {"bytes": "51527024640", "sampledAt": "2026-11-17T12:57:05.742Z"},
+      "used": {"bytes": "0", "sampledAt": "2026-11-17T12:57:05.742Z"},
+      "free": null, "reserved": null}},
+    {"deviceId": 1, "uuid": "GPU-b", "excluded": false,
+     "memory": {"total": null, "used": null, "free": null, "reserved": null}},
+    {"deviceId": -1, "uuid": "GPU-x", "excluded": true, "memory": {
+      "total": null, "used": null,
+      "free": {"bytes": "1048576", "sampledAt": "2026-11-17T12:57:06Z"}, "reserved": null}}
+  ]}}],
+  "gpuMemoryQueriedAt": "2026-11-17T12:57:20Z"
+}"""
+
+
+def gpu_memory_agent(occupied=0, pool_name="gpu"):
+    import json
+
+    measured = json.loads(GATEWAY_GPU_MEMORY)
+    value = agent("node01", pool_name=pool_name, slots=2, occupied=occupied)
+    for index, uuid in enumerate(("GPU-a", "GPU-b")):
+        value["slots"][str(index)]["device"] = {
+            "id": index, "brand": "NVIDIA RTX 6000 Ada Generation", "uuid": uuid, "type": "TYPE_CUDA",
+        }
+    value["gpuTopology"] = measured["agents"][0]["gpuTopology"]
+    return value, measured["gpuMemoryQueriedAt"]
+
+
+class MemoryClient(Client):
+    def __init__(self, pools, agents, queried_at):
+        super().__init__(pools, agents)
+        self.queried_at = queried_at
+
+    def _get(self, endpoint, params=None):
+        value = super()._get(endpoint, params)
+        if endpoint == "api/v1/agents" and params.get("includeGpuMemory") == "true":
+            value = dict(value, gpuMemoryQueriedAt=self.queried_at)
+        return value
+
+
+def test_gpu_memory_comes_from_the_same_agents_request():
+    measured, queried_at = gpu_memory_agent()
+    client = MemoryClient([pool(total=2)], [measured], queried_at)
+
+    report = ResourceInspector(client).resources(1, "gpu", include_gpu_memory=True)
+
+    assert client.calls == [
+        ("api/v1/agents", {"limit": 0, "includeGpuMemory": "true"}),
+        ("api/v1/resource-pools", {"limit": 0}),
+    ]
+    model = "NVIDIA RTX 6000 Ada Generation"
+    assert report["gpu_memory"] == {
+        "queried_at": "2026-11-17T12:57:20Z",
+        "gpus": [
+            {
+                "agent_id": "node01", "uuid": "GPU-a", "device_id": 0, "model": model,
+                "excluded": False,
+                "total": {"bytes": 51527024640, "sampled_at": "2026-11-17T12:57:05.742Z"},
+                "used": {"bytes": 0, "sampled_at": "2026-11-17T12:57:05.742Z"},
+                "free": None, "reserved": None,
+            },
+            {
+                "agent_id": "node01", "uuid": "GPU-b", "device_id": 1, "model": model,
+                "excluded": False, "total": None, "used": None, "free": None, "reserved": None,
+            },
+            {
+                "agent_id": "node01", "uuid": "GPU-x", "device_id": -1, "model": None,
+                "excluded": True, "total": None, "used": None,
+                "free": {"bytes": 1048576, "sampled_at": "2026-11-17T12:57:06Z"},
+                "reserved": None,
+            },
+        ],
+    }
+
+
+def test_gpu_memory_is_not_requested_by_default():
+    measured, queried_at = gpu_memory_agent()
+    client = MemoryClient([pool(total=2)], [measured], queried_at)
+
+    report = ResourceInspector(client).resources(1, "gpu")
+
+    assert "gpu_memory" not in report
+    assert client.calls[0] == ("api/v1/agents", {"limit": 0})
+
+
+def test_free_gpu_memory_does_not_make_a_busy_slot_available():
+    measured, queried_at = gpu_memory_agent(occupied=2)
+    client = MemoryClient([pool(total=2, used=2)], [measured], queried_at)
+
+    report = ResourceInspector(client).resources(1, "gpu", include_gpu_memory=True)
+
+    assert report["available"] is False
+    assert report["gpu_memory"]["gpus"][0]["used"]["bytes"] == 0
+
+
+def test_gpu_memory_of_other_pools_is_left_out():
+    measured, queried_at = gpu_memory_agent(pool_name="other")
+    client = MemoryClient([pool(total=2), pool("other", total=2)], [measured], queried_at)
+
+    assert ResourceInspector(client).resources(
+        1, "gpu", include_gpu_memory=True
+    )["gpu_memory"]["gpus"] == []
+    assert len(ResourceInspector(client).resources(
+        1, None, include_gpu_memory=True
+    )["gpu_memory"]["gpus"]) == 3
+
+
+def test_a_master_without_gpu_memory_is_unsupported_not_unmeasured():
+    # An older master ignores includeGpuMemory and answers without gpuMemoryQueriedAt.
+    measured, _ = gpu_memory_agent()
+    for gpu in measured["gpuTopology"]["gpus"]:
+        gpu.pop("memory")
+    client = Client([pool(total=2)], [measured])
+
+    with pytest.raises(APIError) as caught:
+        ResourceInspector(client).resources(1, "gpu", include_gpu_memory=True)
+
+    assert caught.value.code == "unsupported"
+
+
+def test_a_failed_gpu_memory_read_fails_the_request():
+    error = APIError("the GPU memory query failed", code=503)
+    client = Client([pool(total=2)], [], error=error)
+
+    with pytest.raises(APIError) as caught:
+        ResourceInspector(client).resources(1, "gpu", include_gpu_memory=True)
+
+    assert caught.value is error
+    assert client.calls == [("api/v1/agents", {"limit": 0, "includeGpuMemory": "true"})]
+
+
+@pytest.mark.parametrize(
+    "reading",
+    [
+        {"bytes": "-1", "sampledAt": "2026-11-17T12:57:05Z"},
+        {"bytes": "1.5", "sampledAt": "2026-11-17T12:57:05Z"},
+        {"bytes": True, "sampledAt": "2026-11-17T12:57:05Z"},
+        {"bytes": "10"},
+        {"sampledAt": "2026-11-17T12:57:05Z"},
+        "10",
+    ],
+)
+def test_a_malformed_gpu_memory_reading_is_an_invalid_response(reading):
+    measured, queried_at = gpu_memory_agent()
+    measured["gpuTopology"]["gpus"][0]["memory"]["used"] = reading
+    client = MemoryClient([pool(total=2)], [measured], queried_at)
+
+    with pytest.raises(APIError) as caught:
+        ResourceInspector(client).resources(1, "gpu", include_gpu_memory=True)
+
+    assert caught.value.code == "invalid_response"
+
+
+def test_include_gpu_memory_must_be_a_boolean():
+    with pytest.raises(ValueError):
+        ResourceInspector(Client([], [])).resources(1, None, include_gpu_memory="yes")

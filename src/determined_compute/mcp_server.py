@@ -305,6 +305,7 @@ def create_server(
                 Optional[Literal["soft", "strong", False]], BeforeValidator(_exact_preference)
             ] = None,
             gpu_groups: Optional[list[dict[str, Any]]] = None,
+            include_gpu_memory: bool = False,
         ) -> dict[str, Any]:
             """Inspect current scheduler capacity; slots=0 checks auxiliary capacity, not free GPUs.
 
@@ -314,9 +315,12 @@ def create_server(
             with "strong" and 2 or more slots each pool adds max_numa_node_free_slots and
             max_numa_node_slots. Pass the request's gpu_groups ([{name, count, models}], counts
             adding up to slots) to check for one agent with free GPUs for every group.
+            include_gpu_memory adds gpu_memory: each GPU's total, used, free and reserved
+            bytes with sampled_at, null without a sample; availability still comes from slots.
             """
             return await call(
-                resource_inspector.resources, slots, pool, prefer_gpu_topology, gpu_groups
+                resource_inspector.resources, slots, pool, prefer_gpu_topology, gpu_groups,
+                include_gpu_memory,
             )
 
     if shell_access is not None:

@@ -272,7 +272,7 @@ positive integer for an experiment, which can also be passed as a numeric string
 | `compute_list` | `kind`, optional `limit=50`, `offset=0`, `marker`, `states` | One page of the account's tasks, newest first; with `states`, only experiments or generic tasks in those states; with `marker`, the tasks on that page whose config carries it |
 | `compute_shell_connect` | `id`, optional `local_port`, `wait_seconds=0` (up to 600) | Opens or returns a local SSH tunnel to one of the account's running shells; see [shell access](#shell-access) |
 | `compute_shell_disconnect` | `id` | Closes that tunnel and deletes the shell's key file; the shell keeps running. Returns `disconnected` and, when it was, `files`: `removed`, or `kept` when the directory may now belong to another server |
-| `compute_resources` | optional `slots=1`, `pool`, `prefer_gpu_topology`, `gpu_groups` | Current scheduler capacity and candidate pools. With `"strong"` and 2 or more slots, each pool adds `max_numa_node_free_slots` (largest `"strong"` task that fits now) and `max_numa_node_slots` (largest the master accepts with the current agents). With `gpu_groups`, whose counts must add up to `slots`, a pool is available when one agent has free GPUs for every group. Each pool also has `description`, `gpu_models` and `per_agent_free_gpus_by_model` |
+| `compute_resources` | optional `slots=1`, `pool`, `prefer_gpu_topology`, `gpu_groups`, `include_gpu_memory=false` | Current scheduler capacity and candidate pools. With `"strong"` and 2 or more slots, each pool adds `max_numa_node_free_slots` (largest `"strong"` task that fits now) and `max_numa_node_slots` (largest the master accepts with the current agents). With `gpu_groups`, whose counts must add up to `slots`, a pool is available when one agent has free GPUs for every group. Each pool also has `description`, `gpu_models` and `per_agent_free_gpus_by_model`. `include_gpu_memory` adds `gpu_memory` |
 | `storage_check` | `path` | Access information for a mapped container path |
 | `storage_sync` | `local_dir`, `shared_dir`, optional `dry_run=true` | Preview or copy local directory contents to shared storage |
 | `storage_fetch` | `shared_dir`, `local_dir`, optional `dry_run=true` | Preview or copy shared directory contents locally |
@@ -302,6 +302,18 @@ does not match the pool, or a slot's device or GPU brand is unreadable.
 example `{"node": {"NVIDIA CMP 170HX": 3, "NVIDIA GeForce RTX 5060 Ti": 2}}`, counting free
 slots as admission does; it is `null` when the agent list does not match the pool or a GPU's
 model is unreadable. None of these facts changes admission.
+
+With `include_gpu_memory: true`, the report adds `gpu_memory`, read with the same agents
+request: `queried_at`, when the master read it, and `gpus`, one entry per GPU of the agents
+(of `pool` when given) with `agent_id`, `uuid`, `device_id`, `model` (`null` for a GPU that
+is not a slot), `excluded`, and `total`, `used`, `free` and `reserved`, each
+`{bytes, sampled_at}` or `null` without a sample. `sampled_at` is the sample's timestamp
+in Prometheus, which for DCGM-Exporter is the scrape time, not when DCGM read the GPU. The readings come from the cluster's DCGM-Exporter through the master and are
+observations only: a GPU with free memory but a busy slot is still not capacity. A master
+that does not report GPU memory fails with `unsupported`; a failed read on the master, for
+example without monitoring, fails the call with the master's error, and nothing falls back
+to another source. For a task's own memory use over time, use `compute_usage` with
+`gpu_memory_used_bytes`.
 
 Admission counts slots as the pool does: a drained or disabled slot, and every slot of a
 disabled agent, is not capacity, and a draining slot or agent counts only the slots that
