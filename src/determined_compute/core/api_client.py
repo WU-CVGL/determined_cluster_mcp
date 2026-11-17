@@ -877,6 +877,9 @@ class DeterminedAPIClient:
             raise ValueError("launch options apply only to generic tasks")
         if kind == "experiment":
             return "api/v1/experiments", {"config": _config_text(config), "activate": True}
+        # Sent as a mapping, but serialized here so that a config JSON cannot encode fails
+        # before the request, as for the other kinds.
+        json.dumps(config, allow_nan=False)
         return f"api/v1/{kind}s", {"config": config}
 
     @staticmethod

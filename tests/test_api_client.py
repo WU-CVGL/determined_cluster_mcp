@@ -530,10 +530,12 @@ def test_experiment_config_values_reach_the_master_unchanged(monkeypatch):
     assert yaml.safe_load(text) == config
 
 
-def test_experiment_config_rejects_non_finite_numbers_before_any_request(monkeypatch):
+@pytest.mark.parametrize('kind', ['command', 'shell', 'experiment', 'generic'])
+@pytest.mark.parametrize('value', [float('nan'), float('inf'), object()])
+def test_a_config_json_cannot_encode_fails_before_any_request(monkeypatch, kind, value):
     monkeypatch.setattr(requests, 'post', lambda *a, **kw: pytest.fail('no request may be sent'))
     with pytest.raises(APIError) as caught:
-        client().launch_task('experiment', {'hyperparameters': {'lr': float('nan')}})
+        client().launch_task(kind, {'hyperparameters': {'lr': value}})
     assert caught.value.code == 'invalid_request'
     assert not isinstance(caught.value, SubmissionUncertainError)
 
