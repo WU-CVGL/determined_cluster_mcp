@@ -305,8 +305,8 @@ With `include_gpu_memory: true`, the report adds `gpu_memory`, read with the sam
 request: `queried_at`, when the master read it, and `gpus`, one entry per GPU of the agents
 (of `pool` when given) with `agent_id`, `uuid`, `device_id`, `model` (`null` for a GPU that
 is not a slot), `excluded`, and `total`, `used`, `free` and `reserved`, each
-`{bytes, sampled_at}` or `null` without a sample. `sampled_at` is the exporter's sample
-time. The readings come from the cluster's DCGM-Exporter through the master and are
+`{bytes, sampled_at}` or `null` without a sample. `sampled_at` is the sample's timestamp
+in Prometheus, which for DCGM-Exporter is the scrape time, not when DCGM read the GPU. The readings come from the cluster's DCGM-Exporter through the master and are
 observations only: a GPU with free memory but a busy slot is still not capacity. A master
 that does not report GPU memory fails with `unsupported`; a failed read on the master, for
 example without monitoring, fails the call with the master's error, and nothing falls back

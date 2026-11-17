@@ -274,7 +274,7 @@ brand 无法读取时为 `null`。`per_agent_free_gpus_by_model` 把资源池的
 `queried_at` 是 master 读取的时间；`gpus` 为各 agent（给定 `pool` 时仅该资源池）的每张 GPU 一项，
 含 `agent_id`、`uuid`、`device_id`、`model`（不是 slot 的 GPU 为 `null`）、`excluded`，以及
 `total`、`used`、`free`、`reserved`，每项为 `{bytes, sampled_at}`，没有样本时为 `null`。
-`sampled_at` 是 exporter 的采样时间。读数经 master 取自集群的 DCGM-Exporter，仅供观察：显存有余
+`sampled_at` 是该样本在 Prometheus 中的时间戳；对 DCGM-Exporter 而言是抓取时间，而非 DCGM 读取 GPU 的时间。读数经 master 取自集群的 DCGM-Exporter，仅供观察：显存有余
 但 slot 已占用的 GPU 仍不算容量。不提供 GPU 显存的 master 返回 `unsupported`；master 读取失败
 （例如未配置监控）时，调用以 master 的错误失败，不会改用其他来源。任务自身随时间的显存用量请用
 `compute_usage` 的 `gpu_memory_used_bytes`。
