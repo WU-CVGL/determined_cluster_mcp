@@ -80,20 +80,6 @@ class _LookupOutOfTime(Exception):
     """The search for a submission marker used up its time budget."""
 
 
-_FORBIDDEN_FIELDS = {
-    "context",
-    "contextdir",
-    "contextpath",
-    "files",
-    "includes",
-    "modeldefinition",
-    "projectroot",
-    "upload",
-    "uploadcontext",
-    "uploads",
-}
-
-
 # Units of the fixed metric names served by the task resources API.
 _USAGE_METRICS = {
     "allocation_active": "count",
@@ -147,20 +133,6 @@ _TIMESTAMP = re.compile(
 
 def _normalized_key(key: Any) -> str:
     return "".join(character for character in str(key).lower() if character.isalnum())
-
-
-def _reject_upload_fields(value: Any, path: str = "request") -> None:
-    if isinstance(value, Mapping):
-        for key, nested in value.items():
-            normalized = _normalized_key(key)
-            if normalized in _FORBIDDEN_FIELDS:
-                raise ValidationError(
-                    f"{path}.{key} is forbidden; compute tasks use shared mounts only"
-                )
-            _reject_upload_fields(nested, f"{path}.{key}")
-    elif isinstance(value, (list, tuple)):
-        for index, nested in enumerate(value):
-            _reject_upload_fields(nested, f"{path}[{index}]")
 
 
 def _required_text(value: Any, field: str) -> str:
@@ -298,7 +270,6 @@ class ComputeService:
         unknown = set(request) - _REQUEST_FIELDS
         if unknown:
             raise ValidationError(f"request has unknown fields: {sorted(unknown)}")
-        _reject_upload_fields(request)
 
         raw_kind = request.get("kind", "auto")
         if raw_kind != "auto" and raw_kind not in _TASK_KINDS:
@@ -663,7 +634,6 @@ class ComputeService:
         code_revision: Optional[str],
     ) -> Dict[str, Any]:
         config = copy.deepcopy(dict(value or {}))
-        self._validate_config_paths(config)
         checkpoint = config.get("checkpoint_storage")
         if checkpoint is not None:
             if not isinstance(checkpoint, Mapping) or checkpoint.get("type") != "shared_fs":
@@ -702,6 +672,7 @@ class ComputeService:
             raise ValidationError("set prefer_gpu_topology at the top level")
         if "gpu_groups" in resources:
             raise ValidationError("set gpu_groups at the top level")
+        self._validate_devices(resources.get("devices"))
         resources = copy.deepcopy(dict(resources))
         resources.update({"slots_per_trial": slots, "resource_pool": pool})
         if topology is not None:
@@ -750,20 +721,21 @@ class ComputeService:
             raise ValidationError("experiment requires command or experiment_config.entrypoint")
         return config
 
-    def _validate_config_paths(self, value: Any, path: str = "experiment_config") -> None:
-        if isinstance(value, Mapping):
-            for key, nested in value.items():
-                normalized = _normalized_key(key)
-                nested_path = f"{path}.{key}"
-                if normalized == "hostpath":
-                    self.profile.validate_host_path(nested, nested_path)
-                elif normalized == "containerpath":
-                    self.profile.validate_container_path(nested, nested_path)
-                else:
-                    self._validate_config_paths(nested, nested_path)
-        elif isinstance(value, (list, tuple)):
-            for index, nested in enumerate(value):
-                self._validate_config_paths(nested, f"{path}[{index}]")
+    def _validate_devices(self, devices: Any) -> None:
+        # Besides checkpoint storage and bind mounts, devices are the only experiment config
+        # entries with host paths; hyperparameters and other values pass through unchecked.
+        if devices is None:
+            return
+        if not isinstance(devices, list):
+            raise ValidationError("experiment_config.resources.devices must be a list")
+        for index, device in enumerate(devices):
+            path = f"experiment_config.resources.devices[{index}]"
+            if not isinstance(device, Mapping):
+                raise ValidationError(f"{path} must be an object")
+            self.profile.validate_host_path(device.get("host_path"), f"{path}.host_path")
+            self.profile.validate_container_path(
+                device.get("container_path"), f"{path}.container_path"
+            )
 
     @staticmethod
     def _render_entrypoint(command: Any, workdir: str, output_dir: str) -> str:
@@ -811,7 +783,8 @@ class ComputeService:
         except SubmissionUncertainError as exc:
             return self._resolve_unconfirmed(plan, marker, str(exc), exc.details, exc)
         except APIError:
-            # The master answered with a definite rejection, so nothing was submitted.
+            # The request was not sent, or the master answered with a definite rejection, so
+            # nothing was submitted.
             raise
         except Exception as exc:
             return self._resolve_unconfirmed(
